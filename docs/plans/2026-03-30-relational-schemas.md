@@ -17,8 +17,8 @@ Branch: `feat/relational-schemas`
 internal/
 ├── model/
 │   ├── fault.go              # FaultSpec, FaultComposition, FaultCompositionMember, FaultIncompatibility
-│   ├── workload.go           # Flow, Persona, Workload, Attack, AttackResult
-│   ├── experiment.go         # Experiment, ExperimentRun, ExperimentResult, ContributionResult
+│   ├── workload.go           # Flow, Persona, Workload, Attack (+Service, +Role), AttackResult (+Service)
+│   ├── experiment.go         # Experiment (+PrimaryWorkloadID), ExperimentRun, WorkflowRunResult, ServiceRunResult, ContributionResult (+CacheBoxMode)
 │   ├── trace.go              # TraceAnchor, CacheBoxConfig, SyntheticDelayConfig, HistogramBucket
 │   └── policy.go             # PolicyRule, PolicyCondition, PolicyAction, AttackTargetSpec
 ```
@@ -32,7 +32,7 @@ All types defined as Go structs with JSON tags. In-memory stores wrap these with
 A k6 **workload** (high-level flow like "browse" or "checkout") drives broad traffic. Within or alongside it, multiple vegeta **attacks** (precision loads) target specific endpoints. Attacks belong to a workload via `WorkloadID`.
 
 ```
-Workload 1──* Attack 1──1 AttackResult
+Workload 1──* Attack (role: primary|background, service) 1──1 AttackResult (service)
    │
    ├── references Flow (by name, e.g. "online-boutique-browse")
    └── references Persona (by name, e.g. "aggressive")
@@ -88,6 +88,8 @@ type Attack struct {
     WorkloadID      string            `json:"workload_id,omitempty"`      // FK -> Workload.ID (nullable for standalone)
     ExperimentRunID string            `json:"experiment_run_id,omitempty"` // FK -> ExperimentRun.ID
     PolicyRuleID    string            `json:"policy_rule_id,omitempty"`   // FK -> PolicyRule.ID (if policy-triggered)
+    Service         string            `json:"service"`                    // target service name (e.g., "productcatalog")
+    Role            string            `json:"role"`                       // "primary" (measured workflow) or "background" (interference source)
     TargetURL       string            `json:"target_url"`
     TargetMethod    string            `json:"target_method"`
     TargetHeaders   map[string]string `json:"target_headers,omitempty"`
@@ -104,6 +106,7 @@ type Attack struct {
 // AttackResult stores the outcome metrics of a completed attack.
 type AttackResult struct {
     AttackID      string         `json:"attack_id"`   // FK -> Attack.ID (1:1)
+    Service       string         `json:"service"`     // target service name (denormalized from Attack for query convenience)
     TotalRequests uint64         `json:"total_requests"`
     DurationMs    int64          `json:"duration_ms"`
     RateActual    float64        `json:"rate_actual"`
@@ -333,12 +336,13 @@ type HistogramBucket struct {
 
 ## Schema 4: Experiments and Results
 
-An **experiment** is a plan (baseline + N isolation runs + combination runs). Each **experiment run** is one execution with specific services frozen. Runs produce **results** aggregated per service per workflow.
+An **experiment** is a plan (baseline + N isolation runs + combination runs). Each **experiment run** is one execution with specific services frozen. Runs produce two kinds of results: workflow-level latency (from load generator) and per-service metrics (from traces + Prometheus).
 
 ```
-Experiment 1──* ExperimentRun 1──* ExperimentResult
+Experiment 1──* ExperimentRun 1──* WorkflowRunResult (end-to-end workflow latency)
+                    │          1──* ServiceRunResult  (per-service metrics + cache-box fidelity)
                     │
-                    ├── * Attack (via ExperimentRunID FK)
+                    ├── * Attack (role=primary|background, via ExperimentRunID FK)
                     ├── * TraceAnchor (via ExperimentRunID FK)
                     └── * CacheBoxConfig (embedded in run)
 ```
@@ -352,16 +356,20 @@ Experiment 1──* ExperimentRun 1──* ExperimentResult
 //   - scenario:         inject synthetic latency into frozen service ("what-if")
 //   - cache_fidelity:   measure response divergence between live and cached
 type Experiment struct {
-    ID             string    `json:"id"`
-    Name           string    `json:"name"`
-    Description    string    `json:"description,omitempty"`
-    ExperimentType string    `json:"experiment_type"` // interference, isolation, attribution, scenario, cache_fidelity
-    WorkloadID     string    `json:"workload_id"`     // FK -> Workload.ID (load profile)
-    Status         string    `json:"status"`          // planned, running, completed, failed, cancelled
-    CreatedAt      time.Time `json:"created_at"`
-    StartedAt      *time.Time `json:"started_at,omitempty"`
-    CompletedAt    *time.Time `json:"completed_at,omitempty"`
+    ID                 string    `json:"id"`
+    Name               string    `json:"name"`
+    Description        string    `json:"description,omitempty"`
+    ExperimentType     string    `json:"experiment_type"` // interference, isolation, attribution, scenario, cache_fidelity
+    PrimaryWorkloadID  string    `json:"primary_workload_id"`  // FK -> Workload.ID (the workflow being measured, e.g. checkout)
+    Status             string    `json:"status"`               // planned, running, completed, failed, cancelled
+    CreatedAt          time.Time `json:"created_at"`
+    StartedAt          *time.Time `json:"started_at,omitempty"`
+    CompletedAt        *time.Time `json:"completed_at,omitempty"`
 }
+// Background workloads (interference sources) are captured per-run via Attack entities
+// with Role="background" linked to each ExperimentRun. This allows varying background
+// load across runs (e.g., browse at 100 → 2000 RPS) while keeping the primary workload
+// constant (e.g., checkout at 50 RPS). See Attack.Role.
 
 // ExperimentRun is one execution phase within an experiment.
 // An attribution experiment has 1 baseline + N isolation + C(N,2) combination runs.
@@ -386,49 +394,81 @@ type ExperimentRun struct {
     CreatedAt      time.Time        `json:"created_at"`
 }
 
-// ExperimentResult stores aggregated metrics for one service in one run.
-// One row per (run, service, workflow) triple.
-type ExperimentResult struct {
+// WorkflowRunResult stores end-to-end workflow latency for one run.
+// One row per (run, workflow) pair. This is the measurement the delta formula
+// operates on — it captures what the load generator (vegeta/k6) observes at
+// the workflow entry point, not individual service latency.
+//
+// Source: aggregated from AttackResults of primary-role attacks, or from
+// k6 summary output for broad-traffic workloads.
+type WorkflowRunResult struct {
     ID              string  `json:"id"`
     ExperimentRunID string  `json:"experiment_run_id"` // FK -> ExperimentRun.ID
-    Service         string  `json:"service"`
-    Workflow        string  `json:"workflow,omitempty"` // browse, checkout, etc.
+    Workflow        string  `json:"workflow"`           // browse, checkout, etc.
 
-    // Latency percentiles (constant-throughput measurement, no coordinated omission).
+    // End-to-end latency as measured by the load generator.
     LatencyP50Us    int64   `json:"latency_p50_us"`
     LatencyP95Us    int64   `json:"latency_p95_us"`
     LatencyP99Us    int64   `json:"latency_p99_us"`
-    LatencyP999Us   int64   `json:"latency_p999_us"` // reviewers expect p99.9
+    LatencyP999Us   int64   `json:"latency_p999_us"`
 
     RequestCount    int64   `json:"request_count"`
     ErrorRate       float64 `json:"error_rate"`
     ThroughputRPS   float64 `json:"throughput_rps"`
+
+    // Escape hatch for full distribution data (histogram buckets, raw arrays).
+    RawMetrics      json.RawMessage `json:"raw_metrics,omitempty"`
+}
+
+// ServiceRunResult stores per-service metrics for one service in one run.
+// One row per (run, service, workflow) triple. Source: trace backends
+// (Jaeger/Tempo for per-service latency), Prometheus (resource utilization),
+// and cache-box internals (fidelity metrics for frozen services).
+type ServiceRunResult struct {
+    ID              string  `json:"id"`
+    ExperimentRunID string  `json:"experiment_run_id"` // FK -> ExperimentRun.ID
+    Service         string  `json:"service"`
+    Workflow        string  `json:"workflow,omitempty"` // per-workflow breakdown (optional)
+
+    // Per-service latency from traces (ingress span duration at this service).
+    LatencyP50Us    *int64  `json:"latency_p50_us,omitempty"`
+    LatencyP95Us    *int64  `json:"latency_p95_us,omitempty"`
+    LatencyP99Us    *int64  `json:"latency_p99_us,omitempty"`
+
+    // Resource utilization per service pod.
+    CPUMillicores   *int64  `json:"cpu_millicores,omitempty"`
+    MemoryMB        *int64  `json:"memory_mb,omitempty"`
 
     // Cache-box specific (nil if service not frozen in this run).
     CacheHitRate    *float64 `json:"cache_hit_rate,omitempty"`
     CacheExactMatch *float64 `json:"cache_exact_match,omitempty"` // response fidelity: exact match %
     CacheStaleness  *float64 `json:"cache_staleness_ms,omitempty"` // avg age of served cached response
 
-    // Resource utilization per service pod.
-    CPUMillicores   *int64  `json:"cpu_millicores,omitempty"`
-    MemoryMB        *int64  `json:"memory_mb,omitempty"`
-
-    // Escape hatch for full distribution data (histogram buckets, raw arrays).
+    // Escape hatch for full distribution data.
     RawMetrics      json.RawMessage `json:"raw_metrics,omitempty"`
 }
 
-// ContributionResult is derived by comparing a baseline run to an isolation run.
-// Computed: delta_service = baseline_latency - isolated_latency.
-// Stored per (experiment, service, workflow) after all runs complete.
+// ContributionResult is derived by comparing workflow-level latency between
+// a baseline run and an isolation run.
+// Computed: delta_service = baseline_workflow_latency - isolated_workflow_latency.
+// Stored per (experiment, frozen_service, workflow) after all runs complete.
+//
+// The CacheBoxMode field distinguishes two types of isolation:
+//   - "replay":            removes ALL contribution (contention + intrinsic) → delta = total contribution
+//   - "replay_with_delay": preserves intrinsic timing → delta = contention-only contribution
+// Intrinsic cost = total contribution - contention contribution (compare two ContributionResults
+// for the same service with different CacheBoxMode values).
 type ContributionResult struct {
     ID              string  `json:"id"`
     ExperimentID    string  `json:"experiment_id"`    // FK -> Experiment.ID
     Service         string  `json:"service"`          // the frozen service
     Workflow        string  `json:"workflow"`
+    CacheBoxMode    string  `json:"cachebox_mode"`    // "replay" or "replay_with_delay"
     BaselineRunID   string  `json:"baseline_run_id"`  // FK -> ExperimentRun.ID
     IsolationRunID  string  `json:"isolation_run_id"` // FK -> ExperimentRun.ID
 
-    // Marginal contribution: how much latency this service adds under contention.
+    // Marginal contribution: how much workflow latency this service adds.
+    // Computed from WorkflowRunResult rows for baseline vs isolation runs.
     DeltaP50Us      int64   `json:"delta_p50_us"`     // baseline_p50 - isolated_p50
     DeltaP95Us      int64   `json:"delta_p95_us"`
     DeltaP99Us      int64   `json:"delta_p99_us"`
@@ -491,20 +531,26 @@ type AttackTargetSpec struct {
 ```
 Flow ──< Workload >── Persona
               │
-              ├──< Attack >── AttackResult
+              ├──< Attack (service, role=primary|background) >── AttackResult (service)
               │       │
               │       ├── ExperimentRun (FK)
               │       └── PolicyRule (FK, if policy-triggered)
               │
-              └── Experiment (typed: interference/isolation/attribution/scenario/cache_fidelity)
+              └── Experiment (PrimaryWorkloadID; background workloads via Attack.Role per run)
+                     │  (typed: interference/isolation/attribution/scenario/cache_fidelity)
                      │
-                     ├──< ExperimentRun >──< ExperimentResult
+                     ├──< ExperimentRun
                      │         │
+                     │         ├──< WorkflowRunResult (end-to-end workflow latency from load gen)
+                     │         ├──< ServiceRunResult  (per-service metrics, cache-box fidelity, resource util)
+                     │         ├──< Attack (role=primary: measured workflow, role=background: interference)
                      │         ├──< TraceAnchor
                      │         └──  CacheBoxConfig[] (embedded, with key strategy + mutation + TTL)
                      │                 └── SyntheticDelayConfig (histogram + lognormal fit)
                      │
-                     └──< ContributionResult (derived: delta = baseline - isolated)
+                     └──< ContributionResult (delta = baseline_workflow_latency - isolated_workflow_latency)
+                              ├── CacheBoxMode: "replay" (total) vs "replay_with_delay" (contention-only)
+                              ├── intrinsic cost = total_delta - contention_delta
                               └── references BaselineRun, IsolationRun, CombinationRun
 
 FaultSpec ──< FaultCompositionMember(+direction) >── FaultComposition (max depth 3)
@@ -535,16 +581,24 @@ FaultIncompatibility (reference data, validated at composition creation)
 
 7. **Policy engine moves to manteion** -- zeus-go Archer becomes pure execution engine. Manteion evaluates conditions and triggers attacks or cache-box changes.
 
+8. **Split results into workflow-level and service-level** -- `WorkflowRunResult` stores end-to-end workflow latency from the load generator (what the delta formula operates on). `ServiceRunResult` stores per-service metrics from traces/Prometheus (resource utilization, cache-box fidelity). The delta formula in VISION.md always compares workflow-level latency (e.g., "checkout p99 when productcatalog is frozen vs live"), not individual service latency.
+
+9. **Attack.Role distinguishes primary from background workloads** -- Interference experiments (VISION.md lines 132-133) run multiple concurrent workloads: checkout at constant 50 RPS (primary, being measured) + browse at varying RPS (background, interference source). `Experiment.PrimaryWorkloadID` identifies the measured workflow. Background workloads are captured per-run via Attack entities with `Role="background"`, allowing load to vary across runs.
+
+10. **ContributionResult.CacheBoxMode enables contention vs intrinsic decomposition** -- VISION.md distinguishes replay (removes all contribution) from replay-with-delay (preserves intrinsic timing). Two ContributionResult rows per service (one per mode) yield: total_delta (replay), contention_delta (replay-with-delay), intrinsic_cost = total - contention. No schema redesign needed -- just a mode indicator per row.
+
+11. **Attack and AttackResult carry a Service field** -- Enables composition from individual vegeta results upward to ServiceRunResult and WorkflowRunResult without URL parsing. AttackResult.Service is denormalized from Attack for query convenience.
+
 ---
 
 ## Implementation Order
 
 1. `go.mod` (no new deps needed)
 2. `internal/model/fault.go` -- FaultSpec, FaultComposition, FaultCompositionMember, FaultIncompatibility
-3. `internal/model/workload.go` -- Flow, Persona, Workload, Attack, AttackResult
+3. `internal/model/workload.go` -- Flow, Persona, Workload, Attack (with Service + Role), AttackResult (with Service)
 4. `internal/model/trace.go` -- TraceAnchor, CacheBoxConfig, SyntheticDelayConfig, HistogramBucket
 5. `internal/model/policy.go` -- PolicyRule, PolicyCondition, PolicyAction, AttackTargetSpec
-6. `internal/model/experiment.go` -- Experiment, ExperimentRun, ExperimentResult, ContributionResult
+6. `internal/model/experiment.go` -- Experiment (PrimaryWorkloadID), ExperimentRun, WorkflowRunResult, ServiceRunResult, ContributionResult (with CacheBoxMode)
 7. Validation methods on each type (`Validate() error`)
 8. Incompatibility seed data (the table of hard/soft constraints)
 9. Composition depth validation (max 3) and per-direction network toxic enforcement
@@ -559,6 +613,8 @@ FaultIncompatibility (reference data, validated at composition creation)
 6. Unit test: composition depth > 3 rejected
 7. Unit test: two network toxics same direction in parallel rejected; different directions passes
 8. Unit test: `CacheBoxConfig.Validate()` -- mutation policy deny blocks POST, allow with whitelist passes
-9. Unit test: `ContributionResult` delta computation from two ExperimentResult rows
-10. Unit test: `PolicyRule.Validate()` -- condition operators, action types
-11. Unit test: experiment abort propagation when isolation run fails
+9. Unit test: `ContributionResult` delta computation from two WorkflowRunResult rows (baseline vs isolation)
+10. Unit test: `ContributionResult` with CacheBoxMode="replay" vs "replay_with_delay" yields total vs contention delta
+11. Unit test: `PolicyRule.Validate()` -- condition operators, action types
+12. Unit test: `Attack.Validate()` -- Role must be "primary" or "background"; Service required
+13. Unit test: experiment abort propagation when isolation run fails
