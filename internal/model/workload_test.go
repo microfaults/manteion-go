@@ -10,7 +10,7 @@ func TestAttack_Validate(t *testing.T) {
 	base := func() Attack {
 		return Attack{
 			ID: "a1", Service: "productcatalog", Role: "primary",
-			TargetURL: "http://productcatalog:3550/products",
+			TargetURL:    "http://productcatalog:3550/products",
 			TargetMethod: "GET", Rate: 100, DurationMs: 30000,
 			Status: "pending", CreatedAt: time.Now(),
 		}

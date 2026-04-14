@@ -1,0 +1,86 @@
+// Package api provides the REST API server for manteion.
+// It follows the zeus-go Archer pattern: a Server struct that owns
+// dependencies and exposes Handler() returning a configured http.Handler.
+package api
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+)
+
+// Server holds all dependencies for the manteion API.
+// TODO: Add *rule.Store, *sdk.Registry, *zeus.Client when store layer is implemented.
+type Server struct {
+	logger *slog.Logger
+}
+
+// NewServer creates a new API server.
+func NewServer(logger *slog.Logger) *Server {
+	return &Server{
+		logger: logger,
+	}
+}
+
+// Handler returns an http.Handler with all routes registered.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.routes(mux)
+	return mux
+}
+
+// routes registers all API routes using Go 1.22+ method-path patterns.
+func (s *Server) routes(mux *http.ServeMux) {
+	// Health
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
+
+	// Rule CRUD
+	mux.HandleFunc("POST /api/v1/rules", s.handleCreateRule)
+	mux.HandleFunc("GET /api/v1/rules", s.handleListRules)
+	mux.HandleFunc("GET /api/v1/rules/{id}", s.handleGetRule)
+	mux.HandleFunc("PUT /api/v1/rules/{id}", s.handleUpdateRule)
+	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.handleDeleteRule)
+
+	// SDK registration & polling
+	mux.HandleFunc("POST /api/v1/sdk/register", s.handleRegister)
+	mux.HandleFunc("DELETE /api/v1/sdk/register/{id}", s.handleDeregister)
+	mux.HandleFunc("GET /api/v1/sdk/instances", s.handleListInstances)
+	mux.HandleFunc("GET /api/v1/sdk/rules", s.handlePollRules)
+	mux.HandleFunc("GET /api/v1/sdk/init", s.handleInit)
+
+	// Zeus proxy (pass-through to Archer)
+	mux.HandleFunc("POST /api/v1/zeus/workloads", s.handleZeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/workloads", s.handleZeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/workloads/{id}", s.handleZeusProxy)
+	mux.HandleFunc("POST /api/v1/zeus/attacks", s.handleZeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/attacks/{id}", s.handleZeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/attacks/{id}", s.handleZeusProxy)
+	mux.HandleFunc("POST /api/v1/zeus/policies", s.handleZeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/policies", s.handleZeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/policies/{id}", s.handleZeusProxy)
+}
+
+// --- JSON helpers ---
+
+// writeJSON serializes v as JSON and writes it with the given status code.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// Best-effort — headers already sent.
+		slog.Error("writeJSON encode error", "error", err)
+	}
+}
+
+// writeError writes a JSON error response: {"error": msg}.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// readJSON decodes the request body into v.
+func readJSON(r *http.Request, v any) error {
+	defer r.Body.Close()
+	return json.NewDecoder(r.Body).Decode(v)
+}

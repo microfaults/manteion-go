@@ -61,9 +61,9 @@ func (c *PolicyCondition) Validate() error {
 
 // PolicyAction describes what happens when a condition fires.
 type PolicyAction struct {
-	ActionType     string           `json:"action_type"` // "attack" or "cachebox_mode_change"
+	ActionType     string            `json:"action_type"` // "attack" or "cachebox_mode_change"
 	AttackTarget   *AttackTargetSpec `json:"attack_target,omitempty"`
-	CacheBoxChange *CacheBoxConfig  `json:"cachebox_change,omitempty"`
+	CacheBoxChange *CacheBoxConfig   `json:"cachebox_change,omitempty"`
 }
 
 func (a *PolicyAction) Validate() error {

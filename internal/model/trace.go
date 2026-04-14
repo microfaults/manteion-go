@@ -48,21 +48,21 @@ func (t *TraceAnchor) Validate() error {
 // boundary to replay cached responses instead of doing real work. Zero CPU,
 // zero queueing, but the call graph structure is preserved.
 type CacheBoxConfig struct {
-	Service          string `json:"service"`
-	Mode             string `json:"mode"`             // "passthrough", "replay", "replay_with_delay"
-	WorkflowScope    string `json:"workflow_scope"`    // meta-trace-id pattern, "" = all traffic
-	KeyStrategy      string `json:"key_strategy"`      // "exact", "fuzzy", "parametric"
-	MutationPolicy   string `json:"mutation_policy"`   // "deny" (default), "allow"
-	SafeMethods      []string `json:"safe_methods,omitempty"`
+	Service          string                `json:"service"`
+	Mode             string                `json:"mode"`            // "passthrough", "replay", "replay_with_delay"
+	WorkflowScope    string                `json:"workflow_scope"`  // meta-trace-id pattern, "" = all traffic
+	KeyStrategy      string                `json:"key_strategy"`    // "exact", "fuzzy", "parametric"
+	MutationPolicy   string                `json:"mutation_policy"` // "deny" (default), "allow"
+	SafeMethods      []string              `json:"safe_methods,omitempty"`
 	SyntheticDelay   *SyntheticDelayConfig `json:"synthetic_delay,omitempty"`
-	WarmupDurationMs int64  `json:"warmup_duration_ms,omitempty"`
-	CacheTTLMs       int64  `json:"cache_ttl_ms,omitempty"`
+	WarmupDurationMs int64                 `json:"warmup_duration_ms,omitempty"`
+	CacheTTLMs       int64                 `json:"cache_ttl_ms,omitempty"`
 }
 
 var (
-	validCacheBoxModes      = map[string]bool{"passthrough": true, "replay": true, "replay_with_delay": true}
-	validKeyStrategies      = map[string]bool{"exact": true, "fuzzy": true, "parametric": true}
-	validMutationPolicies   = map[string]bool{"deny": true, "allow": true}
+	validCacheBoxModes    = map[string]bool{"passthrough": true, "replay": true, "replay_with_delay": true}
+	validKeyStrategies    = map[string]bool{"exact": true, "fuzzy": true, "parametric": true}
+	validMutationPolicies = map[string]bool{"deny": true, "allow": true}
 )
 
 func (c *CacheBoxConfig) Validate() error {

@@ -64,7 +64,7 @@ func TestExperimentRun_Validate(t *testing.T) {
 			ExperimentRun{
 				ID: "r2", ExperimentID: "e1", RunType: "isolation",
 				FrozenServices: []CacheBoxConfig{frozenProductcatalog},
-				Status: "pending", CreatedAt: time.Now(),
+				Status:         "pending", CreatedAt: time.Now(),
 			},
 			false,
 		},
@@ -85,7 +85,7 @@ func TestExperimentRun_Validate(t *testing.T) {
 			ExperimentRun{
 				ID: "r4", ExperimentID: "e1", RunType: "baseline",
 				FrozenServices: []CacheBoxConfig{frozenProductcatalog},
-				Status: "pending",
+				Status:         "pending",
 			},
 			true,
 		},

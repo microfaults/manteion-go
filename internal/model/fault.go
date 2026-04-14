@@ -13,8 +13,8 @@ type FaultSpec struct {
 	ID         string          `json:"id"`
 	Name       string          `json:"name"`
 	Category   string          `json:"category"`   // "inline", "network", "resource"
-	FaultType  string          `json:"fault_type"`  // e.g. "error", "blackhole", "cpu"
-	Config     json.RawMessage `json:"config"`      // type-specific parameters
+	FaultType  string          `json:"fault_type"` // e.g. "error", "blackhole", "cpu"
+	Config     json.RawMessage `json:"config"`     // type-specific parameters
 	DurationMs int64           `json:"duration_ms,omitempty"`
 	RampUpMs   int64           `json:"ramp_up_ms,omitempty"`
 	RampDownMs int64           `json:"ramp_down_ms,omitempty"`
@@ -112,10 +112,10 @@ func (m *FaultCompositionMember) Validate() error {
 // FaultIncompatibility defines a pair of fault types that cannot be composed.
 // Stored as reference data; validated at composition creation time.
 type FaultIncompatibility struct {
-	FaultTypeA     string `json:"fault_type_a"`     // e.g. "network:blackhole"
-	FaultTypeB     string `json:"fault_type_b"`     // e.g. "network:rst"
-	Scope          string `json:"scope"`            // "parallel", "sequential", "any"
-	ConstraintType string `json:"constraint_type"`  // "hard" or "soft"
+	FaultTypeA     string `json:"fault_type_a"`    // e.g. "network:blackhole"
+	FaultTypeB     string `json:"fault_type_b"`    // e.g. "network:rst"
+	Scope          string `json:"scope"`           // "parallel", "sequential", "any"
+	ConstraintType string `json:"constraint_type"` // "hard" or "soft"
 	Reason         string `json:"reason"`
 }
 
