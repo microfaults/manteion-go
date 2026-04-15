@@ -7,18 +7,46 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+
+	"manteion-go/internal/store"
+	"manteion-go/internal/zeus"
 )
 
 // Server holds all dependencies for the manteion API.
-// TODO: Add *rule.Store, *sdk.Registry, *zeus.Client when store layer is implemented.
 type Server struct {
-	logger *slog.Logger
+	logger      *slog.Logger
+	rules       *store.RuleRepo
+	faults      *store.FaultRepo
+	sdk         *store.SDKRepo
+	experiments *store.ExperimentRepo
+	workloads   *store.WorkloadRepo
+	policies    *store.PolicyRepo
+	traces      *store.TraceRepo
+	zeus        *zeus.Client
 }
 
-// NewServer creates a new API server.
-func NewServer(logger *slog.Logger) *Server {
+// NewServer creates a new API server with all repository and client dependencies.
+func NewServer(
+	logger *slog.Logger,
+	rules *store.RuleRepo,
+	faults *store.FaultRepo,
+	sdk *store.SDKRepo,
+	experiments *store.ExperimentRepo,
+	workloads *store.WorkloadRepo,
+	policies *store.PolicyRepo,
+	traces *store.TraceRepo,
+	zeusClient *zeus.Client,
+) *Server {
 	return &Server{
-		logger: logger,
+		logger:      logger,
+		rules:       rules,
+		faults:      faults,
+		sdk:         sdk,
+		experiments: experiments,
+		workloads:   workloads,
+		policies:    policies,
+		traces:      traces,
+		zeus:        zeusClient,
 	}
 }
 

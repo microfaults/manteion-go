@@ -25,6 +25,11 @@ spec:
               value: ":8080"
             - name: ZEUS_URL
               value: "http://archer:8080"
+            - name: MANTEION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: manteion-postgres
+                  key: DATABASE_URL
           livenessProbe:
             httpGet:
               path: /healthz

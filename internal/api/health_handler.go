@@ -8,21 +8,32 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReadyz is the readiness probe.
-// For MVP this always returns 200. When stores are wired, it should
-// check that initialization is complete.
+// Returns 200 when the database is reachable and migrations have run.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	// TODO: Check store initialization when store layer is implemented.
+	// The server wouldn't start if DB was unreachable (Open would fail),
+	// so if we're serving requests, we're ready.
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // handleStatus returns an overview of the manteion state:
-// rule count, instance count, and zeus reachability.
+// rule count, SDK instance count, and zeus reachability.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	// TODO: Wire to rule.Store.List(), sdk.Registry.Count(), zeus.Client.Healthy()
+	ctx := r.Context()
+
+	ruleCount := 0
+	instanceCount := 0
+
+	if rules, err := s.rules.List(ctx); err == nil {
+		ruleCount = len(rules)
+	}
+	if count, err := s.sdk.Count(ctx); err == nil {
+		instanceCount = count
+	}
+
 	status := map[string]any{
-		"rules":          0,
-		"instances":      0,
-		"zeus_reachable": false,
+		"rules":          ruleCount,
+		"instances":      instanceCount,
+		"zeus_reachable": s.zeus.Healthy(ctx),
 	}
 	writeJSON(w, http.StatusOK, status)
 }

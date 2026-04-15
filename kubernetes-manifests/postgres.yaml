@@ -1,0 +1,73 @@
+---
+# PostgreSQL Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: manteion-postgres
+type: Opaque
+stringData:
+  POSTGRES_USER: manteion
+  POSTGRES_PASSWORD: manteion
+  POSTGRES_DB: manteion
+  DATABASE_URL: "postgres://manteion:manteion@manteion-postgres:5432/manteion?sslmode=disable"
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: manteion-postgres
+spec:
+  serviceName: manteion-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: manteion-postgres
+  template:
+    metadata:
+      labels:
+        app: manteion-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: manteion-postgres
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "manteion"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: manteion-postgres
+spec:
+  selector:
+    app: manteion-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None  # Headless for StatefulSet

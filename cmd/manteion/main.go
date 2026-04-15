@@ -1,6 +1,9 @@
 // Command manteion is the central coordination controller for the atropos
 // ecosystem. It provides centralized rule management, zeus-go workflow
 // orchestration, and SDK startup dependency enforcement.
+//
+// All state is persisted in PostgreSQL. Connection configured via
+// MANTEION_DATABASE_URL environment variable.
 package main
 
 import (
@@ -13,6 +16,9 @@ import (
 	"time"
 
 	"manteion-go/internal/api"
+	"manteion-go/internal/db"
+	"manteion-go/internal/store"
+	"manteion-go/internal/zeus"
 )
 
 func main() {
@@ -23,13 +29,39 @@ func main() {
 
 	// Configuration from environment variables.
 	addr := envOr("MANTEION_ADDR", ":8080")
+	dsn := envOr("MANTEION_DATABASE_URL",
+		"postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable")
+	zeusURL := envOr("ZEUS_URL", "http://archer:8080")
 
-	// TODO: Wire stores and zeus client when store layer is implemented.
-	// ruleStore := rule.NewStore()
-	// sdkRegistry := sdk.NewRegistry()
-	// zeusClient := zeus.NewClient(envOr("ZEUS_URL", "http://archer:8080"))
+	// Connect to PostgreSQL and run migrations.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	srv := api.NewServer(logger)
+	database, err := db.Open(ctx, dsn)
+	if err != nil {
+		logger.Error("database connection failed", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close(database)
+
+	// Create repositories.
+	ruleRepo := store.NewRuleRepo(database)
+	faultRepo := store.NewFaultRepo(database)
+	sdkRepo := store.NewSDKRepo(database)
+	experimentRepo := store.NewExperimentRepo(database)
+	workloadRepo := store.NewWorkloadRepo(database)
+	policyRepo := store.NewPolicyRepo(database)
+	traceRepo := store.NewTraceRepo(database)
+
+	// Create zeus client.
+	zeusClient := zeus.NewClient(zeusURL)
+
+	// Create the API server with all dependencies.
+	srv := api.NewServer(logger,
+		ruleRepo, faultRepo, sdkRepo,
+		experimentRepo, workloadRepo, policyRepo, traceRepo,
+		zeusClient,
+	)
 
 	httpServer := &http.Server{
 		Addr:         addr,
@@ -39,13 +71,12 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Graceful shutdown: listen for SIGINT/SIGTERM.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	// Start server in a goroutine.
 	go func() {
-		logger.Info("manteion starting", "addr", addr)
+		logger.Info("manteion starting",
+			"addr", addr,
+			"zeus_url", zeusURL,
+		)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)
 			os.Exit(1)

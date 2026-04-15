@@ -1,39 +1,62 @@
 package api
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
+	"strconv"
+
+	"manteion-go/internal/model"
+	"manteion-go/internal/store"
 )
 
 // handleRegister registers (or re-registers) an SDK instance.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	var body map[string]any
-	if err := readJSON(r, &body); err != nil {
+	var inst model.SDKInstance
+	if err := readJSON(r, &inst); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	id, _ := body["id"].(string)
-	service, _ := body["service"].(string)
-	s.logger.Info("sdk registered (stub)", "id", id, "service", service)
+	if err := s.sdk.Register(r.Context(), &inst); err != nil {
+		s.logger.Error("sdk register failed", "error", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	// TODO: Wire to sdk.Registry.Register()
+	s.logger.Info("sdk registered", "id", inst.ID, "service", inst.Service)
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "registered"})
 }
 
 // handleDeregister removes an SDK instance.
 func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.logger.Info("sdk deregistered (stub)", "id", id)
 
-	// TODO: Wire to sdk.Registry.Deregister(id)
+	if err := s.sdk.Deregister(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "instance not found")
+			return
+		}
+		s.logger.Error("sdk deregister failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to deregister")
+		return
+	}
+
+	s.logger.Info("sdk deregistered", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleListInstances returns all registered SDK instances.
 func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
-	// TODO: Wire to sdk.Registry.List()
-	writeJSON(w, http.StatusOK, []any{})
+	instances, err := s.sdk.List(r.Context())
+	if err != nil {
+		s.logger.Error("list instances failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list instances")
+		return
+	}
+	if instances == nil {
+		instances = []*model.SDKInstance{}
+	}
+	writeJSON(w, http.StatusOK, instances)
 }
 
 // handlePollRules is the SDK polling endpoint.
@@ -41,17 +64,52 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 // Returns 304 if store version == requested version, otherwise 200 with rules.
 func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	service := r.URL.Query().Get("service")
-	version := r.URL.Query().Get("version")
+	if service == "" {
+		writeError(w, http.StatusBadRequest, "service query parameter required")
+		return
+	}
 
-	s.logger.Info("sdk poll (stub)", "service", service, "version", version)
+	versionStr := r.URL.Query().Get("version")
+	requestedVersion, _ := strconv.ParseUint(versionStr, 10, 64)
 
-	// TODO: Wire to rule.Store.Version() and rule.Store.ForService(service)
-	// If store version matches requested version, return 304.
-	// Otherwise return current version + filtered rules.
+	ctx := r.Context()
+
+	// Check current rule version.
+	currentVersion, err := s.rules.Version(ctx)
+	if err != nil {
+		s.logger.Error("read rule version failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to read rule version")
+		return
+	}
+
+	// 304 Not Modified — client already has the latest rules.
+	if requestedVersion == currentVersion {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	// Fetch rules for this service.
+	rules, err := s.rules.ForService(ctx, service)
+	if err != nil {
+		s.logger.Error("fetch rules for service failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to fetch rules")
+		return
+	}
+
+	// Touch poll timestamp for the instance (best-effort, don't fail the poll).
+	if instanceID := r.URL.Query().Get("instance_id"); instanceID != "" {
+		if touchErr := s.sdk.TouchPoll(ctx, instanceID); touchErr != nil {
+			s.logger.Warn("touch poll failed", "instance_id", instanceID, "error", touchErr)
+		}
+	}
+
+	if rules == nil {
+		rules = []*model.Rule{}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version": 0,
-		"rules":   []any{},
+		"version": currentVersion,
+		"rules":   rules,
 	})
 }
 
@@ -59,32 +117,4 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 // Returns 200 when manteion is ready to serve rules.
 func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-}
-
-// sdkRulesResponse is the response shape for GET /api/v1/sdk/rules.
-// Defined here for documentation; will be used when store is wired.
-type sdkRulesResponse struct {
-	Version uint64 `json:"version"`
-	Rules   []any  `json:"rules"`
-}
-
-// registerRequest is the expected body for POST /api/v1/sdk/register.
-// Defined here for documentation; will be used when store is wired.
-type registerRequest struct {
-	ID      string `json:"id"`
-	Service string `json:"service"`
-	Version string `json:"version"`
-	Address string `json:"address"`
-}
-
-func init() {
-	// Prevent unused type warnings. These types document the API contract
-	// and will be used when the store layer is implemented.
-	_ = sdkRulesResponse{}
-	_ = registerRequest{}
-}
-
-// notImplemented is a helper for endpoints not yet wired.
-func notImplemented(w http.ResponseWriter, what string) {
-	writeError(w, http.StatusNotImplemented, fmt.Sprintf("%s: not yet implemented", what))
 }
