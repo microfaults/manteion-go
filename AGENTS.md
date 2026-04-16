@@ -49,8 +49,8 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 
 - **Workloads & Attacks** — k6 workloads (Flow + Persona) with vegeta sub-attacks. Types in `internal/model/workload.go`.
 - **Fault Rules** — Composable fault specs: atomic faults + composition trees (max depth 3, parallel or sequential). Network faults are direction-aware (upstream/downstream). Incompatibility validation at composition creation. Types in `internal/model/fault.go`.
-- **Experiments** — 5 types: interference, isolation, attribution, scenario, cache_fidelity. Each experiment has runs (baseline + isolation + combination). Results aggregated per (run, service, workflow). ContributionResult stores delta computation. Types in `internal/model/experiment.go`.
-- **Trace Anchors** — Pointers into Jaeger/Prometheus/Tempo (time range, filters), not trace data itself. CacheBoxConfig describes frozen service state (key strategy, mutation policy, synthetic delay). Types in `internal/model/trace.go`.
+- **Experiments** — Each experiment has runs (baseline + isolation + combination). Experiments are described by their runs' `FrozenServices` and each cache-box's `Mode`; there is no experiment-type discriminator. Results aggregated per (run, service, workflow). ContributionResult stores delta computation. Types in `internal/model/experiment.go`.
+- **Trace Anchors** — Pointers into Jaeger/Prometheus/Tempo (time range, filters), not trace data itself. CacheBoxConfig describes frozen service state: `KeyStrategy` (`"exact"`, `"exact_with_host"`, `"exact_with_body"` — aligns with atropos SDK `cachebox.KeyStrategy` constants), `MutationPolicy`/`SafeMethods` (reproducibility metadata only, not enforced by SDK), and `SyntheticDelay`. Types in `internal/model/trace.go`.
 - **Policy** — Metric-triggered actions: launch attacks or change cache-box modes. Migrated from zeus-go Archer. Types in `internal/model/policy.go`.
 
 ## Code Style
