@@ -7,13 +7,10 @@ import (
 	"time"
 )
 
-// Experiment is an experiment plan. Maps to one of 5 experiment types
-// from the research protocol:
-//   - interference:     cross-workflow interference quantification (all live, varying load)
-//   - isolation:        freeze shared services, show interference eliminated
-//   - attribution:      freeze all except one, measure single-service contribution
-//   - scenario:         inject synthetic latency into frozen service ("what-if")
-//   - cache_fidelity:   measure response divergence between live and cached
+// Experiment is an experiment plan for quantifying per-service contribution
+// to workflow latency. The experiment's behavior is fully determined by its
+// runs' FrozenServices and each cache-box's Mode — there is no separate
+// "type" discriminator.
 //
 // PrimaryWorkloadID identifies the workflow being measured (e.g. checkout at 50 RPS).
 // Background workloads (interference sources) are captured per-run via Attack
@@ -22,17 +19,11 @@ type Experiment struct {
 	ID                string     `json:"id"`
 	Name              string     `json:"name"`
 	Description       string     `json:"description,omitempty"`
-	ExperimentType    string     `json:"experiment_type"`
 	PrimaryWorkloadID string     `json:"primary_workload_id"`
 	Status            string     `json:"status"`
 	CreatedAt         time.Time  `json:"created_at"`
 	StartedAt         *time.Time `json:"started_at,omitempty"`
 	CompletedAt       *time.Time `json:"completed_at,omitempty"`
-}
-
-var validExperimentTypes = map[string]bool{
-	"interference": true, "isolation": true, "attribution": true,
-	"scenario": true, "cache_fidelity": true,
 }
 
 var validExperimentStatuses = map[string]bool{
@@ -45,9 +36,6 @@ func (e *Experiment) Validate() error {
 	}
 	if e.Name == "" {
 		return errors.New("experiment: name required")
-	}
-	if !validExperimentTypes[e.ExperimentType] {
-		return fmt.Errorf("experiment: invalid experiment_type %q", e.ExperimentType)
 	}
 	if e.PrimaryWorkloadID == "" {
 		return errors.New("experiment: primary_workload_id required")

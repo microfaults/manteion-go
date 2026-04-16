@@ -8,7 +8,7 @@ import (
 func TestExperiment_Validate(t *testing.T) {
 	base := func() Experiment {
 		return Experiment{
-			ID: "e1", Name: "attribution-checkout", ExperimentType: "attribution",
+			ID: "e1", Name: "attribution-checkout",
 			PrimaryWorkloadID: "w1", Status: "planned", CreatedAt: time.Now(),
 		}
 	}
@@ -18,10 +18,9 @@ func TestExperiment_Validate(t *testing.T) {
 		modify  func(*Experiment)
 		wantErr bool
 	}{
-		{"valid attribution", nil, false},
-		{"valid interference", func(e *Experiment) { e.ExperimentType = "interference" }, false},
-		{"valid cache_fidelity", func(e *Experiment) { e.ExperimentType = "cache_fidelity" }, false},
-		{"invalid type", func(e *Experiment) { e.ExperimentType = "bad" }, true},
+		{"valid", nil, false},
+		{"missing id", func(e *Experiment) { e.ID = "" }, true},
+		{"missing name", func(e *Experiment) { e.Name = "" }, true},
 		{"missing primary_workload_id", func(e *Experiment) { e.PrimaryWorkloadID = "" }, true},
 		{"invalid status", func(e *Experiment) { e.Status = "bad" }, true},
 	}
