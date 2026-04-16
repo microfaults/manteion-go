@@ -27,10 +27,10 @@ func (r *ExperimentRepo) Create(ctx context.Context, exp *model.Experiment) erro
 	}
 
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO experiments (id, name, description, experiment_type,
+		INSERT INTO experiments (id, name, description,
 			primary_workload_id, status, created_at, started_at, completed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		exp.ID, exp.Name, nullString(exp.Description), exp.ExperimentType,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		exp.ID, exp.Name, nullString(exp.Description),
 		exp.PrimaryWorkloadID, exp.Status, exp.CreatedAt, exp.StartedAt, exp.CompletedAt,
 	)
 	if err != nil {
@@ -44,11 +44,11 @@ func (r *ExperimentRepo) Get(ctx context.Context, id string) (*model.Experiment,
 	var exp model.Experiment
 	var desc sql.NullString
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, name, description, experiment_type,
+		SELECT id, name, description,
 			primary_workload_id, status, created_at, started_at, completed_at
 		FROM experiments WHERE id = $1`, id,
 	).Scan(
-		&exp.ID, &exp.Name, &desc, &exp.ExperimentType,
+		&exp.ID, &exp.Name, &desc,
 		&exp.PrimaryWorkloadID, &exp.Status, &exp.CreatedAt, &exp.StartedAt, &exp.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -64,7 +64,7 @@ func (r *ExperimentRepo) Get(ctx context.Context, id string) (*model.Experiment,
 // List returns all experiments ordered by creation time (newest first).
 func (r *ExperimentRepo) List(ctx context.Context) ([]*model.Experiment, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, description, experiment_type,
+		SELECT id, name, description,
 			primary_workload_id, status, created_at, started_at, completed_at
 		FROM experiments ORDER BY created_at DESC`)
 	if err != nil {
@@ -77,7 +77,7 @@ func (r *ExperimentRepo) List(ctx context.Context) ([]*model.Experiment, error) 
 		var exp model.Experiment
 		var desc sql.NullString
 		if err := rows.Scan(
-			&exp.ID, &exp.Name, &desc, &exp.ExperimentType,
+			&exp.ID, &exp.Name, &desc,
 			&exp.PrimaryWorkloadID, &exp.Status, &exp.CreatedAt, &exp.StartedAt, &exp.CompletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan experiment: %w", err)

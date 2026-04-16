@@ -19,6 +19,7 @@ type migration struct {
 var migrations = []migration{
 	{1, "initial schema", initialSchema},
 	{2, "add trace_anchors index", `CREATE INDEX IF NOT EXISTS idx_trace_anchors_run ON trace_anchors(experiment_run_id);`},
+	{3, "drop experiments.experiment_type", `ALTER TABLE experiments DROP COLUMN IF EXISTS experiment_type;`},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -240,8 +241,6 @@ CREATE TABLE IF NOT EXISTS experiments (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
     description         TEXT,
-    experiment_type     TEXT NOT NULL CHECK (experiment_type IN
-        ('interference','isolation','attribution','scenario','cache_fidelity')),
     primary_workload_id TEXT NOT NULL REFERENCES workloads(id),
     status              TEXT NOT NULL CHECK (status IN
         ('planned','running','completed','failed','cancelled')),
