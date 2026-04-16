@@ -49,11 +49,11 @@ func (t *TraceAnchor) Validate() error {
 // zero queueing, but the call graph structure is preserved.
 type CacheBoxConfig struct {
 	Service          string                `json:"service"`
-	Mode             string                `json:"mode"`            // "passthrough", "replay", "replay_with_delay"
-	WorkflowScope    string                `json:"workflow_scope"`  // meta-trace-id pattern, "" = all traffic
-	KeyStrategy      string                `json:"key_strategy"`    // "exact", "fuzzy", "parametric"
-	MutationPolicy   string                `json:"mutation_policy"` // "deny" (default), "allow"
-	SafeMethods      []string              `json:"safe_methods,omitempty"`
+	Mode             string                `json:"mode"`             // "passthrough", "replay", "replay_with_delay"
+	WorkflowScope    string                `json:"workflow_scope"`   // meta-trace-id pattern, "" = all traffic
+	KeyStrategy      string                `json:"key_strategy"`     // "exact", "exact_with_host", "exact_with_body" — matches SDK cachebox.KeyStrategy
+	MutationPolicy   string                `json:"mutation_policy"`  // "deny" (default), "allow". Metadata only — not enforced by SDK. Records operator intent for experiment reproducibility.
+	SafeMethods      []string              `json:"safe_methods,omitempty"` // Metadata only — not enforced by SDK.
 	SyntheticDelay   *SyntheticDelayConfig `json:"synthetic_delay,omitempty"`
 	WarmupDurationMs int64                 `json:"warmup_duration_ms,omitempty"`
 	CacheTTLMs       int64                 `json:"cache_ttl_ms,omitempty"`
@@ -61,7 +61,7 @@ type CacheBoxConfig struct {
 
 var (
 	validCacheBoxModes    = map[string]bool{"passthrough": true, "replay": true, "replay_with_delay": true}
-	validKeyStrategies    = map[string]bool{"exact": true, "fuzzy": true, "parametric": true}
+	validKeyStrategies    = map[string]bool{"exact": true, "exact_with_host": true, "exact_with_body": true}
 	validMutationPolicies = map[string]bool{"deny": true, "allow": true}
 )
 

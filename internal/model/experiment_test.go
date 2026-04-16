@@ -73,7 +73,7 @@ func TestExperimentRun_Validate(t *testing.T) {
 				ID: "r3", ExperimentID: "e1", RunType: "combination",
 				FrozenServices: []CacheBoxConfig{
 					frozenProductcatalog,
-					{Service: "currency", Mode: "replay", KeyStrategy: "fuzzy", MutationPolicy: "deny"},
+					{Service: "currency", Mode: "replay", KeyStrategy: "exact_with_host", MutationPolicy: "deny"},
 				},
 				Status: "completed", CreatedAt: time.Now(),
 			},
