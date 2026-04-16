@@ -33,10 +33,17 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 ## Architecture
 
 - REST API using stdlib `net/http` with Go 1.22+ method-path routing (`mux.HandleFunc("METHOD /path", handler)`)
-- In-memory stores with `sync.RWMutex` (same pattern as zeus-go `workload.Registry`)
+- PostgreSQL-backed persistence via pgx/v5 (`internal/db/` for connection management and migrations, `internal/store/` for domain repositories)
 - HTTP proxy to zeus-go Archer for workload/attack operations
-- Version-based SDK polling (304 Not Modified on no-change)
-- Zero external Go dependencies — stdlib only
+- Version-based SDK polling (304 Not Modified on no-change) via `rule_version` counter bumped atomically on every rule mutation
+- Docker-compose for local development (postgres:17-alpine)
+
+### Storage
+
+- PostgreSQL for all persistent state: rules, fault specs/compositions, experiments, results, workloads, trace anchors, policy rules
+- Schema managed by embedded migrations in `internal/db/migrations.go`
+- Rule version counter (`rule_version` single-row table) enables efficient 304 polling
+- TODO: in-memory caching layer for hot-path polling (rule version + compiled rules); SDK instances may move to in-memory store (ephemeral, high-frequency writes)
 
 ## Key Domains
 
@@ -48,7 +55,7 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 
 ## Code Style
 
-- Go 1.25, stdlib only (no external deps for MVP)
+- Go 1.25. External deps: pgx/v5 for PostgreSQL. Minimize further deps.
 - Follow zeus-go patterns: `Server` struct with `Handler()`, `routes()`, JSON helpers (`writeJSON`, `writeError`, `readJSON`)
 - String IDs for foreign keys, no ORM
 - `json.RawMessage` for opaque/extensible fields (fault config, k6 steps, query hints)
@@ -64,13 +71,22 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 ## Reference Files
 
 Plans:
-- `docs/plans/2026-03-30-scaffolding.md` — API scaffolding (project structure, routes, types, implementation order)
+- `docs/plans/2026-03-30-scaffolding.md` — API scaffolding (project structure, routes, types, implementation order). Note: storage layer superseded by postgres in baac8c5.
 - `docs/plans/2026-03-30-relational-schemas.md` — Full data model (5 schema domains, fault incompatibility tables, design decisions)
+- `docs/plans/2026-04-01-sdk-liveness-reaper.md` — SDK liveness detection and instance reaper design (not yet implemented)
+
+Implementation:
+- `internal/db/migrations.go` — Schema DDL and migration runner
+- `internal/store/` — PostgreSQL-backed domain repositories (rule_repo, fault_repo, sdk_repo, experiment_repo, workload_repo, policy_repo, trace_repo)
+- `internal/store/helpers.go` — Shared repo utilities (transactions, JSONB marshalling, NULL conversions)
+- `internal/model/composition_validate.go` — Composition depth, direction, and incompatibility validation
+- `docker-compose.yml` — Local development database (postgres:17-alpine)
 
 Companion repos (patterns to follow):
 - `zeus-go/internal/api/server.go` — Server struct, routes, JSON helpers
 - `zeus-go/internal/workload/registry.go` — In-memory store with sync.RWMutex
 - `zeus-go/cmd/archer/main.go` — Entry point, wiring, graceful shutdown
+- `zeus-go/docs/workflow-dsl-v2.md` — Workflow DSL v2 spec (persona-key references in tree nodes)
 - `atropos-go/internal/evaluator/evaluator.go` — Evaluator interface (what manteion rules configure)
 - `atropos-go/internal/fault/` — Fault type implementations (what FaultSpec maps to)
 - `atropos-go/VISION.md` — Full research vision, problem statement, roadmap phases

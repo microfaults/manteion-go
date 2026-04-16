@@ -15,9 +15,14 @@ type Flow struct {
 	Description       string          `json:"description,omitempty"`
 	Targets           []string        `json:"targets"`
 	EstimatedRPSPerVU float64         `json:"estimated_rps_per_vu"`
-	Steps             json.RawMessage `json:"steps"`
-	Thresholds        json.RawMessage `json:"thresholds,omitempty"`
-	CreatedAt         time.Time       `json:"created_at"`
+	// Steps is a DSL v2 workflow tree (sequence/parallel/delay/optional/request nodes).
+	// Stored opaquely -- k6 parses this at runtime. Tree nodes may reference persona
+	// keys (e.g., "persona_key": "explore_prob" on optional nodes, or think-time
+	// lookups on delay nodes). Resolution happens at k6 execution time by looking up
+	// the key in the Persona associated with the Workload.
+	Steps      json.RawMessage `json:"steps"`
+	Thresholds json.RawMessage `json:"thresholds,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
 }
 
 func (f *Flow) Validate() error {

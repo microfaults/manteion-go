@@ -138,6 +138,16 @@ func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rul
 	return r.scanRules(rows)
 }
 
+// Count returns the total number of rules.
+func (r *RuleRepo) Count(ctx context.Context) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rules`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count rules: %w", err)
+	}
+	return n, nil
+}
+
 // Version returns the current rule store version number.
 func (r *RuleRepo) Version(ctx context.Context) (uint64, error) {
 	var v uint64

@@ -165,5 +165,10 @@ func DefaultIncompatibilities() []FaultIncompatibility {
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "memory allocation triggers GC which skews CPU duty-cycle measurements",
 		},
+		{
+			FaultTypeA: "inline:latency", FaultTypeB: "inline:hang",
+			Scope: "parallel", ConstraintType: "soft",
+			Reason: "hang blocks indefinitely, making the latency delay invisible",
+		},
 	}
 }

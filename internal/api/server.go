@@ -4,6 +4,7 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 // Server holds all dependencies for the manteion API.
 type Server struct {
 	logger      *slog.Logger
+	db          *sql.DB
 	rules       *store.RuleRepo
 	faults      *store.FaultRepo
 	sdk         *store.SDKRepo
@@ -28,6 +30,7 @@ type Server struct {
 // NewServer creates a new API server with all repository and client dependencies.
 func NewServer(
 	logger *slog.Logger,
+	db *sql.DB,
 	rules *store.RuleRepo,
 	faults *store.FaultRepo,
 	sdk *store.SDKRepo,
@@ -39,6 +42,7 @@ func NewServer(
 ) *Server {
 	return &Server{
 		logger:      logger,
+		db:          db,
 		rules:       rules,
 		faults:      faults,
 		sdk:         sdk,

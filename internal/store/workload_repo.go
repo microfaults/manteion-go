@@ -330,10 +330,45 @@ func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack,
 
 // ListAttacksByWorkload returns all attacks for a workload.
 func (r *WorkloadRepo) ListAttacksByWorkload(ctx context.Context, workloadID string) ([]*model.Attack, error) {
-	// TODO: implement full scan loop (same pattern as ListWorkloads).
-	// For now return empty to unblock compilation.
-	_ = workloadID
-	return nil, nil
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, workload_id, experiment_run_id, policy_rule_id,
+			service, role, target_url, target_method, target_headers,
+			rate, duration_ms, dedup_bypass, meta_trace_id, status,
+			started_at, completed_at, created_at
+		FROM attacks WHERE workload_id = $1
+		ORDER BY created_at`, workloadID)
+	if err != nil {
+		return nil, fmt.Errorf("list attacks by workload: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*model.Attack
+	for rows.Next() {
+		var a model.Attack
+		var workloadIDN, expRunID, policyRuleID sql.NullString
+		var dedup, metaTrace sql.NullString
+		var headersJSON []byte
+
+		err := rows.Scan(
+			&a.ID, &workloadIDN, &expRunID, &policyRuleID,
+			&a.Service, &a.Role, &a.TargetURL, &a.TargetMethod, &headersJSON,
+			&a.Rate, &a.DurationMs, &dedup, &metaTrace, &a.Status,
+			&a.StartedAt, &a.CompletedAt, &a.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan attack: %w", err)
+		}
+		a.WorkloadID = fromNullString(workloadIDN)
+		a.ExperimentRunID = fromNullString(expRunID)
+		a.PolicyRuleID = fromNullString(policyRuleID)
+		a.DedupBypass = fromNullString(dedup)
+		a.MetaTraceID = fromNullString(metaTrace)
+		if err := jsonbScan(headersJSON, &a.TargetHeaders); err != nil {
+			return nil, fmt.Errorf("unmarshal target_headers: %w", err)
+		}
+		result = append(result, &a)
+	}
+	return result, rows.Err()
 }
 
 // CreateAttackResult inserts attack outcome metrics.

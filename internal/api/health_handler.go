@@ -8,10 +8,12 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReadyz is the readiness probe.
-// Returns 200 when the database is reachable and migrations have run.
+// Returns 200 when the database is reachable, 503 otherwise.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	// The server wouldn't start if DB was unreachable (Open would fail),
-	// so if we're serving requests, we're ready.
+	if err := s.db.PingContext(r.Context()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "database unreachable")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -23,8 +25,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ruleCount := 0
 	instanceCount := 0
 
-	if rules, err := s.rules.List(ctx); err == nil {
-		ruleCount = len(rules)
+	if count, err := s.rules.Count(ctx); err == nil {
+		ruleCount = count
 	}
 	if count, err := s.sdk.Count(ctx); err == nil {
 		instanceCount = count

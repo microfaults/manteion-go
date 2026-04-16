@@ -57,7 +57,7 @@ func main() {
 	zeusClient := zeus.NewClient(zeusURL)
 
 	// Create the API server with all dependencies.
-	srv := api.NewServer(logger,
+	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, sdkRepo,
 		experimentRepo, workloadRepo, policyRepo, traceRepo,
 		zeusClient,

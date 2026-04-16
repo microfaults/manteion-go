@@ -99,6 +99,16 @@ type SyntheticDelayConfig struct {
 	FitSigma         *float64          `json:"fit_sigma,omitempty"`
 }
 
+func (s *SyntheticDelayConfig) Validate() error {
+	if s.P50Us < 0 || s.P95Us < 0 || s.P99Us < 0 {
+		return errors.New("synthetic delay: percentiles must be non-negative")
+	}
+	if (s.FitMu == nil) != (s.FitSigma == nil) {
+		return errors.New("synthetic delay: fit_mu and fit_sigma must both be present or both absent")
+	}
+	return nil
+}
+
 // HistogramBucket is one bucket in an observed latency histogram.
 type HistogramBucket struct {
 	UpperBoundUs int64 `json:"upper_bound_us"`

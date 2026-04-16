@@ -18,6 +18,7 @@ type migration struct {
 // New migrations are appended; existing entries must never be modified.
 var migrations = []migration{
 	{1, "initial schema", initialSchema},
+	{2, "add trace_anchors index", `CREATE INDEX IF NOT EXISTS idx_trace_anchors_run ON trace_anchors(experiment_run_id);`},
 }
 
 // Migrate applies any pending migrations to the database.
