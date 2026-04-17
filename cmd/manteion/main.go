@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"manteion-go/internal/api"
+	"manteion-go/internal/atrocontrol"
+	"manteion-go/internal/atropos"
 	"manteion-go/internal/db"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
@@ -56,11 +58,20 @@ func main() {
 	// Create zeus client.
 	zeusClient := zeus.NewClient(zeusURL)
 
+	// Create atropos transport + orchestration controller.
+	txClient := atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: 5 * time.Second}))
+	resolver := &atrocontrol.RepoResolver{Repo: sdkRepo}
+	controller := atrocontrol.New(txClient, resolver,
+		atrocontrol.WithDefaultTimeout(2*time.Second),
+		atrocontrol.WithDefaultConcurrency(16),
+		atrocontrol.WithLogger(logger),
+	)
+
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, sdkRepo,
 		experimentRepo, workloadRepo, policyRepo, traceRepo,
-		zeusClient,
+		zeusClient, controller.IntentReader(),
 	)
 
 	httpServer := &http.Server{

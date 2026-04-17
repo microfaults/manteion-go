@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"manteion-go/internal/model"
+	"manteion-go/internal/ruleconv"
 	"manteion-go/internal/store"
 )
 
@@ -24,7 +25,22 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("sdk registered", "id", inst.ID, "service", inst.Service)
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "registered"})
+
+	resp := map[string]any{"status": "registered"}
+	if s.intent != nil {
+		if intent, ok := s.intent.Get(inst.Service); ok {
+			if intent.Rules != nil {
+				resp["rules"] = intent.Rules
+			}
+			if intent.ActiveFault != nil {
+				resp["active_fault"] = intent.ActiveFault
+			}
+			if intent.FreezeCfg != nil {
+				resp["freeze_cfg"] = intent.FreezeCfg
+			}
+		}
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // handleDeregister removes an SDK instance.
@@ -107,9 +123,20 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		rules = []*model.Rule{}
 	}
 
+	specResolver := &ruleconv.FuncResolver{Fn: s.faults.SpecResolver(ctx)}
+	compiled, err := ruleconv.CompileRules(rules, specResolver)
+	if err != nil {
+		s.logger.Error("compile rules failed", "service", service, "error", err)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version": currentVersion,
+			"rules":   rules,
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version": currentVersion,
-		"rules":   rules,
+		"rules":   compiled,
 	})
 }
 

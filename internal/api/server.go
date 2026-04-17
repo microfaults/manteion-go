@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
 )
@@ -25,6 +26,7 @@ type Server struct {
 	policies    *store.PolicyRepo
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
+	intent      atrocontrol.IntentReader
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -39,6 +41,7 @@ func NewServer(
 	policies *store.PolicyRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
+	intent atrocontrol.IntentReader,
 ) *Server {
 	return &Server{
 		logger:      logger,
@@ -51,6 +54,7 @@ func NewServer(
 		policies:    policies,
 		traces:      traces,
 		zeus:        zeusClient,
+		intent:      intent,
 	}
 }
 
