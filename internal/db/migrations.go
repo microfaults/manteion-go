@@ -20,6 +20,12 @@ var migrations = []migration{
 	{1, "initial schema", initialSchema},
 	{2, "add trace_anchors index", `CREATE INDEX IF NOT EXISTS idx_trace_anchors_run ON trace_anchors(experiment_run_id);`},
 	{3, "drop experiments.experiment_type", `ALTER TABLE experiments DROP COLUMN IF EXISTS experiment_type;`},
+	{4, "add fault_composition duration/ramp columns", `
+ALTER TABLE fault_compositions
+    ADD COLUMN IF NOT EXISTS duration_ms BIGINT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS ramp_up_ms BIGINT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS ramp_down_ms BIGINT DEFAULT 0;
+`},
 }
 
 // Migrate applies any pending migrations to the database.

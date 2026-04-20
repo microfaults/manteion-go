@@ -31,7 +31,9 @@ type Direction string
 const (
 	DirectionUpstream   Direction = "upstream"
 	DirectionDownstream Direction = "downstream"
-	DirectionNone       Direction = ""
+	// DirectionNone is the empty string, used explicitly for non-network fault
+	// members where direction is not applicable. Included in IsValid() on purpose.
+	DirectionNone Direction = ""
 )
 
 // IsValid reports whether the Direction is a recognized constant (or empty).
@@ -99,6 +101,9 @@ type FaultComposition struct {
 	ID            string                   `json:"id"`
 	Name          string                   `json:"name"`
 	ExecutionMode ExecutionMode            `json:"execution_mode"` // "parallel" or "sequential"
+	DurationMs    int64                    `json:"duration_ms,omitempty"`
+	RampUpMs      int64                    `json:"ramp_up_ms,omitempty"`
+	RampDownMs    int64                    `json:"ramp_down_ms,omitempty"`
 	Members       []FaultCompositionMember `json:"members"`
 	CreatedAt     time.Time                `json:"created_at"`
 }

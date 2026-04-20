@@ -108,9 +108,11 @@ func (r *FaultRepo) CreateComposition(ctx context.Context, comp *model.FaultComp
 
 	return execTx(ctx, r.db, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO fault_compositions (id, name, execution_mode, created_at)
-			VALUES ($1, $2, $3, $4)`,
-			comp.ID, comp.Name, comp.ExecutionMode, comp.CreatedAt,
+			INSERT INTO fault_compositions (id, name, execution_mode, duration_ms, ramp_up_ms, ramp_down_ms, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			comp.ID, comp.Name, comp.ExecutionMode,
+			comp.DurationMs, comp.RampUpMs, comp.RampDownMs,
+			comp.CreatedAt,
 		)
 		if err != nil {
 			return fmt.Errorf("insert fault_composition: %w", err)
@@ -138,9 +140,11 @@ func (r *FaultRepo) CreateComposition(ctx context.Context, comp *model.FaultComp
 func (r *FaultRepo) GetComposition(ctx context.Context, id string) (*model.FaultComposition, error) {
 	var comp model.FaultComposition
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, name, execution_mode, created_at
+		SELECT id, name, execution_mode, duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		FROM fault_compositions WHERE id = $1`, id,
-	).Scan(&comp.ID, &comp.Name, &comp.ExecutionMode, &comp.CreatedAt)
+	).Scan(&comp.ID, &comp.Name, &comp.ExecutionMode,
+		&comp.DurationMs, &comp.RampUpMs, &comp.RampDownMs,
+		&comp.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -181,7 +185,7 @@ func (r *FaultRepo) GetComposition(ctx context.Context, id string) (*model.Fault
 // ListCompositions returns all compositions (without members loaded).
 func (r *FaultRepo) ListCompositions(ctx context.Context) ([]*model.FaultComposition, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, execution_mode, created_at
+		SELECT id, name, execution_mode, duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		FROM fault_compositions ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list fault_compositions: %w", err)
@@ -191,7 +195,9 @@ func (r *FaultRepo) ListCompositions(ctx context.Context) ([]*model.FaultComposi
 	var result []*model.FaultComposition
 	for rows.Next() {
 		var comp model.FaultComposition
-		if err := rows.Scan(&comp.ID, &comp.Name, &comp.ExecutionMode, &comp.CreatedAt); err != nil {
+		if err := rows.Scan(&comp.ID, &comp.Name, &comp.ExecutionMode,
+			&comp.DurationMs, &comp.RampUpMs, &comp.RampDownMs,
+			&comp.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan fault_composition: %w", err)
 		}
 		result = append(result, &comp)

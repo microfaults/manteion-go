@@ -242,6 +242,38 @@ func TestCompileRule_CompositionDanglingSpec(t *testing.T) {
 	}
 }
 
+func TestCompileRule_CompositionDurationRamp(t *testing.T) {
+	specs := mapSpecResolver{
+		"f1": {ID: "f1", Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"50ms"}`)},
+		"f2": {ID: "f2", Category: "inline", FaultType: "error", Config: json.RawMessage(`{"status_code":500}`)},
+	}
+	comps := mapCompResolver{
+		"c1": {
+			ID: "c1", Name: "storm", ExecutionMode: model.ExecutionParallel,
+			DurationMs: 30000, RampUpMs: 5000, RampDownMs: 5000,
+			Members: []model.FaultCompositionMember{
+				{FaultSpecID: "f1"},
+				{FaultSpecID: "f2"},
+			},
+		},
+	}
+	r := &model.Rule{ID: "r1", Name: "r", FaultCompositionID: "c1"}
+
+	out, err := CompileRule(r, specs, comps)
+	if err != nil {
+		t.Fatalf("CompileRule: %v", err)
+	}
+	if out.Composition == nil {
+		t.Fatal("expected Composition")
+	}
+	if out.Composition.DurationMs != 30000 {
+		t.Errorf("DurationMs = %d", out.Composition.DurationMs)
+	}
+	if out.Composition.RampUpMs != 5000 || out.Composition.RampDownMs != 5000 {
+		t.Errorf("ramp = up:%d down:%d", out.Composition.RampUpMs, out.Composition.RampDownMs)
+	}
+}
+
 func TestCompileRule_CompositionWithDirection(t *testing.T) {
 	specs := mapSpecResolver{
 		"spec-net": {

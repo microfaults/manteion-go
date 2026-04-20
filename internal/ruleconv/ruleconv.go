@@ -42,9 +42,14 @@ type CompiledFault struct {
 }
 
 // CompiledComposition is a resolved FaultComposition tree with all specs inlined.
+// ExecutionMode and member Direction are plain strings (not model.ExecutionMode /
+// model.Direction) to decouple the wire contract from internal Go type refactors.
 type CompiledComposition struct {
 	Name          string                      `json:"name"`
 	ExecutionMode string                      `json:"execution_mode"`
+	DurationMs    int64                       `json:"duration_ms,omitempty"`
+	RampUpMs      int64                       `json:"ramp_up_ms,omitempty"`
+	RampDownMs    int64                       `json:"ramp_down_ms,omitempty"`
 	Members       []CompiledCompositionMember `json:"members"`
 }
 
@@ -106,11 +111,11 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 		if comps == nil {
 			return CompiledRule{}, fmt.Errorf("rule %q: composition resolver required for FaultCompositionID", r.ID)
 		}
-		ic, err := resolveComposition(r.FaultCompositionID, specs, comps, 0)
+		cc, err := resolveComposition(r.FaultCompositionID, specs, comps, 0)
 		if err != nil {
 			return CompiledRule{}, fmt.Errorf("rule %q: %w", r.ID, err)
 		}
-		cr.Composition = ic
+		cr.Composition = cc
 	}
 
 	return cr, nil
@@ -153,9 +158,12 @@ func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositi
 		return nil, fmt.Errorf("composition %q not found", id)
 	}
 
-	ic := &CompiledComposition{
+	cc := &CompiledComposition{
 		Name:          comp.Name,
 		ExecutionMode: string(comp.ExecutionMode),
+		DurationMs:    comp.DurationMs,
+		RampUpMs:      comp.RampUpMs,
+		RampDownMs:    comp.RampDownMs,
 		Members:       make([]CompiledCompositionMember, len(comp.Members)),
 	}
 
@@ -180,10 +188,10 @@ func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositi
 			member.Composition = child
 		}
 
-		ic.Members[i] = member
+		cc.Members[i] = member
 	}
 
-	return ic, nil
+	return cc, nil
 }
 
 // FuncResolver adapts a func(id string) *model.FaultSpec into FaultSpecResolver.
