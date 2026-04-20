@@ -138,7 +138,11 @@ const maxCompositionDepth = 3
 
 func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositionResolver, depth int) (*CompiledComposition, error) {
 	if depth >= maxCompositionDepth {
-		return nil, fmt.Errorf("composition %q exceeds max depth %d", id, maxCompositionDepth)
+		return nil, fmt.Errorf(
+			"composition %q nesting exceeds max depth %d (atoms→groups→top-level). "+
+				"The cap is enforced at resolution time and may be raised in a future revision.",
+			id, maxCompositionDepth,
+		)
 	}
 
 	comp, err := comps.GetFaultComposition(id)
