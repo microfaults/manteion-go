@@ -123,7 +123,7 @@ func (r *FaultRepo) CreateComposition(ctx context.Context, comp *model.FaultComp
 				VALUES ($1, $2, $3, $4, $5)`,
 				comp.ID, i,
 				nullString(m.FaultSpecID), nullString(m.ChildCompositionID),
-				nullString(m.Direction),
+				nullString(string(m.Direction)),
 			)
 			if err != nil {
 				return fmt.Errorf("insert composition member[%d]: %w", i, err)
@@ -168,7 +168,7 @@ func (r *FaultRepo) GetComposition(ctx context.Context, id string) (*model.Fault
 		_ = pos // slice order = insert order via ORDER BY position
 		m.FaultSpecID = fromNullString(faultSpecID)
 		m.ChildCompositionID = fromNullString(childCompID)
-		m.Direction = fromNullString(direction)
+		m.Direction = model.Direction(fromNullString(direction))
 		comp.Members = append(comp.Members, m)
 	}
 	if err := rows.Err(); err != nil {

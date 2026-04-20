@@ -7,6 +7,42 @@ import (
 	"time"
 )
 
+// ExecutionMode controls how composition members coordinate.
+type ExecutionMode string
+
+const (
+	ExecutionParallel   ExecutionMode = "parallel"
+	ExecutionSequential ExecutionMode = "sequential"
+)
+
+// IsValid reports whether the ExecutionMode is a recognized constant.
+func (m ExecutionMode) IsValid() bool {
+	switch m {
+	case ExecutionParallel, ExecutionSequential:
+		return true
+	}
+	return false
+}
+
+// Direction is an optional per-member tag for network faults indicating
+// which atropos toxic pipe the fault attaches to. Empty means not applicable.
+type Direction string
+
+const (
+	DirectionUpstream   Direction = "upstream"
+	DirectionDownstream Direction = "downstream"
+	DirectionNone       Direction = ""
+)
+
+// IsValid reports whether the Direction is a recognized constant (or empty).
+func (d Direction) IsValid() bool {
+	switch d {
+	case DirectionUpstream, DirectionDownstream, DirectionNone:
+		return true
+	}
+	return false
+}
+
 // FaultSpec is an atomic fault definition. Maps to exactly one atropos-go
 // fault type. Three categories: inline, network, resource.
 type FaultSpec struct {
@@ -62,7 +98,7 @@ func (f *FaultSpec) Validate() error {
 type FaultComposition struct {
 	ID            string                   `json:"id"`
 	Name          string                   `json:"name"`
-	ExecutionMode string                   `json:"execution_mode"` // "parallel" or "sequential"
+	ExecutionMode ExecutionMode            `json:"execution_mode"` // "parallel" or "sequential"
 	Members       []FaultCompositionMember `json:"members"`
 	CreatedAt     time.Time                `json:"created_at"`
 }
@@ -74,7 +110,7 @@ func (c *FaultComposition) Validate() error {
 	if c.Name == "" {
 		return errors.New("fault composition: name required")
 	}
-	if c.ExecutionMode != "parallel" && c.ExecutionMode != "sequential" {
+	if !c.ExecutionMode.IsValid() {
 		return fmt.Errorf("fault composition: invalid execution_mode %q", c.ExecutionMode)
 	}
 	if len(c.Members) < 2 {
@@ -91,9 +127,9 @@ func (c *FaultComposition) Validate() error {
 // FaultCompositionMember is one slot in a composition.
 // Exactly one of FaultSpecID or ChildCompositionID must be set.
 type FaultCompositionMember struct {
-	FaultSpecID        string `json:"fault_spec_id,omitempty"`
-	ChildCompositionID string `json:"child_composition_id,omitempty"`
-	Direction          string `json:"direction,omitempty"` // "upstream", "downstream", "" (non-network)
+	FaultSpecID        string    `json:"fault_spec_id,omitempty"`
+	ChildCompositionID string    `json:"child_composition_id,omitempty"`
+	Direction          Direction `json:"direction,omitempty"` // "upstream", "downstream", "" (non-network)
 }
 
 func (m *FaultCompositionMember) Validate() error {
@@ -102,7 +138,7 @@ func (m *FaultCompositionMember) Validate() error {
 	if hasFault == hasChild {
 		return errors.New("exactly one of fault_spec_id or child_composition_id must be set")
 	}
-	if m.Direction != "" && m.Direction != "upstream" && m.Direction != "downstream" {
+	if !m.Direction.IsValid() {
 		return fmt.Errorf("invalid direction %q", m.Direction)
 	}
 	return nil

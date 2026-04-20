@@ -151,13 +151,13 @@ func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositi
 
 	ic := &CompiledComposition{
 		Name:          comp.Name,
-		ExecutionMode: comp.ExecutionMode,
+		ExecutionMode: string(comp.ExecutionMode),
 		Members:       make([]CompiledCompositionMember, len(comp.Members)),
 	}
 
 	for i, m := range comp.Members {
 		member := CompiledCompositionMember{
-			Direction: m.Direction,
+			Direction: string(m.Direction),
 		}
 
 		switch {

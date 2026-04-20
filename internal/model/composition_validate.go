@@ -40,7 +40,7 @@ func walkDepth(comp *FaultComposition, resolve CompositionResolver, current, max
 // networkMemberInfo is a resolved member with its fault spec category and direction.
 type networkMemberInfo struct {
 	FaultType string
-	Direction string
+	Direction Direction
 }
 
 // ValidateNetworkDirections enforces that a parallel composition has at most one
@@ -48,7 +48,7 @@ type networkMemberInfo struct {
 // upstream + throttle downstream). Sequential compositions skip this check
 // since toxics are swapped at phase boundaries.
 func ValidateNetworkDirections(comp *FaultComposition, resolveFault FaultSpecResolver, resolveComp CompositionResolver) error {
-	if comp.ExecutionMode != "parallel" {
+	if comp.ExecutionMode != ExecutionParallel {
 		return nil
 	}
 
@@ -60,7 +60,7 @@ func ValidateNetworkDirections(comp *FaultComposition, resolveFault FaultSpecRes
 	// Group by direction — at most one network toxic per direction.
 	byDirection := map[string][]string{} // direction -> list of fault types
 	for _, nm := range networkMembers {
-		dir := nm.Direction
+		dir := string(nm.Direction)
 		if dir == "" {
 			dir = "unspecified"
 		}
@@ -174,8 +174,8 @@ func collectLeaves(comp *FaultComposition, resolveFault FaultSpecResolver, resol
 // matchesPair checks if a pair of fault types matches an incompatibility rule.
 // For sequential scope, order matters: FaultTypeA must match the earlier member (a)
 // and FaultTypeB the later member (b). For parallel/any scope, order is symmetric.
-func matchesPair(a, b string, rule FaultIncompatibility, mode string) bool {
-	if rule.Scope != "any" && rule.Scope != mode {
+func matchesPair(a, b string, rule FaultIncompatibility, mode ExecutionMode) bool {
+	if rule.Scope != "any" && rule.Scope != string(mode) {
 		return false
 	}
 	if rule.Scope == "sequential" {
