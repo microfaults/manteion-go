@@ -124,7 +124,8 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	specResolver := &ruleconv.FuncResolver{Fn: s.faults.SpecResolver(ctx)}
-	compiled, err := ruleconv.CompileRules(rules, specResolver)
+	compResolver := &ruleconv.FuncCompositionResolver{Fn: s.faults.CompositionResolver(ctx)}
+	compiled, err := ruleconv.CompileRules(rules, specResolver, compResolver)
 	if err != nil {
 		s.logger.Error("compile rules failed", "service", service, "error", err)
 		writeJSON(w, http.StatusOK, map[string]any{
