@@ -27,12 +27,12 @@ type CompiledRule struct {
 	Labels         map[string]string `json:"labels,omitempty"`
 	Mode           string            `json:"mode"`
 	Priority       int               `json:"priority"`
-	Fault          *InlineFault      `json:"fault,omitempty"`
-	Composition    *InlineComposition `json:"composition,omitempty"`
+	Fault          *CompiledFault      `json:"fault,omitempty"`
+	Composition    *CompiledComposition `json:"composition,omitempty"`
 }
 
-// InlineFault is a resolved FaultSpec with config inlined.
-type InlineFault struct {
+// CompiledFault is a resolved FaultSpec with config inlined.
+type CompiledFault struct {
 	Category   string          `json:"category"`
 	FaultType  string          `json:"fault_type"`
 	Config     json.RawMessage `json:"config"`
@@ -41,19 +41,19 @@ type InlineFault struct {
 	RampDownMs int64           `json:"ramp_down_ms,omitempty"`
 }
 
-// InlineComposition is a resolved FaultComposition tree with all specs inlined.
-type InlineComposition struct {
+// CompiledComposition is a resolved FaultComposition tree with all specs inlined.
+type CompiledComposition struct {
 	Name          string                    `json:"name"`
 	ExecutionMode string                    `json:"execution_mode"`
-	Members       []InlineCompositionMember `json:"members"`
+	Members       []CompiledCompositionMember `json:"members"`
 }
 
-// InlineCompositionMember is a resolved member — either a leaf fault or a nested composition.
-type InlineCompositionMember struct {
+// CompiledCompositionMember is a resolved member — either a leaf fault or a nested composition.
+type CompiledCompositionMember struct {
 	Position    int                `json:"position"`
 	Direction   string             `json:"direction,omitempty"`
-	Fault       *InlineFault       `json:"fault,omitempty"`
-	Composition *InlineComposition `json:"composition,omitempty"`
+	Fault       *CompiledFault       `json:"fault,omitempty"`
+	Composition *CompiledComposition `json:"composition,omitempty"`
 }
 
 // CompileRules resolves FaultSpec/Composition references and produces wire-ready compiled rules.
@@ -117,7 +117,7 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 	return cr, nil
 }
 
-func resolveSpec(id string, specs FaultSpecResolver) (*InlineFault, error) {
+func resolveSpec(id string, specs FaultSpecResolver) (*CompiledFault, error) {
 	spec, err := specs.GetFaultSpec(id)
 	if err != nil {
 		return nil, fmt.Errorf("resolve fault spec %q: %w", id, err)
@@ -125,7 +125,7 @@ func resolveSpec(id string, specs FaultSpecResolver) (*InlineFault, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("fault spec %q not found", id)
 	}
-	return &InlineFault{
+	return &CompiledFault{
 		Category:   spec.Category,
 		FaultType:  spec.FaultType,
 		Config:     spec.Config,
@@ -137,7 +137,7 @@ func resolveSpec(id string, specs FaultSpecResolver) (*InlineFault, error) {
 
 const maxCompositionDepth = 3
 
-func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositionResolver, depth int) (*InlineComposition, error) {
+func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositionResolver, depth int) (*CompiledComposition, error) {
 	if depth >= maxCompositionDepth {
 		return nil, fmt.Errorf("composition %q exceeds max depth %d", id, maxCompositionDepth)
 	}
@@ -150,14 +150,14 @@ func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositi
 		return nil, fmt.Errorf("composition %q not found", id)
 	}
 
-	ic := &InlineComposition{
+	ic := &CompiledComposition{
 		Name:          comp.Name,
 		ExecutionMode: comp.ExecutionMode,
-		Members:       make([]InlineCompositionMember, len(comp.Members)),
+		Members:       make([]CompiledCompositionMember, len(comp.Members)),
 	}
 
 	for i, m := range comp.Members {
-		member := InlineCompositionMember{
+		member := CompiledCompositionMember{
 			Position:  m.Position,
 			Direction: m.Direction,
 		}
