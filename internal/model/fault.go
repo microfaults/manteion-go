@@ -91,7 +91,6 @@ func (c *FaultComposition) Validate() error {
 // FaultCompositionMember is one slot in a composition.
 // Exactly one of FaultSpecID or ChildCompositionID must be set.
 type FaultCompositionMember struct {
-	Position           int    `json:"position"`
 	FaultSpecID        string `json:"fault_spec_id,omitempty"`
 	ChildCompositionID string `json:"child_composition_id,omitempty"`
 	Direction          string `json:"direction,omitempty"` // "upstream", "downstream", "" (non-network)

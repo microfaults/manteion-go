@@ -22,12 +22,12 @@ type FaultCompositionResolver interface {
 // without additional lookups. This exists because atroposdk.StaticRule's
 // Decision.Fault is a Go interface that can't survive JSON roundtrip.
 type CompiledRule struct {
-	Name           string            `json:"name"`
-	InjectionPoint string            `json:"injection_point,omitempty"`
-	Labels         map[string]string `json:"labels,omitempty"`
-	Mode           string            `json:"mode"`
-	Priority       int               `json:"priority"`
-	Fault          *CompiledFault      `json:"fault,omitempty"`
+	Name           string               `json:"name"`
+	InjectionPoint string               `json:"injection_point,omitempty"`
+	Labels         map[string]string    `json:"labels,omitempty"`
+	Mode           string               `json:"mode"`
+	Priority       int                  `json:"priority"`
+	Fault          *CompiledFault       `json:"fault,omitempty"`
 	Composition    *CompiledComposition `json:"composition,omitempty"`
 }
 
@@ -43,15 +43,14 @@ type CompiledFault struct {
 
 // CompiledComposition is a resolved FaultComposition tree with all specs inlined.
 type CompiledComposition struct {
-	Name          string                    `json:"name"`
-	ExecutionMode string                    `json:"execution_mode"`
+	Name          string                      `json:"name"`
+	ExecutionMode string                      `json:"execution_mode"`
 	Members       []CompiledCompositionMember `json:"members"`
 }
 
 // CompiledCompositionMember is a resolved member — either a leaf fault or a nested composition.
 type CompiledCompositionMember struct {
-	Position    int                `json:"position"`
-	Direction   string             `json:"direction,omitempty"`
+	Direction   string               `json:"direction,omitempty"`
 	Fault       *CompiledFault       `json:"fault,omitempty"`
 	Composition *CompiledComposition `json:"composition,omitempty"`
 }
@@ -158,7 +157,6 @@ func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositi
 
 	for i, m := range comp.Members {
 		member := CompiledCompositionMember{
-			Position:  m.Position,
 			Direction: m.Direction,
 		}
 

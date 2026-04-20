@@ -71,8 +71,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c1", Name: "test", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1", Direction: "upstream"},
-					{Position: 1, FaultSpecID: "f2", Direction: "downstream"},
+					{FaultSpecID: "f1", Direction: "upstream"},
+					{FaultSpecID: "f2", Direction: "downstream"},
 				},
 				CreatedAt: time.Now(),
 			},
@@ -83,8 +83,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c2", Name: "test", ExecutionMode: "sequential",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1"},
-					{Position: 1, FaultSpecID: "f2"},
+					{FaultSpecID: "f1"},
+					{FaultSpecID: "f2"},
 				},
 				CreatedAt: time.Now(),
 			},
@@ -95,8 +95,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c3", Name: "test", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1"},
-					{Position: 1, ChildCompositionID: "c1"},
+					{FaultSpecID: "f1"},
+					{ChildCompositionID: "c1"},
 				},
 				CreatedAt: time.Now(),
 			},
@@ -107,8 +107,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c4", Name: "test", ExecutionMode: "bad",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1"},
-					{Position: 1, FaultSpecID: "f2"},
+					{FaultSpecID: "f1"},
+					{FaultSpecID: "f2"},
 				},
 			},
 			wantErr: true,
@@ -118,7 +118,7 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c5", Name: "test", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1"},
+					{FaultSpecID: "f1"},
 				},
 			},
 			wantErr: true,
@@ -128,8 +128,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c6", Name: "test", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1", ChildCompositionID: "c1"},
-					{Position: 1, FaultSpecID: "f2"},
+					{FaultSpecID: "f1", ChildCompositionID: "c1"},
+					{FaultSpecID: "f2"},
 				},
 			},
 			wantErr: true,
@@ -139,8 +139,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c7", Name: "test", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0},
-					{Position: 1, FaultSpecID: "f2"},
+					{},
+					{FaultSpecID: "f2"},
 				},
 			},
 			wantErr: true,
@@ -150,8 +150,8 @@ func TestFaultComposition_Validate(t *testing.T) {
 			comp: FaultComposition{
 				ID: "c8", Name: "test", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "f1", Direction: "sideways"},
-					{Position: 1, FaultSpecID: "f2"},
+					{FaultSpecID: "f1", Direction: "sideways"},
+					{FaultSpecID: "f2"},
 				},
 			},
 			wantErr: true,

@@ -116,17 +116,17 @@ func (r *FaultRepo) CreateComposition(ctx context.Context, comp *model.FaultComp
 			return fmt.Errorf("insert fault_composition: %w", err)
 		}
 
-		for _, m := range comp.Members {
+		for i, m := range comp.Members {
 			_, err := tx.ExecContext(ctx, `
 				INSERT INTO fault_composition_members
 					(composition_id, position, fault_spec_id, child_composition_id, direction)
 				VALUES ($1, $2, $3, $4, $5)`,
-				comp.ID, m.Position,
+				comp.ID, i,
 				nullString(m.FaultSpecID), nullString(m.ChildCompositionID),
 				nullString(m.Direction),
 			)
 			if err != nil {
-				return fmt.Errorf("insert composition member[%d]: %w", m.Position, err)
+				return fmt.Errorf("insert composition member[%d]: %w", i, err)
 			}
 		}
 
@@ -160,10 +160,12 @@ func (r *FaultRepo) GetComposition(ctx context.Context, id string) (*model.Fault
 
 	for rows.Next() {
 		var m model.FaultCompositionMember
+		var pos int
 		var faultSpecID, childCompID, direction sql.NullString
-		if err := rows.Scan(&m.Position, &faultSpecID, &childCompID, &direction); err != nil {
+		if err := rows.Scan(&pos, &faultSpecID, &childCompID, &direction); err != nil {
 			return nil, fmt.Errorf("scan composition member: %w", err)
 		}
+		_ = pos // slice order = insert order via ORDER BY position
 		m.FaultSpecID = fromNullString(faultSpecID)
 		m.ChildCompositionID = fromNullString(childCompID)
 		m.Direction = fromNullString(direction)

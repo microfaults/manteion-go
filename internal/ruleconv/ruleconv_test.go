@@ -22,11 +22,11 @@ func (m mapCompResolver) GetFaultComposition(id string) (*model.FaultComposition
 func TestCompileRules_FaultSpec(t *testing.T) {
 	specs := mapSpecResolver{
 		"spec-latency": {
-			ID:         "spec-latency",
-			Name:       "200ms latency",
-			Category:   "inline",
-			FaultType:  "latency",
-			Config:     json.RawMessage(`{"delay":"200ms"}`),
+			ID:        "spec-latency",
+			Name:      "200ms latency",
+			Category:  "inline",
+			FaultType: "latency",
+			Config:    json.RawMessage(`{"delay":"200ms"}`),
 		},
 	}
 
@@ -117,8 +117,8 @@ func TestCompileRule_Composition(t *testing.T) {
 		"comp-chaos": {
 			ID: "comp-chaos", Name: "chaos-combo", ExecutionMode: "sequential",
 			Members: []model.FaultCompositionMember{
-				{Position: 0, FaultSpecID: "spec-latency"},
-				{Position: 1, FaultSpecID: "spec-error"},
+				{FaultSpecID: "spec-latency"},
+				{FaultSpecID: "spec-error"},
 			},
 		},
 	}
@@ -186,15 +186,15 @@ func TestCompileRule_NestedComposition(t *testing.T) {
 		"child-comp": {
 			ID: "child-comp", Name: "child", ExecutionMode: "parallel",
 			Members: []model.FaultCompositionMember{
-				{Position: 0, FaultSpecID: "spec-a"},
-				{Position: 1, FaultSpecID: "spec-b"},
+				{FaultSpecID: "spec-a"},
+				{FaultSpecID: "spec-b"},
 			},
 		},
 		"parent-comp": {
 			ID: "parent-comp", Name: "parent", ExecutionMode: "sequential",
 			Members: []model.FaultCompositionMember{
-				{Position: 0, ChildCompositionID: "child-comp"},
-				{Position: 1, FaultSpecID: "spec-c"},
+				{ChildCompositionID: "child-comp"},
+				{FaultSpecID: "spec-c"},
 			},
 		},
 	}
@@ -226,8 +226,8 @@ func TestCompileRule_CompositionDanglingSpec(t *testing.T) {
 		"comp-bad": {
 			ID: "comp-bad", Name: "bad", ExecutionMode: "parallel",
 			Members: []model.FaultCompositionMember{
-				{Position: 0, FaultSpecID: "nonexistent"},
-				{Position: 1, FaultSpecID: "also-nonexistent"},
+				{FaultSpecID: "nonexistent"},
+				{FaultSpecID: "also-nonexistent"},
 			},
 		},
 	}
@@ -258,8 +258,8 @@ func TestCompileRule_CompositionWithDirection(t *testing.T) {
 		"comp-net": {
 			ID: "comp-net", Name: "net-combo", ExecutionMode: "parallel",
 			Members: []model.FaultCompositionMember{
-				{Position: 0, FaultSpecID: "spec-net", Direction: "upstream"},
-				{Position: 1, FaultSpecID: "spec-throttle", Direction: "downstream"},
+				{FaultSpecID: "spec-net", Direction: "upstream"},
+				{FaultSpecID: "spec-throttle", Direction: "downstream"},
 			},
 		},
 	}

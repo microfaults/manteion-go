@@ -33,8 +33,8 @@ func TestValidateCompositionDepth(t *testing.T) {
 	flat := &FaultComposition{
 		ID: "flat", Name: "flat", ExecutionMode: "parallel",
 		Members: []FaultCompositionMember{
-			{Position: 0, FaultSpecID: "inline-latency"},
-			{Position: 1, FaultSpecID: "res-cpu"},
+			{FaultSpecID: "inline-latency"},
+			{FaultSpecID: "res-cpu"},
 		},
 	}
 
@@ -43,8 +43,8 @@ func TestValidateCompositionDepth(t *testing.T) {
 	nested2 := &FaultComposition{
 		ID: "nested2", Name: "nested2", ExecutionMode: "parallel",
 		Members: []FaultCompositionMember{
-			{Position: 0, FaultSpecID: "res-io"},
-			{Position: 1, ChildCompositionID: "flat"},
+			{FaultSpecID: "res-io"},
+			{ChildCompositionID: "flat"},
 		},
 	}
 
@@ -53,8 +53,8 @@ func TestValidateCompositionDepth(t *testing.T) {
 	nested3 := &FaultComposition{
 		ID: "nested3", Name: "nested3", ExecutionMode: "sequential",
 		Members: []FaultCompositionMember{
-			{Position: 0, FaultSpecID: "inline-error"},
-			{Position: 1, ChildCompositionID: "nested2"},
+			{FaultSpecID: "inline-error"},
+			{ChildCompositionID: "nested2"},
 		},
 	}
 
@@ -63,8 +63,8 @@ func TestValidateCompositionDepth(t *testing.T) {
 	nested4 := &FaultComposition{
 		ID: "nested4", Name: "nested4", ExecutionMode: "parallel",
 		Members: []FaultCompositionMember{
-			{Position: 0, FaultSpecID: "res-cpu"},
-			{Position: 1, ChildCompositionID: "nested3"},
+			{FaultSpecID: "res-cpu"},
+			{ChildCompositionID: "nested3"},
 		},
 	}
 
@@ -102,8 +102,8 @@ func TestValidateNetworkDirections(t *testing.T) {
 			&FaultComposition{
 				ID: "ok-dir", Name: "ok", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-latency", Direction: "upstream"},
-					{Position: 1, FaultSpecID: "net-throttle", Direction: "downstream"},
+					{FaultSpecID: "net-latency", Direction: "upstream"},
+					{FaultSpecID: "net-throttle", Direction: "downstream"},
 				},
 			},
 			false,
@@ -113,8 +113,8 @@ func TestValidateNetworkDirections(t *testing.T) {
 			&FaultComposition{
 				ID: "ok-mixed", Name: "ok", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-latency", Direction: "upstream"},
-					{Position: 1, FaultSpecID: "res-cpu"},
+					{FaultSpecID: "net-latency", Direction: "upstream"},
+					{FaultSpecID: "res-cpu"},
 				},
 			},
 			false,
@@ -124,8 +124,8 @@ func TestValidateNetworkDirections(t *testing.T) {
 			&FaultComposition{
 				ID: "bad-dir", Name: "bad", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-latency", Direction: "upstream"},
-					{Position: 1, FaultSpecID: "net-throttle", Direction: "upstream"},
+					{FaultSpecID: "net-latency", Direction: "upstream"},
+					{FaultSpecID: "net-throttle", Direction: "upstream"},
 				},
 			},
 			true,
@@ -135,8 +135,8 @@ func TestValidateNetworkDirections(t *testing.T) {
 			&FaultComposition{
 				ID: "bad-nodir", Name: "bad", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-latency"},
-					{Position: 1, FaultSpecID: "net-throttle"},
+					{FaultSpecID: "net-latency"},
+					{FaultSpecID: "net-throttle"},
 				},
 			},
 			true,
@@ -146,8 +146,8 @@ func TestValidateNetworkDirections(t *testing.T) {
 			&FaultComposition{
 				ID: "seq-net", Name: "seq", ExecutionMode: "sequential",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-latency"},
-					{Position: 1, FaultSpecID: "net-rst"},
+					{FaultSpecID: "net-latency"},
+					{FaultSpecID: "net-rst"},
 				},
 			},
 			false, // sequential skips direction check
@@ -178,8 +178,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "bad-bh", Name: "bad", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-blackhole", Direction: "upstream"},
-					{Position: 1, FaultSpecID: "net-throttle", Direction: "downstream"},
+					{FaultSpecID: "net-blackhole", Direction: "upstream"},
+					{FaultSpecID: "net-throttle", Direction: "downstream"},
 				},
 			},
 			true, false,
@@ -189,8 +189,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "bad-bh-lat", Name: "bad", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-blackhole"},
-					{Position: 1, FaultSpecID: "net-latency"},
+					{FaultSpecID: "net-blackhole"},
+					{FaultSpecID: "net-latency"},
 				},
 			},
 			true, false,
@@ -200,8 +200,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "bad-drip", Name: "bad", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-drip"},
-					{Position: 1, FaultSpecID: "net-throttle"},
+					{FaultSpecID: "net-drip"},
+					{FaultSpecID: "net-throttle"},
 				},
 			},
 			true, false,
@@ -211,8 +211,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "soft-res", Name: "soft", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "res-cpu"},
-					{Position: 1, FaultSpecID: "res-memory"},
+					{FaultSpecID: "res-cpu"},
+					{FaultSpecID: "res-memory"},
 				},
 			},
 			false, true,
@@ -222,8 +222,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "ok-cross", Name: "ok", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "inline-latency"},
-					{Position: 1, FaultSpecID: "res-cpu"},
+					{FaultSpecID: "inline-latency"},
+					{FaultSpecID: "res-cpu"},
 				},
 			},
 			false, false,
@@ -233,8 +233,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "ok-res", Name: "ok", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "res-cpu"},
-					{Position: 1, FaultSpecID: "res-io"},
+					{FaultSpecID: "res-cpu"},
+					{FaultSpecID: "res-io"},
 				},
 			},
 			false, false,
@@ -244,8 +244,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "ok-loss-io", Name: "ok", ExecutionMode: "parallel",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "net-loss"},
-					{Position: 1, FaultSpecID: "res-io"},
+					{FaultSpecID: "net-loss"},
+					{FaultSpecID: "res-io"},
 				},
 			},
 			false, false,
@@ -255,8 +255,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "ok-seq", Name: "ok", ExecutionMode: "sequential",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "inline-latency"},
-					{Position: 1, FaultSpecID: "inline-error"},
+					{FaultSpecID: "inline-latency"},
+					{FaultSpecID: "inline-error"},
 				},
 			},
 			false, false,
@@ -266,8 +266,8 @@ func TestValidateCompositionIncompatibilities(t *testing.T) {
 			&FaultComposition{
 				ID: "soft-seq", Name: "soft", ExecutionMode: "sequential",
 				Members: []FaultCompositionMember{
-					{Position: 0, FaultSpecID: "inline-error"},
-					{Position: 1, FaultSpecID: "inline-latency"},
+					{FaultSpecID: "inline-error"},
+					{FaultSpecID: "inline-latency"},
 				},
 			},
 			false, true,
@@ -332,8 +332,8 @@ func TestValidateComposition_Integration(t *testing.T) {
 		comp := &FaultComposition{
 			ID: "int-ok", Name: "ok", ExecutionMode: "parallel",
 			Members: []FaultCompositionMember{
-				{Position: 0, FaultSpecID: "net-latency", Direction: "upstream"},
-				{Position: 1, FaultSpecID: "net-throttle", Direction: "downstream"},
+				{FaultSpecID: "net-latency", Direction: "upstream"},
+				{FaultSpecID: "net-throttle", Direction: "downstream"},
 			},
 			CreatedAt: time.Now(),
 		}
@@ -347,8 +347,8 @@ func TestValidateComposition_Integration(t *testing.T) {
 		comp := &FaultComposition{
 			ID: "int-bad", Name: "bad", ExecutionMode: "parallel",
 			Members: []FaultCompositionMember{
-				{Position: 0, FaultSpecID: "net-blackhole"},
-				{Position: 1, FaultSpecID: "net-rst"},
+				{FaultSpecID: "net-blackhole"},
+				{FaultSpecID: "net-rst"},
 			},
 			CreatedAt: time.Now(),
 		}
