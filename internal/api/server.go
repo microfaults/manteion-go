@@ -82,6 +82,19 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.handleUpdateRule)
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.handleDeleteRule)
 
+	// Fault spec CRUD
+	mux.HandleFunc("POST /api/v1/faults/specs", s.handleCreateFaultSpec)
+	mux.HandleFunc("GET /api/v1/faults/specs", s.handleListFaultSpecs)
+	mux.HandleFunc("GET /api/v1/faults/specs/{id}", s.handleGetFaultSpec)
+	mux.HandleFunc("DELETE /api/v1/faults/specs/{id}", s.handleDeleteFaultSpec)
+
+	// Fault composition CRUD (validates depth, directions, incompatibilities
+	// via model.ValidateComposition before persisting).
+	mux.HandleFunc("POST /api/v1/faults/compositions", s.handleCreateFaultComposition)
+	mux.HandleFunc("GET /api/v1/faults/compositions", s.handleListFaultCompositions)
+	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
+	mux.HandleFunc("DELETE /api/v1/faults/compositions/{id}", s.handleDeleteFaultComposition)
+
 	// SDK registration & polling
 	mux.HandleFunc("POST /api/v1/sdk/register", s.handleRegister)
 	mux.HandleFunc("DELETE /api/v1/sdk/register/{id}", s.handleDeregister)
