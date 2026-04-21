@@ -53,6 +53,27 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 - **Trace Anchors** — Pointers into Jaeger/Prometheus/Tempo (time range, filters), not trace data itself. CacheBoxConfig describes frozen service state: `KeyStrategy` (`"exact"`, `"exact_with_host"`, `"exact_with_body"` — aligns with atropos SDK `cachebox.KeyStrategy` constants), `MutationPolicy`/`SafeMethods` (reproducibility metadata only, not enforced by SDK), and `SyntheticDelay`. Types in `internal/model/trace.go`.
 - **Policy** — Metric-triggered actions: launch attacks or change cache-box modes. Migrated from zeus-go Archer. Types in `internal/model/policy.go`.
 
+## HTTP API
+
+All routes live on the main API mux (see `internal/api/server.go`). Responses are JSON; errors use `{"error": "..."}`. Successful creates return 201; lists return `[]` (never `null`) on empty; not-found returns 404 via `errors.Is(err, store.ErrNotFound)`.
+
+### Fault Specs & Compositions
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST   | `/api/v1/faults/specs` | Create a fault spec |
+| GET    | `/api/v1/faults/specs` | List all fault specs |
+| GET    | `/api/v1/faults/specs/{id}` | Get a fault spec |
+| DELETE | `/api/v1/faults/specs/{id}` | Delete a fault spec |
+| POST   | `/api/v1/faults/compositions` | Create a composition (runs full `model.ValidateComposition` — depth ≤ 3, network-direction rules, incompatibilities) |
+| GET    | `/api/v1/faults/compositions` | List compositions |
+| GET    | `/api/v1/faults/compositions/{id}` | Get a composition |
+| DELETE | `/api/v1/faults/compositions/{id}` | Delete a composition |
+
+Create-spec: server assigns `id` if absent (`spec-…`) and always overwrites `created_at`. Validation failures return 400 (`Warn` log); store/DB failures return 500 (`Error` log).
+
+Create-composition: same server-authoritative id/timestamp treatment. The handler resolves `FaultSpecID`/`FaultCompositionID` references against the store before `ValidateComposition`, so dangling references surface as 400 validation errors — not 500s.
+
 ## Code Style
 
 - Go 1.25. External deps: pgx/v5 for PostgreSQL. Minimize further deps.
