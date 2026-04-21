@@ -1,0 +1,17 @@
+apiVersion: skaffold/v4beta6
+kind: Config
+metadata:
+  name: manteion
+build:
+  artifacts:
+    - image: manteion
+      docker:
+        dockerfile: Dockerfile
+  local:
+    push: false
+manifests:
+  kustomize:
+    paths:
+      - kubernetes-manifests
+deploy:
+  kubectl: {}
