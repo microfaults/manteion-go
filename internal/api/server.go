@@ -20,6 +20,7 @@ type Server struct {
 	db          *sql.DB
 	rules       *store.RuleRepo
 	faults      *store.FaultRepo
+	faultStore  FaultStore
 	sdk         *store.SDKRepo
 	experiments *store.ExperimentRepo
 	workloads   *store.WorkloadRepo
@@ -35,6 +36,7 @@ func NewServer(
 	db *sql.DB,
 	rules *store.RuleRepo,
 	faults *store.FaultRepo,
+	faultStore FaultStore,
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
 	workloads *store.WorkloadRepo,
@@ -48,6 +50,7 @@ func NewServer(
 		db:          db,
 		rules:       rules,
 		faults:      faults,
+		faultStore:  faultStore,
 		sdk:         sdk,
 		experiments: experiments,
 		workloads:   workloads,
