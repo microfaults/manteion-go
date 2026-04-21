@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -104,6 +105,11 @@ func (f *fakeFaultRepo) CompositionResolver(ctx context.Context) model.Compositi
 // Alias the real store sentinel so handler code's
 // errors.Is(err, store.ErrNotFound) correctly returns 404 against the fake.
 var errFakeNotFound = store.ErrNotFound
+
+// errSimulatedDB stands in for a post-validation storage failure when a test
+// sets fakeFaultRepo.err — used to assert the handler reports 500, not 400,
+// once ValidateComposition has already succeeded.
+var errSimulatedDB = errors.New("simulated db failure")
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -207,5 +213,176 @@ func TestHandleCreateFaultComposition_DanglingSpec(t *testing.T) {
 	}
 	if repo.comps["comp-2"] != nil {
 		t.Fatal("dangling composition should not have been stored")
+	}
+}
+
+func TestHandleCreateFaultSpec_MalformedJSON(t *testing.T) {
+	repo := newFakeFaultRepo()
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/faults/specs", s.handleCreateFaultSpec)
+
+	// Truncated object (missing closing brace) — readJSON should reject.
+	body := `{"id":"spec-1","name":"x",`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/faults/specs", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
+	}
+	if len(repo.specs) != 0 {
+		t.Errorf("malformed request should not have stored anything, got %d specs", len(repo.specs))
+	}
+}
+
+func TestHandleListFaultSpecs(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.specs["s1"] = &model.FaultSpec{
+		ID: "s1", Name: "a", Category: "inline", FaultType: "latency",
+		Config: json.RawMessage(`{"delay":"50ms"}`),
+	}
+	repo.specs["s2"] = &model.FaultSpec{
+		ID: "s2", Name: "b", Category: "inline", FaultType: "error",
+		Config: json.RawMessage(`{"status_code":500}`),
+	}
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/faults/specs", s.handleListFaultSpecs)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/faults/specs", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var got []*model.FaultSpec
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d specs, want 2", len(got))
+	}
+}
+
+func TestHandleGetFaultSpec_NotFound(t *testing.T) {
+	repo := newFakeFaultRepo()
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/faults/specs/{id}", s.handleGetFaultSpec)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/faults/specs/ghost", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleDeleteFaultSpec_Success(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.specs["spec-1"] = &model.FaultSpec{
+		ID: "spec-1", Name: "a", Category: "inline", FaultType: "latency",
+		Config: json.RawMessage(`{"delay":"50ms"}`),
+	}
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /api/v1/faults/specs/{id}", s.handleDeleteFaultSpec)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/faults/specs/spec-1", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if _, exists := repo.specs["spec-1"]; exists {
+		t.Error("spec not removed from store after successful delete")
+	}
+}
+
+func TestHandleDeleteFaultSpec_NotFound(t *testing.T) {
+	repo := newFakeFaultRepo()
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /api/v1/faults/specs/{id}", s.handleDeleteFaultSpec)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/faults/specs/ghost", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleListFaultCompositions(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.comps["c1"] = &model.FaultComposition{ID: "c1", Name: "comp"}
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/faults/compositions", s.handleListFaultCompositions)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/faults/compositions", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+}
+
+func TestHandleGetFaultComposition_NotFound(t *testing.T) {
+	repo := newFakeFaultRepo()
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/faults/compositions/ghost", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+// TestHandleCreateFaultComposition_DBError exercises the post-validation
+// failure path. The fake's err field is injected so CreateComposition returns
+// after ValidateComposition has already succeeded — confirming C1 (500, not
+// 400) when the store layer itself fails.
+func TestHandleCreateFaultComposition_DBError(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.specs["spec-a"] = &model.FaultSpec{
+		ID: "spec-a", Name: "latency", Category: "inline", FaultType: "latency",
+		Config: json.RawMessage(`{"delay":"100ms"}`),
+	}
+	repo.specs["spec-b"] = &model.FaultSpec{
+		ID: "spec-b", Name: "error", Category: "inline", FaultType: "error",
+		Config: json.RawMessage(`{"status_code":500}`),
+	}
+	repo.err = errSimulatedDB
+
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/faults/compositions", s.handleCreateFaultComposition)
+
+	body := `{
+		"id":"comp-3","name":"ok","execution_mode":"parallel",
+		"members":[
+			{"fault_spec_id":"spec-a"},
+			{"fault_spec_id":"spec-b"}
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/faults/compositions", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body=%s", w.Code, w.Body.String())
+	}
+	if repo.comps["comp-3"] != nil {
+		t.Error("composition should not be stored when store returns error")
 	}
 }

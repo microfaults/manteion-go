@@ -19,13 +19,17 @@ func (s *Server) handleCreateFaultSpec(w http.ResponseWriter, r *http.Request) {
 	if spec.ID == "" {
 		spec.ID = generateID("spec")
 	}
-	if spec.CreatedAt.IsZero() {
-		spec.CreatedAt = time.Now()
+	spec.CreatedAt = time.Now()
+
+	if err := spec.Validate(); err != nil {
+		s.logger.Warn("fault spec validation failed", "id", spec.ID, "error", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	if err := s.faultStore.CreateSpec(r.Context(), &spec); err != nil {
-		s.logger.Error("create fault spec failed", "error", err)
-		writeError(w, http.StatusBadRequest, err.Error())
+		s.logger.Error("create fault spec failed", "id", spec.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to create spec")
 		return
 	}
 	s.logger.Info("fault spec created", "id", spec.ID, "category", spec.Category, "type", spec.FaultType)
@@ -92,9 +96,7 @@ func (s *Server) handleCreateFaultComposition(w http.ResponseWriter, r *http.Req
 	if comp.ID == "" {
 		comp.ID = generateID("comp")
 	}
-	if comp.CreatedAt.IsZero() {
-		comp.CreatedAt = time.Now()
-	}
+	comp.CreatedAt = time.Now()
 
 	ctx := r.Context()
 	specResolver := s.faultStore.SpecResolver(ctx)
@@ -107,8 +109,8 @@ func (s *Server) handleCreateFaultComposition(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := s.faultStore.CreateComposition(ctx, &comp); err != nil {
-		s.logger.Error("create composition failed", "error", err)
-		writeError(w, http.StatusBadRequest, err.Error())
+		s.logger.Error("create composition failed", "id", comp.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to create composition")
 		return
 	}
 	s.logger.Info("composition created", "id", comp.ID, "mode", comp.ExecutionMode, "members", len(comp.Members))
