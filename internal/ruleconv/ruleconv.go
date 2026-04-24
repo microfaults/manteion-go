@@ -1,0 +1,221 @@
+package ruleconv
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"manteion-go/internal/model"
+)
+
+// FaultSpecResolver looks up a FaultSpec by ID.
+type FaultSpecResolver interface {
+	GetFaultSpec(id string) (*model.FaultSpec, error)
+}
+
+// FaultCompositionResolver looks up a FaultComposition by ID.
+type FaultCompositionResolver interface {
+	GetFaultComposition(id string) (*model.FaultComposition, error)
+}
+
+// CompiledRule is the wire format for resolved rules served to SDKs.
+// It inlines fault config so the SDK can construct evaluator rules
+// without additional lookups. This exists because atroposdk.StaticRule's
+// Decision.Fault is a Go interface that can't survive JSON roundtrip.
+type CompiledRule struct {
+	Name           string               `json:"name"`
+	InjectionPoint string               `json:"injection_point,omitempty"`
+	Labels         map[string]string    `json:"labels,omitempty"`
+	Mode           string               `json:"mode"`
+	Priority       int                  `json:"priority"`
+	Fault          *CompiledFault       `json:"fault,omitempty"`
+	Composition    *CompiledComposition `json:"composition,omitempty"`
+}
+
+// CompiledFault is a resolved FaultSpec with config inlined.
+type CompiledFault struct {
+	Category   string          `json:"category"`
+	FaultType  string          `json:"fault_type"`
+	Config     json.RawMessage `json:"config"`
+	DurationMs int64           `json:"duration_ms,omitempty"`
+	RampUpMs   int64           `json:"ramp_up_ms,omitempty"`
+	RampDownMs int64           `json:"ramp_down_ms,omitempty"`
+}
+
+// CompiledComposition is a resolved FaultComposition tree with all specs inlined.
+// ExecutionMode and member Direction are plain strings (not model.ExecutionMode /
+// model.Direction) to decouple the wire contract from internal Go type refactors.
+type CompiledComposition struct {
+	Name          string                      `json:"name"`
+	ExecutionMode string                      `json:"execution_mode"`
+	DurationMs    int64                       `json:"duration_ms,omitempty"`
+	RampUpMs      int64                       `json:"ramp_up_ms,omitempty"`
+	RampDownMs    int64                       `json:"ramp_down_ms,omitempty"`
+	Members       []CompiledCompositionMember `json:"members"`
+}
+
+// CompiledCompositionMember is a resolved member — either a leaf fault or a nested composition.
+type CompiledCompositionMember struct {
+	Direction   string               `json:"direction,omitempty"`
+	Fault       *CompiledFault       `json:"fault,omitempty"`
+	Composition *CompiledComposition `json:"composition,omitempty"`
+}
+
+// CompileRules resolves FaultSpec/Composition references and produces wire-ready compiled rules.
+func CompileRules(rules []*model.Rule, specs FaultSpecResolver, comps ...FaultCompositionResolver) ([]CompiledRule, error) {
+	var compResolver FaultCompositionResolver
+	if len(comps) > 0 {
+		compResolver = comps[0]
+	}
+
+	var out []CompiledRule
+	for _, r := range rules {
+		compiled, err := compileRule(r, specs, compResolver)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, compiled)
+	}
+	if out == nil {
+		out = []CompiledRule{}
+	}
+	return out, nil
+}
+
+// CompileRule resolves a single rule.
+func CompileRule(r *model.Rule, specs FaultSpecResolver, comps ...FaultCompositionResolver) (CompiledRule, error) {
+	var compResolver FaultCompositionResolver
+	if len(comps) > 0 {
+		compResolver = comps[0]
+	}
+	return compileRule(r, specs, compResolver)
+}
+
+func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionResolver) (CompiledRule, error) {
+	cr := CompiledRule{
+		Name:           r.Name,
+		InjectionPoint: r.Match.InjectionPoint,
+		Labels:         r.Match.Labels,
+		Mode:           r.Mode,
+		Priority:       r.Priority,
+	}
+
+	switch {
+	case r.FaultSpecID != "":
+		f, err := resolveSpec(r.FaultSpecID, specs)
+		if err != nil {
+			return CompiledRule{}, fmt.Errorf("rule %q: %w", r.ID, err)
+		}
+		cr.Fault = f
+
+	case r.FaultCompositionID != "":
+		if comps == nil {
+			return CompiledRule{}, fmt.Errorf("rule %q: composition resolver required for FaultCompositionID", r.ID)
+		}
+		cc, err := resolveComposition(r.FaultCompositionID, specs, comps, 0)
+		if err != nil {
+			return CompiledRule{}, fmt.Errorf("rule %q: %w", r.ID, err)
+		}
+		cr.Composition = cc
+	}
+
+	return cr, nil
+}
+
+func resolveSpec(id string, specs FaultSpecResolver) (*CompiledFault, error) {
+	spec, err := specs.GetFaultSpec(id)
+	if err != nil {
+		return nil, fmt.Errorf("resolve fault spec %q: %w", id, err)
+	}
+	if spec == nil {
+		return nil, fmt.Errorf("fault spec %q not found", id)
+	}
+	return &CompiledFault{
+		Category:   spec.Category,
+		FaultType:  spec.FaultType,
+		Config:     spec.Config,
+		DurationMs: spec.DurationMs,
+		RampUpMs:   spec.RampUpMs,
+		RampDownMs: spec.RampDownMs,
+	}, nil
+}
+
+const maxCompositionDepth = 3
+
+func resolveComposition(id string, specs FaultSpecResolver, comps FaultCompositionResolver, depth int) (*CompiledComposition, error) {
+	if depth >= maxCompositionDepth {
+		return nil, fmt.Errorf(
+			"composition %q nesting exceeds max depth %d (atoms→groups→top-level). "+
+				"The cap is enforced at resolution time and may be raised in a future revision.",
+			id, maxCompositionDepth,
+		)
+	}
+
+	comp, err := comps.GetFaultComposition(id)
+	if err != nil {
+		return nil, fmt.Errorf("resolve composition %q: %w", id, err)
+	}
+	if comp == nil {
+		return nil, fmt.Errorf("composition %q not found", id)
+	}
+
+	cc := &CompiledComposition{
+		Name:          comp.Name,
+		ExecutionMode: string(comp.ExecutionMode),
+		DurationMs:    comp.DurationMs,
+		RampUpMs:      comp.RampUpMs,
+		RampDownMs:    comp.RampDownMs,
+		Members:       make([]CompiledCompositionMember, len(comp.Members)),
+	}
+
+	for i, m := range comp.Members {
+		member := CompiledCompositionMember{
+			Direction: string(m.Direction),
+		}
+
+		switch {
+		case m.FaultSpecID != "":
+			f, err := resolveSpec(m.FaultSpecID, specs)
+			if err != nil {
+				return nil, fmt.Errorf("composition %q member[%d]: %w", id, i, err)
+			}
+			member.Fault = f
+
+		case m.ChildCompositionID != "":
+			child, err := resolveComposition(m.ChildCompositionID, specs, comps, depth+1)
+			if err != nil {
+				return nil, fmt.Errorf("composition %q member[%d]: %w", id, i, err)
+			}
+			member.Composition = child
+		}
+
+		cc.Members[i] = member
+	}
+
+	return cc, nil
+}
+
+// FuncResolver adapts a func(id string) *model.FaultSpec into FaultSpecResolver.
+type FuncResolver struct {
+	Fn func(id string) *model.FaultSpec
+}
+
+func (f *FuncResolver) GetFaultSpec(id string) (*model.FaultSpec, error) {
+	spec := f.Fn(id)
+	if spec == nil {
+		return nil, nil
+	}
+	return spec, nil
+}
+
+// FuncCompositionResolver adapts a func into FaultCompositionResolver.
+type FuncCompositionResolver struct {
+	Fn func(id string) *model.FaultComposition
+}
+
+func (f *FuncCompositionResolver) GetFaultComposition(id string) (*model.FaultComposition, error) {
+	comp := f.Fn(id)
+	if comp == nil {
+		return nil, nil
+	}
+	return comp, nil
+}
