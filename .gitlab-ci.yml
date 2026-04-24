@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# Mirror to GitHub — Push merged branches to GitHub
+#
+# Triggers on push to main/develop (i.e., when an MR is merged on GitLab).
+# Pushes the same commit to the corresponding branch on GitHub.
+#
+# No infinite loop: GitHub Actions will trigger but its push back here is a
+# no-op because the commit already exists on GitLab (ref unchanged → no event).
+#
+# Required GitLab CI/CD Variables (Settings > CI/CD > Variables, masked):
+#   GITHUB_PUSH_TOKEN — GitHub personal access token with repo (or
+#                        contents:write) scope
+# ---------------------------------------------------------------------------
+
+stages:
+  - mirror
+
+mirror-to-github:
+  stage: mirror
+  image: alpine:latest
+
+  rules:
+    # Only run on pushes to main or develop
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: always
+
+  before_script:
+    - apk add --no-cache git
+
+  script:
+    - git remote add github "https://x-access-token:${GITHUB_PUSH_TOKEN}@github.com/microfaults/manteion-go.git"
+    - git push github "HEAD:refs/heads/${CI_COMMIT_BRANCH}" --force
+    - echo "✅ Pushed ${CI_COMMIT_BRANCH} to GitHub"
