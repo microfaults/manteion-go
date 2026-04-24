@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Mirror to GitLab — Push merged branches to UCSC GitLab
+#
+# Triggers on push to main/develop (i.e., when a PR is merged on GitHub).
+# Pushes the same commit to the corresponding branch on GitLab.
+#
+# No infinite loop: GitLab CI will trigger but its push back here is a no-op
+# because the commit already exists on GitHub (ref unchanged → no event).
+#
+# Required GitHub Secrets:
+#   GITLAB_PUSH_TOKEN — GitLab personal access token with write_repository scope
+#                       (Settings > CI/CD > Repository > Deploy tokens, or
+#                        User Settings > Access Tokens)
+# ---------------------------------------------------------------------------
+
+name: Mirror to GitLab
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # Skip if the push was made by the mirror bot itself (safety net)
+    if: github.actor != 'gitlab-mirror-bot'
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_PUSH_TOKEN }}
+        run: |
+          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@git.ucsc.edu/microfaults/manteion-go.git"
+          git push gitlab "${{ github.ref_name }}" --force
+          echo "✅ Pushed ${{ github.ref_name }} to GitLab"
