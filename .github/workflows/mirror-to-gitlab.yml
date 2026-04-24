@@ -9,23 +9,22 @@
 #
 # Required GitHub Secrets:
 #   GITLAB_PUSH_TOKEN — GitLab personal access token with write_repository scope
-#                       (Settings > CI/CD > Repository > Deploy tokens, or
-#                        User Settings > Access Tokens)
 # ---------------------------------------------------------------------------
 
 name: Mirror to GitLab
-
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    # Skip if the push was made by the mirror bot itself (safety net)
-    if: github.actor != 'gitlab-mirror-bot'
+    # 1. Skip if the actor is a bot
+    # 2. Skip if the commit message contains [skip ci] (sent from GitLab)
+    if: |
+      github.actor != 'gitlab-mirror-bot' && 
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, 'Gitlab github sync')
 
     steps:
       - name: Checkout full history
@@ -38,5 +37,7 @@ jobs:
           GITLAB_TOKEN: ${{ secrets.GITLAB_PUSH_TOKEN }}
         run: |
           git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@git.ucsc.edu/microfaults/manteion-go.git"
-          git push gitlab "${{ github.ref_name }}" --force
-          echo "✅ Pushed ${{ github.ref_name }} to GitLab"
+          # Use '-o ci.skip' which is a GitLab-specific push option to skip the next pipeline
+          git push gitlab "${{ github.ref_name }}" --force -o ci.skip
+          echo "✅ Pushed to GitLab with skip-ci flag."
+
