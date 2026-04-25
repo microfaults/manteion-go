@@ -178,6 +178,10 @@ Client methods: `NewClient`, `Do` (generic proxy), `Status`, `Healthy`
 13. `kubernetes-manifests/kustomization.yaml`
 14. `skaffold.yaml`
 
+## Supersession Note (2026-04-15)
+
+The storage layer described in this plan (in-memory `sync.RWMutex` stores, zero external deps) was superseded by commit baac8c5 which introduced PostgreSQL via pgx/v5. The new layout uses `internal/db/` (connection + migrations) and `internal/store/` (layer-grouped repos) instead of the planned `internal/rule/store.go` and `internal/sdk/registry.go`. API routes, model types, server patterns, and the SDK polling protocol remain as specified here. See `docs/plans/2026-03-30-relational-schemas.md` for the data model that the postgres implementation realizes.
+
 ## What's Left as TODO
 
 | Area | Scaffolded | TODO (needs your input) |
