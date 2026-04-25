@@ -1,33 +1,99 @@
 # ---------------------------------------------------------------------------
+# AI Code Review Bot — GitLab CI/CD Pipeline
+#
+# Triggers:
+#   - Schedule: Auto-diffs commits from the last REVIEW_HOURS hours against HEAD.
+#   - Manual (web UI / API): Set FROM_COMMIT (and optionally TO_COMMIT).
+#
+# Required CI/CD variables (Settings > CI/CD > Variables, masked):
+#   ANTHROPIC_API_KEY — Anthropic API key          [if LLM_PROVIDER=claude]
+#   GOOGLE_API_KEY    — Google AI API key          [if LLM_PROVIDER=gemini]
+#
+# Optional (set project-wide or override per-run in web UI / trigger API):
+#   GITLAB_API_TOKEN  — Project access token (api scope); enables commit comments
+#   LLM_PROVIDER      — "claude" (default) or "gemini"
+#   LLM_MODEL         — Override model ID (e.g. "claude-opus-4-6")
+#   REVIEW_PROMPT     — Extra review instructions appended to the system prompt
+#   FROM_COMMIT       — Base commit ref (manual mode; omit for scheduled lookback)
+#   TO_COMMIT         — Head commit ref (default: HEAD)
+#   REVIEW_HOURS      — Hours to look back in scheduled mode (default: 24)
+#   MAX_DIFF_CHARS    — Max diff characters sent to the LLM (default: 120000)
+# ---------------------------------------------------------------------------
+
+variables:
+  LLM_PROVIDER: "claude"
+  LLM_MODEL: ""
+  REVIEW_PROMPT: ""
+  FROM_COMMIT: ""
+  TO_COMMIT: "HEAD"
+  REVIEW_HOURS: "24"
+  MAX_DIFF_CHARS: "120000"
+  GIT_DEPTH: "0"   # full clone so git log --since works reliably
+  SKIP_MIRROR: "false"
+
+stages:
+  - review
+  - mirror
+
+ai-review:
+  stage: review
+  image: python:3.12-slim
+  allow_failure: true
+  retry:
+    max: 2
+    when: script_failure
+  timeout: 15m
+
+  rules:
+    # Scheduled pipeline (cron — configure rate in Build > Pipeline schedules)
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    # Manual trigger from GitLab web UI (Build > Pipelines > Run pipeline)
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    # API / webhook trigger
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+
+  artifacts:
+    name: "ai-review-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - review-output/
+    expire_in: 30 days
+    when: always
+
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git > /dev/null
+
+  script:
+    - python3 scripts/ai-review.py
+
+# ---------------------------------------------------------------------------
 # Mirror to GitHub — Push merged branches to GitHub
 #
 # Triggers on push to main/develop (i.e., when an MR is merged on GitLab).
-# Pushes the same commit to the corresponding branch on GitHub.
+# Pushes the EXACT same commit objects to GitHub to maintain SHA parity.
 #
-# No infinite loop: GitHub Actions will trigger but its push back here is a
-# no-op because the commit already exists on GitLab (ref unchanged → no event).
-#
-# Required GitLab CI/CD Variables (Settings > CI/CD > Variables, masked):
-#   GITHUB_PUSH_TOKEN — GitHub personal access token with repo (or
-#                        contents:write) scope
+# Required GitLab CI/CD Variables:
+#   GITHUB_PUSH_TOKEN — GitHub PAT with 'repo' scope
 # ---------------------------------------------------------------------------
-
-stages:
-  - mirror
 
 mirror-to-github:
   stage: mirror
   image: alpine:latest
-
+  variables:
+    GIT_DEPTH: "0"
   rules:
-    # Only run on pushes to main or develop
-    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
-      when: always
-
-  before_script:
-    - apk add --no-cache git
-
+    # 1. Hard block if this push originated from the GitHub mirror script
+    - if: '$SKIP_MIRROR == "true"'
+      when: never
+    # 2. Manual only: Only appears in the UI on main/develop
+    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop") && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "push")'
+      when: manual
+      allow_failure: true
   script:
+    - apk add --no-cache git
     - git remote add github "https://x-access-token:${GITHUB_PUSH_TOKEN}@github.com/microfaults/manteion-go.git"
-    - git push github "HEAD:refs/heads/${CI_COMMIT_BRANCH}" --force
-    - echo "✅ Pushed ${CI_COMMIT_BRANCH} to GitHub"
+    
+    # We push with a push option to tell GitHub Actions to skip its mirror if needed
+    # (Though the GitHub 'actor' check is usually sufficient, this is extra safety)
+    - git push github "HEAD:refs/heads/${CI_COMMIT_BRANCH}" --force -o "source=gitlab"
+    - echo "✅ Manual mirror to GitHub complete."
+
