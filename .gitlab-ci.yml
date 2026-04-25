@@ -29,6 +29,7 @@ variables:
   REVIEW_HOURS: "24"
   MAX_DIFF_CHARS: "120000"
   GIT_DEPTH: "0"   # full clone so git log --since works reliably
+  SKIP_MIRROR: "false"
 
 stages:
   - review
@@ -68,25 +69,31 @@ ai-review:
 # Mirror to GitHub — Push merged branches to GitHub
 #
 # Triggers on push to main/develop (i.e., when an MR is merged on GitLab).
-# Pushes the same commit to the corresponding branch on GitHub.
+# Pushes the EXACT same commit objects to GitHub to maintain SHA parity.
 #
-# Required GitLab CI/CD Variables (Settings > CI/CD > Variables, masked):
-#   GITHUB_PUSH_TOKEN — GitHub personal access token with repo scope
+# Required GitLab CI/CD Variables:
+#   GITHUB_PUSH_TOKEN — GitHub PAT with 'repo' scope
 # ---------------------------------------------------------------------------
 
 mirror-to-github:
   stage: mirror
   image: alpine:latest
+  variables:
+    GIT_DEPTH: "0"
   rules:
-    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop") && $CI_COMMIT_MESSAGE !~ /\[skip ci\]/'
-      when: always
-
+    # 1. Hard block if this push originated from the GitHub mirror script
+    - if: '$SKIP_MIRROR == "true"'
+      when: never
+    # 2. Manual only: Only appears in the UI on main/develop
+    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop") && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "push")'
+      when: manual
+      allow_failure: true
   script:
     - apk add --no-cache git
-    - git config --global user.email "bot@git.ucsc.edu"
-    - git config --global user.name "GitLab Mirror Bot"
     - git remote add github "https://x-access-token:${GITHUB_PUSH_TOKEN}@github.com/microfaults/manteion-go.git"
-    # We push the current HEAD but add a push option to tell GitHub to skip CI
-    - git push github "HEAD:refs/heads/${CI_COMMIT_BRANCH}" --force -o ci.skip
-    - echo "✅ Pushed to GitHub. Hash is consistent."
+    
+    # We push with a push option to tell GitHub Actions to skip its mirror if needed
+    # (Though the GitHub 'actor' check is usually sufficient, this is extra safety)
+    - git push github "HEAD:refs/heads/${CI_COMMIT_BRANCH}" --force -o "source=gitlab"
+    - echo "✅ Manual mirror to GitHub complete."
 
