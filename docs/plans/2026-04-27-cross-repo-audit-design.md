@@ -17,6 +17,8 @@ Produce alignment across the three Go repos (`manteion-go`, `atropos-go`, `zeus-
 3. What the atropos service-author API should grow toward.
 4. How OpenAPI specs are generated and kept in sync.
 
+**Refactoring posture (all three repos):** all three Go repos are pre-v1 with no live external consumers. Renames, restructures, and deletions can be done in single PRs without deprecation pipelines, compatibility shims, or migration windows. The zeus policies deletion is the cleanest example of this posture in action; the same applies to anything else this audit identifies.
+
 ## Non-goals
 
 - Implementing audit findings, atropos extensions, or specs in this design — those land via the implementation plan that follows.
@@ -57,9 +59,9 @@ Findings tagged: `{drift | gap | dead-code | duplicate | naming}` × `{blocker |
 
 **Evidence:** zeus's `internal/api/` route table vs `api-contract.md` claims; what manteion's UI surface needs that the passthrough hides (`API-NEEDED §C.3`); the `policies` redundancy with manteion's renamed `AutoRule`.
 
-**Decision (this brainstorm, 2026-04-27):** zeus's `policies` path is functionally redundant with manteion's `AutoRule`. Plan for **deletion** (not deprecation) — see Sequencing §7.
+**Decision (this brainstorm, 2026-04-27):** zeus's `policies` path is functionally redundant with manteion's `AutoRule`. Plan for **deletion** (not deprecation) — see Sequencing §7. The rest of zeus (workloads, attacks, k6 driver, run lifecycle) stays in scope and gets the full audit + annotation treatment.
 
-**Open question — confirm before implementation begins:** "zeus is not in use, remove code liberally" — does this apply to the policies engine specifically, or to the entire zeus-go service? This document assumes **only the policies engine + manteion's `/api/v1/zeus/policies` proxy routes**, with the rest of zeus (workloads, attacks, k6 driver) staying in scope. If broader retirement is intended, the audit's zeus chapter shrinks dramatically and manteion's zeus client + remaining proxy routes are also removable.
+**Pre-v1 posture (confirmed 2026-04-27):** zeus has no live external consumers; PRs that touch its surface can rename/restructure/delete freely. No deprecation flags, no compatibility shims. Same applies to manteion and atropos.
 
 ### service-beds — checkoutService only
 
@@ -227,7 +229,6 @@ The implementation plan that follows this design decomposes into the steps below
 
 ## Open questions
 
-- **Zeus retirement scope.** "Zeus is not in use, remove code liberally" — assumed to apply to the policies engine specifically. Confirm whether the rest of zeus (workloads, attacks, k6 driver) stays in scope; if not, sequencing §2 zeus annotation PR drops, manteion's zeus client + remaining proxy routes also get deleted.
 - **AutoRule route naming.** `/api/v1/autorules` vs `/api/v1/auto-rules`. Default to `/autorules` matching existing `/rules` convention; UI confirms.
 - **Atropos admin spec mount path.** Recommended default `/atropos/admin/`; host services may override but spec defaults to this.
 - **`cachebox.Stats()` shape.** Fixed Go struct (recommended) vs Prometheus collector. Services adapt to their Prom registry on their side.
@@ -242,7 +243,6 @@ The implementation plan that follows this design decomposes into the steps below
 - Atropos admin spec has no real "base URL" → mitigated by recommending the `/atropos/admin/` default mount path.
 - Schema-refactors plan and this audit overlap (Phase 2.6 changes `compiled_rule.go`; this audit annotates it) → coordination note, not a blocker; different layers.
 - swag v2 is newer than v1 — may have annotation gaps or edge-case bugs. Mitigation: Foundations PR validates the toolchain end-to-end before propagation.
-- "Zeus is not in use" interpretation risk — see Open Questions.
 
 ---
 
