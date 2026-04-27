@@ -5,12 +5,12 @@ import (
 	"time"
 )
 
-func TestPolicyRule_Validate(t *testing.T) {
-	base := func() PolicyRule {
-		return PolicyRule{
+func TestAutoRule_Validate(t *testing.T) {
+	base := func() AutoRule {
+		return AutoRule{
 			ID: "p1", Name: "auto-attack", Enabled: true,
-			Condition: PolicyCondition{Metric: "checkout_p99_us", Operator: "gt", Threshold: 50000},
-			Action: PolicyAction{
+			Condition: AutoRuleCondition{Metric: "checkout_p99_us", Operator: "gt", Threshold: 50000},
+			Action: AutoRuleAction{
 				ActionType: "attack",
 				AttackTarget: &AttackTargetSpec{
 					URL: "http://productcatalog:3550/products", Method: "GET",
@@ -24,12 +24,12 @@ func TestPolicyRule_Validate(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		modify  func(*PolicyRule)
+		modify  func(*AutoRule)
 		wantErr bool
 	}{
 		{"valid attack action", nil, false},
-		{"valid cachebox action", func(r *PolicyRule) {
-			r.Action = PolicyAction{
+		{"valid cachebox action", func(r *AutoRule) {
+			r.Action = AutoRuleAction{
 				ActionType: "cachebox_mode_change",
 				CacheBoxChange: &CacheBoxConfig{
 					Service: "productcatalog", Mode: "replay",
@@ -37,21 +37,21 @@ func TestPolicyRule_Validate(t *testing.T) {
 				},
 			}
 		}, false},
-		{"invalid operator", func(r *PolicyRule) { r.Condition.Operator = "bad" }, true},
-		{"missing metric", func(r *PolicyRule) { r.Condition.Metric = "" }, true},
-		{"invalid action_type", func(r *PolicyRule) {
-			r.Action = PolicyAction{ActionType: "bad"}
+		{"invalid operator", func(r *AutoRule) { r.Condition.Operator = "bad" }, true},
+		{"missing metric", func(r *AutoRule) { r.Condition.Metric = "" }, true},
+		{"invalid action_type", func(r *AutoRule) {
+			r.Action = AutoRuleAction{ActionType: "bad"}
 		}, true},
-		{"attack without target", func(r *PolicyRule) {
-			r.Action = PolicyAction{ActionType: "attack"}
+		{"attack without target", func(r *AutoRule) {
+			r.Action = AutoRuleAction{ActionType: "attack"}
 		}, true},
-		{"cachebox without config", func(r *PolicyRule) {
-			r.Action = PolicyAction{ActionType: "cachebox_mode_change"}
+		{"cachebox without config", func(r *AutoRule) {
+			r.Action = AutoRuleAction{ActionType: "cachebox_mode_change"}
 		}, true},
-		{"attack target missing url", func(r *PolicyRule) {
+		{"attack target missing url", func(r *AutoRule) {
 			r.Action.AttackTarget.URL = ""
 		}, true},
-		{"attack target zero rate", func(r *PolicyRule) {
+		{"attack target zero rate", func(r *AutoRule) {
 			r.Action.AttackTarget.Rate = 0
 		}, true},
 		{"all operators valid", nil, false},
@@ -71,9 +71,9 @@ func TestPolicyRule_Validate(t *testing.T) {
 	}
 }
 
-func TestPolicyCondition_AllOperators(t *testing.T) {
+func TestAutoRuleCondition_AllOperators(t *testing.T) {
 	for _, op := range []string{"gt", "gte", "lt", "lte", "eq"} {
-		c := PolicyCondition{Metric: "test", Operator: op, Threshold: 1.0}
+		c := AutoRuleCondition{Metric: "test", Operator: op, Threshold: 1.0}
 		if err := c.Validate(); err != nil {
 			t.Errorf("operator %q should be valid, got: %v", op, err)
 		}

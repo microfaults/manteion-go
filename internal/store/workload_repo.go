@@ -277,12 +277,12 @@ func (r *WorkloadRepo) CreateAttack(ctx context.Context, a *model.Attack) error 
 	}
 
 	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO attacks (id, workload_id, experiment_run_id, policy_rule_id,
+		INSERT INTO attacks (id, workload_id, experiment_run_id, auto_rule_id,
 			service, role, target_url, target_method, target_headers,
 			rate, duration_ms, dedup_bypass, meta_trace_id, status,
 			started_at, completed_at, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
-		a.ID, nullString(a.WorkloadID), nullString(a.ExperimentRunID), nullString(a.PolicyRuleID),
+		a.ID, nullString(a.WorkloadID), nullString(a.ExperimentRunID), nullString(a.AutoRuleID),
 		a.Service, a.Role, a.TargetURL, a.TargetMethod, headersJSON,
 		a.Rate, a.DurationMs, nullString(a.DedupBypass), nullString(a.MetaTraceID), a.Status,
 		a.StartedAt, a.CompletedAt, a.CreatedAt,
@@ -296,17 +296,17 @@ func (r *WorkloadRepo) CreateAttack(ctx context.Context, a *model.Attack) error 
 // GetAttack returns an attack by ID, or ErrNotFound.
 func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack, error) {
 	var a model.Attack
-	var workloadID, expRunID, policyRuleID, dedup, metaTrace sql.NullString
+	var workloadID, expRunID, autoRuleID, dedup, metaTrace sql.NullString
 	var headersJSON []byte
 
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, workload_id, experiment_run_id, policy_rule_id,
+		SELECT id, workload_id, experiment_run_id, auto_rule_id,
 			service, role, target_url, target_method, target_headers,
 			rate, duration_ms, dedup_bypass, meta_trace_id, status,
 			started_at, completed_at, created_at
 		FROM attacks WHERE id = $1`, id,
 	).Scan(
-		&a.ID, &workloadID, &expRunID, &policyRuleID,
+		&a.ID, &workloadID, &expRunID, &autoRuleID,
 		&a.Service, &a.Role, &a.TargetURL, &a.TargetMethod, &headersJSON,
 		&a.Rate, &a.DurationMs, &dedup, &metaTrace, &a.Status,
 		&a.StartedAt, &a.CompletedAt, &a.CreatedAt,
@@ -319,7 +319,7 @@ func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack,
 	}
 	a.WorkloadID = fromNullString(workloadID)
 	a.ExperimentRunID = fromNullString(expRunID)
-	a.PolicyRuleID = fromNullString(policyRuleID)
+	a.AutoRuleID = fromNullString(autoRuleID)
 	a.DedupBypass = fromNullString(dedup)
 	a.MetaTraceID = fromNullString(metaTrace)
 	if err := jsonbScan(headersJSON, &a.TargetHeaders); err != nil {
@@ -331,7 +331,7 @@ func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack,
 // ListAttacksByWorkload returns all attacks for a workload.
 func (r *WorkloadRepo) ListAttacksByWorkload(ctx context.Context, workloadID string) ([]*model.Attack, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, workload_id, experiment_run_id, policy_rule_id,
+		SELECT id, workload_id, experiment_run_id, auto_rule_id,
 			service, role, target_url, target_method, target_headers,
 			rate, duration_ms, dedup_bypass, meta_trace_id, status,
 			started_at, completed_at, created_at
@@ -345,12 +345,12 @@ func (r *WorkloadRepo) ListAttacksByWorkload(ctx context.Context, workloadID str
 	var result []*model.Attack
 	for rows.Next() {
 		var a model.Attack
-		var workloadIDN, expRunID, policyRuleID sql.NullString
+		var workloadIDN, expRunID, autoRuleID sql.NullString
 		var dedup, metaTrace sql.NullString
 		var headersJSON []byte
 
 		err := rows.Scan(
-			&a.ID, &workloadIDN, &expRunID, &policyRuleID,
+			&a.ID, &workloadIDN, &expRunID, &autoRuleID,
 			&a.Service, &a.Role, &a.TargetURL, &a.TargetMethod, &headersJSON,
 			&a.Rate, &a.DurationMs, &dedup, &metaTrace, &a.Status,
 			&a.StartedAt, &a.CompletedAt, &a.CreatedAt,
@@ -360,7 +360,7 @@ func (r *WorkloadRepo) ListAttacksByWorkload(ctx context.Context, workloadID str
 		}
 		a.WorkloadID = fromNullString(workloadIDN)
 		a.ExperimentRunID = fromNullString(expRunID)
-		a.PolicyRuleID = fromNullString(policyRuleID)
+		a.AutoRuleID = fromNullString(autoRuleID)
 		a.DedupBypass = fromNullString(dedup)
 		a.MetaTraceID = fromNullString(metaTrace)
 		if err := jsonbScan(headersJSON, &a.TargetHeaders); err != nil {

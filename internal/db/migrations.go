@@ -26,6 +26,11 @@ ALTER TABLE fault_compositions
     ADD COLUMN IF NOT EXISTS ramp_up_ms BIGINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS ramp_down_ms BIGINT DEFAULT 0;
 `},
+	{5, "rename policy_rules to auto_rules", `
+ALTER TABLE policy_rules RENAME TO auto_rules;
+ALTER TABLE attacks RENAME COLUMN policy_rule_id TO auto_rule_id;
+ALTER TABLE attacks RENAME CONSTRAINT fk_attacks_policy_rule TO fk_attacks_auto_rule;
+`},
 }
 
 // Migrate applies any pending migrations to the database.

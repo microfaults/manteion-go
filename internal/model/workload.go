@@ -116,7 +116,7 @@ type Attack struct {
 	ID              string            `json:"id"`
 	WorkloadID      string            `json:"workload_id,omitempty"`
 	ExperimentRunID string            `json:"experiment_run_id,omitempty"`
-	PolicyRuleID    string            `json:"policy_rule_id,omitempty"`
+	AutoRuleID      string            `json:"auto_rule_id,omitempty"`
 	Service         string            `json:"service"`
 	Role            string            `json:"role"` // "primary" or "background"
 	TargetURL       string            `json:"target_url"`

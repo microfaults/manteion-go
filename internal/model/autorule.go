@@ -6,40 +6,42 @@ import (
 	"time"
 )
 
-// PolicyRule defines a metric-triggered action. Evaluates conditions on a tick
+// AutoRule defines a metric-triggered action. Evaluates conditions on a tick
 // interval and launches attacks (or cache-box mode changes) when conditions are met.
-// Ownership migrated from zeus-go's Archer to manteion.
-type PolicyRule struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Enabled   bool            `json:"enabled"`
-	Condition PolicyCondition `json:"condition"`
-	Action    PolicyAction    `json:"action"`
-	Cooldown  time.Duration   `json:"cooldown"`
-	CreatedAt time.Time       `json:"created_at"`
+// Ownership migrated from zeus-go's Archer to manteion. Renamed from PolicyRule
+// to disambiguate from request-matching Rule and to align with the UI's "AutoRules"
+// nomenclature (manteion-ui/docs/API-NEEDED.md §C.4).
+type AutoRule struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Enabled   bool              `json:"enabled"`
+	Condition AutoRuleCondition `json:"condition"`
+	Action    AutoRuleAction    `json:"action"`
+	Cooldown  time.Duration     `json:"cooldown"`
+	CreatedAt time.Time         `json:"created_at"`
 }
 
-func (r *PolicyRule) Validate() error {
+func (r *AutoRule) Validate() error {
 	if r.ID == "" {
-		return errors.New("policy rule: id required")
+		return errors.New("auto rule: id required")
 	}
 	if r.Name == "" {
-		return errors.New("policy rule: name required")
+		return errors.New("auto rule: name required")
 	}
 	if err := r.Condition.Validate(); err != nil {
-		return fmt.Errorf("policy rule: %w", err)
+		return fmt.Errorf("auto rule: %w", err)
 	}
 	if err := r.Action.Validate(); err != nil {
-		return fmt.Errorf("policy rule: %w", err)
+		return fmt.Errorf("auto rule: %w", err)
 	}
 	if r.Cooldown < 0 {
-		return errors.New("policy rule: cooldown must be non-negative")
+		return errors.New("auto rule: cooldown must be non-negative")
 	}
 	return nil
 }
 
-// PolicyCondition is a threshold check against a named metric.
-type PolicyCondition struct {
+// AutoRuleCondition is a threshold check against a named metric.
+type AutoRuleCondition struct {
 	Metric    string  `json:"metric"`
 	Operator  string  `json:"operator"` // gt, gte, lt, lte, eq
 	Threshold float64 `json:"threshold"`
@@ -49,7 +51,7 @@ var validOperators = map[string]bool{
 	"gt": true, "gte": true, "lt": true, "lte": true, "eq": true,
 }
 
-func (c *PolicyCondition) Validate() error {
+func (c *AutoRuleCondition) Validate() error {
 	if c.Metric == "" {
 		return errors.New("condition: metric required")
 	}
@@ -59,14 +61,14 @@ func (c *PolicyCondition) Validate() error {
 	return nil
 }
 
-// PolicyAction describes what happens when a condition fires.
-type PolicyAction struct {
+// AutoRuleAction describes what happens when a condition fires.
+type AutoRuleAction struct {
 	ActionType     string            `json:"action_type"` // "attack" or "cachebox_mode_change"
 	AttackTarget   *AttackTargetSpec `json:"attack_target,omitempty"`
 	CacheBoxChange *CacheBoxConfig   `json:"cachebox_change,omitempty"`
 }
 
-func (a *PolicyAction) Validate() error {
+func (a *AutoRuleAction) Validate() error {
 	switch a.ActionType {
 	case "attack":
 		if a.AttackTarget == nil {
@@ -83,7 +85,7 @@ func (a *PolicyAction) Validate() error {
 	}
 }
 
-// AttackTargetSpec describes the target for a policy-triggered attack.
+// AttackTargetSpec describes the target for an auto-rule-triggered attack.
 type AttackTargetSpec struct {
 	URL         string `json:"url"`
 	Method      string `json:"method"`

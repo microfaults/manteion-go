@@ -52,7 +52,7 @@ func main() {
 	sdkRepo := store.NewSDKRepo(database)
 	experimentRepo := store.NewExperimentRepo(database)
 	workloadRepo := store.NewWorkloadRepo(database)
-	policyRepo := store.NewPolicyRepo(database)
+	autoRuleRepo := store.NewAutoRuleRepo(database)
 	traceRepo := store.NewTraceRepo(database)
 
 	// Create zeus client.
@@ -70,7 +70,7 @@ func main() {
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, sdkRepo,
-		experimentRepo, workloadRepo, policyRepo, traceRepo,
+		experimentRepo, workloadRepo, autoRuleRepo, traceRepo,
 		zeusClient, controller.IntentReader(),
 	)
 

@@ -24,7 +24,7 @@ type Server struct {
 	sdk         *store.SDKRepo
 	experiments *store.ExperimentRepo
 	workloads   *store.WorkloadRepo
-	policies    *store.PolicyRepo
+	autoRules   *store.AutoRuleRepo
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
 	intent      atrocontrol.IntentReader
@@ -40,7 +40,7 @@ func NewServer(
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
 	workloads *store.WorkloadRepo,
-	policies *store.PolicyRepo,
+	autoRules *store.AutoRuleRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
 	intent atrocontrol.IntentReader,
@@ -54,7 +54,7 @@ func NewServer(
 		sdk:         sdk,
 		experiments: experiments,
 		workloads:   workloads,
-		policies:    policies,
+		autoRules:   autoRules,
 		traces:      traces,
 		zeus:        zeusClient,
 		intent:      intent,
