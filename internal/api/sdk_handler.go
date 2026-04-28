@@ -11,6 +11,19 @@ import (
 )
 
 // handleRegister registers (or re-registers) an SDK instance.
+//
+// @Summary      Register SDK instance
+// @Description  Registers an atropos-go SDK process. The 201 response carries
+// @Description  status="registered" and may include initial intent payload
+// @Description  (rules, active_fault, freeze_cfg) when an IntentReader is
+// @Description  configured for the service.
+// @Tags         sdk
+// @Accept       json
+// @Produce      json
+// @Param        instance  body      model.SDKInstance  true  "SDK instance metadata"
+// @Success      201       {object}  map[string]any     "registration ack with optional intent fields"
+// @Failure      400       {object}  api.ErrorResponse  "invalid JSON or registration error"
+// @Router       /sdk/register [post]
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var inst model.SDKInstance
 	if err := readJSON(r, &inst); err != nil {
@@ -44,6 +57,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeregister removes an SDK instance.
+//
+// @Summary      Deregister SDK instance
+// @Tags         sdk
+// @Param        id   path  string  true  "Instance ID"
+// @Success      204  "instance deregistered"
+// @Failure      404  {object}  api.ErrorResponse  "instance not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /sdk/register/{id} [delete]
 func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -62,6 +83,15 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListInstances returns all registered SDK instances.
+//
+// @Summary      List SDK instances
+// @Description  Returns all currently registered SDK instances. Status is computed
+// @Description  (alive/stale/dead) from last-poll-at.
+// @Tags         sdk
+// @Produce      json
+// @Success      200  {array}   model.SDKInstance
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /sdk/instances [get]
 func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	instances, err := s.sdk.List(r.Context())
 	if err != nil {
@@ -78,6 +108,23 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 // handlePollRules is the SDK polling endpoint.
 // Query params: ?service=X&version=N
 // Returns 304 if store version == requested version, otherwise 200 with rules.
+//
+// @Summary      Poll for rule updates
+// @Description  SDKs send their last-known rule version via the version query param.
+// @Description  Returns 304 if unchanged, 200 with the current rule set otherwise.
+// @Description  The 200 body wraps the version and the compiled rule list:
+// @Description  {"version": uint64, "rules": []ruleconv.CompiledRule}.
+// @Description  Optional instance_id query param triggers a best-effort poll-timestamp touch.
+// @Tags         sdk
+// @Produce      json
+// @Param        service      query     string  true   "service name"
+// @Param        version      query     integer false  "last known rule version (uint64); omit on first poll"
+// @Param        instance_id  query     string  false  "SDK instance ID for poll-timestamp tracking"
+// @Success      200          {object}  map[string]any  "{version, rules: []ruleconv.CompiledRule}"
+// @Success      304          "no rule changes since requested version"
+// @Failure      400          {object}  api.ErrorResponse  "service query parameter required"
+// @Failure      500          {object}  api.ErrorResponse
+// @Router       /sdk/rules [get]
 func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	service := r.URL.Query().Get("service")
 	if service == "" {
@@ -143,6 +190,14 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 
 // handleInit is the startup readiness check for SDK initialization.
 // Returns 200 when manteion is ready to serve rules.
+//
+// @Summary      SDK init readiness
+// @Description  Returns 200 with status="ready" when manteion is ready to
+// @Description  serve rules. Used by atropos-go SDKs as a startup gate.
+// @Tags         sdk
+// @Produce      json
+// @Success      200  {object}  map[string]string  "{status: ready}"
+// @Router       /sdk/init [get]
 func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

@@ -299,24 +299,46 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 
 - [ ] **Step 6: Annotate `health_handler.go`** — `handleHealthz`, `handleReadyz`, `handleStatus`. Tag: `health`. Simple 200/503 responses.
 
-- [ ] **Step 7: Annotate `zeus_handler.go` (workloads + attacks only)**. The proxy handles a small number of routes; tag: `zeus-proxy`. Body shapes are passthrough and not modeled in manteion — annotate as opaque.
-
 ```go
-// handleZeusProxy forwards workload and attack requests to zeus-go.
-//
-// @Summary      Zeus passthrough
-// @Description  Proxies the request to zeus-go's load generation API.
-// @Description  Body and response shapes are defined by zeus-go; see its OpenAPI spec.
-// @Tags         zeus-proxy
-// @Accept       json
-// @Produce      json
-// @Success      200  "passthrough — see zeus-go spec for response shape"
-// @Failure      502  {object}  api.ErrorResponse  "zeus unreachable"
-// @Router       /zeus/workloads [post]
-func (s *Server) handleZeusProxy(w http.ResponseWriter, r *http.Request) {
+// @Router       /healthz [get]
+// @Router       /readyz  [get]
 ```
 
-Repeat the `@Router` line per registered zeus route (workloads GET/POST/DELETE, attacks GET/POST/DELETE). Skip the `policies` arms — Task 12 deletes them.
+Note: health endpoints are mounted at root (for direct k8s probes) AND under `/api/v1/...` (so OpenAPI clients composing `servers[0].url + path_key` reach a real route). The `@Router` path stays bare (e.g., `/healthz`) — same convention as every other endpoint. Two `mux.HandleFunc` registrations per health route do the actual dual-mounting.
+
+OpenAPI 3.x composes URLs as `servers[0].url + path_key` literally with no base-path stripping. With `servers[0].url = http://host/api/v1` and a bare `@Router /healthz`, spec consumers compose `http://host/api/v1/healthz`, which hits the `/api/v1/healthz` mux registration. Direct k8s probes still hit `/healthz` at root. If `@Router` were instead `/api/v1/healthz`, spec consumers would compose `http://host/api/v1/api/v1/healthz` and 404.
+
+```go
+mux.HandleFunc("GET /healthz", s.handleHealthz)
+mux.HandleFunc("GET /readyz", s.handleReadyz)
+mux.HandleFunc("GET /api/v1/healthz", s.handleHealthz)
+mux.HandleFunc("GET /api/v1/readyz", s.handleReadyz)
+```
+
+- [ ] **Step 7: Annotate `zeus_handler.go` (workloads + attacks only)**. The proxy handles a small number of routes; tag: `zeus-proxy`. Body shapes are passthrough and not modeled in manteion — annotate as opaque.
+
+Multi-`@Router` on a single handler produces invalid OpenAPI when path templates differ (`/{id}` vs root) or when accept/produce differs across methods (e.g. GET takes no body but `@Accept json` propagates to all routers). Use thin shims that all call a shared private helper (`(*Server).zeusProxy`); each shim carries one `@Router`, the right `@Accept`/`@Produce`, and any `@Param id path` needed.
+
+```go
+// Shared private helper — kept un-annotated.
+func (s *Server) zeusProxy(w http.ResponseWriter, r *http.Request) { /* existing body */ }
+
+// handleZeusWorkloadDelete forwards DELETE /zeus/workloads/{id} to zeus-go.
+//
+// @Summary      Delete workload (Zeus passthrough)
+// @Description  Proxies the request to zeus-go's load generation API.
+// @Tags         zeus-proxy
+// @Param        id       path      string             true  "Workload ID (zeus-defined)"
+// @Success      204
+// @Failure      502      {object}  api.ErrorResponse  "zeus unreachable"
+// @Failure      default  {object}  api.ErrorResponse  "upstream-propagated 4xx/5xx"
+// @Router       /zeus/workloads/{id} [delete]
+func (s *Server) handleZeusWorkloadDelete(w http.ResponseWriter, r *http.Request) {
+	s.zeusProxy(w, r)
+}
+```
+
+Repeat the per-shim form for the other five routes (workloads POST/GET, attacks POST/GET-with-id/DELETE-with-id). Skip the `policies` arms — Task 12 deletes them; keep them routed via an unannotated `handleZeusProxy` alias until then.
 
 - [ ] **Step 8: Regenerate spec and verify**
 
@@ -340,6 +362,8 @@ git commit -m "feat(openapi): annotate manteion-go handlers"
 ## Task 3: Annotate atropos-go admin handlers
 
 Atropos exposes three admin handlers (`FaultAdminHandler`, `CacheBoxAdminHandler`, `RulesAdminHandler`) for host services to mount. Spec describes their endpoint shape with the recommended mount path `/atropos/admin/`.
+
+Note: follow the per-shim convention established in Task 2 for any handler that serves multiple methods or path templates. A single Go function carrying multiple `@Router` lines plus `@Accept json` propagates the request-body schema onto GET routes, breaks when path templates differ across methods, and produces an invalid OpenAPI document. Each method gets its own thin shim with one `@Router`, the right `@Accept`/`@Produce`, and any necessary `@Param`; shims share behavior via a private helper. The atropos admin handlers below are currently monolithic — Task 3 splits them.
 
 **Files:**
 - Create: `Makefile`, `.gitlab-ci.yml`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`, package-level annotation file `atropos.go` additions
@@ -397,24 +421,42 @@ package atropos
 
 - [ ] **Step 4: Annotate `FaultAdminHandler`** (`admin.go`)
 
-Add above `func FaultAdminHandlerWith(...)`:
+Split the monolithic `FaultAdminHandlerWith` into two per-method shims that share a private helper. Each shim carries a single `@Router`, the correct `@Accept`/`@Produce`, and any required `@Param`. The implementer adapts to atropos-go's actual function signatures and internal types.
 
 ```go
-// FaultAdminHandlerWith returns an http.Handler for ad-hoc per-request fault binding.
+// faultAdminPost and faultAdminGet hold the per-method bodies; the shared
+// FaultAdminHandlerWith wrapper (if kept for back-compat) just dispatches by
+// method. The shim form gives swag a single @Router per Go function, which is
+// the only shape that produces a valid OpenAPI document when methods differ in
+// body shape or path template.
+
+func faultAdminPost(eval *DemoEvaluator, resolve NetworkResolver) http.Handler { /* POST body */ }
+func faultAdminGet(eval *DemoEvaluator) http.Handler                            { /* GET body */ }
+
+// FaultAdminPostHandler accepts a per-request fault binding.
 //
-// @Summary      Bind a fault to the next request matching criteria
-// @Description  POST registers a transient fault binding evaluated by the demo evaluator.
-// @Description  GET returns current bindings.
+// @Summary      Bind a fault to the next matching request
 // @Tags         admin
 // @Accept       json
 // @Produce      json
-// @Param        binding  body  FaultRequest  false  "binding (POST only)"
-// @Success      200  {array}   FaultStatus
+// @Param        binding  body  FaultRequest  true  "binding"
 // @Success      201  {object}  FaultStatus
 // @Failure      400  {object}  ErrorResponse  "invalid binding"
 // @Router       /faults [post]
+func FaultAdminPostHandler(eval *DemoEvaluator, resolve NetworkResolver) http.Handler {
+	return faultAdminPost(eval, resolve)
+}
+
+// FaultAdminGetHandler returns the current bindings.
+//
+// @Summary      List current fault bindings
+// @Tags         admin
+// @Produce      json
+// @Success      200  {array}   FaultStatus
 // @Router       /faults [get]
-func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Handler {
+func FaultAdminGetHandler(eval *DemoEvaluator) http.Handler {
+	return faultAdminGet(eval)
+}
 ```
 
 Note: atropos doesn't have an `ErrorResponse` type yet. Define it now in `errors.go` (Task 7 expands this file with sentinels):
@@ -431,42 +473,73 @@ type ErrorResponse struct {
 
 - [ ] **Step 5: Annotate `CacheBoxAdminHandler`** (`cachebox_admin.go`)
 
+Split into per-method shims (GET inspect / POST mode-set) sharing a private helper. POST takes a body; GET does not. Annotating one Go function with both methods would propagate `@Accept json` onto the GET path, which is invalid.
+
 ```go
-// CacheBoxAdminHandler returns an http.Handler for runtime cache-box control.
+func cacheBoxAdminGet(cb *CacheBox) http.Handler  { /* GET body — return mode + stats */ }
+func cacheBoxAdminPost(cb *CacheBox) http.Handler { /* POST body — switch mode / set delay */ }
+
+// CacheBoxAdminGetHandler returns the current cache-box mode and stats.
 //
-// @Summary      Inspect or change cache-box state
-// @Description  GET returns current mode + stats. POST {mode} switches mode.
-// @Description  POST {synthetic_delay} sets replay-with-delay parameters.
+// @Summary      Inspect cache-box state
+// @Tags         admin
+// @Produce      json
+// @Success      200  {object}  cachebox.Stats
+// @Router       /cachebox [get]
+func CacheBoxAdminGetHandler(cb *CacheBox) http.Handler {
+	return cacheBoxAdminGet(cb)
+}
+
+// CacheBoxAdminPostHandler switches the cache-box mode or sets replay-with-delay parameters.
+//
+// @Summary      Change cache-box state
+// @Description  Body shape is `{mode}` for mode-set or `{synthetic_delay}` for replay-with-delay.
 // @Tags         admin
 // @Accept       json
 // @Produce      json
-// @Param        body  body  DelayRequest  false  "delay configuration (mode-set requests)"
+// @Param        body  body  DelayRequest  true  "mode-set / delay configuration"
 // @Success      200  {object}  cachebox.Stats
 // @Failure      400  {object}  ErrorResponse
-// @Router       /cachebox [get]
 // @Router       /cachebox [post]
-func CacheBoxAdminHandler(cb *CacheBox) http.Handler {
+func CacheBoxAdminPostHandler(cb *CacheBox) http.Handler {
+	return cacheBoxAdminPost(cb)
+}
 ```
 
 (Task 8's `cachebox.Stats` type lives in `internal/cachebox`; if not yet exported, mark this annotation TODO and Task 8 wires it.)
 
 - [ ] **Step 6: Annotate `RulesAdminHandler`** (`rules_admin.go`)
 
+Split into per-method shims (GET list / POST replace) sharing a private helper. POST consumes a JSON body and returns 204; GET takes no body and returns the rule array. One Go function per method keeps the spec valid.
+
 ```go
-// RulesAdminHandler returns an http.Handler for runtime rule management.
+func rulesAdminGet(eval *StaticEvaluator) http.Handler  { /* GET body — return current rules */ }
+func rulesAdminPost(eval *StaticEvaluator) http.Handler { /* POST body — replace atomically */ }
+
+// RulesAdminGetHandler returns the current SDK runtime rules.
 //
-// @Summary      Manage SDK runtime rules
-// @Description  GET returns the current rule list. POST replaces it atomically with the body.
+// @Summary      List SDK runtime rules
+// @Tags         admin
+// @Produce      json
+// @Success      200  {array}  StaticRule
+// @Router       /rules [get]
+func RulesAdminGetHandler(eval *StaticEvaluator) http.Handler {
+	return rulesAdminGet(eval)
+}
+
+// RulesAdminPostHandler atomically replaces the SDK runtime rules.
+//
+// @Summary      Replace SDK runtime rules
 // @Tags         admin
 // @Accept       json
 // @Produce      json
-// @Param        rules  body  []StaticRule  false  "rules (POST only)"
-// @Success      200  {array}  StaticRule
+// @Param        rules  body  []StaticRule  true  "replacement rules"
 // @Success      204  "rules replaced"
 // @Failure      400  {object}  ErrorResponse  "invalid rules"
-// @Router       /rules [get]
 // @Router       /rules [post]
-func RulesAdminHandler(eval *StaticEvaluator) http.Handler {
+func RulesAdminPostHandler(eval *StaticEvaluator) http.Handler {
+	return rulesAdminPost(eval)
+}
 ```
 
 - [ ] **Step 7: Copy `docs/openapi-conventions.md` from manteion-go (adjust intro for atropos-specific context)**

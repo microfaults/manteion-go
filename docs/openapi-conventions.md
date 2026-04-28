@@ -36,3 +36,18 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 Run `make openapi` from the repo root.
 
 Commit `docs/swagger.{yaml,json}` together with handler edits. CI fails if the spec is stale.
+
+## Known annotation gaps
+
+These are places where the generated spec is approximate because the underlying
+handler conflates error categories. They are tracked here so consumers know not
+to over-trust the 4xx/5xx breakdown until the handler is fixed.
+
+- `handleRegister` (`POST /sdk/register`) and `handleCreateRule` (`POST /rules`)
+  collapse validation errors and infrastructure failures (DB unreachable, etc.)
+  into a single 400. The proper split is 400 for validation, 500 for
+  infrastructure. Until error classification is fixed in the handlers (separate
+  follow-up), the spec's 4xx/5xx breakdown for these endpoints is approximate.
+  Note: `handleRegister` is *not* a 409 candidate — `store.SDKRepo.Register` is
+  an `INSERT ... ON CONFLICT DO UPDATE` upsert with no "duplicate" semantic to
+  surface.

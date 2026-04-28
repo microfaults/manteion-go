@@ -12,6 +12,18 @@ import (
 )
 
 // handleCreateRule creates a new fault injection rule.
+//
+// @Summary      Create rule
+// @Description  Persist a new rule. The store layer validates the rule per
+// @Description  model.Rule.Validate() (id/name/service required, exactly one of
+// @Description  fault_spec_id or fault_composition_id, mode in {inline,background}).
+// @Tags         rules
+// @Accept       json
+// @Produce      json
+// @Param        rule  body      model.Rule  true  "Rule definition"
+// @Success      201   {object}  model.Rule
+// @Failure      400   {object}  api.ErrorResponse  "validation error or infrastructure failure (currently collapsed; see openapi-conventions.md known gaps)"
+// @Router       /rules [post]
 func (s *Server) handleCreateRule(w http.ResponseWriter, r *http.Request) {
 	var rule model.Rule
 	if err := readJSON(r, &rule); err != nil {
@@ -60,6 +72,15 @@ func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetRule returns a single rule by ID.
+//
+// @Summary      Get rule
+// @Tags         rules
+// @Produce      json
+// @Param        id   path      string  true  "Rule ID"
+// @Success      200  {object}  model.Rule
+// @Failure      404  {object}  api.ErrorResponse  "rule not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /rules/{id} [get]
 func (s *Server) handleGetRule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rule, err := s.rules.Get(r.Context(), id)
@@ -76,6 +97,18 @@ func (s *Server) handleGetRule(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUpdateRule updates an existing rule by ID.
+//
+// @Summary      Update rule
+// @Description  Replace an existing rule. The id in the path overrides any id in the body.
+// @Tags         rules
+// @Accept       json
+// @Produce      json
+// @Param        id    path      string      true  "Rule ID"
+// @Param        rule  body      model.Rule  true  "Updated rule"
+// @Success      200   {object}  model.Rule
+// @Failure      400   {object}  api.ErrorResponse  "invalid JSON or validation error"
+// @Failure      404   {object}  api.ErrorResponse  "rule not found"
+// @Router       /rules/{id} [put]
 func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -102,6 +135,14 @@ func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeleteRule deletes a rule by ID.
+//
+// @Summary      Delete rule
+// @Tags         rules
+// @Param        id   path  string  true  "Rule ID"
+// @Success      204  "rule deleted"
+// @Failure      404  {object}  api.ErrorResponse  "rule not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /rules/{id} [delete]
 func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 

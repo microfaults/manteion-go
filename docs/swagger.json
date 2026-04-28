@@ -10,6 +10,118 @@
                 },
                 "type": "object"
             },
+            "model.Direction": {
+                "description": "\"upstream\", \"downstream\", \"\" (non-network)",
+                "enum": [
+                    "upstream",
+                    "downstream",
+                    ""
+                ],
+                "type": "string",
+                "x-enum-varnames": [
+                    "DirectionUpstream",
+                    "DirectionDownstream",
+                    "DirectionNone"
+                ]
+            },
+            "model.ExecutionMode": {
+                "description": "\"parallel\" or \"sequential\"",
+                "enum": [
+                    "parallel",
+                    "sequential"
+                ],
+                "type": "string",
+                "x-enum-varnames": [
+                    "ExecutionParallel",
+                    "ExecutionSequential"
+                ]
+            },
+            "model.FaultComposition": {
+                "properties": {
+                    "created_at": {
+                        "type": "string"
+                    },
+                    "duration_ms": {
+                        "type": "integer"
+                    },
+                    "execution_mode": {
+                        "$ref": "#/components/schemas/model.ExecutionMode"
+                    },
+                    "id": {
+                        "type": "string"
+                    },
+                    "members": {
+                        "items": {
+                            "$ref": "#/components/schemas/model.FaultCompositionMember"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "ramp_down_ms": {
+                        "type": "integer"
+                    },
+                    "ramp_up_ms": {
+                        "type": "integer"
+                    }
+                },
+                "type": "object"
+            },
+            "model.FaultCompositionMember": {
+                "properties": {
+                    "child_composition_id": {
+                        "type": "string"
+                    },
+                    "direction": {
+                        "$ref": "#/components/schemas/model.Direction"
+                    },
+                    "fault_spec_id": {
+                        "type": "string"
+                    }
+                },
+                "type": "object"
+            },
+            "model.FaultSpec": {
+                "properties": {
+                    "category": {
+                        "description": "\"inline\", \"network\", \"resource\"",
+                        "type": "string"
+                    },
+                    "config": {
+                        "description": "type-specific parameters",
+                        "items": {
+                            "type": "integer"
+                        },
+                        "type": "array",
+                        "uniqueItems": false
+                    },
+                    "created_at": {
+                        "type": "string"
+                    },
+                    "duration_ms": {
+                        "type": "integer"
+                    },
+                    "fault_type": {
+                        "description": "e.g. \"error\", \"blackhole\", \"cpu\"",
+                        "type": "string"
+                    },
+                    "id": {
+                        "type": "string"
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "ramp_down_ms": {
+                        "type": "integer"
+                    },
+                    "ramp_up_ms": {
+                        "type": "integer"
+                    }
+                },
+                "type": "object"
+            },
             "model.MatchCriteria": {
                 "properties": {
                     "injection_point": {
@@ -64,6 +176,33 @@
                     }
                 },
                 "type": "object"
+            },
+            "model.SDKInstance": {
+                "properties": {
+                    "address": {
+                        "type": "string"
+                    },
+                    "id": {
+                        "type": "string"
+                    },
+                    "last_poll_at": {
+                        "type": "string"
+                    },
+                    "registered_at": {
+                        "type": "string"
+                    },
+                    "service": {
+                        "type": "string"
+                    },
+                    "status": {
+                        "description": "\"alive\",\"stale\",\"dead\" \u2014 computed, not persisted",
+                        "type": "string"
+                    },
+                    "version": {
+                        "type": "string"
+                    }
+                },
+                "type": "object"
             }
         }
     },
@@ -73,6 +212,436 @@
         "version": "1.0"
     },
     "paths": {
+        "/faults/compositions": {
+            "get": {
+                "description": "Returns all fault compositions in creation order.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "items": {
+                                        "$ref": "#/components/schemas/model.FaultComposition"
+                                    },
+                                    "type": "array"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "List fault compositions",
+                "tags": [
+                    "faults"
+                ]
+            },
+            "post": {
+                "description": "Persist a composition (parallel or sequential group of fault members).\nValidates depth (max 3), per-member directions, and pairwise fault\nincompatibilities against the current spec/composition repos.",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    {
+                                        "type": "object"
+                                    },
+                                    {
+                                        "$ref": "#/components/schemas/model.FaultComposition",
+                                        "summary": "composition",
+                                        "description": "Composition definition"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "description": "Composition definition",
+                    "required": true
+                },
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.FaultComposition"
+                                }
+                            }
+                        },
+                        "description": "Created"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "validation error (incl. depth or incompatibility)"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Create fault composition",
+                "tags": [
+                    "faults"
+                ]
+            }
+        },
+        "/faults/compositions/{id}": {
+            "delete": {
+                "parameters": [
+                    {
+                        "description": "Fault composition ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "composition deleted"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "composition not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Delete fault composition",
+                "tags": [
+                    "faults"
+                ]
+            },
+            "get": {
+                "parameters": [
+                    {
+                        "description": "Fault composition ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.FaultComposition"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "composition not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Get fault composition",
+                "tags": [
+                    "faults"
+                ]
+            }
+        },
+        "/faults/specs": {
+            "get": {
+                "description": "Returns all fault specs in creation order.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "items": {
+                                        "$ref": "#/components/schemas/model.FaultSpec"
+                                    },
+                                    "type": "array"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "List fault specs",
+                "tags": [
+                    "faults"
+                ]
+            },
+            "post": {
+                "description": "Persist an atomic fault definition. The body is validated per\nmodel.FaultSpec.Validate() \u2014 category in {inline,network,resource},\nfault_type matches the category, and config is non-empty.",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    {
+                                        "type": "object"
+                                    },
+                                    {
+                                        "$ref": "#/components/schemas/model.FaultSpec",
+                                        "summary": "spec",
+                                        "description": "Fault spec definition"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "description": "Fault spec definition",
+                    "required": true
+                },
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.FaultSpec"
+                                }
+                            }
+                        },
+                        "description": "Created"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "validation error"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Create fault spec",
+                "tags": [
+                    "faults"
+                ]
+            }
+        },
+        "/faults/specs/{id}": {
+            "delete": {
+                "parameters": [
+                    {
+                        "description": "Fault spec ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "spec deleted"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "spec not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Delete fault spec",
+                "tags": [
+                    "faults"
+                ]
+            },
+            "get": {
+                "parameters": [
+                    {
+                        "description": "Fault spec ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.FaultSpec"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "spec not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Get fault spec",
+                "tags": [
+                    "faults"
+                ]
+            }
+        },
+        "/healthz": {
+            "get": {
+                "description": "Returns 200 if the process is running. No dependency checks.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {
+                                        "type": "string"
+                                    },
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "{status: ok}"
+                    }
+                },
+                "summary": "Liveness probe",
+                "tags": [
+                    "health"
+                ]
+            }
+        },
+        "/readyz": {
+            "get": {
+                "description": "Returns 200 once the database is reachable, 503 otherwise.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {
+                                        "type": "string"
+                                    },
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "{status: ok}"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "database unreachable"
+                    }
+                },
+                "summary": "Readiness probe",
+                "tags": [
+                    "health"
+                ]
+            }
+        },
         "/rules": {
             "get": {
                 "description": "Returns all configured rules, ordered by priority descending.",
@@ -104,6 +673,745 @@
                 "summary": "List rules",
                 "tags": [
                     "rules"
+                ]
+            },
+            "post": {
+                "description": "Persist a new rule. The store layer validates the rule per\nmodel.Rule.Validate() (id/name/service required, exactly one of\nfault_spec_id or fault_composition_id, mode in {inline,background}).",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    {
+                                        "type": "object"
+                                    },
+                                    {
+                                        "$ref": "#/components/schemas/model.Rule",
+                                        "summary": "rule",
+                                        "description": "Rule definition"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "description": "Rule definition",
+                    "required": true
+                },
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.Rule"
+                                }
+                            }
+                        },
+                        "description": "Created"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "validation error or infrastructure failure (currently collapsed; see openapi-conventions.md known gaps)"
+                    }
+                },
+                "summary": "Create rule",
+                "tags": [
+                    "rules"
+                ]
+            }
+        },
+        "/rules/{id}": {
+            "delete": {
+                "parameters": [
+                    {
+                        "description": "Rule ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "rule deleted"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "rule not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Delete rule",
+                "tags": [
+                    "rules"
+                ]
+            },
+            "get": {
+                "parameters": [
+                    {
+                        "description": "Rule ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.Rule"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "rule not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Get rule",
+                "tags": [
+                    "rules"
+                ]
+            },
+            "put": {
+                "description": "Replace an existing rule. The id in the path overrides any id in the body.",
+                "parameters": [
+                    {
+                        "description": "Rule ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    {
+                                        "type": "object"
+                                    },
+                                    {
+                                        "$ref": "#/components/schemas/model.Rule",
+                                        "summary": "rule",
+                                        "description": "Updated rule"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "description": "Updated rule",
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/model.Rule"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "invalid JSON or validation error"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "rule not found"
+                    }
+                },
+                "summary": "Update rule",
+                "tags": [
+                    "rules"
+                ]
+            }
+        },
+        "/sdk/init": {
+            "get": {
+                "description": "Returns 200 with status=\"ready\" when manteion is ready to\nserve rules. Used by atropos-go SDKs as a startup gate.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {
+                                        "type": "string"
+                                    },
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "{status: ready}"
+                    }
+                },
+                "summary": "SDK init readiness",
+                "tags": [
+                    "sdk"
+                ]
+            }
+        },
+        "/sdk/instances": {
+            "get": {
+                "description": "Returns all currently registered SDK instances. Status is computed\n(alive/stale/dead) from last-poll-at.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "items": {
+                                        "$ref": "#/components/schemas/model.SDKInstance"
+                                    },
+                                    "type": "array"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "List SDK instances",
+                "tags": [
+                    "sdk"
+                ]
+            }
+        },
+        "/sdk/register": {
+            "post": {
+                "description": "Registers an atropos-go SDK process. The 201 response carries\nstatus=\"registered\" and may include initial intent payload\n(rules, active_fault, freeze_cfg) when an IntentReader is\nconfigured for the service.",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    {
+                                        "type": "object"
+                                    },
+                                    {
+                                        "$ref": "#/components/schemas/model.SDKInstance",
+                                        "summary": "instance",
+                                        "description": "SDK instance metadata"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "description": "SDK instance metadata",
+                    "required": true
+                },
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {},
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "registration ack with optional intent fields"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "invalid JSON or registration error"
+                    }
+                },
+                "summary": "Register SDK instance",
+                "tags": [
+                    "sdk"
+                ]
+            }
+        },
+        "/sdk/register/{id}": {
+            "delete": {
+                "parameters": [
+                    {
+                        "description": "Instance ID",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "instance deregistered"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "instance not found"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Deregister SDK instance",
+                "tags": [
+                    "sdk"
+                ]
+            }
+        },
+        "/sdk/rules": {
+            "get": {
+                "description": "SDKs send their last-known rule version via the version query param.\nReturns 304 if unchanged, 200 with the current rule set otherwise.\nThe 200 body wraps the version and the compiled rule list:\n{\"version\": uint64, \"rules\": []ruleconv.CompiledRule}.\nOptional instance_id query param triggers a best-effort poll-timestamp touch.",
+                "parameters": [
+                    {
+                        "description": "service name",
+                        "in": "query",
+                        "name": "service",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "description": "last known rule version (uint64); omit on first poll",
+                        "in": "query",
+                        "name": "version",
+                        "schema": {
+                            "type": "integer"
+                        }
+                    },
+                    {
+                        "description": "SDK instance ID for poll-timestamp tracking",
+                        "in": "query",
+                        "name": "instance_id",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {},
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "{version, rules: []ruleconv.CompiledRule}"
+                    },
+                    "304": {
+                        "description": "no rule changes since requested version"
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "service query parameter required"
+                    },
+                    "500": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Internal Server Error"
+                    }
+                },
+                "summary": "Poll for rule updates",
+                "tags": [
+                    "sdk"
+                ]
+            }
+        },
+        "/status": {
+            "get": {
+                "description": "Returns a summary of internal counters and downstream reachability:\nrules (int), instances (int), zeus_reachable (bool).",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {},
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "{rules, instances, zeus_reachable}"
+                    }
+                },
+                "summary": "Manteion status overview",
+                "tags": [
+                    "health"
+                ]
+            }
+        },
+        "/zeus/attacks": {
+            "post": {
+                "description": "Proxies the request to zeus-go's load generation API.\nBody and response shapes are defined by zeus-go; see its OpenAPI spec.\nThe response status code is propagated from upstream.",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "passthrough \u2014 see zeus-go spec for response shape"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "zeus unreachable"
+                    },
+                    "default": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "upstream-propagated 4xx/5xx"
+                    }
+                },
+                "summary": "Create attack (Zeus passthrough)",
+                "tags": [
+                    "zeus-proxy"
+                ]
+            }
+        },
+        "/zeus/attacks/{id}": {
+            "delete": {
+                "description": "Proxies the request to zeus-go's load generation API.",
+                "parameters": [
+                    {
+                        "description": "Attack ID (zeus-defined)",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "passthrough \u2014 see zeus-go spec for response shape"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "zeus unreachable"
+                    },
+                    "default": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "upstream-propagated 4xx/5xx"
+                    }
+                },
+                "summary": "Delete attack (Zeus passthrough)",
+                "tags": [
+                    "zeus-proxy"
+                ]
+            },
+            "get": {
+                "description": "Proxies the request to zeus-go's load generation API.\nResponse shape is defined by zeus-go; see its OpenAPI spec.",
+                "parameters": [
+                    {
+                        "description": "Attack ID (zeus-defined)",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "passthrough \u2014 see zeus-go spec for response shape"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "zeus unreachable"
+                    },
+                    "default": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "upstream-propagated 4xx/5xx"
+                    }
+                },
+                "summary": "Get attack (Zeus passthrough)",
+                "tags": [
+                    "zeus-proxy"
+                ]
+            }
+        },
+        "/zeus/workloads": {
+            "get": {
+                "description": "Proxies the request to zeus-go's load generation API.\nResponse shape is defined by zeus-go; see its OpenAPI spec.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "passthrough \u2014 see zeus-go spec for response shape"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "zeus unreachable"
+                    },
+                    "default": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "upstream-propagated 4xx/5xx"
+                    }
+                },
+                "summary": "List workloads (Zeus passthrough)",
+                "tags": [
+                    "zeus-proxy"
+                ]
+            },
+            "post": {
+                "description": "Proxies the request to zeus-go's load generation API.\nBody and response shapes are defined by zeus-go; see its OpenAPI spec.\nThe response status code is propagated from upstream.",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object"
+                                }
+                            }
+                        },
+                        "description": "passthrough \u2014 see zeus-go spec for response shape"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "zeus unreachable"
+                    },
+                    "default": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "upstream-propagated 4xx/5xx"
+                    }
+                },
+                "summary": "Create workload (Zeus passthrough)",
+                "tags": [
+                    "zeus-proxy"
+                ]
+            }
+        },
+        "/zeus/workloads/{id}": {
+            "delete": {
+                "description": "Proxies the request to zeus-go's load generation API.",
+                "parameters": [
+                    {
+                        "description": "Workload ID (zeus-defined)",
+                        "in": "path",
+                        "name": "id",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "passthrough \u2014 see zeus-go spec for response shape"
+                    },
+                    "502": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "zeus unreachable"
+                    },
+                    "default": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "upstream-propagated 4xx/5xx"
+                    }
+                },
+                "summary": "Delete workload (Zeus passthrough)",
+                "tags": [
+                    "zeus-proxy"
                 ]
             }
         }
