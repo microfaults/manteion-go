@@ -45,10 +45,6 @@ type PolicyCondition struct {
 	Threshold float64 `json:"threshold"`
 }
 
-var validOperators = map[string]bool{
-	"gt": true, "gte": true, "lt": true, "lte": true, "eq": true,
-}
-
 func (c *PolicyCondition) Validate() error {
 	if c.Metric == "" {
 		return errors.New("condition: metric required")
@@ -81,29 +77,4 @@ func (a *PolicyAction) Validate() error {
 	default:
 		return fmt.Errorf("action: invalid action_type %q", a.ActionType)
 	}
-}
-
-// AttackTargetSpec describes the target for a policy-triggered attack.
-type AttackTargetSpec struct {
-	URL         string `json:"url"`
-	Method      string `json:"method"`
-	Rate        int    `json:"rate"`
-	DurationMs  int64  `json:"duration_ms"`
-	DedupBypass string `json:"dedup_bypass,omitempty"`
-}
-
-func (s *AttackTargetSpec) Validate() error {
-	if s.URL == "" {
-		return errors.New("attack target: url required")
-	}
-	if s.Method == "" {
-		return errors.New("attack target: method required")
-	}
-	if s.Rate <= 0 {
-		return errors.New("attack target: rate must be > 0")
-	}
-	if s.DurationMs <= 0 {
-		return errors.New("attack target: duration_ms must be > 0")
-	}
-	return nil
 }

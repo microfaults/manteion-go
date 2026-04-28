@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"manteion-go/internal/model"
 )
@@ -143,9 +142,4 @@ func (r *PolicyRepo) scanPolicyRules(rows *sql.Rows) ([]*model.PolicyRule, error
 		result = append(result, &rule)
 	}
 	return result, rows.Err()
-}
-
-// durationFromNs converts nanoseconds stored in DB to time.Duration.
-func durationFromNs(ns int64) time.Duration {
-	return time.Duration(ns)
 }
