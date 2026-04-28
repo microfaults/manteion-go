@@ -38,6 +38,14 @@ func (s *Server) handleCreateRule(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListRules returns all rules.
+//
+// @Summary      List rules
+// @Description  Returns all configured rules, ordered by priority descending.
+// @Tags         rules
+// @Produce      json
+// @Success      200  {array}   model.Rule
+// @Failure      500  {object}  api.ErrorResponse  "internal error"
+// @Router       /rules [get]
 func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
 	rules, err := s.rules.List(r.Context())
 	if err != nil {

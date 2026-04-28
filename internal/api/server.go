@@ -126,9 +126,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 }
 
-// writeError writes a JSON error response: {"error": msg}.
+// writeError writes a JSON error response using the standard envelope.
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, ErrorResponse{Error: msg})
 }
 
 // readJSON decodes the request body into v.

@@ -1,0 +1,79 @@
+components:
+  schemas:
+    api.ErrorResponse:
+      properties:
+        error:
+          example: validation failed
+          type: string
+      type: object
+    model.MatchCriteria:
+      properties:
+        injection_point:
+          description: ingress/egress/transient/custom, "" = any
+          type: string
+        labels:
+          additionalProperties:
+            type: string
+          description: AND semantics
+          type: object
+      type: object
+    model.Rule:
+      properties:
+        created_at:
+          type: string
+        enabled:
+          type: boolean
+        fault_composition_id:
+          type: string
+        fault_spec_id:
+          type: string
+        id:
+          type: string
+        match:
+          $ref: '#/components/schemas/model.MatchCriteria'
+        mode:
+          description: '"inline" or "background"'
+          type: string
+        name:
+          type: string
+        priority:
+          type: integer
+        service:
+          type: string
+        updated_at:
+          type: string
+      type: object
+info:
+  description: 'Central coordination controller for the atropos ecosystem.
+
+    Manages rules, faults, experiments, workflows, and SDK lifecycle.'
+  title: Manteion Control-Plane API
+  version: '1.0'
+openapi: 3.1.0
+paths:
+  /rules:
+    get:
+      description: Returns all configured rules, ordered by priority descending.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/model.Rule'
+                type: array
+          description: OK
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: internal error
+      summary: List rules
+      tags:
+      - rules
+servers:
+- description: Local dev (HTTP)
+  url: http://localhost:8080/api/v1
+- description: Local dev (HTTPS)
+  url: https://localhost:8080/api/v1

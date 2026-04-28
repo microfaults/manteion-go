@@ -23,6 +23,14 @@ import (
 	"manteion-go/internal/zeus"
 )
 
+// @title           Manteion Control-Plane API
+// @version         1.0
+// @description     Central coordination controller for the atropos ecosystem.
+// @description     Manages rules, faults, experiments, workflows, and SDK lifecycle.
+// @servers.url            http://localhost:8080/api/v1
+// @servers.description    Local dev (HTTP)
+// @servers.url            https://localhost:8080/api/v1
+// @servers.description    Local dev (HTTPS)
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,

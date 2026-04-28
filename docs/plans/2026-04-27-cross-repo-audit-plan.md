@@ -15,15 +15,15 @@
 ## File Structure Overview
 
 **`manteion-go`**
-- New: `Makefile`, `.github/workflows/openapi.yml`, `internal/api/error_response.go`, `internal/api/autorule_handler.go`, `internal/api/autorule_handler_test.go`, `docs/swagger.yaml`, `docs/swagger.json`, `docs/openapi-conventions.md`
+- New: `Makefile`, `.gitlab-ci.yml`, `internal/api/error_response.go`, `internal/api/autorule_handler.go`, `internal/api/autorule_handler_test.go`, `docs/swagger.yaml`, `docs/swagger.json`, `docs/openapi-conventions.md`
 - Modified: `cmd/manteion/main.go` (server constructor args), `internal/api/server.go` (annotations + AutoRule routes + drop `/api/v1/zeus/policies`), every `internal/api/*_handler.go` (annotations), `internal/api/zeus_handler.go` (drop policies switch arms)
 
 **`atropos-go`**
-- New: `Makefile`, `.github/workflows/openapi.yml`, `info.go`, `info_test.go`, `decision_context.go`, `decision_context_test.go`, `errors.go`, `errors_test.go`, `snapshot.go`, `snapshot_test.go`, `snapshot_admin.go`, `snapshot_admin_test.go`, `match.go`, `match_test.go`, `docs/swagger.yaml`, `docs/swagger.json`, `docs/openapi-conventions.md`
+- New: `Makefile`, `.gitlab-ci.yml`, `info.go`, `info_test.go`, `decision_context.go`, `decision_context_test.go`, `errors.go`, `errors_test.go`, `snapshot.go`, `snapshot_test.go`, `snapshot_admin.go`, `snapshot_admin_test.go`, `match.go`, `match_test.go`, `docs/swagger.yaml`, `docs/swagger.json`, `docs/openapi-conventions.md`
 - Modified: `admin.go`, `cachebox_admin.go`, `rules_admin.go` (annotations), `atropos.go` (`ActiveRules`, `SDKInfo`, `Snapshot`, `TestMatch` exports), `middleware.go` (stash decision on ctx), `internal/cachebox/cachebox.go` (expose `Stats()` if not already), `internal/evaluator/static.go` (read-only access for `TestMatch`)
 
 **`zeus-go`**
-- New: `Makefile`, `.github/workflows/openapi.yml`, `docs/swagger.yaml`, `docs/swagger.json`
+- New: `Makefile`, `.gitlab-ci.yml`, `docs/swagger.yaml`, `docs/swagger.json`
 - Modified: every `internal/api/*_handler.go` (annotations), `docs/api-contract.md` (slim to overview)
 - Deleted: `internal/policy/engine.go` and any policy-related routes/wiring
 
@@ -41,7 +41,7 @@
 Establishes the OpenAPI generation pattern that Tasks 2–4 propagate. Defines the standard error envelope as a Go type so swag annotations can reference it.
 
 **Files:**
-- Create: `Makefile`, `.github/workflows/openapi.yml`, `internal/api/error_response.go`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`
+- Create: `Makefile`, `.gitlab-ci.yml`, `internal/api/error_response.go`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`
 - Modify: `internal/api/server.go` (`writeError` to use new type + add `@title`/`@version` package-level annotations; annotate `handleListRules` as the reference example)
 - Test: existing handler tests still pass
 
@@ -120,13 +120,14 @@ Insert above `func main()`:
 // @version         1.0
 // @description     Central coordination controller for the atropos ecosystem.
 // @description     Manages rules, faults, experiments, workflows, and SDK lifecycle.
-// @host            localhost:8080
-// @BasePath        /api/v1
-// @schemes         http https
-// @produce         json
-// @accept          json
+// @servers.url            http://localhost:8080/api/v1
+// @servers.description    Local dev (HTTP)
+// @servers.url            https://localhost:8080/api/v1
+// @servers.description    Local dev (HTTPS)
 func main() {
 ```
+
+See `docs/openapi-conventions.md` for the rationale: the deprecated host/basepath/schemes annotation triplet produces malformed `servers:` URLs in swag v2; the `@servers.url` / `@servers.description` directives pair by ordinal position.
 
 - [ ] **Step 6: Annotate `handleListRules` as the reference example in `internal/api/rule_handler.go`**
 
@@ -201,40 +202,36 @@ make openapi
 Commit `docs/swagger.{yaml,json}` together with handler edits. CI fails if the spec is stale.
 ```
 
-- [ ] **Step 10: Create CI workflow `.github/workflows/openapi.yml`**
+- [ ] **Step 10: Extend `.gitlab-ci.yml` with the OpenAPI freshness gate**
+
+If the file doesn't exist in this repo, create it. If it exists (e.g., manteion-go already has an AI review bot pipeline), add the `check` stage and `openapi-check` job alongside what's there.
+
+Trigger only on pushes to `main` and `develop` per project convention — feature branches don't pay the gate cost.
 
 ```yaml
-name: OpenAPI spec freshness
+stages:
+  - check       # add if not present; existing stages remain
+  - review      # any existing stages keep their position
 
-on:
-  pull_request:
-    paths:
-      - 'cmd/**'
-      - 'internal/api/**'
-      - 'internal/model/**'
-      - 'docs/swagger.*'
-      - 'Makefile'
-  push:
-    branches: [main, develop]
-
-jobs:
-  spec-fresh:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-      - name: Install swag v2
-        run: go install github.com/swaggo/swag/v2/cmd/swag@latest
-      - name: Verify spec is fresh
-        run: make openapi-check
+# OpenAPI spec freshness gate.
+# Fails the pipeline if generated docs/swagger.{yaml,json} is stale relative
+# to handler code.
+openapi-check:
+  stage: check
+  image: golang:1.25
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+  before_script:
+    - go install github.com/swaggo/swag/v2/cmd/swag@latest
+    - export PATH=$PATH:$(go env GOPATH)/bin
+  script:
+    - make openapi-check
 ```
 
 - [ ] **Step 11: Commit foundations**
 
 ```bash
-git add Makefile .github/workflows/openapi.yml \
+git add Makefile .gitlab-ci.yml \
   internal/api/error_response.go internal/api/server.go \
   internal/api/rule_handler.go cmd/manteion/main.go \
   docs/openapi-conventions.md docs/swagger.yaml docs/swagger.json \
@@ -345,7 +342,7 @@ git commit -m "feat(openapi): annotate manteion-go handlers"
 Atropos exposes three admin handlers (`FaultAdminHandler`, `CacheBoxAdminHandler`, `RulesAdminHandler`) for host services to mount. Spec describes their endpoint shape with the recommended mount path `/atropos/admin/`.
 
 **Files:**
-- Create: `Makefile`, `.github/workflows/openapi.yml`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`, package-level annotation file `atropos.go` additions
+- Create: `Makefile`, `.gitlab-ci.yml`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`, package-level annotation file `atropos.go` additions
 - Modify: `admin.go`, `cachebox_admin.go`, `rules_admin.go` (per-handler annotations)
 
 - [ ] **Step 1: Install swag v2 in atropos-go module**
@@ -386,17 +383,13 @@ build:
 - [ ] **Step 3: Add package-level annotations at top of `atropos.go`**
 
 ```go
-// @title           Atropos SDK Admin API
-// @version         1.0
-// @description     Admin handlers exposed by the atropos-go SDK. Host services
-// @description     mount these handlers at a path of their choice; recommended
-// @description     mount path is /atropos/admin/. Endpoints below are documented
-// @description     relative to that mount path.
-// @host            (host-defined)
-// @BasePath        /atropos/admin
-// @schemes         http https
-// @produce         json
-// @accept          json
+// @title       Atropos SDK Admin API
+// @version     1.0
+// @description Admin handlers exposed by the atropos-go SDK. Host services
+// @description mount these handlers at a path of their choice; recommended
+// @description mount path is /atropos/admin/. The generated spec intentionally
+// @description omits a `servers:` block — the host service that mounts these
+// @description handlers supplies its own server URL when serving the spec.
 
 // Package atropos provides the Go SDK for the atropos fault-injection control plane.
 package atropos
@@ -495,34 +488,30 @@ go test ./...
 
 Expected: spec generated; tests pass.
 
-- [ ] **Step 9: Add CI workflow `.github/workflows/openapi.yml`** (same as manteion-go's; only paths filter changes)
+- [ ] **Step 9: Add `.gitlab-ci.yml` with the OpenAPI freshness gate** (same job shape as manteion-go's Task 1)
+
+Use the same job from manteion-go's Task 1 Step 10. If atropos-go has no existing `.gitlab-ci.yml`, create it with just `stages: [check]` and the `openapi-check` job. If it has one, add the `check` stage and the job alongside.
 
 ```yaml
-name: OpenAPI spec freshness
-on:
-  pull_request:
-    paths:
-      - '*.go'
-      - 'docs/swagger.*'
-      - 'Makefile'
-  push:
-    branches: [main, develop]
-jobs:
-  spec-fresh:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-      - run: go install github.com/swaggo/swag/v2/cmd/swag@latest
-      - run: make openapi-check
+stages:
+  - check
+
+openapi-check:
+  stage: check
+  image: golang:1.25
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+  before_script:
+    - go install github.com/swaggo/swag/v2/cmd/swag@latest
+    - export PATH=$PATH:$(go env GOPATH)/bin
+  script:
+    - make openapi-check
 ```
 
 - [ ] **Step 10: Commit**
 
 ```bash
-git add Makefile .github/workflows/openapi.yml docs/ \
+git add Makefile .gitlab-ci.yml docs/ \
   errors.go atropos.go admin.go cachebox_admin.go rules_admin.go \
   go.mod go.sum
 git commit -m "feat(openapi): swag v2 toolchain + admin handler annotations"
@@ -535,7 +524,7 @@ git commit -m "feat(openapi): swag v2 toolchain + admin handler annotations"
 Zeus already documents its API in `docs/api-contract.md`. Port that content to handler-level annotations; the markdown shrinks to a high-level overview. Drift between the markdown and code surfaces during this step — record findings in commit messages.
 
 **Files:**
-- Create: `Makefile`, `.github/workflows/openapi.yml`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`, `internal/api/error_response.go`
+- Create: `Makefile`, `.gitlab-ci.yml`, `docs/openapi-conventions.md`, `docs/swagger.yaml`, `docs/swagger.json`, `internal/api/error_response.go`
 - Modify: every handler file under `internal/api/`, `docs/api-contract.md` (slim to overview)
 - Excluded: any `policies` route — Task 12 deletes those
 
@@ -612,12 +601,12 @@ make openapi
 go test ./...
 ```
 
-Then create `.github/workflows/openapi.yml` (same shape as Tasks 1 and 3).
+Then add the `openapi-check` job to `.gitlab-ci.yml` (same job from Tasks 1 and 3 — extend any existing pipeline, or create if missing).
 
 - [ ] **Step 13: Commit (note any drift discovered)**
 
 ```bash
-git add Makefile .github/workflows/openapi.yml internal/api/ docs/ \
+git add Makefile .gitlab-ci.yml internal/api/ docs/ \
   cmd/ go.mod go.sum
 git commit -m "feat(openapi): port api-contract.md to swag annotations
 
