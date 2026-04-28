@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log/slog"
@@ -14,11 +15,23 @@ import (
 	"manteion-go/internal/zeus"
 )
 
+// dbPinger abstracts database ping for health checks and testing.
+type dbPinger interface {
+	PingContext(ctx context.Context) error
+}
+
+// ruleVersioner abstracts rule-version reads for health checks and testing.
+type ruleVersioner interface {
+	Version(ctx context.Context) (uint64, error)
+}
+
 // Server holds all dependencies for the manteion API.
 type Server struct {
 	logger      *slog.Logger
 	db          *sql.DB
+	dbPing      dbPinger    // same as db; separate field so tests can inject a fake
 	rules       *store.RuleRepo
+	rulever     ruleVersioner // same as rules; separate field so tests can inject a fake
 	faults      *store.FaultRepo
 	faultStore  FaultStore
 	sdk         *store.SDKRepo
@@ -28,6 +41,7 @@ type Server struct {
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
 	intent      atrocontrol.IntentReader
+	broker      *EventBroker
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -48,7 +62,9 @@ func NewServer(
 	return &Server{
 		logger:      logger,
 		db:          db,
+		dbPing:      db,
 		rules:       rules,
+		rulever:     rules,
 		faults:      faults,
 		faultStore:  faultStore,
 		sdk:         sdk,
@@ -58,6 +74,7 @@ func NewServer(
 		traces:      traces,
 		zeus:        zeusClient,
 		intent:      intent,
+		broker:      NewEventBroker(),
 	}
 }
 
@@ -101,6 +118,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/sdk/instances", s.handleListInstances)
 	mux.HandleFunc("GET /api/v1/sdk/rules", s.handlePollRules)
 	mux.HandleFunc("GET /api/v1/sdk/init", s.handleInit)
+	mux.HandleFunc("GET /api/v1/sdk/events", s.handleSSEEvents)
 
 	// Zeus proxy (pass-through to Archer)
 	mux.HandleFunc("POST /api/v1/zeus/workloads", s.handleZeusProxy)

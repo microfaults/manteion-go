@@ -144,5 +144,21 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 // handleInit is the startup readiness check for SDK initialization.
 // Returns 200 when manteion is ready to serve rules.
 func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
+	if err := s.dbPing.PingContext(r.Context()); err != nil {
+		s.logger.Warn("sdk/init: db unreachable", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "not_ready",
+			"reason": "database unreachable",
+		})
+		return
+	}
+	if _, err := s.rulever.Version(r.Context()); err != nil {
+		s.logger.Warn("sdk/init: rule store not initialized", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "not_ready",
+			"reason": "rule store not initialized",
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

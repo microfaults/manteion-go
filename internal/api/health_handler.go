@@ -10,7 +10,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // handleReadyz is the readiness probe.
 // Returns 200 when the database is reachable, 503 otherwise.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if err := s.db.PingContext(r.Context()); err != nil {
+	if err := s.dbPing.PingContext(r.Context()); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "database unreachable")
 		return
 	}
@@ -33,6 +33,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := map[string]any{
+		"db_healthy":     s.dbPing.PingContext(ctx) == nil,
 		"rules":          ruleCount,
 		"instances":      instanceCount,
 		"zeus_reachable": s.zeus.Healthy(ctx),
