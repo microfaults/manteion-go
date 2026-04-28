@@ -37,7 +37,7 @@ type Server struct {
 	sdk         *store.SDKRepo
 	experiments *store.ExperimentRepo
 	workloads   *store.WorkloadRepo
-	policies    *store.PolicyRepo
+	autoRules   *store.AutoRuleRepo
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
 	intent      atrocontrol.IntentReader
@@ -54,7 +54,7 @@ func NewServer(
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
 	workloads *store.WorkloadRepo,
-	policies *store.PolicyRepo,
+	autoRules *store.AutoRuleRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
 	intent atrocontrol.IntentReader,
@@ -70,7 +70,7 @@ func NewServer(
 		sdk:         sdk,
 		experiments: experiments,
 		workloads:   workloads,
-		policies:    policies,
+		autoRules:   autoRules,
 		traces:      traces,
 		zeus:        zeusClient,
 		intent:      intent,
@@ -87,9 +87,15 @@ func (s *Server) Handler() http.Handler {
 
 // routes registers all API routes using Go 1.22+ method-path patterns.
 func (s *Server) routes(mux *http.ServeMux) {
-	// Health
+	// Health. Dual-mounted: root for direct-probe consumers (k8s liveness/readiness),
+	// /api/v1/... for spec-driven clients that compose from the server URL — the
+	// OpenAPI spec's `servers[0].url` ends in `/api/v1`, so a bare `/healthz`
+	// path key would resolve to `/api/v1/healthz` on consumers, which would 404
+	// if we only mounted at root. Both mounts share handlers.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.HandleFunc("GET /api/v1/healthz", s.handleHealthz)
+	mux.HandleFunc("GET /api/v1/readyz", s.handleReadyz)
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 
 	// Rule CRUD
@@ -120,13 +126,17 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/sdk/init", s.handleInit)
 	mux.HandleFunc("GET /api/v1/sdk/events", s.handleSSEEvents)
 
-	// Zeus proxy (pass-through to Archer)
-	mux.HandleFunc("POST /api/v1/zeus/workloads", s.handleZeusProxy)
-	mux.HandleFunc("GET /api/v1/zeus/workloads", s.handleZeusProxy)
-	mux.HandleFunc("DELETE /api/v1/zeus/workloads/{id}", s.handleZeusProxy)
-	mux.HandleFunc("POST /api/v1/zeus/attacks", s.handleZeusProxy)
-	mux.HandleFunc("GET /api/v1/zeus/attacks/{id}", s.handleZeusProxy)
-	mux.HandleFunc("DELETE /api/v1/zeus/attacks/{id}", s.handleZeusProxy)
+	// Zeus proxy (pass-through to Archer). Each method/path gets its own shim
+	// so swag emits a single, valid router directive per operation; the shims
+	// share behavior via the private (*Server).zeusProxy helper.
+	mux.HandleFunc("POST /api/v1/zeus/workloads", s.handleZeusWorkloadsCreate)
+	mux.HandleFunc("GET /api/v1/zeus/workloads", s.handleZeusWorkloadsList)
+	mux.HandleFunc("DELETE /api/v1/zeus/workloads/{id}", s.handleZeusWorkloadDelete)
+	mux.HandleFunc("POST /api/v1/zeus/attacks", s.handleZeusAttacksCreate)
+	mux.HandleFunc("GET /api/v1/zeus/attacks/{id}", s.handleZeusAttackGet)
+	mux.HandleFunc("DELETE /api/v1/zeus/attacks/{id}", s.handleZeusAttackDelete)
+	// /zeus/policies routes are intentionally un-annotated — Task 12 deletes
+	// them. They keep using the unannotated handleZeusProxy alias.
 	mux.HandleFunc("POST /api/v1/zeus/policies", s.handleZeusProxy)
 	mux.HandleFunc("GET /api/v1/zeus/policies", s.handleZeusProxy)
 	mux.HandleFunc("DELETE /api/v1/zeus/policies/{id}", s.handleZeusProxy)
@@ -144,9 +154,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 }
 
-// writeError writes a JSON error response: {"error": msg}.
+// writeError writes a JSON error response using the standard envelope.
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, ErrorResponse{Error: msg})
 }
 
 // readJSON decodes the request body into v.

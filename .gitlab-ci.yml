@@ -30,7 +30,24 @@ variables:
   MAX_DIFF_CHARS: "120000"
 
 stages:
+  - check
   - review
+
+# OpenAPI spec freshness gate.
+# Fails the pipeline if generated docs/swagger.{yaml,json} is stale relative
+# to handler code. Triggers only on pushes to develop and main per project
+# convention; feature branches don't pay the gate cost.
+openapi-check:
+  stage: check
+  image: golang:1.25
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-yaml
+    - go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
+    - export PATH=$PATH:$(go env GOPATH)/bin
+  script:
+    - make openapi-check
 
 ai-review:
   stage: review

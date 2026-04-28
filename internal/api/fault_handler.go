@@ -10,6 +10,19 @@ import (
 )
 
 // handleCreateFaultSpec creates a new fault spec.
+//
+// @Summary      Create fault spec
+// @Description  Persist an atomic fault definition. The body is validated per
+// @Description  model.FaultSpec.Validate() — category in {inline,network,resource},
+// @Description  fault_type matches the category, and config is non-empty.
+// @Tags         faults
+// @Accept       json
+// @Produce      json
+// @Param        spec  body      model.FaultSpec  true  "Fault spec definition"
+// @Success      201   {object}  model.FaultSpec
+// @Failure      400   {object}  api.ErrorResponse  "validation error"
+// @Failure      500   {object}  api.ErrorResponse
+// @Router       /faults/specs [post]
 func (s *Server) handleCreateFaultSpec(w http.ResponseWriter, r *http.Request) {
 	var spec model.FaultSpec
 	if err := readJSON(r, &spec); err != nil {
@@ -37,6 +50,14 @@ func (s *Server) handleCreateFaultSpec(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListFaultSpecs returns all fault specs.
+//
+// @Summary      List fault specs
+// @Description  Returns all fault specs in creation order.
+// @Tags         faults
+// @Produce      json
+// @Success      200  {array}   model.FaultSpec
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /faults/specs [get]
 func (s *Server) handleListFaultSpecs(w http.ResponseWriter, r *http.Request) {
 	specs, err := s.faultStore.ListSpecs(r.Context())
 	if err != nil {
@@ -51,6 +72,15 @@ func (s *Server) handleListFaultSpecs(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetFaultSpec returns a single spec by id.
+//
+// @Summary      Get fault spec
+// @Tags         faults
+// @Produce      json
+// @Param        id   path      string  true  "Fault spec ID"
+// @Success      200  {object}  model.FaultSpec
+// @Failure      404  {object}  api.ErrorResponse  "spec not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /faults/specs/{id} [get]
 func (s *Server) handleGetFaultSpec(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	spec, err := s.faultStore.GetSpec(r.Context(), id)
@@ -67,6 +97,14 @@ func (s *Server) handleGetFaultSpec(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeleteFaultSpec removes a fault spec.
+//
+// @Summary      Delete fault spec
+// @Tags         faults
+// @Param        id   path  string  true  "Fault spec ID"
+// @Success      204  "spec deleted"
+// @Failure      404  {object}  api.ErrorResponse  "spec not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /faults/specs/{id} [delete]
 func (s *Server) handleDeleteFaultSpec(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.faultStore.DeleteSpec(r.Context(), id); err != nil {
@@ -87,6 +125,19 @@ func (s *Server) handleDeleteFaultSpec(w http.ResponseWriter, r *http.Request) {
 // current repo contents. This closes A13 — the repo's basic Validate is NOT
 // enough, it doesn't catch depth/incompat violations because those need
 // resolvers.
+//
+// @Summary      Create fault composition
+// @Description  Persist a composition (parallel or sequential group of fault members).
+// @Description  Validates depth (max 3), per-member directions, and pairwise fault
+// @Description  incompatibilities against the current spec/composition repos.
+// @Tags         faults
+// @Accept       json
+// @Produce      json
+// @Param        composition  body      model.FaultComposition  true  "Composition definition"
+// @Success      201          {object}  model.FaultComposition
+// @Failure      400          {object}  api.ErrorResponse  "validation error (incl. depth or incompatibility)"
+// @Failure      500          {object}  api.ErrorResponse
+// @Router       /faults/compositions [post]
 func (s *Server) handleCreateFaultComposition(w http.ResponseWriter, r *http.Request) {
 	var comp model.FaultComposition
 	if err := readJSON(r, &comp); err != nil {
@@ -117,6 +168,15 @@ func (s *Server) handleCreateFaultComposition(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusCreated, comp)
 }
 
+// handleListFaultCompositions returns all fault compositions.
+//
+// @Summary      List fault compositions
+// @Description  Returns all fault compositions in creation order.
+// @Tags         faults
+// @Produce      json
+// @Success      200  {array}   model.FaultComposition
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /faults/compositions [get]
 func (s *Server) handleListFaultCompositions(w http.ResponseWriter, r *http.Request) {
 	comps, err := s.faultStore.ListCompositions(r.Context())
 	if err != nil {
@@ -130,6 +190,16 @@ func (s *Server) handleListFaultCompositions(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, comps)
 }
 
+// handleGetFaultComposition returns a single composition by id.
+//
+// @Summary      Get fault composition
+// @Tags         faults
+// @Produce      json
+// @Param        id   path      string  true  "Fault composition ID"
+// @Success      200  {object}  model.FaultComposition
+// @Failure      404  {object}  api.ErrorResponse  "composition not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /faults/compositions/{id} [get]
 func (s *Server) handleGetFaultComposition(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	comp, err := s.faultStore.GetComposition(r.Context(), id)
@@ -145,6 +215,15 @@ func (s *Server) handleGetFaultComposition(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, comp)
 }
 
+// handleDeleteFaultComposition removes a fault composition.
+//
+// @Summary      Delete fault composition
+// @Tags         faults
+// @Param        id   path  string  true  "Fault composition ID"
+// @Success      204  "composition deleted"
+// @Failure      404  {object}  api.ErrorResponse  "composition not found"
+// @Failure      500  {object}  api.ErrorResponse
+// @Router       /faults/compositions/{id} [delete]
 func (s *Server) handleDeleteFaultComposition(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.faultStore.DeleteComposition(r.Context(), id); err != nil {
