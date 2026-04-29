@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -46,6 +47,7 @@ func (s *Server) handleCreateRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("rule created", "id", rule.ID, "service", rule.Service)
+	s.broadcastRulesChanged(r, rule.Service)
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -131,6 +133,7 @@ func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("rule updated", "id", id)
+	s.broadcastRulesChanged(r, rule.Service)
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -146,6 +149,19 @@ func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	// Fetch service before deleting so we can broadcast to the right subscribers.
+	existing, err := s.rules.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "rule not found")
+		return
+	}
+	if err != nil {
+		s.logger.Error("get rule for delete failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to delete rule")
+		return
+	}
+	service := existing.Service
+
 	if err := s.rules.Delete(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "rule not found")
@@ -157,7 +173,32 @@ func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("rule deleted", "id", id)
+	s.broadcastRulesChanged(r, service)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// broadcastRulesChanged reads the current rule version and broadcasts a
+// rules_changed SSE event to all subscribers for service. Best-effort: if
+// Version() fails, no event is sent (the SDK will still catch up on next poll).
+func (s *Server) broadcastRulesChanged(r *http.Request, service string) {
+	if s.broker == nil {
+		s.logger.Warn("broadcastRulesChanged: broker not initialized; rule-change events will not be broadcast")
+		return
+	}
+	newVersion, err := s.rules.Version(r.Context())
+	if err != nil {
+		s.logger.Warn("broadcastRulesChanged: read version failed", "error", err)
+		return
+	}
+	data, err := json.Marshal(map[string]uint64{"version": newVersion})
+	if err != nil {
+		s.logger.Warn("broadcastRulesChanged: marshal event data failed", "error", err)
+		return
+	}
+	s.broker.Broadcast(service, Event{
+		Type: "rules_changed",
+		Data: string(data),
+	})
 }
 
 // generateID creates a prefixed random hex ID.

@@ -25,7 +25,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // @Failure      503  {object}  api.ErrorResponse  "database unreachable"
 // @Router       /readyz [get]
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if err := s.db.PingContext(r.Context()); err != nil {
+	if err := s.dbPing.PingContext(r.Context()); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "database unreachable")
 		return
 	}
@@ -56,6 +56,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := map[string]any{
+		"db_healthy":     s.dbPing.PingContext(ctx) == nil,
 		"rules":          ruleCount,
 		"instances":      instanceCount,
 		"zeus_reachable": s.zeus.Healthy(ctx),
