@@ -43,12 +43,9 @@ type Server struct {
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
 	intent      atrocontrol.IntentReader
-<<<<<<< HEAD
 	orch        *orchestrator.Orchestrator
 	cacheStore  *cachestore.Store
-=======
 	broker      *EventBroker
->>>>>>> develop
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -83,12 +80,9 @@ func NewServer(
 		traces:      traces,
 		zeus:        zeusClient,
 		intent:      intent,
-<<<<<<< HEAD
 		orch:        orch,
 		cacheStore:  cs,
-=======
 		broker:      NewEventBroker(),
->>>>>>> develop
 	}
 }
 
