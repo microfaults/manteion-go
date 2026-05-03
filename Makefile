@@ -22,7 +22,7 @@
 #   - --parseInternal is required because the API package lives under internal/.
 #   - --outputTypes yaml,json commits both for human review (yaml) and tool consumption (json).
 
-.PHONY: openapi openapi-check test build
+.PHONY: openapi openapi-check test build verify integration e2e
 
 openapi:
 	swag init \
@@ -44,3 +44,24 @@ test:
 
 build:
 	go build ./...
+
+verify: build
+	@echo "=== gofmt ==="
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "These files need gofmt:"; echo "$$unformatted"; exit 1; \
+	fi
+	@echo "=== go vet ==="
+	go vet ./...
+	@echo "=== go test ==="
+	go test ./...
+
+integration:
+	MANTEION_INTEGRATION=1 go test -count=1 -timeout 120s ./...
+
+e2e:
+	docker-compose up -d
+	MANTEION_E2E=1 \
+	MANTEION_INTEGRATION=1 \
+	MANTEION_DATABASE_URL=postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable \
+		go test -count=1 -timeout 300s ./...

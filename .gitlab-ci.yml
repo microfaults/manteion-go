@@ -1,15 +1,19 @@
 # ---------------------------------------------------------------------------
-# AI Code Review Bot — GitLab CI/CD Pipeline
+# manteion-go GitLab CI/CD Pipeline
 #
-# Triggers:
-#   - Schedule: Auto-diffs commits from the last REVIEW_HOURS hours against HEAD.
-#   - Manual (web UI / API): Set FROM_COMMIT (and optionally TO_COMMIT).
+# Stages:
+#   check  — Go build/vet/test, OpenAPI freshness, race detection
+#   review — AI code review (schedule/manual/trigger only)
+#
+# Dependency: manteion-go has a local replace directive for atropos-go.
+# All Go jobs clone the sibling repo via CI_JOB_TOKEN before building.
+# Branch policy: always atropos-go 'develop' (stable integration branch).
 #
 # Required CI/CD variables (Settings > CI/CD > Variables, masked):
 #   ANTHROPIC_API_KEY — Anthropic API key          [if LLM_PROVIDER=claude]
 #   GOOGLE_API_KEY    — Google AI API key          [if LLM_PROVIDER=gemini]
 #
-# Optional (set project-wide or override per-run in web UI / trigger API):
+# Optional:
 #   GITLAB_API_TOKEN  — Project access token (api scope); enables commit comments
 #   LLM_PROVIDER      — "claude" (default) or "gemini"
 #   LLM_MODEL         — Override model ID (e.g. "claude-opus-4-6")
@@ -33,10 +37,78 @@ stages:
   - check
   - review
 
-# OpenAPI spec freshness gate.
-# Fails the pipeline if generated docs/swagger.{yaml,json} is stale relative
-# to handler code. Triggers only on pushes to develop and main per project
-# convention; feature branches don't pay the gate cost.
+# ---------------------------------------------------------------------------
+# Go verification
+# ---------------------------------------------------------------------------
+
+# Shared template for Go jobs that need atropos-go.
+.go-base:
+  image: golang:1.25
+  variables:
+    GOMODCACHE: ${CI_PROJECT_DIR}/.gomodcache
+    GOCACHE: ${CI_PROJECT_DIR}/.gocache
+  cache:
+    key: go-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .gomodcache
+      - .gocache
+  before_script:
+    - git clone --depth 1 --branch develop
+        https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/microfaults/atropos-go.git
+        ../atropos-go
+
+go-verify:
+  extends: .go-base
+  stage: check
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - |
+      unformatted=$(gofmt -l .)
+      if [ -n "$unformatted" ]; then
+        echo "These files need gofmt:"
+        echo "$unformatted"
+        exit 1
+      fi
+    - go vet ./...
+    - go build ./...
+    - go test ./...
+
+go-race:
+  extends: .go-base
+  stage: check
+  variables:
+    CGO_ENABLED: "1"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - go test -race ./...
+
+go-integration:
+  extends: .go-base
+  stage: check
+  services:
+    - name: postgres:18-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: manteion
+    POSTGRES_PASSWORD: manteion
+    POSTGRES_DB: manteion
+    MANTEION_DATABASE_URL: "postgres://manteion:manteion@postgres:5432/manteion?sslmode=disable"
+    MANTEION_INTEGRATION: "1"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - go test -count=1 -timeout 120s ./...
+
+# ---------------------------------------------------------------------------
+# OpenAPI + review
+# ---------------------------------------------------------------------------
+
 openapi-check:
   stage: check
   image: golang:1.25
@@ -57,24 +129,17 @@ ai-review:
     max: 2
     when: script_failure
   timeout: 15m
-
   rules:
-    # Scheduled pipeline (cron — configure rate in Build > Pipeline schedules)
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    # Manual trigger from GitLab web UI (Build > Pipelines > Run pipeline)
     - if: '$CI_PIPELINE_SOURCE == "web"'
-    # API / webhook trigger
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
-
   artifacts:
     name: "ai-review-$CI_COMMIT_SHORT_SHA"
     paths:
       - review-output/
     expire_in: 30 days
     when: always
-
   before_script:
     - apt-get update -qq && apt-get install -y -qq git > /dev/null
-
   script:
     - python3 scripts/ai-review.py
