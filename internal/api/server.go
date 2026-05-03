@@ -11,6 +11,8 @@ import (
 	"net/http"
 
 	"manteion-go/internal/atrocontrol"
+	"manteion-go/internal/cachestore"
+	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
 )
@@ -37,11 +39,16 @@ type Server struct {
 	sdk         *store.SDKRepo
 	experiments *store.ExperimentRepo
 	workloads   *store.WorkloadRepo
-	autoRules   *store.AutoRuleRepo
+	policies    *store.PolicyRepo
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
 	intent      atrocontrol.IntentReader
+<<<<<<< HEAD
+	orch        *orchestrator.Orchestrator
+	cacheStore  *cachestore.Store
+=======
 	broker      *EventBroker
+>>>>>>> develop
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -54,10 +61,12 @@ func NewServer(
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
 	workloads *store.WorkloadRepo,
-	autoRules *store.AutoRuleRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
 	intent atrocontrol.IntentReader,
+	orch *orchestrator.Orchestrator,
+	cs *cachestore.Store,
+	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
 		logger:      logger,
@@ -70,11 +79,16 @@ func NewServer(
 		sdk:         sdk,
 		experiments: experiments,
 		workloads:   workloads,
-		autoRules:   autoRules,
+		policies:    policies,
 		traces:      traces,
 		zeus:        zeusClient,
 		intent:      intent,
+<<<<<<< HEAD
+		orch:        orch,
+		cacheStore:  cs,
+=======
 		broker:      NewEventBroker(),
+>>>>>>> develop
 	}
 }
 
@@ -118,6 +132,32 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
 	mux.HandleFunc("DELETE /api/v1/faults/compositions/{id}", s.handleDeleteFaultComposition)
 
+	// Experiment CRUD + lifecycle
+	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)
+	mux.HandleFunc("GET /api/v1/experiments", s.handleListExperiments)
+	mux.HandleFunc("GET /api/v1/experiments/{id}", s.handleGetExperiment)
+	mux.HandleFunc("DELETE /api/v1/experiments/{id}", s.handleDeleteExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/start", s.handleStartExperiment)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/contributions", s.handleListContributions)
+
+	// Run CRUD + FSM
+	mux.HandleFunc("POST /api/v1/experiments/{id}/runs", s.handleCreateRun)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/runs", s.handleListRuns)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/runs/{runId}", s.handleGetRun)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/start", s.handleStartRun)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/stop", s.handleStopRun)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/pause", s.handlePauseRun)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/resume", s.handleResumeRun)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/runs/{runId}/results", s.handleListRunResults)
+
+	// Policy CRUD + enable/disable
+	mux.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
+	mux.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
+	mux.HandleFunc("GET /api/v1/policies/{id}", s.handleGetPolicy)
+	mux.HandleFunc("DELETE /api/v1/policies/{id}", s.handleDeletePolicy)
+	mux.HandleFunc("PATCH /api/v1/policies/{id}/enable", s.handleEnablePolicy)
+	mux.HandleFunc("PATCH /api/v1/policies/{id}/disable", s.handleDisablePolicy)
+
 	// SDK registration & polling
 	mux.HandleFunc("POST /api/v1/sdk/register", s.handleRegister)
 	mux.HandleFunc("DELETE /api/v1/sdk/register/{id}", s.handleDeregister)
@@ -126,20 +166,21 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/sdk/init", s.handleInit)
 	mux.HandleFunc("GET /api/v1/sdk/events", s.handleSSEEvents)
 
-	// Zeus proxy (pass-through to Archer). Each method/path gets its own shim
-	// so swag emits a single, valid router directive per operation; the shims
-	// share behavior via the private (*Server).zeusProxy helper.
-	mux.HandleFunc("POST /api/v1/zeus/workloads", s.handleZeusWorkloadsCreate)
-	mux.HandleFunc("GET /api/v1/zeus/workloads", s.handleZeusWorkloadsList)
-	mux.HandleFunc("DELETE /api/v1/zeus/workloads/{id}", s.handleZeusWorkloadDelete)
-	mux.HandleFunc("POST /api/v1/zeus/attacks", s.handleZeusAttacksCreate)
-	mux.HandleFunc("GET /api/v1/zeus/attacks/{id}", s.handleZeusAttackGet)
-	mux.HandleFunc("DELETE /api/v1/zeus/attacks/{id}", s.handleZeusAttackDelete)
-	// /zeus/policies routes are intentionally un-annotated — Task 12 deletes
-	// them. They keep using the unannotated handleZeusProxy alias.
-	mux.HandleFunc("POST /api/v1/zeus/policies", s.handleZeusProxy)
-	mux.HandleFunc("GET /api/v1/zeus/policies", s.handleZeusProxy)
-	mux.HandleFunc("DELETE /api/v1/zeus/policies/{id}", s.handleZeusProxy)
+	// Cache ingest + serve
+	mux.HandleFunc("POST /api/v1/cache/ingest", s.handleCacheIngest)
+	mux.HandleFunc("GET /api/v1/cache/entries", s.handleCacheEntries)
+
+	// Zeus proxy (pass-through to Archer for resources manteion doesn't own).
+	// Attacks are NOT proxied — they are orchestrator-managed. Operators interact
+	// with attacks through the experiment/run lifecycle endpoints above. Direct
+	// attack proxy would bypass orchestrator bookkeeping (poller state, result
+	// harvesting, run FSM transitions).
+	mux.HandleFunc("POST /api/v1/zeus/workloads", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/workloads", s.zeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/workloads/{id}", s.zeusProxy)
+	mux.HandleFunc("POST /api/v1/zeus/policies", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/policies", s.zeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/policies/{id}", s.zeusProxy)
 }
 
 // --- JSON helpers ---

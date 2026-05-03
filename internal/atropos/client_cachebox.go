@@ -30,3 +30,8 @@ func (c *Client) ClearCacheBox(ctx context.Context, addr string) error {
 	_, err := c.doExpectStatus(ctx, http.MethodDelete, addr+"/admin/cachebox", nil, http.StatusNoContent)
 	return err
 }
+
+func (c *Client) PostCacheEntries(ctx context.Context, addr string, entries []*atroposdk.CacheBoxEntry) error {
+	_, err := c.doExpectStatus(ctx, http.MethodPost, addr+"/admin/cachebox/entries", entries, http.StatusNoContent)
+	return err
+}

@@ -45,6 +45,10 @@ type PolicyCondition struct {
 	Threshold float64 `json:"threshold"`
 }
 
+var validOperators = map[string]bool{
+	"gt": true, "gte": true, "lt": true, "lte": true, "eq": true,
+}
+
 func (c *PolicyCondition) Validate() error {
 	if c.Metric == "" {
 		return errors.New("condition: metric required")
@@ -55,11 +59,60 @@ func (c *PolicyCondition) Validate() error {
 	return nil
 }
 
+// AttackTargetSpec describes the target for a policy-triggered attack.
+// Validated when PolicyAction.ActionType == "attack"; the engine does not
+// execute this action type today (see policy.executeAction).
+type AttackTargetSpec struct {
+	URL         string `json:"url"`
+	Method      string `json:"method"`
+	Rate        int    `json:"rate"`
+	DurationMs  int64  `json:"duration_ms"`
+	DedupBypass string `json:"dedup_bypass,omitempty"`
+}
+
+func (s *AttackTargetSpec) Validate() error {
+	if s.URL == "" {
+		return errors.New("attack target: url required")
+	}
+	if s.Method == "" {
+		return errors.New("attack target: method required")
+	}
+	if s.Rate <= 0 {
+		return errors.New("attack target: rate must be > 0")
+	}
+	if s.DurationMs <= 0 {
+		return errors.New("attack target: duration_ms must be > 0")
+	}
+	return nil
+}
+
 // PolicyAction describes what happens when a condition fires.
+//
+// Implemented by the engine today: push_rules, clear_rules.
+// Accepted but not yet wired in the engine: attack, cachebox_mode_change.
+// Both future types are manteion's responsibility (Zeus client for attacks,
+// atrocontrol for cache-box mode). The SDK never decides policy.
 type PolicyAction struct {
-	ActionType     string            `json:"action_type"` // "attack" or "cachebox_mode_change"
+	ActionType     string            `json:"action_type"` // push_rules, clear_rules, attack, cachebox_mode_change
 	AttackTarget   *AttackTargetSpec `json:"attack_target,omitempty"`
 	CacheBoxChange *CacheBoxConfig   `json:"cachebox_change,omitempty"`
+	PushRules      *PushRulesAction  `json:"push_rules,omitempty"`
+}
+
+// PushRulesAction identifies which rules to push to which service.
+type PushRulesAction struct {
+	Service string   `json:"service"`
+	RuleIDs []string `json:"rule_ids"`
+}
+
+func (a *PushRulesAction) Validate() error {
+	if a.Service == "" {
+		return errors.New("push_rules: service required")
+	}
+	if len(a.RuleIDs) == 0 {
+		return errors.New("push_rules: at least one rule_id required")
+	}
+	return nil
 }
 
 func (a *PolicyAction) Validate() error {
@@ -74,6 +127,16 @@ func (a *PolicyAction) Validate() error {
 			return errors.New("action: cachebox_change required for action_type=cachebox_mode_change")
 		}
 		return a.CacheBoxChange.Validate()
+	case "push_rules":
+		if a.PushRules == nil {
+			return errors.New("action: push_rules required for action_type=push_rules")
+		}
+		return a.PushRules.Validate()
+	case "clear_rules":
+		if a.PushRules == nil || a.PushRules.Service == "" {
+			return errors.New("action: push_rules.service required for action_type=clear_rules")
+		}
+		return nil
 	default:
 		return fmt.Errorf("action: invalid action_type %q", a.ActionType)
 	}

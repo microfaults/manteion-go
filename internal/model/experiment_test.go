@@ -251,3 +251,154 @@ func TestServiceRunResult_Validate(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateRunGraph(t *testing.T) {
+	run := func(id, expID string, deps ...string) *ExperimentRun {
+		return &ExperimentRun{
+			ID: id, ExperimentID: expID, RunType: "baseline",
+			Status: "pending", DependsOn: deps,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		runs    []*ExperimentRun
+		wantErr bool
+		errSub  string
+	}{
+		{
+			name:    "valid linear DAG: A → B → C",
+			runs:    []*ExperimentRun{run("A", "e1"), run("B", "e1", "A"), run("C", "e1", "B")},
+			wantErr: false,
+		},
+		{
+			name:    "valid fan-out: A → B, A → C",
+			runs:    []*ExperimentRun{run("A", "e1"), run("B", "e1", "A"), run("C", "e1", "A")},
+			wantErr: false,
+		},
+		{
+			name: "valid diamond: A → B,C → D",
+			runs: []*ExperimentRun{
+				run("A", "e1"),
+				run("B", "e1", "A"),
+				run("C", "e1", "A"),
+				run("D", "e1", "B", "C"),
+			},
+			wantErr: false,
+		},
+		{
+			name:    "valid single entry point (no deps)",
+			runs:    []*ExperimentRun{run("A", "e1")},
+			wantErr: false,
+		},
+		{
+			name:    "simple cycle: A → B → A",
+			runs:    []*ExperimentRun{run("A", "e1", "B"), run("B", "e1", "A")},
+			wantErr: true,
+			errSub:  "cycle",
+		},
+		{
+			name: "transitive cycle: A → B → C → A",
+			runs: []*ExperimentRun{
+				run("A", "e1", "C"),
+				run("B", "e1", "A"),
+				run("C", "e1", "B"),
+			},
+			wantErr: true,
+			errSub:  "cycle",
+		},
+		{
+			name:    "unknown dependency reference",
+			runs:    []*ExperimentRun{run("A", "e1"), run("B", "e1", "Z")},
+			wantErr: true,
+			errSub:  "unknown run",
+		},
+		{
+			name: "cross-experiment dependency",
+			runs: []*ExperimentRun{
+				run("A", "e1"),
+				{ID: "B", ExperimentID: "e2", RunType: "baseline", Status: "pending", DependsOn: []string{"A"}},
+			},
+			wantErr: true,
+			errSub:  "different experiment",
+		},
+		{
+			name:    "empty run set",
+			runs:    []*ExperimentRun{},
+			wantErr: false,
+		},
+		{
+			name: "isolation with frozen services but no baseline ancestor",
+			runs: []*ExperimentRun{
+				{ID: "A", ExperimentID: "e1", RunType: "isolation", Status: "pending",
+					FrozenServices: []CacheBoxConfig{{Service: "svc2", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}}},
+				{
+					ID: "B", ExperimentID: "e1", RunType: "isolation",
+					Status: "pending", DependsOn: []string{"A"},
+					FrozenServices: []CacheBoxConfig{{Service: "svc", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
+				},
+			},
+			wantErr: true,
+			errSub:  "no baseline run",
+		},
+		{
+			name: "isolation with frozen services and baseline ancestor",
+			runs: []*ExperimentRun{
+				{ID: "base", ExperimentID: "e1", RunType: "baseline", Status: "pending"},
+				{
+					ID: "iso", ExperimentID: "e1", RunType: "isolation",
+					Status: "pending", DependsOn: []string{"base"},
+					FrozenServices: []CacheBoxConfig{{Service: "svc", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "combination with transitive baseline ancestor",
+			runs: []*ExperimentRun{
+				{ID: "base", ExperimentID: "e1", RunType: "baseline", Status: "pending"},
+				{
+					ID: "iso", ExperimentID: "e1", RunType: "isolation",
+					Status: "pending", DependsOn: []string{"base"},
+					FrozenServices: []CacheBoxConfig{{Service: "svc", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
+				},
+				{
+					ID: "combo", ExperimentID: "e1", RunType: "combination",
+					Status: "pending", DependsOn: []string{"iso"},
+					FrozenServices: []CacheBoxConfig{
+						{Service: "svc", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"},
+						{Service: "svc2", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateRunGraph(tt.runs)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateRunGraph() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && tt.errSub != "" {
+				if got := err.Error(); !contains(got, tt.errSub) {
+					t.Errorf("error %q should contain %q", got, tt.errSub)
+				}
+			}
+		})
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsAt(s, sub))
+}
+
+func containsAt(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

@@ -18,7 +18,11 @@ import (
 	"manteion-go/internal/api"
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/atropos"
+	"manteion-go/internal/cachestore"
 	"manteion-go/internal/db"
+	"manteion-go/internal/orchestrator"
+	"manteion-go/internal/policy"
+	"manteion-go/internal/promql"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
 )
@@ -42,6 +46,8 @@ func main() {
 	dsn := envOr("MANTEION_DATABASE_URL",
 		"postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable")
 	zeusURL := envOr("ZEUS_URL", "http://archer:8080")
+	prometheusURL := envOr("PROMETHEUS_URL", "http://prometheus:9090")
+	cacheDir := envOr("CACHE_DIR", "/var/cache/manteion")
 
 	// Connect to PostgreSQL and run migrations.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -60,7 +66,6 @@ func main() {
 	sdkRepo := store.NewSDKRepo(database)
 	experimentRepo := store.NewExperimentRepo(database)
 	workloadRepo := store.NewWorkloadRepo(database)
-	autoRuleRepo := store.NewAutoRuleRepo(database)
 	traceRepo := store.NewTraceRepo(database)
 
 	// Create zeus client.
@@ -75,11 +80,26 @@ func main() {
 		atrocontrol.WithLogger(logger),
 	)
 
+	policyRepo := store.NewPolicyRepo(database)
+
+	// Create promql client, cache store, orchestrator, and policy engine.
+	promClient := promql.NewClient(prometheusURL)
+	cs := cachestore.New(cacheDir)
+	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, controller, promClient, zeusClient, cs, logger)
+	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)
+
+	// Restore in-flight runs from the DB. Must run before the API server
+	// accepts requests, so callers see consistent state.
+	if err := orch.Recover(ctx); err != nil {
+		logger.Error("orchestrator recover failed", "error", err)
+		os.Exit(1)
+	}
+
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, sdkRepo,
-		experimentRepo, workloadRepo, autoRuleRepo, traceRepo,
-		zeusClient, controller.IntentReader(),
+		experimentRepo, workloadRepo, traceRepo,
+		zeusClient, controller.IntentReader(), orch, cs, policyRepo,
 	)
 
 	httpServer := &http.Server{
@@ -89,6 +109,9 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+
+	// Start policy engine as background goroutine.
+	go policyEngine.Run(ctx)
 
 	// Start server in a goroutine.
 	go func() {

@@ -124,6 +124,7 @@ func (r *SDKRepo) TouchPoll(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("touch poll: %w", err)
 	}
+	// what if n was < 0?
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound

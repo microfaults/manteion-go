@@ -26,10 +26,49 @@ ALTER TABLE fault_compositions
     ADD COLUMN IF NOT EXISTS ramp_up_ms BIGINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS ramp_down_ms BIGINT DEFAULT 0;
 `},
-	{5, "rename policy_rules to auto_rules", `
-ALTER TABLE policy_rules RENAME TO auto_rules;
-ALTER TABLE attacks RENAME COLUMN policy_rule_id TO auto_rule_id;
-ALTER TABLE attacks RENAME CONSTRAINT fk_attacks_policy_rule TO fk_attacks_auto_rule;
+	{5, "add experiment_run phase columns", `
+ALTER TABLE experiment_runs
+    ADD COLUMN IF NOT EXISTS phase_rules        JSONB    NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS transition_cond    JSONB,
+    ADD COLUMN IF NOT EXISTS current_phase      INTEGER  NOT NULL DEFAULT 0;
+`},
+	{6, "add experiment_run zeus_attack_id", `ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS zeus_attack_id TEXT;`},
+	{7, "add paused status to experiment_runs", `
+ALTER TABLE experiment_runs DROP CONSTRAINT IF EXISTS experiment_runs_status_check;
+ALTER TABLE experiment_runs ADD CONSTRAINT experiment_runs_status_check
+    CHECK (status IN ('pending','running','paused','completed','failed'));
+`},
+	{8, "add workload_ids and zeus_attack_ids to experiment_runs", `
+ALTER TABLE experiment_runs
+    ADD COLUMN IF NOT EXISTS workload_ids    JSONB,
+    ADD COLUMN IF NOT EXISTS zeus_attack_ids JSONB;
+`},
+	{9, "add hot-path indexes", `
+CREATE INDEX IF NOT EXISTS idx_experiment_runs_baseline
+    ON experiment_runs(experiment_id, run_type, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_experiment_runs_status
+    ON experiment_runs(status)
+    WHERE status IN ('running','paused');
+CREATE INDEX IF NOT EXISTS idx_contribution_results_baseline_run
+    ON contribution_results(baseline_run_id);
+CREATE INDEX IF NOT EXISTS idx_contribution_results_isolation_run
+    ON contribution_results(isolation_run_id);
+CREATE INDEX IF NOT EXISTS idx_service_run_results_run
+    ON service_run_results(experiment_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_run_results_run
+    ON workflow_run_results(experiment_run_id);
+CREATE INDEX IF NOT EXISTS idx_policy_rules_enabled
+    ON policy_rules(id) WHERE enabled = true;
+`},
+	{10, "add experiment_run depends_on for declarative DAG", `
+ALTER TABLE experiment_runs
+    ADD COLUMN IF NOT EXISTS depends_on JSONB NOT NULL DEFAULT '[]';
+CREATE INDEX IF NOT EXISTS idx_experiment_runs_depends_on
+    ON experiment_runs USING GIN (depends_on);
+`},
+	{11, "add experiment_run persist_cache opt-in flag", `
+ALTER TABLE experiment_runs
+    ADD COLUMN IF NOT EXISTS persist_cache BOOLEAN NOT NULL DEFAULT FALSE;
 `},
 }
 
