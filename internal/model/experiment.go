@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// PhaseTransition defines when a run should advance to its next phase.
+type PhaseTransition struct {
+	Metric    string        `json:"metric"`
+	Operator  string        `json:"operator"`  // gt, gte, lt, lte, eq
+	Threshold float64       `json:"threshold"`
+	Window    time.Duration `json:"window_ns"`
+}
+
+// PhaseRuleSet is the fault rules active during one phase of a run.
+type PhaseRuleSet struct {
+	Phase       int      `json:"phase"`
+	Description string   `json:"description"`
+	RuleIDs     []string `json:"rule_ids"`
+}
+
 // Experiment is an experiment plan for quantifying per-service contribution
 // to workflow latency. The experiment's behavior is fully determined by its
 // runs' FrozenServices and each cache-box's Mode — there is no separate
@@ -50,6 +65,15 @@ func (e *Experiment) Validate() error {
 // An attribution experiment has 1 baseline + N isolation + C(N,2) combination runs.
 // Isolation runs CAN overlap (they freeze different services). If any run fails,
 // the experiment aborts. Partial results from completed runs are preserved.
+//
+// Run FSM: pending → running → completed
+//                    running → paused → running (resume)
+//                    running → failed
+//
+// Run-to-run sequencing is declarative via DependsOn: a run only starts when
+// every run ID it lists has reached status='completed'. Runs with empty
+// DependsOn are entry points (started by StartExperiment). The orchestrator —
+// not the policy engine — is the single authority that advances the DAG.
 type ExperimentRun struct {
 	ID             string            `json:"id"`
 	ExperimentID   string            `json:"experiment_id"`
@@ -57,11 +81,28 @@ type ExperimentRun struct {
 	RunIndex       int               `json:"run_index"`
 	FrozenServices []CacheBoxConfig  `json:"frozen_services,omitempty"`
 	MetaTraceID    string            `json:"meta_trace_id"`
-	Status         string            `json:"status"` // pending, running, completed, failed
+	Status         string            `json:"status"` // pending, running, paused, completed, failed
 	NodePlacement  map[string]string `json:"node_placement,omitempty"`
 	StartedAt      *time.Time        `json:"started_at,omitempty"`
 	CompletedAt    *time.Time        `json:"completed_at,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
+	PhaseRules     []PhaseRuleSet    `json:"phase_rules,omitempty"`
+	TransitionCond *PhaseTransition  `json:"transition_condition,omitempty"`
+	CurrentPhase   int               `json:"current_phase"`
+	// DependsOn lists run IDs that must reach 'completed' before this run starts.
+	// Empty for entry-point runs (typically baseline). Cycles and cross-experiment
+	// references are rejected by ValidateRunGraph.
+	DependsOn []string `json:"depends_on,omitempty"`
+	// PersistCache opts the run into accepting cache-box entry ingestion via
+	// POST /api/v1/cache/ingest. Default false. Typically true on baseline
+	// runs whose cache will be replayed by isolation runs that depend on them.
+	PersistCache bool `json:"persist_cache,omitempty"`
+	// ZeusAttackID is the primary Zeus attack ID (first/only for single-workflow runs).
+	ZeusAttackID string `json:"zeus_attack_id,omitempty"`
+	// WorkloadIDs lists workloads to drive for this run; falls back to Experiment.PrimaryWorkloadID if empty.
+	WorkloadIDs []string `json:"workload_ids,omitempty"`
+	// ZeusAttackIDs holds all attack IDs for multi-workflow runs.
+	ZeusAttackIDs []string `json:"zeus_attack_ids,omitempty"`
 }
 
 var validRunTypes = map[string]bool{
@@ -69,7 +110,7 @@ var validRunTypes = map[string]bool{
 }
 
 var validRunStatuses = map[string]bool{
-	"pending": true, "running": true, "completed": true, "failed": true,
+	"pending": true, "running": true, "paused": true, "completed": true, "failed": true,
 }
 
 func (r *ExperimentRun) Validate() error {
@@ -96,7 +137,124 @@ func (r *ExperimentRun) Validate() error {
 			return fmt.Errorf("experiment run: frozen_services[%d]: %w", i, err)
 		}
 	}
+	if r.TransitionCond != nil {
+		if r.TransitionCond.Metric == "" {
+			return errors.New("experiment run: transition_condition.metric required")
+		}
+		switch r.TransitionCond.Operator {
+		case "gt", "gte", "lt", "lte", "eq":
+		default:
+			return fmt.Errorf("experiment run: transition_condition.operator %q invalid", r.TransitionCond.Operator)
+		}
+		if r.TransitionCond.Window <= 0 {
+			return errors.New("experiment run: transition_condition.window_ns must be > 0")
+		}
+	}
+	for i, ps := range r.PhaseRules {
+		if ps.Phase != i {
+			return fmt.Errorf("experiment run: phase_rules[%d].phase must be %d (sequential from 0)", i, i)
+		}
+	}
+	for _, dep := range r.DependsOn {
+		if dep == r.ID {
+			return errors.New("experiment run: depends_on must not include own id")
+		}
+		if dep == "" {
+			return errors.New("experiment run: depends_on must not contain empty id")
+		}
+	}
 	return nil
+}
+
+// ValidateRunGraph checks the cross-run dependency graph for an experiment.
+// It rejects:
+//   - cycles in DependsOn,
+//   - dependencies on run IDs not present in the experiment,
+//   - dependencies that span experiments.
+//
+// Call this once at experiment-start time before any StartRun is issued.
+func ValidateRunGraph(runs []*ExperimentRun) error {
+	byID := make(map[string]*ExperimentRun, len(runs))
+	for _, r := range runs {
+		byID[r.ID] = r
+	}
+
+	visited := make(map[string]bool, len(runs))
+	onPath := make(map[string]bool, len(runs))
+
+	var dfs func(id string) error
+	dfs = func(id string) error {
+		if onPath[id] {
+			return fmt.Errorf("experiment runs: dependency cycle through run %q", id)
+		}
+		if visited[id] {
+			return nil
+		}
+		onPath[id] = true
+		run := byID[id]
+		for _, dep := range run.DependsOn {
+			depRun, ok := byID[dep]
+			if !ok {
+				return fmt.Errorf("experiment run %q: depends_on references unknown run %q", id, dep)
+			}
+			if depRun.ExperimentID != run.ExperimentID {
+				return fmt.Errorf("experiment run %q: depends_on %q is in a different experiment", id, dep)
+			}
+			if err := dfs(dep); err != nil {
+				return err
+			}
+		}
+		onPath[id] = false
+		visited[id] = true
+		return nil
+	}
+
+	for _, r := range runs {
+		if err := dfs(r.ID); err != nil {
+			return err
+		}
+	}
+
+	// Non-baseline runs with frozen services (cache-box replay) must
+	// transitively depend on at least one baseline run. Without this,
+	// preloadCacheEntries silently skips and the isolation run produces
+	// meaningless results.
+	for _, r := range runs {
+		if r.RunType == "baseline" || len(r.FrozenServices) == 0 {
+			continue
+		}
+		if !hasBaselineAncestor(r.ID, byID) {
+			return fmt.Errorf("experiment run %q (%s): has frozen_services but no baseline run in its dependency chain", r.ID, r.RunType)
+		}
+	}
+	return nil
+}
+
+func hasBaselineAncestor(id string, byID map[string]*ExperimentRun) bool {
+	seen := make(map[string]bool)
+	var walk func(string) bool
+	walk = func(cur string) bool {
+		if seen[cur] {
+			return false
+		}
+		seen[cur] = true
+		r := byID[cur]
+		if r.RunType == "baseline" {
+			return true
+		}
+		for _, dep := range r.DependsOn {
+			if walk(dep) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, dep := range byID[id].DependsOn {
+		if walk(dep) {
+			return true
+		}
+	}
+	return false
 }
 
 // WorkflowRunResult stores end-to-end workflow latency for one run.

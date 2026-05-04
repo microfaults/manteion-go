@@ -5,9 +5,15 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"manteion-go/internal/model"
 )
+
+// durationFromNs converts nanoseconds stored in DB to time.Duration.
+func durationFromNs(ns int64) time.Duration {
+	return time.Duration(ns)
+}
 
 // PolicyRepo provides persistence for metric-triggered policy rules.
 type PolicyRepo struct {
@@ -102,6 +108,20 @@ func (r *PolicyRepo) ListEnabled(ctx context.Context) ([]*model.PolicyRule, erro
 	defer rows.Close()
 
 	return r.scanPolicyRules(rows)
+}
+
+// SetEnabled enables or disables a policy rule.
+func (r *PolicyRepo) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE policy_rules SET enabled = $2 WHERE id = $1`, id, enabled)
+	if err != nil {
+		return fmt.Errorf("set policy enabled: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // Delete removes a policy rule by ID.
