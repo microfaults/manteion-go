@@ -31,7 +31,7 @@ type ruleVersioner interface {
 type Server struct {
 	logger      *slog.Logger
 	db          *sql.DB
-	dbPing      dbPinger    // same as db; separate field so tests can inject a fake
+	dbPing      dbPinger // same as db; separate field so tests can inject a fake
 	rules       *store.RuleRepo
 	rulever     ruleVersioner // same as rules; separate field so tests can inject a fake
 	faults      *store.FaultRepo

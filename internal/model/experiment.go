@@ -10,7 +10,7 @@ import (
 // PhaseTransition defines when a run should advance to its next phase.
 type PhaseTransition struct {
 	Metric    string        `json:"metric"`
-	Operator  string        `json:"operator"`  // gt, gte, lt, lte, eq
+	Operator  string        `json:"operator"` // gt, gte, lt, lte, eq
 	Threshold float64       `json:"threshold"`
 	Window    time.Duration `json:"window_ns"`
 }
@@ -67,8 +67,9 @@ func (e *Experiment) Validate() error {
 // the experiment aborts. Partial results from completed runs are preserved.
 //
 // Run FSM: pending → running → completed
-//                    running → paused → running (resume)
-//                    running → failed
+//
+//	running → paused → running (resume)
+//	running → failed
 //
 // Run-to-run sequencing is declarative via DependsOn: a run only starts when
 // every run ID it lists has reached status='completed'. Runs with empty
