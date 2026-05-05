@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 func (c *Client) PostCacheBoxDelay(ctx context.Context, addr string, req atroposdk.DelayRequest) error {

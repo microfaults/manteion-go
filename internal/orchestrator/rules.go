@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/ruleconv"
 )
 

@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 // fakeAtroposAdmin builds an httptest server that mimics atropos admin handlers.

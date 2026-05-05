@@ -3,12 +3,14 @@ module manteion-go
 go 1.25.5
 
 require (
-	atropos-go v0.0.0-00010101000000-000000000000
+	git.ucsc.edu/microfaults/atropos-go v0.0.6
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.4
 )
 
-replace atropos-go => ../atropos-go
+// Keep local replace for dev iteration; CI/production resolves v0.0.6 from
+// git.ucsc.edu (requires GOPRIVATE + creds).
+replace git.ucsc.edu/microfaults/atropos-go => ../atropos-go
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

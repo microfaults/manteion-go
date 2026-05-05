@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 // Store manages NDJSON cache files rooted at a configurable directory.

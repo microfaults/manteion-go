@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 type ServiceIntent struct {

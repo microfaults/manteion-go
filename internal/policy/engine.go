@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/conditions"
 	"manteion-go/internal/model"

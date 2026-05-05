@@ -3,7 +3,7 @@ package atrocontrol
 import (
 	"context"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 // PreloadEntries fans out a batch of cache entries to all live SDK instances

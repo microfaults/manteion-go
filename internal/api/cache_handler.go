@@ -4,7 +4,7 @@ import (
 	"errors"
 	"net/http"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
 	"manteion-go/internal/store"
 )

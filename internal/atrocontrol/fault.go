@@ -3,7 +3,7 @@ package atrocontrol
 import (
 	"context"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 func (c *Controller) InjectFault(ctx context.Context, service string, req atroposdk.FaultRequest, opts ...CallOption) (FanoutResult, error) {
