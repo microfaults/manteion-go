@@ -8,7 +8,7 @@ import (
 
 // PreloadEntries fans out a batch of cache entries to all live SDK instances
 // of the given service.
-func (c *Controller) PreloadEntries(ctx context.Context, service string, entries []*atroposdk.CacheBoxEntry, opts ...CallOption) (FanoutResult, error) {
+func (c *Controller) PreloadEntries(ctx context.Context, service string, entries []atroposdk.CacheBoxWireEntry, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
 
 	targets, err := c.resolveTargets(ctx, service, co.filter)

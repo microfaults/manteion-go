@@ -9,9 +9,9 @@ import (
 // zeusProxy forwards requests to the Archer (zeus-go) API. It strips the
 // /api/v1/zeus prefix and pipes the request/response verbatim.
 //
-// Only Zeus-owned resources (workloads, policies) are proxied. Attacks are
-// orchestrator-managed and not exposed here — operators interact with attacks
-// through the experiment/run lifecycle endpoints.
+// Only Zeus-owned resources (workflows, runs, datasets) are proxied. Attacks
+// are orchestrator-managed and not exposed here — operators interact with
+// attacks through the experiment/run lifecycle endpoints.
 func (s *Server) zeusProxy(w http.ResponseWriter, r *http.Request) {
 	archerPath := strings.TrimPrefix(r.URL.Path, "/api/v1/zeus")
 	if archerPath == "" {

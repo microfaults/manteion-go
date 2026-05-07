@@ -1,13 +1,17 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
 	"manteion-go/internal/store"
 )
+
+const maxIngestBody = 64 << 20 // 64 MiB — cache batches can be large
 
 // ingestEnvelope is the request body for POST /api/v1/cache/ingest.
 //
@@ -17,10 +21,10 @@ import (
 // to non-baseline runs (e.g., a chaos run that wants to capture cache state)
 // without coupling new use cases to baseline-specific server logic.
 type ingestEnvelope struct {
-	Service  string                     `json:"service"`
-	Instance string                     `json:"instance"`
-	RunID    string                     `json:"run_id"`
-	Entries  []*atroposdk.CacheBoxEntry `json:"entries"`
+	Service  string                        `json:"service"`
+	Instance string                        `json:"instance"`
+	RunID    string                        `json:"run_id"`
+	Entries  []atroposdk.CacheBoxWireEntry `json:"entries"`
 }
 
 // handleCacheIngest receives cache-box entries from SDK instances and persists
@@ -29,7 +33,8 @@ type ingestEnvelope struct {
 // running.
 func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 	var env ingestEnvelope
-	if err := readJSON(r, &env); err != nil {
+	defer r.Body.Close()
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxIngestBody)).Decode(&env); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -96,7 +101,7 @@ func (s *Server) handleCacheEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if entries == nil {
-		entries = []*atroposdk.CacheBoxEntry{}
+		entries = []atroposdk.CacheBoxWireEntry{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
 }

@@ -42,7 +42,7 @@ Operator (curl / UI)
     ▼
 manteion-go  ──────────────────► zeus-go / Archer  (proxy: /api/v1/zeus/*)
     │                                     ▲
-    │  GET /api/v1/sdk/rules?service=X    │ GET /api/v1/zeus/workloads, /attacks, /policies
+    │  GET /api/v1/sdk/rules?service=X    │ GET /api/v1/zeus/workflows, /runs, /datasets
     │  POST /api/v1/sdk/register          │
     ▼                                     │
 atropos-go SDK (in each service pod) ─────┘
@@ -82,7 +82,7 @@ manteion-go (Controller)
 | Fault specs | `POST/GET /api/v1/faults/specs`, `GET/DELETE /api/v1/faults/specs/{id}` |
 | Fault compositions | `POST/GET /api/v1/faults/compositions`, `GET/DELETE /api/v1/faults/compositions/{id}` |
 | SDK | `POST /api/v1/sdk/register`, `DELETE /api/v1/sdk/register/{id}`, `GET /api/v1/sdk/instances`, `GET /api/v1/sdk/rules`, `GET /api/v1/sdk/init` |
-| Zeus proxy | `/api/v1/zeus/workloads`, `/api/v1/zeus/attacks`, `/api/v1/zeus/policies` → Archer |
+| Zeus proxy | `POST/GET /api/v1/zeus/workflows`, `GET/DELETE ./{id}`, `POST ./{id}/validate`, `POST/GET ./{id}/runs`; `GET /api/v1/zeus/runs`, `GET/DELETE ./{run_id}`, `GET ./{run_id}/events`, `GET ./{run_id}/stats`; `POST/GET /api/v1/zeus/datasets`, `GET/DELETE ./{id}`, `POST ./{id}/upload`, `GET ./{id}/sample` → Archer. Attacks NOT proxied (orchestrator-managed). |
 
 ### Environment variables
 
