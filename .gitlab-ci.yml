@@ -110,11 +110,14 @@ go-integration:
 # ---------------------------------------------------------------------------
 
 openapi-check:
+  extends: .go-base
   stage: check
-  image: golang:1.25
   rules:
     - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
   before_script:
+    - git clone --depth 1 --branch develop
+        https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/microfaults/atropos-go.git
+        ../atropos-go
     - apt-get update -qq && apt-get install -y -qq python3 python3-yaml
     - go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
     - export PATH=$PATH:$(go env GOPATH)/bin
