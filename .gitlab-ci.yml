@@ -44,14 +44,6 @@ stages:
 # Shared template for Go jobs that need atropos-go.
 .go-base:
   image: golang:1.25
-  variables:
-    GOMODCACHE: ${CI_PROJECT_DIR}/.gomodcache
-    GOCACHE: ${CI_PROJECT_DIR}/.gocache
-  cache:
-    key: go-${CI_COMMIT_REF_SLUG}
-    paths:
-      - .gomodcache
-      - .gocache
   before_script:
     - git clone --depth 1 --branch develop
         https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/microfaults/atropos-go.git
