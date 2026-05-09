@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/model"
 	"manteion-go/internal/ruleconv"
 	"manteion-go/internal/store"
@@ -149,8 +150,23 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch current intent (manual faults, freeze config).
+	var activeFaults []atroposdk.FaultRequest
+	var freezeCfg *atroposdk.DelayRequest
+	if s.intent != nil {
+		if intent, ok := s.intent.Get(service); ok {
+			for _, req := range intent.ActiveFaults {
+				if req != nil {
+					activeFaults = append(activeFaults, *req)
+				}
+			}
+			freezeCfg = intent.FreezeCfg
+		}
+	}
+
 	// 304 Not Modified — client already has the latest rules.
-	if requestedVersion == currentVersion {
+	// Only 304 if there are NO active manual faults, as we don't version-track those yet.
+	if requestedVersion == currentVersion && len(activeFaults) == 0 && freezeCfg == nil {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -180,16 +196,21 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Error("compile rules failed", "service", service, "error", err)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"version": currentVersion,
-			"rules":   rules,
+			"version":       currentVersion,
+			"rules":         rules,
+			"active_faults": activeFaults,
+			"freeze_cfg":    freezeCfg,
 		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version": currentVersion,
-		"rules":   compiled,
+		"version":       currentVersion,
+		"rules":         compiled,
+		"active_faults": activeFaults,
+		"freeze_cfg":    freezeCfg,
 	})
+
 }
 
 // handleInit is the startup readiness check for SDK initialization.
