@@ -30,25 +30,25 @@ type ruleVersioner interface {
 
 // Server holds all dependencies for the manteion API.
 type Server struct {
-	logger      *slog.Logger
-	db          *sql.DB
-	dbPing      dbPinger // same as db; separate field so tests can inject a fake
-	rules       *store.RuleRepo
-	rulever     ruleVersioner // same as rules; separate field so tests can inject a fake
+	logger       *slog.Logger
+	db           *sql.DB
+	dbPing       dbPinger // same as db; separate field so tests can inject a fake
+	rules        *store.RuleRepo
+	rulever      ruleVersioner // same as rules; separate field so tests can inject a fake
 	faults       *store.FaultRepo
 	faultStore   FaultStore
 	faultConfigs *store.FaultConfigRepo
 	sdk          *store.SDKRepo
 	experiments  *store.ExperimentRepo
-	workloads   *store.WorkloadRepo
-	policies    *store.PolicyRepo
-	traces      *store.TraceRepo
-	zeus        *zeus.Client
-	intent      atrocontrol.IntentReader
-	controller  *atrocontrol.Controller
-	orch        *orchestrator.Orchestrator
-	cacheStore  *cachestore.Store
-	broker      *EventBroker
+	workloads    *store.WorkloadRepo
+	policies     *store.PolicyRepo
+	traces       *store.TraceRepo
+	zeus         *zeus.Client
+	intent       atrocontrol.IntentReader
+	controller   *atrocontrol.Controller
+	orch         *orchestrator.Orchestrator
+	cacheStore   *cachestore.Store
+	broker       *EventBroker
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -71,25 +71,25 @@ func NewServer(
 	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
-		logger:      logger,
-		db:          db,
-		dbPing:      db,
-		rules:       rules,
-		rulever:     rules,
+		logger:       logger,
+		db:           db,
+		dbPing:       db,
+		rules:        rules,
+		rulever:      rules,
 		faults:       faults,
 		faultStore:   faultStore,
 		faultConfigs: faultConfigs,
 		sdk:          sdk,
 		experiments:  experiments,
-		workloads:   workloads,
-		policies:    policies,
-		traces:      traces,
-		zeus:        zeusClient,
-		intent:      intent,
-		controller:  controller,
-		orch:        orch,
-		cacheStore:  cs,
-		broker:      NewEventBroker(),
+		workloads:    workloads,
+		policies:     policies,
+		traces:       traces,
+		zeus:         zeusClient,
+		intent:       intent,
+		controller:   controller,
+		orch:         orch,
+		cacheStore:   cs,
+		broker:       NewEventBroker(),
 	}
 }
 

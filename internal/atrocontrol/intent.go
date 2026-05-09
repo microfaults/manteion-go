@@ -8,11 +8,11 @@ import (
 )
 
 type ServiceIntent struct {
-	Rules       []atroposdk.StaticRule  `json:"rules,omitempty"`
+	Rules        []atroposdk.StaticRule             `json:"rules,omitempty"`
 	ActiveFaults map[string]*atroposdk.FaultRequest `json:"active_faults,omitempty"`
-	FreezeCfg   *atroposdk.DelayRequest `json:"freeze_cfg,omitempty"`
-	AppliedAt   time.Time               `json:"applied_at"`
-	RunID       string                  `json:"run_id,omitempty"`
+	FreezeCfg    *atroposdk.DelayRequest            `json:"freeze_cfg,omitempty"`
+	AppliedAt    time.Time                          `json:"applied_at"`
+	RunID        string                             `json:"run_id,omitempty"`
 }
 
 // IntentReader is the narrow read-only interface exposed to the register handler.

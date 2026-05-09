@@ -19,25 +19,25 @@ const (
 )
 
 type FaultConfig struct {
-	ID                 string            `json:"id"`
-	Name               string            `json:"name"`
-	Description        string            `json:"description,omitempty"`
-	Service            string            `json:"service"`
-	Category           string            `json:"category"`
-	FaultType          string            `json:"fault_type"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Service     string `json:"service"`
+	Category    string `json:"category"`
+	FaultType   string `json:"fault_type"`
 
 	// Exactly one of FaultReq or FaultCompositionID must be set.
-	FaultReq           json.RawMessage   `json:"fault_request,omitempty"`
-	FaultCompositionID *string           `json:"fault_composition_id,omitempty"` // J
+	FaultReq           json.RawMessage `json:"fault_request,omitempty"`
+	FaultCompositionID *string         `json:"fault_composition_id,omitempty"` // J
 
-	DurationMs         int64             `json:"duration_ms"` // 0 = infinite (whitelisted types only)
-	ExperimentRunID    *string           `json:"experiment_run_id,omitempty"`     // #2
+	DurationMs      int64   `json:"duration_ms"`                 // 0 = infinite (whitelisted types only)
+	ExperimentRunID *string `json:"experiment_run_id,omitempty"` // #2
 
-	Status             FaultConfigStatus `json:"status"`
-	CreatedAt          time.Time         `json:"created_at"`
-	UpdatedAt          time.Time         `json:"updated_at"`
-	FiredAt            *time.Time        `json:"fired_at,omitempty"`
-	CompletedAt        *time.Time        `json:"completed_at,omitempty"`
+	Status      FaultConfigStatus `json:"status"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+	FiredAt     *time.Time        `json:"fired_at,omitempty"`
+	CompletedAt *time.Time        `json:"completed_at,omitempty"`
 }
 
 func (f *FaultConfig) Validate() error {
@@ -92,15 +92,17 @@ func (f *FaultConfig) IsInfiniteAllowed(allowlist map[string]bool) bool {
 	}
 	return allowlist[f.ConflictKey()]
 }
+
 // DefaultInfiniteAllowed — fault types safe to fire with duration_ms = 0.
 // Operator config can override via a deployment-time map.
 //
 // Default-deny rationale:
-//   inline:hang        — every matching request hangs forever; caller queue
-//                        saturates in seconds.
-//   network:blackhole  — same shape, network layer.
-//   network:rst        — connection-reset storms; downstream retry
-//                        amplification.
+//
+//	inline:hang        — every matching request hangs forever; caller queue
+//	                     saturates in seconds.
+//	network:blackhole  — same shape, network layer.
+//	network:rst        — connection-reset storms; downstream retry
+//	                     amplification.
 var DefaultInfiniteAllowed = map[string]bool{
 	"inline:latency":   true,
 	"inline:error":     true,
