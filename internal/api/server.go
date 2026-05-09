@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -31,18 +32,20 @@ type ruleVersioner interface {
 type Server struct {
 	logger      *slog.Logger
 	db          *sql.DB
-	dbPing      dbPinger    // same as db; separate field so tests can inject a fake
+	dbPing      dbPinger // same as db; separate field so tests can inject a fake
 	rules       *store.RuleRepo
 	rulever     ruleVersioner // same as rules; separate field so tests can inject a fake
-	faults      *store.FaultRepo
-	faultStore  FaultStore
-	sdk         *store.SDKRepo
-	experiments *store.ExperimentRepo
+	faults       *store.FaultRepo
+	faultStore   FaultStore
+	faultConfigs *store.FaultConfigRepo
+	sdk          *store.SDKRepo
+	experiments  *store.ExperimentRepo
 	workloads   *store.WorkloadRepo
 	policies    *store.PolicyRepo
 	traces      *store.TraceRepo
 	zeus        *zeus.Client
 	intent      atrocontrol.IntentReader
+	controller  *atrocontrol.Controller
 	orch        *orchestrator.Orchestrator
 	cacheStore  *cachestore.Store
 	broker      *EventBroker
@@ -55,12 +58,14 @@ func NewServer(
 	rules *store.RuleRepo,
 	faults *store.FaultRepo,
 	faultStore FaultStore,
+	faultConfigs *store.FaultConfigRepo,
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
 	workloads *store.WorkloadRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
 	intent atrocontrol.IntentReader,
+	controller *atrocontrol.Controller,
 	orch *orchestrator.Orchestrator,
 	cs *cachestore.Store,
 	policies *store.PolicyRepo,
@@ -71,15 +76,17 @@ func NewServer(
 		dbPing:      db,
 		rules:       rules,
 		rulever:     rules,
-		faults:      faults,
-		faultStore:  faultStore,
-		sdk:         sdk,
-		experiments: experiments,
+		faults:       faults,
+		faultStore:   faultStore,
+		faultConfigs: faultConfigs,
+		sdk:          sdk,
+		experiments:  experiments,
 		workloads:   workloads,
 		policies:    policies,
 		traces:      traces,
 		zeus:        zeusClient,
 		intent:      intent,
+		controller:  controller,
 		orch:        orch,
 		cacheStore:  cs,
 		broker:      NewEventBroker(),
@@ -126,6 +133,13 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
 	mux.HandleFunc("DELETE /api/v1/faults/compositions/{id}", s.handleDeleteFaultComposition)
 
+	// Fault configs (long-running persistent faults)
+	mux.HandleFunc("POST /api/v1/faults/configs", s.handleCreateFaultConfig)
+	mux.HandleFunc("GET /api/v1/faults/configs", s.handleListFaultConfigs)
+	mux.HandleFunc("DELETE /api/v1/faults/configs/{id}", s.handleDeleteFaultConfig)
+	mux.HandleFunc("POST /api/v1/faults/configs/{id}/fire", s.handleFireFaultConfig)
+	mux.HandleFunc("POST /api/v1/faults/configs/{id}/cancel", s.handleCancelFaultConfig)
+
 	// Experiment CRUD + lifecycle
 	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)
 	mux.HandleFunc("GET /api/v1/experiments", s.handleListExperiments)
@@ -164,17 +178,33 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/cache/ingest", s.handleCacheIngest)
 	mux.HandleFunc("GET /api/v1/cache/entries", s.handleCacheEntries)
 
-	// Zeus proxy (pass-through to Archer for resources manteion doesn't own).
-	// Attacks are NOT proxied — they are orchestrator-managed. Operators interact
-	// with attacks through the experiment/run lifecycle endpoints above. Direct
-	// attack proxy would bypass orchestrator bookkeeping (poller state, result
-	// harvesting, run FSM transitions).
-	mux.HandleFunc("POST /api/v1/zeus/workloads", s.zeusProxy)
-	mux.HandleFunc("GET /api/v1/zeus/workloads", s.zeusProxy)
-	mux.HandleFunc("DELETE /api/v1/zeus/workloads/{id}", s.zeusProxy)
-	mux.HandleFunc("POST /api/v1/zeus/policies", s.zeusProxy)
-	mux.HandleFunc("GET /api/v1/zeus/policies", s.zeusProxy)
-	mux.HandleFunc("DELETE /api/v1/zeus/policies/{id}", s.zeusProxy)
+	// Zeus proxy — workflow lifecycle (register, validate, trigger runs, view status).
+	// Manteion owns experiment orchestration; zeus owns workflow execution.
+	// Attacks are NOT proxied — they are orchestrator-managed via typed client
+	// methods (StartAttack/StopAttack). Direct attack proxy would bypass
+	// orchestrator bookkeeping (poller state, result harvesting, run FSM).
+	mux.HandleFunc("POST /api/v1/zeus/workflows", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/workflows", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/workflows/{id}", s.zeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/workflows/{id}", s.zeusProxy)
+	mux.HandleFunc("POST /api/v1/zeus/workflows/{id}/validate", s.zeusProxy)
+	mux.HandleFunc("POST /api/v1/zeus/workflows/{id}/runs", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/workflows/{id}/runs", s.zeusProxy)
+
+	// Zeus proxy — run status (cross-workflow).
+	mux.HandleFunc("GET /api/v1/zeus/runs", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/runs/{run_id}", s.zeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/runs/{run_id}", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/runs/{run_id}/events", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/runs/{run_id}/stats", s.zeusProxy)
+
+	// Zeus proxy — datasets.
+	mux.HandleFunc("POST /api/v1/zeus/datasets", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/datasets", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/datasets/{id}", s.zeusProxy)
+	mux.HandleFunc("POST /api/v1/zeus/datasets/{id}/upload", s.zeusProxy)
+	mux.HandleFunc("GET /api/v1/zeus/datasets/{id}/sample", s.zeusProxy)
+	mux.HandleFunc("DELETE /api/v1/zeus/datasets/{id}", s.zeusProxy)
 }
 
 // --- JSON helpers ---
@@ -194,8 +224,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, ErrorResponse{Error: msg})
 }
 
+const maxBodySize = 1 << 20 // 1 MiB
+
 // readJSON decodes the request body into v.
 func readJSON(r *http.Request, v any) error {
 	defer r.Body.Close()
-	return json.NewDecoder(r.Body).Decode(v)
+	return json.NewDecoder(io.LimitReader(r.Body, maxBodySize)).Decode(v)
 }

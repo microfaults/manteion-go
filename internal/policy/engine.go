@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/conditions"
 	"manteion-go/internal/model"
@@ -22,7 +22,7 @@ const defaultTickInterval = 10 * time.Second
 // The engine decides what should happen; the caller (orchestrator loop)
 // is responsible for executing effects via atrocontrol.
 type Effect struct {
-	ActionType string   // "push_rules" or "clear_rules"
+	ActionType string // "push_rules" or "clear_rules"
 	Service    string
 	RuleIDs    []string // non-nil for push_rules; nil for clear_rules
 }

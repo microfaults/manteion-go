@@ -95,11 +95,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	faultConfigRepo := store.NewFaultConfigRepo(database)
+
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
-		ruleRepo, faultRepo, faultRepo, sdkRepo,
+		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, workloadRepo, traceRepo,
-		zeusClient, controller.IntentReader(), orch, cs, policyRepo,
+		zeusClient, controller.IntentReader(), controller, orch, cs, policyRepo,
 	)
 
 	httpServer := &http.Server{
@@ -112,6 +114,9 @@ func main() {
 
 	// Start policy engine as background goroutine.
 	go policyEngine.Run(ctx)
+
+	// Start fault config reaper background goroutine (runs every 5 seconds).
+	srv.StartFaultConfigReaper(ctx, 5*time.Second)
 
 	// Start server in a goroutine.
 	go func() {

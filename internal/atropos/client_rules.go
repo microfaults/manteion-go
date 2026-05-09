@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 func (c *Client) PostRules(ctx context.Context, addr string, rules []atroposdk.StaticRule) error {

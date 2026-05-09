@@ -53,6 +53,7 @@ func truncateAll(conn *sql.DB) {
 		"policy_rules",
 		"sdk_instances",
 		"rules",
+		"fault_configs",
 		"fault_compositions",
 		"fault_specs",
 		"workloads",

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 func (c *Client) PostCacheBoxDelay(ctx context.Context, addr string, req atroposdk.DelayRequest) error {
@@ -31,7 +31,7 @@ func (c *Client) ClearCacheBox(ctx context.Context, addr string) error {
 	return err
 }
 
-func (c *Client) PostCacheEntries(ctx context.Context, addr string, entries []*atroposdk.CacheBoxEntry) error {
+func (c *Client) PostCacheEntries(ctx context.Context, addr string, entries []atroposdk.CacheBoxWireEntry) error {
 	_, err := c.doExpectStatus(ctx, http.MethodPost, addr+"/admin/cachebox/entries", entries, http.StatusNoContent)
 	return err
 }

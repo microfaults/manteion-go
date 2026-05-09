@@ -10,11 +10,11 @@ import (
 // Flow is a k6 flow definition. Steps/thresholds stored as opaque JSON
 // since k6 consumes these directly.
 type Flow struct {
-	ID                string          `json:"id"`
-	Name              string          `json:"name"`
-	Description       string          `json:"description,omitempty"`
-	Targets           []string        `json:"targets"`
-	EstimatedRPSPerVU float64         `json:"estimated_rps_per_vu"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Description       string   `json:"description,omitempty"`
+	Targets           []string `json:"targets"`
+	EstimatedRPSPerVU float64  `json:"estimated_rps_per_vu"`
 	// Steps is a DSL v2 workflow tree (sequence/parallel/delay/optional/request nodes).
 	// Stored opaquely -- k6 parses this at runtime. Tree nodes may reference persona
 	// keys (e.g., "persona_key": "explore_prob" on optional nodes, or think-time

@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 // fakeAtroposAdmin builds an httptest server that mimics atropos admin handlers.
@@ -26,6 +26,7 @@ func fakeAtroposAdmin(t *testing.T) *httptest.Server {
 
 	mux := http.NewServeMux()
 	mux.Handle("/admin/fault", faultHandler)
+	mux.Handle("/admin/fault/", faultHandler)
 	mux.Handle("/admin/rules", rulesHandler)
 	mux.Handle("/admin/cachebox", cacheboxHandler)
 	mux.Handle("/admin/cachebox/", cacheboxHandler)
@@ -45,22 +46,23 @@ func TestFaultRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFault: %v", err)
 	}
-	if status.Active {
+	if len(status.Faults) > 0 {
 		t.Fatal("expected inactive initially")
 	}
 
 	// POST a latency fault
 	postStatus, err := c.PostFault(ctx, srv.URL, atroposdk.FaultRequest{
-		Type:  "latency",
-		Delay: "100ms",
+		Category: "inline",
+		Type:     "latency",
+		Config:   []byte(`{"delay":"100ms"}`),
 	})
 	if err != nil {
 		t.Fatalf("PostFault: %v", err)
 	}
-	if !postStatus.Active {
-		t.Fatal("expected active after POST")
+	if len(postStatus.Faults) == 0 {
+		t.Fatal("expected active faults after POST")
 	}
-	if postStatus.Fault == nil || postStatus.Fault.Type != "latency" {
+	if postStatus.Faults[0].Type != "latency" {
 		t.Fatal("expected latency fault in response")
 	}
 
@@ -69,12 +71,12 @@ func TestFaultRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFault after POST: %v", err)
 	}
-	if !status.Active {
-		t.Fatal("expected active after POST")
+	if len(status.Faults) == 0 {
+		t.Fatal("expected active faults after POST")
 	}
 
 	// DELETE
-	if err := c.DeleteFault(ctx, srv.URL); err != nil {
+	if err := c.DeleteFault(ctx, srv.URL, "inline"); err != nil {
 		t.Fatalf("DeleteFault: %v", err)
 	}
 
@@ -83,7 +85,7 @@ func TestFaultRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFault after DELETE: %v", err)
 	}
-	if status.Active {
+	if len(status.Faults) > 0 {
 		t.Fatal("expected inactive after DELETE")
 	}
 }

@@ -57,6 +57,15 @@ CREATE INDEX IF NOT EXISTS idx_service_run_results_run
     ON service_run_results(experiment_run_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_run_results_run
     ON workflow_run_results(experiment_run_id);
+CREATE TABLE IF NOT EXISTS policy_rules (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    condition   JSONB NOT NULL,
+    action      JSONB NOT NULL,
+    cooldown_ns BIGINT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE INDEX IF NOT EXISTS idx_policy_rules_enabled
     ON policy_rules(id) WHERE enabled = true;
 `},
@@ -69,6 +78,58 @@ CREATE INDEX IF NOT EXISTS idx_experiment_runs_depends_on
 	{11, "add experiment_run persist_cache opt-in flag", `
 ALTER TABLE experiment_runs
     ADD COLUMN IF NOT EXISTS persist_cache BOOLEAN NOT NULL DEFAULT FALSE;
+`},
+	{12, "add fault_configs table", `
+CREATE TABLE IF NOT EXISTS fault_configs (
+    id                   TEXT        PRIMARY KEY,
+    name                 TEXT        NOT NULL,
+    description          TEXT        NOT NULL DEFAULT '',
+    service              TEXT        NOT NULL,
+    category             TEXT        NOT NULL CHECK (category IN ('inline','network','resource')),
+    fault_type           TEXT        NOT NULL,
+    fault_request        JSONB,
+    fault_composition_id TEXT        NULL REFERENCES fault_compositions(id) ON DELETE SET NULL,
+    duration_ms          BIGINT      NOT NULL DEFAULT 0,
+    experiment_run_id    TEXT        NULL REFERENCES experiment_runs(id) ON DELETE SET NULL,
+    status               TEXT        NOT NULL DEFAULT 'ready'
+                         CHECK (status IN ('ready','active','completed','manually_cancelled','failed')),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    fired_at             TIMESTAMPTZ,
+    completed_at         TIMESTAMPTZ,
+    CONSTRAINT fault_request_or_composition CHECK (
+        (fault_request IS NOT NULL) OR (fault_composition_id IS NOT NULL)
+    )
+);
+
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS fault_composition_id TEXT NULL REFERENCES fault_compositions(id) ON DELETE SET NULL;
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS duration_ms BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS experiment_run_id TEXT NULL REFERENCES experiment_runs(id) ON DELETE SET NULL;
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ready';
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS fired_at TIMESTAMPTZ;
+ALTER TABLE fault_configs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+-- Re-apply constraints if they might be missing
+ALTER TABLE fault_configs DROP CONSTRAINT IF EXISTS fault_configs_category_check;
+ALTER TABLE fault_configs ADD CONSTRAINT fault_configs_category_check CHECK (category IN ('inline','network','resource'));
+ALTER TABLE fault_configs DROP CONSTRAINT IF EXISTS fault_configs_status_check;
+ALTER TABLE fault_configs ADD CONSTRAINT fault_configs_status_check CHECK (status IN ('ready','active','completed','manually_cancelled','failed'));
+ALTER TABLE fault_configs DROP CONSTRAINT IF EXISTS fault_request_or_composition;
+ALTER TABLE fault_configs ADD CONSTRAINT fault_request_or_composition CHECK ((fault_request IS NOT NULL) OR (fault_composition_id IS NOT NULL));
+
+CREATE INDEX IF NOT EXISTS idx_fault_configs_service
+    ON fault_configs(service);
+CREATE INDEX IF NOT EXISTS idx_fault_configs_status
+    ON fault_configs(status);
+CREATE INDEX IF NOT EXISTS idx_fault_configs_experiment_run
+    ON fault_configs(experiment_run_id) WHERE experiment_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_fault_configs_reaper
+    ON fault_configs(fired_at) WHERE status = 'active' AND duration_ms > 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fault_conflict
+    ON fault_configs(service, category) WHERE status = 'active';
 `},
 }
 
@@ -306,12 +367,56 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
     run_index       INT NOT NULL,
     frozen_services JSONB,
     meta_trace_id   TEXT NOT NULL,
-    status          TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+    status          TEXT NOT NULL CHECK (status IN ('pending','running','paused','completed','failed')),
     node_placement  JSONB,
+    depends_on      JSONB NOT NULL DEFAULT '[]',
+    persist_cache   BOOLEAN NOT NULL DEFAULT FALSE,
+    phase_rules     JSONB NOT NULL DEFAULT '[]',
+    transition_cond JSONB,
+    current_phase   INTEGER NOT NULL DEFAULT 0,
+    zeus_attack_id  TEXT,
+    workload_ids    JSONB,
+    zeus_attack_ids JSONB,
     started_at      TIMESTAMPTZ,
     completed_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ========== FAULT CONFIG DOMAIN ==========
+
+CREATE TABLE IF NOT EXISTS fault_configs (
+    id                   TEXT        PRIMARY KEY,
+    name                 TEXT        NOT NULL,
+    description          TEXT        NOT NULL DEFAULT '',
+    service              TEXT        NOT NULL,
+    category             TEXT        NOT NULL CHECK (category IN ('inline','network','resource')),
+    fault_type           TEXT        NOT NULL,
+    fault_request        JSONB,
+    fault_composition_id TEXT        NULL REFERENCES fault_compositions(id) ON DELETE SET NULL,
+    duration_ms          BIGINT      NOT NULL DEFAULT 0,
+    experiment_run_id    TEXT        NULL REFERENCES experiment_runs(id) ON DELETE SET NULL,
+    status               TEXT        NOT NULL DEFAULT 'ready'
+                         CHECK (status IN ('ready','active','completed','manually_cancelled','failed')),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    fired_at             TIMESTAMPTZ,
+    completed_at         TIMESTAMPTZ,
+    CONSTRAINT fault_request_or_composition CHECK (
+        (fault_request IS NOT NULL) OR (fault_composition_id IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_fault_configs_service
+    ON fault_configs(service);
+CREATE INDEX IF NOT EXISTS idx_fault_configs_status
+    ON fault_configs(status);
+CREATE INDEX IF NOT EXISTS idx_fault_configs_experiment_run
+    ON fault_configs(experiment_run_id) WHERE experiment_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_fault_configs_reaper
+    ON fault_configs(fired_at) WHERE status = 'active' AND duration_ms > 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fault_conflict
+    ON fault_configs(service, category) WHERE status = 'active';
 
 -- Deferred FK from attacks to experiment_runs.
 ALTER TABLE attacks

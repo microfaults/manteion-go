@@ -604,4 +604,3 @@ func TestFullCycle_PauseResumeThenStop(t *testing.T) {
 	}
 	assertRunStatus(t, ctx, run.ID, "completed")
 }
-

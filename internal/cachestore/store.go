@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 // Store manages NDJSON cache files rooted at a configurable directory.
@@ -52,9 +52,7 @@ func (s *Store) lockFor(key string) *sync.Mutex {
 // Write appends entries for a (runID, service) pair to the corresponding .jsonl
 // file. Safe to call concurrently for different pairs; calls for the same pair
 // are serialized internally so JSON lines never interleave.
-// Entries are pointers because atroposdk.CacheBoxEntry contains atomic.Int64
-// (HitCount) and is not safe to copy.
-func (s *Store) Write(runID, service string, entries []*atroposdk.CacheBoxEntry) error {
+func (s *Store) Write(runID, service string, entries []atroposdk.CacheBoxWireEntry) error {
 	key := runID + "/" + service
 	l := s.lockFor(key)
 	l.Lock()
@@ -82,7 +80,7 @@ func (s *Store) Write(runID, service string, entries []*atroposdk.CacheBoxEntry)
 
 // Read returns all entries stored for a (runID, service) pair.
 // Returns nil, nil if no file exists yet.
-func (s *Store) Read(runID, service string) ([]*atroposdk.CacheBoxEntry, error) {
+func (s *Store) Read(runID, service string) ([]atroposdk.CacheBoxWireEntry, error) {
 	path := filepath.Join(s.root, runID, service+".jsonl")
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -93,11 +91,11 @@ func (s *Store) Read(runID, service string) ([]*atroposdk.CacheBoxEntry, error) 
 	}
 	defer f.Close()
 
-	var entries []*atroposdk.CacheBoxEntry
+	var entries []atroposdk.CacheBoxWireEntry
 	dec := json.NewDecoder(f)
 	for dec.More() {
-		e := new(atroposdk.CacheBoxEntry)
-		if err := dec.Decode(e); err != nil {
+		var e atroposdk.CacheBoxWireEntry
+		if err := dec.Decode(&e); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)

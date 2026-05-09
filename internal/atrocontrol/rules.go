@@ -3,7 +3,7 @@ package atrocontrol
 import (
 	"context"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 func (c *Controller) PushRules(ctx context.Context, service string, rules []atroposdk.StaticRule, opts ...CallOption) (FanoutResult, error) {

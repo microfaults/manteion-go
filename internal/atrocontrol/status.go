@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 type ServiceStatus struct {

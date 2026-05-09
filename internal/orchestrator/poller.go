@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	zeusPollingInterval = 15 * time.Second
+	zeusPollingInterval    = 15 * time.Second
 	defaultMaxPollDuration = 30 * time.Minute
 )
 

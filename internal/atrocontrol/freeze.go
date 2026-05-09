@@ -3,7 +3,7 @@ package atrocontrol
 import (
 	"context"
 
-	atroposdk "atropos-go"
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
 
 func (c *Controller) FreezeService(ctx context.Context, service string, cfg atroposdk.DelayRequest, opts ...CallOption) (FanoutResult, error) {
