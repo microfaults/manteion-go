@@ -34,7 +34,13 @@ func (c *Client) GetFault(ctx context.Context, addr string) (atroposdk.FaultStat
 	return status, nil
 }
 
-func (c *Client) DeleteFault(ctx context.Context, addr string) error {
+func (c *Client) DeleteFault(ctx context.Context, addr, category string) error {
+	path := "/admin/fault/" + category // Should url-escape, but standard categories are safe.
+	_, err := c.doExpectStatus(ctx, http.MethodDelete, addr+path, nil, http.StatusOK)
+	return err
+}
+
+func (c *Client) DeleteAllFaults(ctx context.Context, addr string) error {
 	_, err := c.doExpectStatus(ctx, http.MethodDelete, addr+"/admin/fault", nil, http.StatusOK)
 	return err
 }

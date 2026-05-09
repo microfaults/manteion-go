@@ -45,8 +45,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			if intent.Rules != nil {
 				resp["rules"] = intent.Rules
 			}
-			if intent.ActiveFault != nil {
-				resp["active_fault"] = intent.ActiveFault
+			if len(intent.ActiveFaults) > 0 {
+				var faults []any
+				for _, req := range intent.ActiveFaults {
+					faults = append(faults, req)
+				}
+				resp["active_faults"] = faults
 			}
 			if intent.FreezeCfg != nil {
 				resp["freeze_cfg"] = intent.FreezeCfg

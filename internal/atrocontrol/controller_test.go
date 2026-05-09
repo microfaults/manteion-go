@@ -52,6 +52,7 @@ func setupAtroposServers(t *testing.T, n int) []string {
 
 		mux := http.NewServeMux()
 		mux.Handle("/admin/fault", atroposdk.FaultAdminHandler())
+		mux.Handle("/admin/fault/", atroposdk.FaultAdminHandler())
 		mux.Handle("/admin/rules", atroposdk.RulesAdminHandler(eval))
 		mux.Handle("/admin/cachebox", atroposdk.CacheBoxAdminHandler(cb))
 		mux.Handle("/admin/cachebox/", atroposdk.CacheBoxAdminHandler(cb))
@@ -149,7 +150,9 @@ func TestInjectFaultFanout(t *testing.T) {
 	ctx := context.Background()
 
 	result, err := ctrl.InjectFault(ctx, "productcatalog", atroposdk.FaultRequest{
-		Type: "latency", Delay: "200ms",
+		Category: "inline",
+		Type:     "latency",
+		Config:   []byte(`{"delay":"200ms"}`),
 	})
 	if err != nil {
 		t.Fatalf("InjectFault: %v", err)
@@ -160,7 +163,7 @@ func TestInjectFaultFanout(t *testing.T) {
 
 	// Verify intent.
 	intent, ok := ctrl.IntentReader().Get("productcatalog")
-	if !ok || intent.ActiveFault == nil {
+	if !ok || len(intent.ActiveFaults) == 0 {
 		t.Fatal("expected fault intent to be set")
 	}
 }
@@ -184,7 +187,9 @@ func TestPartialFailure(t *testing.T) {
 	ctrl = New(tx, resolver, WithDefaultTimeout(1*time.Second))
 
 	result, err := ctrl.InjectFault(ctx, "frontend", atroposdk.FaultRequest{
-		Type: "error", StatusCode: 503, Message: "down",
+		Category: "inline",
+		Type:     "error",
+		Config:   []byte(`{"status_code":503,"message":"down"}`),
 	})
 	if err != nil {
 		t.Fatalf("InjectFault: %v", err)
