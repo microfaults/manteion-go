@@ -61,8 +61,8 @@ type FaultSpec struct {
 
 var validFaultTypes = map[string][]string{
 	"inline":   {"error", "hang", "latency"},
-	"network":  {"blackhole", "drip", "latency", "loss", "rst", "throttle"},
-	"resource": {"cpu", "memory", "io"},
+	"network":  {"blackhole", "drip", "latency", "retransmit_delay", "rst", "throttle"},
+	"resource": {"cpu", "disk", "io", "memory"},
 }
 
 func (f *FaultSpec) Validate() error {
@@ -186,7 +186,7 @@ func DefaultIncompatibilities() []FaultIncompatibility {
 			Reason: "both block the request; redundant",
 		},
 		{
-			FaultTypeA: "network:loss", FaultTypeB: "network:rst",
+			FaultTypeA: "network:retransmit_delay", FaultTypeB: "network:rst",
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "both can reset connection; intent is ambiguous",
 		},

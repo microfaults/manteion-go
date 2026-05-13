@@ -4,7 +4,7 @@ Manteion is the central coordination controller for the atropos ecosystem. It tu
 
 ## Ecosystem
 
-- **atropos-go** — Fault injection + OTel instrumentation SDK embedded in each service. Core interface: `Evaluator.Evaluate(ctx, Request) *Decision`. Three fault categories: inline (error/hang/latency), network (blackhole/drip/latency/loss/rst/throttle), resource (cpu/memory/io). Always-on tracing with `atropos.*` span attributes.
+- **atropos-go** — Fault injection + OTel instrumentation SDK embedded in each service. Core interface: `Evaluator.Evaluate(ctx, Request) *Decision`. Three fault categories: inline (error/hang/latency), network (blackhole/drip/latency/retransmit_delay/rst/throttle), resource (cpu/disk/io/memory). Always-on tracing with `atropos.*` span attributes.
 - **zeus-go** — Load generation platform. Archer REST API orchestrates k6 workloads (broad traffic) and vegeta attacks (precision endpoint loads). After policy migration to manteion, Archer is a pure execution engine.
 - **service-beds** — Go HTTP recreations of Google's Online Boutique (13 services) with OTel + atropos instrumentation. Deployed via Skaffold/Kubernetes.
 - **manteion-go** (this repo) — Sits between SDKs (atropos-go) and load gen (zeus-go). Pushes evaluator rules and cache-box mode changes to SDK instances. Orchestrates experiments. Owns policy evaluation.
