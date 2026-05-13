@@ -577,66 +577,49 @@ func (o *Orchestrator) StopRun(ctx context.Context, runID string, status string)
 	return nil
 }
 
-// startZeusAttacks launches a Zeus attack for each workload associated with the run.
-// It uses run.WorkloadIDs if set, falling back to the experiment's PrimaryWorkloadID.
-// Returns all started attack IDs (may be empty if no workload is configured).
+// startZeusAttacks launches a Zeus attack using the experiment's attack config.
+// Returns all started attack IDs (may be empty if no attack config is set).
 func (o *Orchestrator) startZeusAttacks(ctx context.Context, run *model.ExperimentRun) ([]string, error) {
-	workloadIDs := run.WorkloadIDs
-	if len(workloadIDs) == 0 {
-		exp, err := o.experiments.Get(ctx, run.ExperimentID)
-		if err != nil {
-			return nil, fmt.Errorf("get experiment: %w", err)
-		}
-		if exp.PrimaryWorkloadID == "" {
-			return nil, nil
-		}
-		workloadIDs = []string{exp.PrimaryWorkloadID}
+	exp, err := o.experiments.Get(ctx, run.ExperimentID)
+	if err != nil {
+		return nil, fmt.Errorf("get experiment: %w", err)
+	}
+	if exp.TargetURL == "" {
+		return nil, nil
 	}
 
-	var attackIDs []string
-	for _, wlID := range workloadIDs {
-		id, err := o.startOneAttack(ctx, run, wlID)
-		if err != nil {
-			o.logger.Warn("orchestrator: start attack for workload failed",
-				"run_id", run.ID, "workload_id", wlID, "error", err)
-			continue
-		}
-		attackIDs = append(attackIDs, id)
+	id, err := o.startOneAttack(ctx, run, exp)
+	if err != nil {
+		o.logger.Warn("orchestrator: start attack failed",
+			"run_id", run.ID, "error", err)
+		return nil, err
 	}
-	return attackIDs, nil
+	return []string{id}, nil
 }
 
-func (o *Orchestrator) startOneAttack(ctx context.Context, run *model.ExperimentRun, workloadID string) (string, error) {
-	workload, err := o.workloads.GetWorkload(ctx, workloadID)
-	if err != nil {
-		return "", fmt.Errorf("get workload %q: %w", workloadID, err)
-	}
-	flow, err := o.workloads.GetFlow(ctx, workload.FlowID)
-	if err != nil {
-		return "", fmt.Errorf("get flow %q: %w", workload.FlowID, err)
-	}
-	if len(flow.Targets) == 0 {
-		return "", fmt.Errorf("flow %q has no targets", flow.ID)
-	}
-
-	// Generate the attack ID locally and persist BEFORE calling Zeus so a
-	// crash mid-flight leaves a known correlation ID to reconcile against.
-	// Zeus is expected to honor this ID (de-dupe on conflict for retries).
+func (o *Orchestrator) startOneAttack(ctx context.Context, run *model.ExperimentRun, exp *model.Experiment) (string, error) {
 	attackID := uuid.NewString()
 	if err := o.experiments.AppendRunAttackID(ctx, run.ID, attackID); err != nil {
 		return "", fmt.Errorf("persist attack id: %w", err)
 	}
 
+	method := exp.TargetMethod
+	if method == "" {
+		method = "GET"
+	}
+	duration := fmt.Sprintf("%ds", exp.DurationSec)
+	if exp.DurationSec <= 0 {
+		duration = "30s"
+	}
+
 	zeusID, err := o.zeusClient.StartAttack(ctx, zeus.AttackRequest{
-		ID:           attackID,
-		WorkloadID:   workload.ID,
-		Service:      flow.Targets[0],
-		Role:         "primary",
-		TargetURL:    flow.Targets[0],
-		TargetMethod: "GET",
-		Rate:         int(workload.Rate),
-		DurationMs:   0,
-		MetaTraceID:  run.MetaTraceID,
+		ID:            attackID,
+		Target:        zeus.AttackTargetSpec{URL: exp.TargetURL, Method: method},
+		Rate:          exp.Rate,
+		Duration:      duration,
+		MetaTraceID:   run.MetaTraceID,
+		ExperimentID:  exp.ID,
+		WorkflowLabel: exp.PrimaryWorkflowID,
 	})
 	if err != nil {
 		return "", err

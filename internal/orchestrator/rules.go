@@ -2,17 +2,15 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/ruleconv"
 )
 
 // loadCompiledRules fetches rules by ID, resolves fault specs via ruleconv,
-// and returns StaticRules ready for atrocontrol.PushRules.
+// and returns CompiledRules in wire format ready for atrocontrol.PushRules.
 // An empty or nil ruleIDs slice returns nil (clears rules on the target service).
-func (o *Orchestrator) loadCompiledRules(ctx context.Context, ruleIDs []string) ([]atroposdk.StaticRule, error) {
+func (o *Orchestrator) loadCompiledRules(ctx context.Context, ruleIDs []string) ([]ruleconv.CompiledRule, error) {
 	if len(ruleIDs) == 0 {
 		return nil, nil
 	}
@@ -32,19 +30,9 @@ func (o *Orchestrator) loadCompiledRules(ctx context.Context, ruleIDs []string) 
 		modelRules = append(modelRules, &compiled)
 	}
 
-	// JSON roundtrip: ruleconv.CompiledRule → atroposdk.CompiledRule (same wire schema).
-	data, err := json.Marshal(modelRules)
-	if err != nil {
-		return nil, fmt.Errorf("marshal compiled rules: %w", err)
+	out := make([]ruleconv.CompiledRule, len(modelRules))
+	for i, cr := range modelRules {
+		out[i] = *cr
 	}
-	var sdkCompiled []atroposdk.CompiledRule
-	if err := json.Unmarshal(data, &sdkCompiled); err != nil {
-		return nil, fmt.Errorf("unmarshal compiled rules: %w", err)
-	}
-
-	staticRules, err := atroposdk.DecodeCompiledRules(sdkCompiled)
-	if err != nil {
-		return nil, fmt.Errorf("decode compiled rules: %w", err)
-	}
-	return staticRules, nil
+	return out, nil
 }

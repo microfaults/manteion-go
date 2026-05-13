@@ -70,6 +70,87 @@ CREATE INDEX IF NOT EXISTS idx_experiment_runs_depends_on
 ALTER TABLE experiment_runs
     ADD COLUMN IF NOT EXISTS persist_cache BOOLEAN NOT NULL DEFAULT FALSE;
 `},
+	{12, "add rule action_type and cachebox columns", `
+ALTER TABLE rules
+    ADD COLUMN IF NOT EXISTS action_type          TEXT NOT NULL DEFAULT 'fault_spec',
+    ADD COLUMN IF NOT EXISTS cachebox_mode         TEXT,
+    ADD COLUMN IF NOT EXISTS cachebox_key_strategy  TEXT;
+
+UPDATE rules SET action_type = 'fault_composition' WHERE fault_composition_id IS NOT NULL;
+
+DO $$
+DECLARE
+    con_name TEXT;
+BEGIN
+    SELECT conname INTO con_name
+    FROM pg_constraint
+    WHERE conrelid = 'rules'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%fault_spec_id IS NOT NULL AND fault_composition_id IS NULL%';
+    IF con_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE rules DROP CONSTRAINT %I', con_name);
+    END IF;
+END $$;
+
+ALTER TABLE rules ADD CONSTRAINT rules_action_check CHECK (
+    CASE action_type
+        WHEN 'fault_spec'        THEN fault_spec_id IS NOT NULL AND fault_composition_id IS NULL AND cachebox_mode IS NULL
+        WHEN 'fault_composition' THEN fault_composition_id IS NOT NULL AND fault_spec_id IS NULL AND cachebox_mode IS NULL
+        WHEN 'cachebox'          THEN cachebox_mode IS NOT NULL AND fault_spec_id IS NULL AND fault_composition_id IS NULL
+    END
+);
+
+ALTER TABLE rules ALTER COLUMN fault_spec_id DROP NOT NULL;
+ALTER TABLE rules ALTER COLUMN fault_composition_id DROP NOT NULL;
+`},
+	{13, "remove transitional workload models and slim attacks", `
+-- Drop FK references before dropping tables.
+ALTER TABLE attacks DROP CONSTRAINT IF EXISTS attacks_workload_id_fkey;
+ALTER TABLE experiments DROP CONSTRAINT IF EXISTS experiments_primary_workload_id_fkey;
+
+-- Slim attacks: remove transitional columns, add zeus_attack_id.
+ALTER TABLE attacks
+    DROP COLUMN IF EXISTS workload_id,
+    DROP COLUMN IF EXISTS auto_rule_id,
+    DROP COLUMN IF EXISTS role,
+    DROP COLUMN IF EXISTS status,
+    DROP COLUMN IF EXISTS started_at,
+    ADD COLUMN IF NOT EXISTS zeus_attack_id TEXT;
+
+-- Drop role/status CHECK constraints (auto-named).
+DO $$
+DECLARE
+    con_name TEXT;
+BEGIN
+    FOR con_name IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'attacks'::regclass
+          AND contype = 'c'
+          AND (pg_get_constraintdef(oid) LIKE '%role%' OR pg_get_constraintdef(oid) LIKE '%status%')
+    LOOP
+        EXECUTE format('ALTER TABLE attacks DROP CONSTRAINT IF EXISTS %I', con_name);
+    END LOOP;
+END $$;
+
+-- Rename experiment columns.
+ALTER TABLE experiments RENAME COLUMN primary_workload_id TO primary_workflow_id;
+ALTER TABLE experiment_runs RENAME COLUMN workload_ids TO workflow_ids;
+
+-- Drop FK on primary_workflow_id (it pointed at workloads; now references zeus workflow IDs).
+ALTER TABLE experiments DROP CONSTRAINT IF EXISTS experiments_primary_workload_id_fkey;
+
+-- Now safe to drop tables.
+DROP TABLE IF EXISTS workloads;
+DROP TABLE IF EXISTS personas;
+DROP TABLE IF EXISTS flows;
+`},
+	{14, "add experiment attack config columns", `
+ALTER TABLE experiments
+    ADD COLUMN IF NOT EXISTS target_url     TEXT,
+    ADD COLUMN IF NOT EXISTS target_method  TEXT,
+    ADD COLUMN IF NOT EXISTS rate           INT,
+    ADD COLUMN IF NOT EXISTS duration_sec   INT;
+`},
 }
 
 // Migrate applies any pending migrations to the database.

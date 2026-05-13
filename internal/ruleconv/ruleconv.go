@@ -21,6 +21,8 @@ type FaultCompositionResolver interface {
 // It inlines fault config so the SDK can construct evaluator rules
 // without additional lookups. This exists because atroposdk.StaticRule's
 // Decision.Fault is a Go interface that can't survive JSON roundtrip.
+//
+// Exactly one of Fault, Composition, or CacheBox must be set.
 type CompiledRule struct {
 	Name           string               `json:"name"`
 	InjectionPoint string               `json:"injection_point,omitempty"`
@@ -29,6 +31,13 @@ type CompiledRule struct {
 	Priority       int                  `json:"priority"`
 	Fault          *CompiledFault       `json:"fault,omitempty"`
 	Composition    *CompiledComposition `json:"composition,omitempty"`
+	CacheBox       *CompiledCacheBox    `json:"cachebox,omitempty"`
+}
+
+// CompiledCacheBox is a resolved cache-box action for a rule.
+type CompiledCacheBox struct {
+	Mode        string `json:"mode"`         // "passthrough" | "replay" | "replay_with_delay"
+	KeyStrategy string `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
 }
 
 // CompiledFault is a resolved FaultSpec with config inlined.
@@ -99,23 +108,29 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 		Priority:       r.Priority,
 	}
 
-	switch {
-	case r.FaultSpecID != "":
-		f, err := resolveSpec(r.FaultSpecID, specs)
+	switch r.Action.Type {
+	case "fault_spec":
+		f, err := resolveSpec(r.Action.FaultSpecID, specs)
 		if err != nil {
 			return CompiledRule{}, fmt.Errorf("rule %q: %w", r.ID, err)
 		}
 		cr.Fault = f
 
-	case r.FaultCompositionID != "":
+	case "fault_composition":
 		if comps == nil {
-			return CompiledRule{}, fmt.Errorf("rule %q: composition resolver required for FaultCompositionID", r.ID)
+			return CompiledRule{}, fmt.Errorf("rule %q: composition resolver required for fault_composition", r.ID)
 		}
-		cc, err := resolveComposition(r.FaultCompositionID, specs, comps, 0)
+		cc, err := resolveComposition(r.Action.FaultCompID, specs, comps, 0)
 		if err != nil {
 			return CompiledRule{}, fmt.Errorf("rule %q: %w", r.ID, err)
 		}
 		cr.Composition = cc
+
+	case "cachebox":
+		cr.CacheBox = &CompiledCacheBox{
+			Mode:        r.Action.CacheBox.Mode,
+			KeyStrategy: r.Action.CacheBox.KeyStrategy,
+		}
 	}
 
 	return cr, nil

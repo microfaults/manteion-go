@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+	"manteion-go/internal/ruleconv"
 )
 
 // fakeAtroposAdmin builds an httptest server that mimics atropos admin handlers.
@@ -102,11 +103,12 @@ func TestRulesRoundtrip(t *testing.T) {
 		t.Fatalf("expected 0 rules, got %d", len(rules))
 	}
 
-	// POST rules
-	want := []atroposdk.StaticRule{
-		{Name: "freeze-productcatalog", Point: atroposdk.Egress},
+	// POST rules (now accepts CompiledRule wire format)
+	compiled := []ruleconv.CompiledRule{
+		{Name: "freeze-productcatalog", InjectionPoint: "egress", Mode: "inline",
+			CacheBox: &ruleconv.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}},
 	}
-	if err := c.PostRules(ctx, srv.URL, want); err != nil {
+	if err := c.PostRules(ctx, srv.URL, compiled); err != nil {
 		t.Fatalf("PostRules: %v", err)
 	}
 

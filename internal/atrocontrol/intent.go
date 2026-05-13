@@ -5,10 +5,11 @@ import (
 	"time"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+	"manteion-go/internal/ruleconv"
 )
 
 type ServiceIntent struct {
-	Rules       []atroposdk.StaticRule  `json:"rules,omitempty"`
+	Rules       []ruleconv.CompiledRule `json:"rules,omitempty"`
 	ActiveFault *atroposdk.FaultRequest `json:"active_fault,omitempty"`
 	FreezeCfg   *atroposdk.DelayRequest `json:"freeze_cfg,omitempty"`
 	AppliedAt   time.Time               `json:"applied_at"`

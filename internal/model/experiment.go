@@ -27,18 +27,23 @@ type PhaseRuleSet struct {
 // runs' FrozenServices and each cache-box's Mode — there is no separate
 // "type" discriminator.
 //
-// PrimaryWorkloadID identifies the workflow being measured (e.g. checkout at 50 RPS).
-// Background workloads (interference sources) are captured per-run via Attack
-// entities with Role="background", allowing load to vary across runs.
+// PrimaryWorkflowID identifies the zeus workflow being measured.
 type Experiment struct {
 	ID                string     `json:"id"`
 	Name              string     `json:"name"`
 	Description       string     `json:"description,omitempty"`
-	PrimaryWorkloadID string     `json:"primary_workload_id"`
+	PrimaryWorkflowID string     `json:"primary_workflow_id"`
 	Status            string     `json:"status"`
 	CreatedAt         time.Time  `json:"created_at"`
 	StartedAt         *time.Time `json:"started_at,omitempty"`
 	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+
+	// Attack config for load generation. Used by the orchestrator to build
+	// zeus attack requests. Optional — if empty, no attacks are launched.
+	TargetURL    string `json:"target_url,omitempty"`
+	TargetMethod string `json:"target_method,omitempty"`
+	Rate         int    `json:"rate,omitempty"`
+	DurationSec  int    `json:"duration_sec,omitempty"`
 }
 
 var validExperimentStatuses = map[string]bool{
@@ -52,8 +57,8 @@ func (e *Experiment) Validate() error {
 	if e.Name == "" {
 		return errors.New("experiment: name required")
 	}
-	if e.PrimaryWorkloadID == "" {
-		return errors.New("experiment: primary_workload_id required")
+	if e.PrimaryWorkflowID == "" {
+		return errors.New("experiment: primary_workflow_id required")
 	}
 	if !validExperimentStatuses[e.Status] {
 		return fmt.Errorf("experiment: invalid status %q", e.Status)
@@ -100,8 +105,8 @@ type ExperimentRun struct {
 	PersistCache bool `json:"persist_cache,omitempty"`
 	// ZeusAttackID is the primary Zeus attack ID (first/only for single-workflow runs).
 	ZeusAttackID string `json:"zeus_attack_id,omitempty"`
-	// WorkloadIDs lists workloads to drive for this run; falls back to Experiment.PrimaryWorkloadID if empty.
-	WorkloadIDs []string `json:"workload_ids,omitempty"`
+	// WorkflowIDs lists zeus workflows to drive for this run; falls back to Experiment.PrimaryWorkflowID if empty.
+	WorkflowIDs []string `json:"workflow_ids,omitempty"`
 	// ZeusAttackIDs holds all attack IDs for multi-workflow runs.
 	ZeusAttackIDs []string `json:"zeus_attack_ids,omitempty"`
 }

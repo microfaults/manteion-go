@@ -12,12 +12,11 @@ import (
 	"manteion-go/internal/store"
 )
 
-// handleCreateRule creates a new fault injection rule.
+// handleCreateRule creates a new rule (fault injection or cache-box).
 //
 // @Summary      Create rule
-// @Description  Persist a new rule. The store layer validates the rule per
-// @Description  model.Rule.Validate() (id/name/service required, exactly one of
-// @Description  fault_spec_id or fault_composition_id, mode in {inline,background}).
+// @Description  Persist a new rule. Action.Type discriminates between fault_spec,
+// @Description  fault_composition, and cachebox — exactly one payload must be set.
 // @Tags         rules
 // @Accept       json
 // @Produce      json

@@ -6,9 +6,10 @@ import (
 	"net/http"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+	"manteion-go/internal/ruleconv"
 )
 
-func (c *Client) PostRules(ctx context.Context, addr string, rules []atroposdk.StaticRule) error {
+func (c *Client) PostRules(ctx context.Context, addr string, rules []ruleconv.CompiledRule) error {
 	_, err := c.doExpectStatus(ctx, http.MethodPost, addr+"/admin/rules", rules, http.StatusNoContent)
 	return err
 }

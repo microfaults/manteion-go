@@ -31,14 +31,14 @@ func TestCompileRules_FaultSpec(t *testing.T) {
 	}
 
 	rules := []*model.Rule{{
-		ID:          "rule-1",
-		Name:        "inject-latency",
-		Service:     "productcatalog",
-		Enabled:     true,
-		Priority:    10,
-		Match:       model.MatchCriteria{InjectionPoint: "egress", Labels: map[string]string{"svc": "cart"}},
-		FaultSpecID: "spec-latency",
-		Mode:        "inline",
+		ID:       "rule-1",
+		Name:     "inject-latency",
+		Service:  "productcatalog",
+		Enabled:  true,
+		Priority: 10,
+		Match:    model.MatchCriteria{InjectionPoint: "egress", Labels: map[string]string{"svc": "cart"}},
+		Action:   model.RuleAction{Type: "fault_spec", FaultSpecID: "spec-latency"},
+		Mode:     "inline",
 	}}
 
 	compiled, err := CompileRules(rules, specs)
@@ -77,10 +77,10 @@ func TestCompileRules_FaultSpec(t *testing.T) {
 func TestCompileRule_DanglingSpec(t *testing.T) {
 	specs := mapSpecResolver{}
 	rules := []*model.Rule{{
-		ID:          "rule-1",
-		Name:        "dangling",
-		FaultSpecID: "nonexistent",
-		Mode:        "inline",
+		ID:     "rule-1",
+		Name:   "dangling",
+		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "nonexistent"},
+		Mode:   "inline",
 	}}
 
 	_, err := CompileRules(rules, specs)
@@ -124,10 +124,10 @@ func TestCompileRule_Composition(t *testing.T) {
 	}
 
 	rules := []*model.Rule{{
-		ID:                 "rule-comp",
-		Name:               "chaos-rule",
-		FaultCompositionID: "comp-chaos",
-		Mode:               "inline",
+		ID:     "rule-comp",
+		Name:   "chaos-rule",
+		Action: model.RuleAction{Type: "fault_composition", FaultCompID: "comp-chaos"},
+		Mode:   "inline",
 	}}
 
 	compiled, err := CompileRules(rules, specs, comps)
@@ -200,7 +200,9 @@ func TestCompileRule_NestedComposition(t *testing.T) {
 	}
 
 	rules := []*model.Rule{{
-		ID: "rule-nested", Name: "nested", FaultCompositionID: "parent-comp", Mode: "inline",
+		ID: "rule-nested", Name: "nested",
+		Action: model.RuleAction{Type: "fault_composition", FaultCompID: "parent-comp"},
+		Mode:   "inline",
 	}}
 
 	compiled, err := CompileRules(rules, specs, comps)
@@ -233,7 +235,9 @@ func TestCompileRule_CompositionDanglingSpec(t *testing.T) {
 	}
 
 	rules := []*model.Rule{{
-		ID: "rule-bad", Name: "bad", FaultCompositionID: "comp-bad", Mode: "inline",
+		ID: "rule-bad", Name: "bad",
+		Action: model.RuleAction{Type: "fault_composition", FaultCompID: "comp-bad"},
+		Mode:   "inline",
 	}}
 
 	_, err := CompileRules(rules, specs, comps)
@@ -257,7 +261,7 @@ func TestCompileRule_CompositionDurationRamp(t *testing.T) {
 			},
 		},
 	}
-	r := &model.Rule{ID: "r1", Name: "r", FaultCompositionID: "c1"}
+	r := &model.Rule{ID: "r1", Name: "r", Action: model.RuleAction{Type: "fault_composition", FaultCompID: "c1"}}
 
 	out, err := CompileRule(r, specs, comps)
 	if err != nil {
@@ -297,7 +301,9 @@ func TestCompileRule_CompositionWithDirection(t *testing.T) {
 	}
 
 	rules := []*model.Rule{{
-		ID: "rule-net", Name: "net", FaultCompositionID: "comp-net", Mode: "inline",
+		ID: "rule-net", Name: "net",
+		Action: model.RuleAction{Type: "fault_composition", FaultCompID: "comp-net"},
+		Mode:   "inline",
 	}}
 
 	compiled, err := CompileRules(rules, specs, comps)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -33,14 +34,32 @@ func (o *Orchestrator) HarvestResults(ctx context.Context, run *model.Experiment
 }
 
 func (o *Orchestrator) harvestOne(ctx context.Context, run *model.ExperimentRun, attackID string) error {
-	result, err := o.zeusClient.GetAttackResult(ctx, attackID)
-	if errors.Is(err, zeus.ErrAttackResultNotReady) {
-		o.logger.Info("orchestrator: attack result not yet available",
+	var result *zeus.AttackResultInfo
+	var err error
+	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	for attempt := 0; attempt <= len(backoff); attempt++ {
+		result, err = o.zeusClient.GetAttackResult(ctx, attackID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, zeus.ErrAttackResultNotReady) {
+			return fmt.Errorf("get attack result: %w", err)
+		}
+		if attempt < len(backoff) {
+			o.logger.Info("orchestrator: attack result not yet available, retrying",
+				"run_id", run.ID, "attack_id", attackID,
+				"attempt", attempt+1, "backoff", backoff[attempt])
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff[attempt]):
+			}
+		}
+	}
+	if result == nil {
+		o.logger.Warn("orchestrator: attack result not available after retries",
 			"run_id", run.ID, "attack_id", attackID)
 		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("get attack result: %w", err)
 	}
 
 	// Derive throughput from request count and duration if not provided.

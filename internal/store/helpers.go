@@ -70,3 +70,11 @@ func fromNullString(ns sql.NullString) string {
 	}
 	return ""
 }
+
+// nullInt converts an int to sql.NullInt32 (0 → NULL).
+func nullInt(n int) sql.NullInt32 {
+	if n == 0 {
+		return sql.NullInt32{}
+	}
+	return sql.NullInt32{Int32: int32(n), Valid: true}
+}

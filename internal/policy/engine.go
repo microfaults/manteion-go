@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/conditions"
 	"manteion-go/internal/model"
@@ -208,8 +207,10 @@ func (e *Engine) executeAction(ctx context.Context, rule *model.PolicyRule) erro
 		return err
 	case "attack", "cachebox_mode_change":
 		// Accepted by model validation but not yet wired to Zeus/atrocontrol.
-		// Log at Info so an operator sees the rule fired — silent skips would
-		// be a debugging trap.
+		// Now that cache-box is expressible as a Rule, cachebox_mode_change
+		// could be implemented as "push a cache-box rule" — same as push_rules
+		// but constructing a cache-box rule on the fly. Deferred: operators can
+		// create cache-box rules manually and use push_rules to activate them.
 		e.logger.Info("policy engine: action type not yet implemented; rule fired but had no effect",
 			"rule_id", rule.ID,
 			"action_type", rule.Action.ActionType)
@@ -232,8 +233,8 @@ func (e *Engine) doPushRules(ctx context.Context, action *model.PushRulesAction)
 }
 
 // loadCompiledRules fetches rules by ID, resolves fault specs via ruleconv,
-// and returns StaticRules ready for atrocontrol.PushRules.
-func (e *Engine) loadCompiledRules(ctx context.Context, ruleIDs []string) ([]atroposdk.StaticRule, error) {
+// and returns CompiledRules in wire format ready for atrocontrol.PushRules.
+func (e *Engine) loadCompiledRules(ctx context.Context, ruleIDs []string) ([]ruleconv.CompiledRule, error) {
 	modelRules := make([]*model.Rule, 0, len(ruleIDs))
 	for _, id := range ruleIDs {
 		r, err := e.rules.Get(ctx, id)
@@ -249,38 +250,5 @@ func (e *Engine) loadCompiledRules(ctx context.Context, ruleIDs []string) ([]atr
 	if err != nil {
 		return nil, fmt.Errorf("compile rules: %w", err)
 	}
-
-	static := make([]atroposdk.StaticRule, len(compiled))
-	for i, cr := range compiled {
-		static[i] = atroposdk.StaticRule{
-			Name:   cr.Name,
-			Point:  parseInjectionPoint(cr.InjectionPoint),
-			Labels: cr.Labels,
-			Decision: atroposdk.Decision{
-				Name: cr.Name,
-				Mode: parseMode(cr.Mode),
-			},
-		}
-	}
-	return static, nil
-}
-
-func parseInjectionPoint(s string) atroposdk.InjectionPoint {
-	switch s {
-	case "egress":
-		return atroposdk.Egress
-	case "transient":
-		return atroposdk.Transient
-	case "custom":
-		return atroposdk.Custom
-	default:
-		return atroposdk.Ingress
-	}
-}
-
-func parseMode(s string) atroposdk.Mode {
-	if s == "background" {
-		return atroposdk.Background
-	}
-	return atroposdk.Inline
+	return compiled, nil
 }

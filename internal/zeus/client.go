@@ -74,22 +74,25 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
-// AttackRequest is the body sent to POST /api/v1/attacks to launch a load attack.
-//
-// ID is an optional client-generated correlation ID. When set, Zeus must use
-// this ID for the attack (de-duping on conflict so retries are idempotent).
-// Manteion always sets this so a crash between Zeus.StartAttack and DB persist
-// can be reconciled on restart by calling GetAttack(ID).
+// AttackTargetSpec matches zeus's attacker.TargetSpec JSON schema.
+type AttackTargetSpec struct {
+	URL     string            `json:"url"`
+	Method  string            `json:"method"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// AttackRequest matches zeus's attacker.AttackConfig JSON schema.
+// ID is an optional client-generated correlation ID for crash recovery.
 type AttackRequest struct {
-	ID           string `json:"id,omitempty"`
-	WorkloadID   string `json:"workload_id"`
-	Service      string `json:"service"`
-	Role         string `json:"role"`
-	TargetURL    string `json:"target_url"`
-	TargetMethod string `json:"target_method"`
-	Rate         int    `json:"rate"`
-	DurationMs   int64  `json:"duration_ms"`
-	MetaTraceID  string `json:"meta_trace_id,omitempty"`
+	ID            string           `json:"id,omitempty"`
+	Target        AttackTargetSpec `json:"target"`
+	Rate          int              `json:"rate"`
+	Duration      string           `json:"duration"` // Go duration string: "30s", "5m"
+	DedupBypass   string           `json:"dedup_bypass,omitempty"`
+	MetaTraceID   string           `json:"meta_trace_id,omitempty"`
+	ExperimentID  string           `json:"experiment_id,omitempty"`
+	RunRef        string           `json:"run_ref,omitempty"`
+	WorkflowLabel string           `json:"workflow_label,omitempty"`
 }
 
 // AttackResponse is the body returned by POST /api/v1/attacks.

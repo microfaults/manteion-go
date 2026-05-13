@@ -9,7 +9,7 @@ func TestExperiment_Validate(t *testing.T) {
 	base := func() Experiment {
 		return Experiment{
 			ID: "e1", Name: "attribution-checkout",
-			PrimaryWorkloadID: "w1", Status: "planned", CreatedAt: time.Now(),
+			PrimaryWorkflowID: "w1", Status: "planned", CreatedAt: time.Now(),
 		}
 	}
 
@@ -21,7 +21,7 @@ func TestExperiment_Validate(t *testing.T) {
 		{"valid", nil, false},
 		{"missing id", func(e *Experiment) { e.ID = "" }, true},
 		{"missing name", func(e *Experiment) { e.Name = "" }, true},
-		{"missing primary_workload_id", func(e *Experiment) { e.PrimaryWorkloadID = "" }, true},
+		{"missing primary_workflow_id", func(e *Experiment) { e.PrimaryWorkflowID = "" }, true},
 		{"invalid status", func(e *Experiment) { e.Status = "bad" }, true},
 	}
 

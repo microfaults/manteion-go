@@ -12,6 +12,7 @@ import (
 
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/model"
+	"manteion-go/internal/ruleconv"
 )
 
 // fakeResolver returns canned instance lists keyed by service name.
@@ -242,8 +243,9 @@ func TestPushRules(t *testing.T) {
 	ctrl := newTestController(t, urls)
 	ctx := context.Background()
 
-	rules := []atroposdk.StaticRule{
-		{Name: "freeze-svc", Point: atroposdk.Egress},
+	rules := []ruleconv.CompiledRule{
+		{Name: "freeze-svc", InjectionPoint: "egress", Mode: "inline",
+			CacheBox: &ruleconv.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}},
 	}
 	result, err := ctrl.PushRules(ctx, "productcatalog", rules)
 	if err != nil {

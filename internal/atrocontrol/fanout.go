@@ -27,10 +27,10 @@ func fanout(ctx context.Context, targets []target, op opFn, cfg callOpts) Fanout
 	var wg sync.WaitGroup
 
 	for _, t := range targets {
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(t target) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			opCtx := ctx

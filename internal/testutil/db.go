@@ -55,9 +55,6 @@ func truncateAll(conn *sql.DB) {
 		"rules",
 		"fault_compositions",
 		"fault_specs",
-		"workloads",
-		"flows",
-		"personas",
 	}
 	for _, tbl := range tables {
 		_, _ = conn.Exec("DELETE FROM " + tbl)

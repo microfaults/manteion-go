@@ -29,10 +29,12 @@ func (r *ExperimentRepo) Create(ctx context.Context, exp *model.Experiment) erro
 
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO experiments (id, name, description,
-			primary_workload_id, status, created_at, started_at, completed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			primary_workflow_id, status, created_at, started_at, completed_at,
+			target_url, target_method, rate, duration_sec)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		exp.ID, exp.Name, nullString(exp.Description),
-		exp.PrimaryWorkloadID, exp.Status, exp.CreatedAt, exp.StartedAt, exp.CompletedAt,
+		exp.PrimaryWorkflowID, exp.Status, exp.CreatedAt, exp.StartedAt, exp.CompletedAt,
+		nullString(exp.TargetURL), nullString(exp.TargetMethod), nullInt(exp.Rate), nullInt(exp.DurationSec),
 	)
 	if err != nil {
 		return fmt.Errorf("insert experiment: %w", err)
@@ -43,14 +45,17 @@ func (r *ExperimentRepo) Create(ctx context.Context, exp *model.Experiment) erro
 // Get returns an experiment by ID, or ErrNotFound.
 func (r *ExperimentRepo) Get(ctx context.Context, id string) (*model.Experiment, error) {
 	var exp model.Experiment
-	var desc sql.NullString
+	var desc, targetURL, targetMethod sql.NullString
+	var rate, durSec sql.NullInt32
 	err := r.db.QueryRowContext(ctx, `
 		SELECT id, name, description,
-			primary_workload_id, status, created_at, started_at, completed_at
+			primary_workflow_id, status, created_at, started_at, completed_at,
+			target_url, target_method, rate, duration_sec
 		FROM experiments WHERE id = $1`, id,
 	).Scan(
 		&exp.ID, &exp.Name, &desc,
-		&exp.PrimaryWorkloadID, &exp.Status, &exp.CreatedAt, &exp.StartedAt, &exp.CompletedAt,
+		&exp.PrimaryWorkflowID, &exp.Status, &exp.CreatedAt, &exp.StartedAt, &exp.CompletedAt,
+		&targetURL, &targetMethod, &rate, &durSec,
 	)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -59,6 +64,14 @@ func (r *ExperimentRepo) Get(ctx context.Context, id string) (*model.Experiment,
 		return nil, fmt.Errorf("get experiment: %w", err)
 	}
 	exp.Description = fromNullString(desc)
+	exp.TargetURL = fromNullString(targetURL)
+	exp.TargetMethod = fromNullString(targetMethod)
+	if rate.Valid {
+		exp.Rate = int(rate.Int32)
+	}
+	if durSec.Valid {
+		exp.DurationSec = int(durSec.Int32)
+	}
 	return &exp, nil
 }
 
@@ -66,7 +79,8 @@ func (r *ExperimentRepo) Get(ctx context.Context, id string) (*model.Experiment,
 func (r *ExperimentRepo) List(ctx context.Context) ([]*model.Experiment, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, name, description,
-			primary_workload_id, status, created_at, started_at, completed_at
+			primary_workflow_id, status, created_at, started_at, completed_at,
+			target_url, target_method, rate, duration_sec
 		FROM experiments ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list experiments: %w", err)
@@ -76,14 +90,24 @@ func (r *ExperimentRepo) List(ctx context.Context) ([]*model.Experiment, error) 
 	var result []*model.Experiment
 	for rows.Next() {
 		var exp model.Experiment
-		var desc sql.NullString
+		var desc, targetURL, targetMethod sql.NullString
+		var rate, durSec sql.NullInt32
 		if err := rows.Scan(
 			&exp.ID, &exp.Name, &desc,
-			&exp.PrimaryWorkloadID, &exp.Status, &exp.CreatedAt, &exp.StartedAt, &exp.CompletedAt,
+			&exp.PrimaryWorkflowID, &exp.Status, &exp.CreatedAt, &exp.StartedAt, &exp.CompletedAt,
+			&targetURL, &targetMethod, &rate, &durSec,
 		); err != nil {
 			return nil, fmt.Errorf("scan experiment: %w", err)
 		}
 		exp.Description = fromNullString(desc)
+		exp.TargetURL = fromNullString(targetURL)
+		exp.TargetMethod = fromNullString(targetMethod)
+		if rate.Valid {
+			exp.Rate = int(rate.Int32)
+		}
+		if durSec.Valid {
+			exp.DurationSec = int(durSec.Int32)
+		}
 		result = append(result, &exp)
 	}
 	return result, rows.Err()
@@ -126,9 +150,9 @@ func (r *ExperimentRepo) CreateRun(ctx context.Context, run *model.ExperimentRun
 	if err != nil {
 		return fmt.Errorf("marshal transition_cond: %w", err)
 	}
-	workloadIDsJSON, err := jsonbMarshal(run.WorkloadIDs)
+	workflowIDsJSON, err := jsonbMarshal(run.WorkflowIDs)
 	if err != nil {
-		return fmt.Errorf("marshal workload_ids: %w", err)
+		return fmt.Errorf("marshal workflow_ids: %w", err)
 	}
 	zeusAttackIDsJSON, err := jsonbMarshal(run.ZeusAttackIDs)
 	if err != nil {
@@ -144,13 +168,13 @@ func (r *ExperimentRepo) CreateRun(ctx context.Context, run *model.ExperimentRun
 			frozen_services, meta_trace_id, status, node_placement,
 			started_at, completed_at, created_at,
 			phase_rules, transition_cond, current_phase,
-			workload_ids, zeus_attack_ids, depends_on, persist_cache)
+			workflow_ids, zeus_attack_ids, depends_on, persist_cache)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
 		run.ID, run.ExperimentID, run.RunType, run.RunIndex,
 		frozenJSON, run.MetaTraceID, run.Status, placementJSON,
 		run.StartedAt, run.CompletedAt, run.CreatedAt,
 		phaseRulesJSON, transCondJSON, run.CurrentPhase,
-		workloadIDsJSON, zeusAttackIDsJSON, dependsOnJSON, run.PersistCache,
+		workflowIDsJSON, zeusAttackIDsJSON, dependsOnJSON, run.PersistCache,
 	)
 	if err != nil {
 		return fmt.Errorf("insert experiment_run: %w", err)
@@ -162,7 +186,7 @@ func (r *ExperimentRepo) CreateRun(ctx context.Context, run *model.ExperimentRun
 func (r *ExperimentRepo) GetRun(ctx context.Context, id string) (*model.ExperimentRun, error) {
 	var run model.ExperimentRun
 	var frozenJSON, placementJSON, phaseRulesJSON, transCondJSON []byte
-	var workloadIDsJSON, zeusAttackIDsJSON, dependsOnJSON []byte
+	var workflowIDsJSON, zeusAttackIDsJSON, dependsOnJSON []byte
 	var zeusAttackID sql.NullString
 
 	err := r.db.QueryRowContext(ctx, `
@@ -170,14 +194,14 @@ func (r *ExperimentRepo) GetRun(ctx context.Context, id string) (*model.Experime
 			frozen_services, meta_trace_id, status, node_placement,
 			started_at, completed_at, created_at,
 			phase_rules, transition_cond, current_phase, zeus_attack_id,
-			workload_ids, zeus_attack_ids, depends_on, persist_cache
+			workflow_ids, zeus_attack_ids, depends_on, persist_cache
 		FROM experiment_runs WHERE id = $1`, id,
 	).Scan(
 		&run.ID, &run.ExperimentID, &run.RunType, &run.RunIndex,
 		&frozenJSON, &run.MetaTraceID, &run.Status, &placementJSON,
 		&run.StartedAt, &run.CompletedAt, &run.CreatedAt,
 		&phaseRulesJSON, &transCondJSON, &run.CurrentPhase, &zeusAttackID,
-		&workloadIDsJSON, &zeusAttackIDsJSON, &dependsOnJSON, &run.PersistCache,
+		&workflowIDsJSON, &zeusAttackIDsJSON, &dependsOnJSON, &run.PersistCache,
 	)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -198,8 +222,8 @@ func (r *ExperimentRepo) GetRun(ctx context.Context, id string) (*model.Experime
 	if err := jsonbScan(transCondJSON, &run.TransitionCond); err != nil {
 		return nil, fmt.Errorf("unmarshal transition_cond: %w", err)
 	}
-	if err := jsonbScan(workloadIDsJSON, &run.WorkloadIDs); err != nil {
-		return nil, fmt.Errorf("unmarshal workload_ids: %w", err)
+	if err := jsonbScan(workflowIDsJSON, &run.WorkflowIDs); err != nil {
+		return nil, fmt.Errorf("unmarshal workflow_ids: %w", err)
 	}
 	if err := jsonbScan(zeusAttackIDsJSON, &run.ZeusAttackIDs); err != nil {
 		return nil, fmt.Errorf("unmarshal zeus_attack_ids: %w", err)
@@ -244,7 +268,7 @@ func (r *ExperimentRepo) ListRunsByExperiment(ctx context.Context, experimentID 
 			frozen_services, meta_trace_id, status, node_placement,
 			started_at, completed_at, created_at,
 			phase_rules, transition_cond, current_phase, zeus_attack_id,
-			workload_ids, zeus_attack_ids, depends_on, persist_cache
+			workflow_ids, zeus_attack_ids, depends_on, persist_cache
 		FROM experiment_runs WHERE experiment_id = $1
 		ORDER BY run_index`, experimentID)
 	if err != nil {
@@ -267,14 +291,14 @@ func (r *ExperimentRepo) ListRunsByExperiment(ctx context.Context, experimentID 
 func (r *ExperimentRepo) scanRun(rows *sql.Rows) (*model.ExperimentRun, error) {
 	var run model.ExperimentRun
 	var frozenJSON, placementJSON, phaseRulesJSON, transCondJSON []byte
-	var workloadIDsJSON, zeusAttackIDsJSON, dependsOnJSON []byte
+	var workflowIDsJSON, zeusAttackIDsJSON, dependsOnJSON []byte
 	var zeusAttackID sql.NullString
 	if err := rows.Scan(
 		&run.ID, &run.ExperimentID, &run.RunType, &run.RunIndex,
 		&frozenJSON, &run.MetaTraceID, &run.Status, &placementJSON,
 		&run.StartedAt, &run.CompletedAt, &run.CreatedAt,
 		&phaseRulesJSON, &transCondJSON, &run.CurrentPhase, &zeusAttackID,
-		&workloadIDsJSON, &zeusAttackIDsJSON, &dependsOnJSON, &run.PersistCache,
+		&workflowIDsJSON, &zeusAttackIDsJSON, &dependsOnJSON, &run.PersistCache,
 	); err != nil {
 		return nil, fmt.Errorf("scan experiment run: %w", err)
 	}
@@ -290,7 +314,7 @@ func (r *ExperimentRepo) scanRun(rows *sql.Rows) (*model.ExperimentRun, error) {
 	if err := jsonbScan(transCondJSON, &run.TransitionCond); err != nil {
 		return nil, err
 	}
-	if err := jsonbScan(workloadIDsJSON, &run.WorkloadIDs); err != nil {
+	if err := jsonbScan(workflowIDsJSON, &run.WorkflowIDs); err != nil {
 		return nil, err
 	}
 	if err := jsonbScan(zeusAttackIDsJSON, &run.ZeusAttackIDs); err != nil {
@@ -378,7 +402,7 @@ func (r *ExperimentRepo) ListRunsByStatus(ctx context.Context, statuses []string
 			frozen_services, meta_trace_id, status, node_placement,
 			started_at, completed_at, created_at,
 			phase_rules, transition_cond, current_phase, zeus_attack_id,
-			workload_ids, zeus_attack_ids, depends_on, persist_cache
+			workflow_ids, zeus_attack_ids, depends_on, persist_cache
 		FROM experiment_runs WHERE status IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY created_at`
 	rows, err := r.db.QueryContext(ctx, query, args...)
@@ -405,7 +429,7 @@ func (r *ExperimentRepo) ListPendingRuns(ctx context.Context, experimentID strin
 			frozen_services, meta_trace_id, status, node_placement,
 			started_at, completed_at, created_at,
 			phase_rules, transition_cond, current_phase, zeus_attack_id,
-			workload_ids, zeus_attack_ids, depends_on, persist_cache
+			workflow_ids, zeus_attack_ids, depends_on, persist_cache
 		FROM experiment_runs WHERE experiment_id = $1 AND status = 'pending'
 		ORDER BY run_index`, experimentID)
 	if err != nil {

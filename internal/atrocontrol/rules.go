@@ -3,10 +3,10 @@ package atrocontrol
 import (
 	"context"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+	"manteion-go/internal/ruleconv"
 )
 
-func (c *Controller) PushRules(ctx context.Context, service string, rules []atroposdk.StaticRule, opts ...CallOption) (FanoutResult, error) {
+func (c *Controller) PushRules(ctx context.Context, service string, rules []ruleconv.CompiledRule, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
 
 	c.intent.Set(service, ServiceIntent{
@@ -27,7 +27,7 @@ func (c *Controller) PushRules(ctx context.Context, service string, rules []atro
 	return result, nil
 }
 
-func (c *Controller) PushRulesToInstance(ctx context.Context, instanceID string, rules []atroposdk.StaticRule, opts ...CallOption) error {
+func (c *Controller) PushRulesToInstance(ctx context.Context, instanceID string, rules []ruleconv.CompiledRule, opts ...CallOption) error {
 	inst, err := c.resolveInstance(ctx, instanceID)
 	if err != nil {
 		return err

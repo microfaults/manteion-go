@@ -130,54 +130,17 @@ func newOrchestrator(t *testing.T) *Orchestrator {
 	)
 }
 
-// seedMinimalExperiment inserts the FK prerequisite chain required by the
-// experiments table:
-//
-//	persona → flow → workload → experiment
-//
+// seedMinimalExperiment inserts a minimal experiment with a workflow reference.
 // Returns the inserted experiment. Everything is given unique IDs derived from
 // the test name so parallel sub-tests do not collide.
 func seedMinimalExperiment(t *testing.T, ctx context.Context) *model.Experiment {
 	t.Helper()
 	tag := uniqueTag(t)
 
-	persona := &model.Persona{
-		ID:   "persona-" + tag,
-		Name: "test-persona-" + tag,
-	}
-	if err := testWorkRepo.CreatePersona(ctx, persona); err != nil {
-		t.Fatalf("seed persona: %v", err)
-	}
-
-	flow := &model.Flow{
-		ID:        "flow-" + tag,
-		Name:      "test-flow-" + tag,
-		Targets:   []string{"http://svc:8080"},
-		Steps:     []byte(`{"type":"request","method":"GET","path":"/"}`),
-		CreatedAt: time.Now(),
-	}
-	if err := testWorkRepo.CreateFlow(ctx, flow); err != nil {
-		t.Fatalf("seed flow: %v", err)
-	}
-
-	workload := &model.Workload{
-		ID:        "wl-" + tag,
-		Name:      "test-workload-" + tag,
-		FlowID:    flow.ID,
-		PersonaID: persona.ID,
-		VUs:       1,
-		Rate:      1.0,
-		Status:    "pending",
-		CreatedAt: time.Now(),
-	}
-	if err := testWorkRepo.CreateWorkload(ctx, workload); err != nil {
-		t.Fatalf("seed workload: %v", err)
-	}
-
 	exp := &model.Experiment{
 		ID:                "exp-" + tag,
 		Name:              "test-experiment-" + tag,
-		PrimaryWorkloadID: workload.ID,
+		PrimaryWorkflowID: "wf-" + tag,
 		Status:            "planned",
 		CreatedAt:         time.Now(),
 	}
@@ -186,17 +149,7 @@ func seedMinimalExperiment(t *testing.T, ctx context.Context) *model.Experiment 
 	}
 
 	t.Cleanup(func() {
-		// Cascade delete via experiment FK cleans up runs automatically.
-		// We still need to remove the experiment and its FK chain manually
-		// because there is no cross-table cascade from experiments up to
-		// workloads/flows/personas.
 		_ = testExperRepo.Delete(context.Background(), exp.ID)
-		_, _ = testDB.ExecContext(context.Background(),
-			`DELETE FROM workloads WHERE id = $1`, workload.ID)
-		_, _ = testDB.ExecContext(context.Background(),
-			`DELETE FROM flows WHERE id = $1`, flow.ID)
-		_, _ = testDB.ExecContext(context.Background(),
-			`DELETE FROM personas WHERE id = $1`, persona.ID)
 	})
 
 	return exp
