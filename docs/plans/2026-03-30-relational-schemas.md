@@ -158,7 +158,7 @@ type FaultSpec struct {
 | network | `blackhole` | (none) | Pre-dial hijack, no data flows |
 | network | `drip` | `chunk_size` (bytes), `interval_ms` | Controls byte-by-byte timing |
 | network | `latency` | `delay_ms`, `jitter_ms` | Per-chunk delay |
-| network | `loss` | `rate` (0.0-1.0), `retransmit_delay_ms`, `reset_threshold` | Can trigger RST |
+| network | `retransmit_delay` | `rate` (0.0-1.0), `delay_ms`, `reset_threshold` | Can trigger RST; does NOT drop bytes (userspace TCP can't) — simulates retransmit delay only |
 | network | `rst` | `after_bytes`, `after_duration_ms` | TCP connection reset |
 | network | `throttle` | `bytes_per_sec` | Token-bucket rate limit |
 | resource | `cpu` | `target_load` (0.0-1.0) | Duty-cycle spinning |
@@ -217,7 +217,7 @@ type FaultIncompatibility struct {
 | A | B | Scope | Reason |
 |---|---|-------|--------|
 | `inline:hang` | `network:blackhole` | parallel | Both block the request -- redundant. Hang blocks app thread; blackhole blocks TCP. |
-| `network:loss` (with reset_threshold>0) | `network:rst` | parallel | Both can reset the connection. Whichever threshold hits first wins -- intent is ambiguous. |
+| `network:retransmit_delay` (with reset_threshold>0) | `network:rst` | parallel | Both can reset the connection. Whichever threshold hits first wins -- intent is ambiguous. |
 | `inline:error` | `inline:latency` | sequential (error first) | Error completes immediately, latency after it is meaningless if error already returned. |
 | `inline:error` | `inline:hang` | parallel | Error completes immediately, hang blocks -- conflicting intent. |
 | `resource:cpu` | `resource:memory` | parallel | Memory allocation triggers GC which skews CPU duty-cycle measurements. Results may be misleading. |
@@ -228,7 +228,7 @@ type FaultIncompatibility struct {
 |---|---|-------|-----|
 | `network:latency` (upstream) | `network:throttle` (downstream) | parallel | Different directions -- independent stream workers. |
 | `inline:latency` | `resource:cpu` | parallel | Different mechanisms, additive effects. |
-| `network:loss` | `resource:io` | parallel | Network + resource, independent. |
+| `network:retransmit_delay` | `resource:io` | parallel | Network + resource, independent. |
 | `inline:latency` | `inline:error` | sequential (latency then error) | Adds delay before returning error -- valid chaos scenario. |
 | `resource:cpu` | `resource:io` | parallel | Independent mechanisms (spinning vs. disk). |
 | `network:latency` | `network:rst` | sequential | Progressive degradation: slow then reset -- valid failure cascade. |

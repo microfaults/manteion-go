@@ -42,7 +42,7 @@ So the SDK now treats every register/poll response's `DurationMs` as authoritati
 
 The DemoEvaluator holds at most one fault per category (`inline`, `network`, `resource`). Per-request decision picks the first matching category in priority order `inline > network > resource`. The `Type` field after the colon is metadata; it does not key the slot. **Specificity must live in the rule's request-match conditions**, not in slot keying.
 
-Trade-off: you cannot arm two faults of the same category simultaneously on the same service (e.g., `network:latency` on one path and `network:loss` on another). To express that, define a `FaultComposition` referencing both atomic faults; the composition is resolved at fire time and emitted as one wire FaultRequest whose internal logic the SDK evaluates per-request. True chained-effects-within-a-single-decision (latency THEN error on the same response) is V6 work.
+Trade-off: you cannot arm two faults of the same category simultaneously on the same service (e.g., `network:latency` on one path and `network:retransmit_delay` on another). To express that, define a `FaultComposition` referencing both atomic faults; the composition is resolved at fire time and emitted as one wire FaultRequest whose internal logic the SDK evaluates per-request. True chained-effects-within-a-single-decision (latency THEN error on the same response) is V6 work.
 
 ---
 
@@ -167,7 +167,7 @@ Per-type `Config` schemas:
 | `inline:hang` | `{}` (uses DurationMs only) |
 | `network:latency` | `{"delay":"300ms","jitter":"50ms"}` |
 | `network:throttle` | `{"rate_kbps":1024}` |
-| `network:loss` | `{"percent":10}` |
+| `network:retransmit_delay` | `{"rate":0.1,"delay":"100ms"}` |
 | `network:drip` | `{"bytes":64,"interval":"100ms"}` |
 | `network:rst` / `network:blackhole` | `{}` |
 | `resource:cpu/memory/io/disk` | `{"percent":80}` |
@@ -620,7 +620,7 @@ func (f *FaultConfig) IsInfiniteAllowed(allowlist map[string]bool) bool {
 // Composed faults are referenced via FaultCompositionID instead.
 var validFaultTypes = map[string][]string{
     "inline":   {"error", "hang", "latency"},
-    "network":  {"blackhole", "drip", "latency", "loss", "rst", "throttle"},
+    "network":  {"blackhole", "drip", "latency", "retransmit_delay", "rst", "throttle"},
     "resource": {"cpu", "memory", "io", "disk"}, // 'disk' added (B fix)
 }
 
@@ -639,7 +639,7 @@ var DefaultInfiniteAllowed = map[string]bool{
     "network:latency":  true,
     "network:throttle": true,
     "network:drip":     true,
-    "network:loss":     true,
+    "network:retransmit_delay": true,
     "resource:cpu":     true,
     "resource:memory":  true,
     "resource:io":      true,
