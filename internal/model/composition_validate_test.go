@@ -9,17 +9,17 @@ import (
 
 // Test fixtures: fault specs covering all categories.
 var testSpecs = map[string]*FaultSpec{
-	"net-blackhole":  {ID: "net-blackhole", Name: "blackhole", Category: "network", FaultType: "blackhole", Config: json.RawMessage(`{}`), CreatedAt: time.Now()},
-	"net-latency":    {ID: "net-latency", Name: "latency", Category: "network", FaultType: "latency", Config: json.RawMessage(`{"delay_ms":100}`), CreatedAt: time.Now()},
-	"net-throttle":   {ID: "net-throttle", Name: "throttle", Category: "network", FaultType: "throttle", Config: json.RawMessage(`{"bytes_per_sec":1024}`), CreatedAt: time.Now()},
-	"net-drip":       {ID: "net-drip", Name: "drip", Category: "network", FaultType: "drip", Config: json.RawMessage(`{"chunk_size":1,"interval_ms":100}`), CreatedAt: time.Now()},
-	"net-rst":        {ID: "net-rst", Name: "rst", Category: "network", FaultType: "rst", Config: json.RawMessage(`{"after_bytes":1024}`), CreatedAt: time.Now()},
-	"net-retransmit": {ID: "net-retransmit", Name: "retransmit_delay", Category: "network", FaultType: "retransmit_delay", Config: json.RawMessage(`{"rate":0.1}`), CreatedAt: time.Now()},
-	"inline-latency": {ID: "inline-latency", Name: "latency", Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay_ms":50}`), CreatedAt: time.Now()},
-	"inline-error":   {ID: "inline-error", Name: "error", Category: "inline", FaultType: "error", Config: json.RawMessage(`{"status_code":500}`), CreatedAt: time.Now()},
-	"res-cpu":        {ID: "res-cpu", Name: "cpu", Category: "resource", FaultType: "cpu", Config: json.RawMessage(`{"target_load":0.8}`), CreatedAt: time.Now()},
-	"res-io":         {ID: "res-io", Name: "io", Category: "resource", FaultType: "io", Config: json.RawMessage(`{"read_rate":1024}`), CreatedAt: time.Now()},
-	"res-memory":     {ID: "res-memory", Name: "memory", Category: "resource", FaultType: "memory", Config: json.RawMessage(`{"target_load":0.5}`), CreatedAt: time.Now()},
+	"net-blackhole":  {ID: "net-blackhole", Name: "blackhole", Category: "network", FaultType: "blackhole", Params: json.RawMessage(`{}`), CreatedAt: time.Now()},
+	"net-latency":    {ID: "net-latency", Name: "latency", Category: "network", FaultType: "latency", Params: json.RawMessage(`{"delay_ms":100}`), CreatedAt: time.Now()},
+	"net-throttle":   {ID: "net-throttle", Name: "throttle", Category: "network", FaultType: "throttle", Params: json.RawMessage(`{"bytes_per_sec":1024}`), CreatedAt: time.Now()},
+	"net-drip":       {ID: "net-drip", Name: "drip", Category: "network", FaultType: "drip", Params: json.RawMessage(`{"chunk_size":1,"interval_ms":100}`), CreatedAt: time.Now()},
+	"net-rst":        {ID: "net-rst", Name: "rst", Category: "network", FaultType: "rst", Params: json.RawMessage(`{"after_bytes":1024}`), CreatedAt: time.Now()},
+	"net-retransmit": {ID: "net-retransmit", Name: "retransmit_delay", Category: "network", FaultType: "retransmit_delay", Params: json.RawMessage(`{"rate":0.1}`), CreatedAt: time.Now()},
+	"inline-latency": {ID: "inline-latency", Name: "latency", Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay_ms":50}`), CreatedAt: time.Now()},
+	"inline-error":   {ID: "inline-error", Name: "error", Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`), CreatedAt: time.Now()},
+	"res-cpu":        {ID: "res-cpu", Name: "cpu", Category: "resource", FaultType: "cpu", Params: json.RawMessage(`{"target_load":0.8}`), CreatedAt: time.Now()},
+	"res-io":         {ID: "res-io", Name: "io", Category: "resource", FaultType: "io", Params: json.RawMessage(`{"read_rate":1024}`), CreatedAt: time.Now()},
+	"res-memory":     {ID: "res-memory", Name: "memory", Category: "resource", FaultType: "memory", Params: json.RawMessage(`{"target_load":0.5}`), CreatedAt: time.Now()},
 }
 
 func testFaultResolver(id string) *FaultSpec { return testSpecs[id] }

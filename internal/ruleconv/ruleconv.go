@@ -29,6 +29,7 @@ type CompiledRule struct {
 	Labels         map[string]string    `json:"labels,omitempty"`
 	Mode           string               `json:"mode"`
 	Priority       int                  `json:"priority"`
+	StartPolicy    string               `json:"start_policy,omitempty"`
 	Fault          *CompiledFault       `json:"fault,omitempty"`
 	Composition    *CompiledComposition `json:"composition,omitempty"`
 	CacheBox       *CompiledCacheBox    `json:"cachebox,omitempty"`
@@ -40,14 +41,31 @@ type CompiledCacheBox struct {
 	KeyStrategy string `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
 }
 
-// CompiledFault is a resolved FaultSpec with config inlined.
+// CompiledFault is a resolved FaultSpec on the wire.
+//
+// The category determines which sibling field is populated:
+//   - "inline"   → Params holds the toxic-specific params; no envelope.
+//   - "network"  → Network envelope holds host/target/direction/scope;
+//     Params holds the toxic-specific params.
+//   - "resource" → Params holds the toxic-specific params; no envelope.
 type CompiledFault struct {
-	Category   string          `json:"category"`
-	FaultType  string          `json:"fault_type"`
-	Config     json.RawMessage `json:"config"`
-	DurationMs int64           `json:"duration_ms,omitempty"`
-	RampUpMs   int64           `json:"ramp_up_ms,omitempty"`
-	RampDownMs int64           `json:"ramp_down_ms,omitempty"`
+	Category   string `json:"category"`
+	FaultType  string `json:"fault_type"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	RampUpMs   int64  `json:"ramp_up_ms,omitempty"`
+	RampDownMs int64  `json:"ramp_down_ms,omitempty"`
+
+	Network *CompiledNetworkEnvelope `json:"network,omitempty"`
+	Params  json.RawMessage          `json:"params,omitempty"`
+}
+
+// CompiledNetworkEnvelope is the network-category-only envelope on the wire.
+// Matches atropos-go's NetworkEnvelope.
+type CompiledNetworkEnvelope struct {
+	Host      string  `json:"host"`
+	Target    string  `json:"target,omitempty"`
+	Direction string  `json:"direction,omitempty"`
+	Scope     float64 `json:"scope,omitempty"`
 }
 
 // CompiledComposition is a resolved FaultComposition tree with all specs inlined.
@@ -106,6 +124,7 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 		Labels:         r.Match.Labels,
 		Mode:           r.Mode,
 		Priority:       r.Priority,
+		StartPolicy:    r.StartPolicy,
 	}
 
 	switch r.Action.Type {
@@ -144,14 +163,28 @@ func resolveSpec(id string, specs FaultSpecResolver) (*CompiledFault, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("fault spec %q not found", id)
 	}
-	return &CompiledFault{
+	cf := &CompiledFault{
 		Category:   spec.Category,
 		FaultType:  spec.FaultType,
-		Config:     spec.Config,
+		Params:     spec.Params,
 		DurationMs: spec.DurationMs,
 		RampUpMs:   spec.RampUpMs,
 		RampDownMs: spec.RampDownMs,
-	}, nil
+	}
+	if spec.Category == "network" {
+		host := spec.Host
+		if host == "" {
+			host = "proxy"
+		}
+		env := &CompiledNetworkEnvelope{Host: host}
+		if spec.Network != nil {
+			env.Target = spec.Network.Target
+			env.Direction = spec.Network.Direction
+			env.Scope = spec.Network.Scope
+		}
+		cf.Network = env
+	}
+	return cf, nil
 }
 
 const maxCompositionDepth = 3

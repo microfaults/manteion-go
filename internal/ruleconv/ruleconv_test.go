@@ -26,7 +26,7 @@ func TestCompileRules_FaultSpec(t *testing.T) {
 			Name:      "200ms latency",
 			Category:  "inline",
 			FaultType: "latency",
-			Config:    json.RawMessage(`{"delay":"200ms"}`),
+			Params:    json.RawMessage(`{"delay":"200ms"}`),
 		},
 	}
 
@@ -104,12 +104,12 @@ func TestCompileRule_Composition(t *testing.T) {
 	specs := mapSpecResolver{
 		"spec-latency": {
 			ID: "spec-latency", Name: "latency", Category: "inline",
-			FaultType: "latency", Config: json.RawMessage(`{"delay":"100ms"}`),
+			FaultType: "latency", Params: json.RawMessage(`{"delay":"100ms"}`),
 			DurationMs: 100,
 		},
 		"spec-error": {
 			ID: "spec-error", Name: "error", Category: "inline",
-			FaultType: "error", Config: json.RawMessage(`{"status_code":500,"message":"fail"}`),
+			FaultType: "error", Params: json.RawMessage(`{"status_code":500,"message":"fail"}`),
 		},
 	}
 
@@ -177,9 +177,9 @@ func TestCompileRule_Composition(t *testing.T) {
 
 func TestCompileRule_NestedComposition(t *testing.T) {
 	specs := mapSpecResolver{
-		"spec-a": {ID: "spec-a", Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"50ms"}`)},
-		"spec-b": {ID: "spec-b", Category: "inline", FaultType: "error", Config: json.RawMessage(`{"status_code":500}`)},
-		"spec-c": {ID: "spec-c", Category: "inline", FaultType: "hang", Config: json.RawMessage(`{"duration":"1s"}`)},
+		"spec-a": {ID: "spec-a", Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"50ms"}`)},
+		"spec-b": {ID: "spec-b", Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`)},
+		"spec-c": {ID: "spec-c", Category: "inline", FaultType: "hang", Params: json.RawMessage(`{"duration":"1s"}`)},
 	}
 
 	comps := mapCompResolver{
@@ -248,8 +248,8 @@ func TestCompileRule_CompositionDanglingSpec(t *testing.T) {
 
 func TestCompileRule_CompositionDurationRamp(t *testing.T) {
 	specs := mapSpecResolver{
-		"f1": {ID: "f1", Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"50ms"}`)},
-		"f2": {ID: "f2", Category: "inline", FaultType: "error", Config: json.RawMessage(`{"status_code":500}`)},
+		"f1": {ID: "f1", Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"50ms"}`)},
+		"f2": {ID: "f2", Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`)},
 	}
 	comps := mapCompResolver{
 		"c1": {
@@ -282,11 +282,11 @@ func TestCompileRule_CompositionWithDirection(t *testing.T) {
 	specs := mapSpecResolver{
 		"spec-net": {
 			ID: "spec-net", Category: "network", FaultType: "latency",
-			Config: json.RawMessage(`{"delay":"100ms"}`),
+			Params: json.RawMessage(`{"delay":"100ms"}`),
 		},
 		"spec-throttle": {
 			ID: "spec-throttle", Category: "network", FaultType: "throttle",
-			Config: json.RawMessage(`{"bytes_per_sec":1024}`),
+			Params: json.RawMessage(`{"bytes_per_sec":1024}`),
 		},
 	}
 

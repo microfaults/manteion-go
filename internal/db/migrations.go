@@ -151,6 +151,54 @@ ALTER TABLE experiments
     ADD COLUMN IF NOT EXISTS rate           INT,
     ADD COLUMN IF NOT EXISTS duration_sec   INT;
 `},
+	{15, "rename network:loss fault_type → retransmit_delay", `
+UPDATE fault_specs
+   SET fault_type = 'retransmit_delay'
+ WHERE category = 'network' AND fault_type = 'loss';
+`},
+	{16, "add fault_specs.host + network envelope columns", `
+ALTER TABLE fault_specs
+    ADD COLUMN IF NOT EXISTS host             TEXT;
+
+-- The network envelope (only meaningful for category='network').
+-- Stored as nullable columns rather than a single JSONB to make UI
+-- form validation, indexing, and constraint enforcement first-class.
+ALTER TABLE fault_specs
+    ADD COLUMN IF NOT EXISTS network_target    TEXT,
+    ADD COLUMN IF NOT EXISTS network_direction TEXT,
+    ADD COLUMN IF NOT EXISTS network_scope     DOUBLE PRECISION;
+
+-- Default existing rows: network → proxy; inline/resource → process
+-- (process = inline-host for resource faults, just a label).
+UPDATE fault_specs SET host = 'proxy'   WHERE category = 'network' AND host IS NULL;
+UPDATE fault_specs SET host = 'process' WHERE category IN ('inline', 'resource') AND host IS NULL;
+
+-- Enforce host vocab. Network envelope columns must be NULL on non-network.
+ALTER TABLE fault_specs
+    ADD CONSTRAINT fault_specs_host_check CHECK (
+        host IN ('proxy', 'inline', 'process')
+    );
+ALTER TABLE fault_specs
+    ADD CONSTRAINT fault_specs_envelope_check CHECK (
+        category = 'network' OR (
+            network_target IS NULL AND
+            network_direction IS NULL AND
+            network_scope IS NULL
+        )
+    );
+ALTER TABLE fault_specs
+    ADD CONSTRAINT fault_specs_direction_check CHECK (
+        network_direction IS NULL OR network_direction IN ('upstream', 'downstream')
+    );
+`},
+	{17, "add rules.start_policy", `
+ALTER TABLE rules
+    ADD COLUMN IF NOT EXISTS start_policy TEXT NOT NULL DEFAULT 'deduplicate_by_rule';
+ALTER TABLE rules
+    ADD CONSTRAINT rules_start_policy_check CHECK (
+        start_policy IN ('deduplicate_by_rule', 'always_start')
+    );
+`},
 }
 
 // Migrate applies any pending migrations to the database.

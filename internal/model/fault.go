@@ -47,16 +47,35 @@ func (d Direction) IsValid() bool {
 
 // FaultSpec is an atomic fault definition. Maps to exactly one atropos-go
 // fault type. Three categories: inline, network, resource.
+//
+// Host selects where the toxic runs:
+//   - "proxy"   → TCP proxy sidecar; only valid for category="network"
+//   - "inline"  → in-process RoundTripper response shaping (v6; only network)
+//   - "process" → in-process Go fault (inline + resource categories)
+//
+// NetworkEnvelope (Target/Direction/Scope) is only populated for
+// category="network"; enforced by DB CHECK constraint.
 type FaultSpec struct {
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	Category   string          `json:"category"`   // "inline", "network", "resource"
-	FaultType  string          `json:"fault_type"` // e.g. "error", "blackhole", "cpu"
-	Config     json.RawMessage `json:"config"`     // type-specific parameters
-	DurationMs int64           `json:"duration_ms,omitempty"`
-	RampUpMs   int64           `json:"ramp_up_ms,omitempty"`
-	RampDownMs int64           `json:"ramp_down_ms,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
+	ID         string           `json:"id"`
+	Name       string           `json:"name"`
+	Category   string           `json:"category"`   // "inline", "network", "resource"
+	FaultType  string           `json:"fault_type"` // e.g. "error", "blackhole", "cpu"
+	Host       string           `json:"host,omitempty"`
+	Network    *NetworkEnvelope `json:"network,omitempty"`
+	Params     json.RawMessage  `json:"params"` // type-specific parameters
+	DurationMs int64            `json:"duration_ms,omitempty"`
+	RampUpMs   int64            `json:"ramp_up_ms,omitempty"`
+	RampDownMs int64            `json:"ramp_down_ms,omitempty"`
+	CreatedAt  time.Time        `json:"created_at"`
+}
+
+// NetworkEnvelope holds network-category-only envelope fields that select
+// which traffic the toxic applies to. Stored as separate columns
+// (network_target, network_direction, network_scope) on fault_specs.
+type NetworkEnvelope struct {
+	Target    string  `json:"target,omitempty"`
+	Direction string  `json:"direction,omitempty"`
+	Scope     float64 `json:"scope,omitempty"`
 }
 
 var validFaultTypes = map[string][]string{
@@ -89,9 +108,41 @@ func (f *FaultSpec) Validate() error {
 	if f.Category == "inline" && f.FaultType == "hang" && f.DurationMs <= 0 {
 		return errors.New("fault spec: inline:hang requires duration_ms > 0")
 	}
-	if len(f.Config) == 0 || string(f.Config) == "null" {
-		return errors.New("fault spec: config required")
+	if len(f.Params) == 0 || string(f.Params) == "null" {
+		return errors.New("fault spec: params required")
 	}
+
+	// Host vocabulary + category coupling.
+	if f.Host != "" {
+		switch f.Host {
+		case "proxy", "inline":
+			if f.Category != "network" {
+				return fmt.Errorf("fault spec: host=%q only valid for network category, got %q", f.Host, f.Category)
+			}
+		case "process":
+			if f.Category == "network" {
+				return errors.New("fault spec: host=process invalid for network category")
+			}
+		default:
+			return fmt.Errorf("fault spec: invalid host %q", f.Host)
+		}
+	}
+
+	// NetworkEnvelope is forbidden for non-network categories.
+	if f.Network != nil {
+		if f.Category != "network" {
+			return fmt.Errorf("fault spec: network envelope only valid for network category, got %q", f.Category)
+		}
+		if f.Network.Direction != "" &&
+			f.Network.Direction != "upstream" &&
+			f.Network.Direction != "downstream" {
+			return fmt.Errorf("fault spec: invalid direction %q", f.Network.Direction)
+		}
+		if f.Network.Scope < 0 || f.Network.Scope > 1.0 {
+			return fmt.Errorf("fault spec: scope %.2f out of [0,1]", f.Network.Scope)
+		}
+	}
+
 	return nil
 }
 

@@ -26,11 +26,30 @@ func (r *FaultRepo) CreateSpec(ctx context.Context, spec *model.FaultSpec) error
 		return err
 	}
 
+	var target, direction sql.NullString
+	var scope sql.NullFloat64
+	if spec.Network != nil {
+		if spec.Network.Target != "" {
+			target = sql.NullString{String: spec.Network.Target, Valid: true}
+		}
+		if spec.Network.Direction != "" {
+			direction = sql.NullString{String: spec.Network.Direction, Valid: true}
+		}
+		if spec.Network.Scope > 0 {
+			scope = sql.NullFloat64{Float64: spec.Network.Scope, Valid: true}
+		}
+	}
+
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO fault_specs (id, name, category, fault_type, config,
-			duration_ms, ramp_up_ms, ramp_down_ms, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		spec.ID, spec.Name, spec.Category, spec.FaultType, spec.Config,
+		INSERT INTO fault_specs (
+			id, name, category, fault_type, host, params,
+			network_target, network_direction, network_scope,
+			duration_ms, ramp_up_ms, ramp_down_ms, created_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		spec.ID, spec.Name, spec.Category, spec.FaultType,
+		nullString(spec.Host), spec.Params,
+		target, direction, scope,
 		spec.DurationMs, spec.RampUpMs, spec.RampDownMs, spec.CreatedAt,
 	)
 	if err != nil {
@@ -42,12 +61,16 @@ func (r *FaultRepo) CreateSpec(ctx context.Context, spec *model.FaultSpec) error
 // GetSpec returns a fault spec by ID, or ErrNotFound.
 func (r *FaultRepo) GetSpec(ctx context.Context, id string) (*model.FaultSpec, error) {
 	var spec model.FaultSpec
+	var host, target, direction sql.NullString
+	var scope sql.NullFloat64
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, name, category, fault_type, config,
+		SELECT id, name, category, fault_type, host, params,
+			network_target, network_direction, network_scope,
 			duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		FROM fault_specs WHERE id = $1`, id,
 	).Scan(
-		&spec.ID, &spec.Name, &spec.Category, &spec.FaultType, &spec.Config,
+		&spec.ID, &spec.Name, &spec.Category, &spec.FaultType, &host, &spec.Params,
+		&target, &direction, &scope,
 		&spec.DurationMs, &spec.RampUpMs, &spec.RampDownMs, &spec.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -56,13 +79,16 @@ func (r *FaultRepo) GetSpec(ctx context.Context, id string) (*model.FaultSpec, e
 	if err != nil {
 		return nil, fmt.Errorf("get fault_spec: %w", err)
 	}
+	spec.Host = fromNullString(host)
+	hydrateNetworkEnvelope(&spec, target, direction, scope)
 	return &spec, nil
 }
 
 // ListSpecs returns all fault specifications.
 func (r *FaultRepo) ListSpecs(ctx context.Context) ([]*model.FaultSpec, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, category, fault_type, config,
+		SELECT id, name, category, fault_type, host, params,
+			network_target, network_direction, network_scope,
 			duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		FROM fault_specs ORDER BY created_at`)
 	if err != nil {
@@ -73,16 +99,41 @@ func (r *FaultRepo) ListSpecs(ctx context.Context) ([]*model.FaultSpec, error) {
 	var result []*model.FaultSpec
 	for rows.Next() {
 		var spec model.FaultSpec
+		var host, target, direction sql.NullString
+		var scope sql.NullFloat64
 		err := rows.Scan(
-			&spec.ID, &spec.Name, &spec.Category, &spec.FaultType, &spec.Config,
+			&spec.ID, &spec.Name, &spec.Category, &spec.FaultType, &host, &spec.Params,
+			&target, &direction, &scope,
 			&spec.DurationMs, &spec.RampUpMs, &spec.RampDownMs, &spec.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan fault_spec: %w", err)
 		}
+		spec.Host = fromNullString(host)
+		hydrateNetworkEnvelope(&spec, target, direction, scope)
 		result = append(result, &spec)
 	}
 	return result, rows.Err()
+}
+
+// hydrateNetworkEnvelope populates spec.Network from nullable columns iff
+// any envelope field is set. Keeps Network=nil for non-network specs so
+// JSON omits the field instead of emitting "network":{}.
+func hydrateNetworkEnvelope(spec *model.FaultSpec, target, direction sql.NullString, scope sql.NullFloat64) {
+	if !target.Valid && !direction.Valid && !scope.Valid {
+		return
+	}
+	env := &model.NetworkEnvelope{}
+	if target.Valid {
+		env.Target = target.String
+	}
+	if direction.Valid {
+		env.Direction = direction.String
+	}
+	if scope.Valid {
+		env.Scope = scope.Float64
+	}
+	spec.Network = env
 }
 
 // DeleteSpec removes a fault spec by ID. Fails if referenced by a rule.

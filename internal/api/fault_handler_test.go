@@ -126,7 +126,7 @@ func TestHandleCreateFaultSpec(t *testing.T) {
 		"name":"200ms latency",
 		"category":"inline",
 		"fault_type":"latency",
-		"config":{"delay":"200ms"}
+		"params":{"delay":"200ms"}
 	}`
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/faults/specs", bytes.NewBufferString(body))
@@ -148,7 +148,7 @@ func TestHandleCreateFaultSpec_ValidationError(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/faults/specs", s.handleCreateFaultSpec)
 
-	body := `{"id":"spec-2","name":"x","category":"inline","fault_type":"nonsense","config":{}}`
+	body := `{"id":"spec-2","name":"x","category":"inline","fault_type":"nonsense","params":{}}`
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/faults/specs", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
@@ -163,11 +163,11 @@ func TestHandleCreateFaultComposition_ValidationCalled(t *testing.T) {
 	repo := newFakeFaultRepo()
 	repo.specs["spec-a"] = &model.FaultSpec{
 		ID: "spec-a", Name: "latency", Category: "inline", FaultType: "latency",
-		Config: json.RawMessage(`{"delay":"100ms"}`),
+		Params: json.RawMessage(`{"delay":"100ms"}`),
 	}
 	repo.specs["spec-b"] = &model.FaultSpec{
 		ID: "spec-b", Name: "error", Category: "inline", FaultType: "error",
-		Config: json.RawMessage(`{"status_code":500}`),
+		Params: json.RawMessage(`{"status_code":500}`),
 	}
 
 	s := &Server{faultStore: repo, logger: discardLogger()}
@@ -240,11 +240,11 @@ func TestHandleListFaultSpecs(t *testing.T) {
 	repo := newFakeFaultRepo()
 	repo.specs["s1"] = &model.FaultSpec{
 		ID: "s1", Name: "a", Category: "inline", FaultType: "latency",
-		Config: json.RawMessage(`{"delay":"50ms"}`),
+		Params: json.RawMessage(`{"delay":"50ms"}`),
 	}
 	repo.specs["s2"] = &model.FaultSpec{
 		ID: "s2", Name: "b", Category: "inline", FaultType: "error",
-		Config: json.RawMessage(`{"status_code":500}`),
+		Params: json.RawMessage(`{"status_code":500}`),
 	}
 	s := &Server{faultStore: repo, logger: discardLogger()}
 	mux := http.NewServeMux()
@@ -285,7 +285,7 @@ func TestHandleDeleteFaultSpec_Success(t *testing.T) {
 	repo := newFakeFaultRepo()
 	repo.specs["spec-1"] = &model.FaultSpec{
 		ID: "spec-1", Name: "a", Category: "inline", FaultType: "latency",
-		Config: json.RawMessage(`{"delay":"50ms"}`),
+		Params: json.RawMessage(`{"delay":"50ms"}`),
 	}
 	s := &Server{faultStore: repo, logger: discardLogger()}
 	mux := http.NewServeMux()
@@ -357,11 +357,11 @@ func TestHandleCreateFaultComposition_DBError(t *testing.T) {
 	repo := newFakeFaultRepo()
 	repo.specs["spec-a"] = &model.FaultSpec{
 		ID: "spec-a", Name: "latency", Category: "inline", FaultType: "latency",
-		Config: json.RawMessage(`{"delay":"100ms"}`),
+		Params: json.RawMessage(`{"delay":"100ms"}`),
 	}
 	repo.specs["spec-b"] = &model.FaultSpec{
 		ID: "spec-b", Name: "error", Category: "inline", FaultType: "error",
-		Config: json.RawMessage(`{"status_code":500}`),
+		Params: json.RawMessage(`{"status_code":500}`),
 	}
 	repo.err = errSimulatedDB
 

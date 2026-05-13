@@ -9,17 +9,29 @@ import (
 // Rule binds an action (fault injection or cache-box) to a service + match
 // criteria. The Action field discriminates between fault_spec,
 // fault_composition, and cachebox — exactly one must be set.
+//
+// StartPolicy is the idempotency semantics for the rule's fault start:
+//   - "deduplicate_by_rule" (default): only one fault per rule is active at
+//     a time; subsequent matches against an active rule are no-ops.
+//   - "always_start": every match starts a new fault instance, allowing
+//     stacked effects (two 100ms latencies = 200ms cumulative).
 type Rule struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Service   string        `json:"service"`
-	Enabled   bool          `json:"enabled"`
-	Priority  int           `json:"priority"`
-	Match     MatchCriteria `json:"match"`
-	Action    RuleAction    `json:"action"`
-	Mode      string        `json:"mode"` // "inline" or "background"
-	CreatedAt time.Time     `json:"created_at"`
-	UpdatedAt time.Time     `json:"updated_at"`
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Service     string        `json:"service"`
+	Enabled     bool          `json:"enabled"`
+	Priority    int           `json:"priority"`
+	Match       MatchCriteria `json:"match"`
+	Action      RuleAction    `json:"action"`
+	Mode        string        `json:"mode"`                   // "inline" or "background"
+	StartPolicy string        `json:"start_policy,omitempty"` // "deduplicate_by_rule" (default) | "always_start"
+	CreatedAt   time.Time     `json:"created_at"`
+	UpdatedAt   time.Time     `json:"updated_at"`
+}
+
+var validStartPolicies = map[string]bool{
+	"deduplicate_by_rule": true,
+	"always_start":        true,
 }
 
 // RuleAction is a discriminated union: exactly one of FaultSpecID,
@@ -112,6 +124,12 @@ func (r *Rule) Validate() error {
 	}
 	if r.Mode != "inline" && r.Mode != "background" {
 		return fmt.Errorf("rule: invalid mode %q", r.Mode)
+	}
+	if r.StartPolicy == "" {
+		r.StartPolicy = "deduplicate_by_rule"
+	}
+	if !validStartPolicies[r.StartPolicy] {
+		return fmt.Errorf("rule: invalid start_policy %q", r.StartPolicy)
 	}
 	return nil
 }

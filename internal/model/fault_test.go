@@ -10,7 +10,7 @@ func TestFaultSpec_Validate(t *testing.T) {
 	base := func() FaultSpec {
 		return FaultSpec{
 			ID: "f1", Name: "test", Category: "inline", FaultType: "error",
-			Config: json.RawMessage(`{"status_code":500}`), CreatedAt: time.Now(),
+			Params: json.RawMessage(`{"status_code":500}`), CreatedAt: time.Now(),
 		}
 	}
 
@@ -42,8 +42,8 @@ func TestFaultSpec_Validate(t *testing.T) {
 			f.FaultType = "hang"
 			f.DurationMs = 5000
 		}, false},
-		{"missing config", func(f *FaultSpec) { f.Config = nil }, true},
-		{"null config", func(f *FaultSpec) { f.Config = json.RawMessage("null") }, true},
+		{"missing params", func(f *FaultSpec) { f.Params = nil }, true},
+		{"null params", func(f *FaultSpec) { f.Params = json.RawMessage("null") }, true},
 	}
 
 	for _, tt := range tests {
