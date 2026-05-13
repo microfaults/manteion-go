@@ -177,7 +177,7 @@ func TestDefaultIncompatibilities(t *testing.T) {
 	// Verify known hard incompatibilities are present.
 	found := map[string]bool{}
 	for _, i := range incomp {
-		key := i.FaultTypeA + "+" + i.FaultTypeB + ":" + i.ConstraintType
+		key := i.Subject + "+" + i.Object + ":" + i.ConstraintType
 		found[key] = true
 	}
 

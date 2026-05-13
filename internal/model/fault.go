@@ -200,66 +200,149 @@ func (m *FaultCompositionMember) Validate() error {
 	return nil
 }
 
-// FaultIncompatibility defines a pair of fault types that cannot be composed.
-// Stored as reference data; validated at composition creation time.
-type FaultIncompatibility struct {
-	FaultTypeA     string `json:"fault_type_a"`    // e.g. "network:blackhole"
-	FaultTypeB     string `json:"fault_type_b"`    // e.g. "network:rst"
-	Scope          string `json:"scope"`           // "parallel", "sequential", "any"
+// FaultConstraint is a single rule in the fault compatibility matrix.
+//
+// Kind discriminates between the three types of constraints we track:
+//
+//   - "pair": Subject and Object are both fault types ("category:fault_type").
+//     The pair is incompatible when composed under Scope (parallel/sequential/any).
+//     Subject and Object are symmetric except when Scope="sequential", in which
+//     case Subject must come before Object.
+//
+//   - "host_mode": Subject is a host value ("host:proxy"), Object is a mode
+//     value ("mode:inline" or "mode:background"). The combination of that
+//     host with that mode is incompatible. Scope is always "always".
+//
+//   - "category_mode": Subject is a category ("category:resource"), Object
+//     is a mode ("mode:inline" or "mode:background"). Scope is "always".
+//
+// Subject and Object are namespaced strings so the table can encode any pair
+// of attributes without growing new columns. Wildcards "category:*" within
+// the same kind are supported.
+type FaultConstraint struct {
+	Kind           string `json:"kind"`            // "pair" | "host_mode" | "category_mode"
+	Subject        string `json:"subject"`         // e.g. "network:blackhole", "host:proxy", "category:resource"
+	Object         string `json:"object"`          // pair: other type; mode constraints: "mode:inline"|"mode:background"
+	Scope          string `json:"scope"`           // pair: "parallel"|"sequential"|"any"; mode: "always"
 	ConstraintType string `json:"constraint_type"` // "hard" or "soft"
 	Reason         string `json:"reason"`
 }
 
-// DefaultIncompatibilities returns the known fault incompatibility rules
-// derived from analysis of atropos-go proxy/fault code.
-func DefaultIncompatibilities() []FaultIncompatibility {
-	return []FaultIncompatibility{
-		// Hard incompatibilities — physically undefined behavior.
+// FaultIncompatibility is the legacy alias for FaultConstraint{Kind:"pair"},
+// kept as a type alias so older API consumers compile; new code should use
+// FaultConstraint directly.
+//
+// Deprecated: use FaultConstraint with Kind="pair".
+type FaultIncompatibility = FaultConstraint
+
+// DefaultConstraints returns the known fault compatibility rules derived
+// from analysis of atropos-go fault execution semantics.
+//
+// Includes both pair-incompatibility (composition-level) and Mode×Host
+// constraints (per-rule level). See FaultConstraint for the schema.
+func DefaultConstraints() []FaultConstraint {
+	return []FaultConstraint{
+		// === Pair incompatibilities: hard (physically undefined behavior) ===
 		{
-			FaultTypeA: "network:blackhole", FaultTypeB: "network:*",
+			Kind:    "pair",
+			Subject: "network:blackhole", Object: "network:*",
 			Scope: "parallel", ConstraintType: "hard",
 			Reason: "blackhole hijacks pre-dial; second toxic's Pipe() never runs",
 		},
 		{
-			FaultTypeA: "network:drip", FaultTypeB: "network:throttle",
+			Kind:    "pair",
+			Subject: "network:drip", Object: "network:throttle",
 			Scope: "parallel", ConstraintType: "hard",
 			Reason: "both control stream timing; undefined which controls pacing",
 		},
 		{
-			FaultTypeA: "network:drip", FaultTypeB: "network:latency",
+			Kind:    "pair",
+			Subject: "network:drip", Object: "network:latency",
 			Scope: "parallel", ConstraintType: "hard",
 			Reason: "both add per-chunk delays; double timing control",
 		},
-		// Soft incompatibilities — redundant/confusing but technically executable.
+
+		// === Pair incompatibilities: soft (redundant or confusing) ===
 		{
-			FaultTypeA: "inline:hang", FaultTypeB: "network:blackhole",
+			Kind:    "pair",
+			Subject: "inline:hang", Object: "network:blackhole",
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "both block the request; redundant",
 		},
 		{
-			FaultTypeA: "network:retransmit_delay", FaultTypeB: "network:rst",
+			Kind:    "pair",
+			Subject: "network:retransmit_delay", Object: "network:rst",
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "both can reset connection; intent is ambiguous",
 		},
 		{
-			FaultTypeA: "inline:error", FaultTypeB: "inline:latency",
+			Kind:    "pair",
+			Subject: "inline:error", Object: "inline:latency",
 			Scope: "sequential", ConstraintType: "soft",
 			Reason: "error first makes subsequent latency meaningless",
 		},
 		{
-			FaultTypeA: "inline:error", FaultTypeB: "inline:hang",
+			Kind:    "pair",
+			Subject: "inline:error", Object: "inline:hang",
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "error completes immediately, hang blocks; conflicting intent",
 		},
 		{
-			FaultTypeA: "resource:cpu", FaultTypeB: "resource:memory",
+			Kind:    "pair",
+			Subject: "resource:cpu", Object: "resource:memory",
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "memory allocation triggers GC which skews CPU duty-cycle measurements",
 		},
 		{
-			FaultTypeA: "inline:latency", FaultTypeB: "inline:hang",
+			Kind:    "pair",
+			Subject: "inline:latency", Object: "inline:hang",
 			Scope: "parallel", ConstraintType: "soft",
 			Reason: "hang blocks indefinitely, making the latency delay invisible",
 		},
+
+		// === Host×Mode constraints ===
+		// A network.Proxy fault's Handle.Done fires only after the proxy's
+		// listener lifetime elapses. Inline mode would block the request
+		// goroutine for the full proxy duration (typically 30s+).
+		{
+			Kind:    "host_mode",
+			Subject: "host:proxy", Object: "mode:inline",
+			Scope: "always", ConstraintType: "hard",
+			Reason: "inline mode blocks request for entire proxy listener lifetime",
+		},
+
+		// === Category×Mode constraints ===
+		// Resource faults (cpu/memory/io/disk stress) run for seconds-to-minutes;
+		// blocking the request for that duration is rarely intended.
+		{
+			Kind:    "category_mode",
+			Subject: "category:resource", Object: "mode:inline",
+			Scope: "always", ConstraintType: "soft",
+			Reason: "resource stress typically runs longer than a request; blocking is rarely intended",
+		},
+		// Inline faults (latency/error/hang) are designed to affect the request
+		// they fire on. background mode means the request continues without
+		// waiting, defeating the purpose.
+		{
+			Kind:    "category_mode",
+			Subject: "category:inline", Object: "mode:background",
+			Scope: "always", ConstraintType: "soft",
+			Reason: "inline faults are intended to affect the request; background mode means the request doesn't wait for them",
+		},
 	}
+}
+
+// DefaultIncompatibilities returns only the Kind="pair" constraints from
+// DefaultConstraints(), preserving the old API for existing callers.
+//
+// Deprecated: use DefaultConstraints() and filter by Kind.
+func DefaultIncompatibilities() []FaultConstraint {
+	all := DefaultConstraints()
+	var pairs []FaultConstraint
+	for _, c := range all {
+		if c.Kind == "pair" {
+			pairs = append(pairs, c)
+		}
+	}
+	return pairs
 }

@@ -171,19 +171,23 @@ func collectLeaves(comp *FaultComposition, resolveFault FaultSpecResolver, resol
 	return result, nil
 }
 
-// matchesPair checks if a pair of fault types matches an incompatibility rule.
-// For sequential scope, order matters: FaultTypeA must match the earlier member (a)
-// and FaultTypeB the later member (b). For parallel/any scope, order is symmetric.
-func matchesPair(a, b string, rule FaultIncompatibility, mode ExecutionMode) bool {
+// matchesPair checks if a pair of fault types matches a Kind="pair"
+// constraint. For sequential scope, order matters: Subject must match the
+// earlier member (a) and Object the later member (b). For parallel/any
+// scope, order is symmetric.
+func matchesPair(a, b string, rule FaultConstraint, mode ExecutionMode) bool {
+	if rule.Kind != "" && rule.Kind != "pair" {
+		return false
+	}
 	if rule.Scope != "any" && rule.Scope != string(mode) {
 		return false
 	}
 	if rule.Scope == "sequential" {
-		// Order-sensitive: A must come before B.
-		return matchesType(a, rule.FaultTypeA) && matchesType(b, rule.FaultTypeB)
+		// Order-sensitive: Subject must come before Object.
+		return matchesType(a, rule.Subject) && matchesType(b, rule.Object)
 	}
-	return (matchesType(a, rule.FaultTypeA) && matchesType(b, rule.FaultTypeB)) ||
-		(matchesType(a, rule.FaultTypeB) && matchesType(b, rule.FaultTypeA))
+	return (matchesType(a, rule.Subject) && matchesType(b, rule.Object)) ||
+		(matchesType(a, rule.Object) && matchesType(b, rule.Subject))
 }
 
 // matchesType checks if a concrete fault type matches a rule type pattern.
