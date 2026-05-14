@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
@@ -91,7 +92,25 @@ func NewServer(
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.routes(mux)
-	return mux
+
+	allowed_origins := os.Getenv("CORS_ALLOWED_ORIGINS")
+	if allowed_origins == "" {
+		allowed_origins = "*"
+	}
+
+	// Simple CORS middleware for local development.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", allowed_origins)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Faults-Lab-Environment")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // routes registers all API routes using Go 1.22+ method-path patterns.
