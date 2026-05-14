@@ -31,9 +31,9 @@ import (
 // @version         1.0
 // @description     Central coordination controller for the atropos ecosystem.
 // @description     Manages rules, faults, experiments, workflows, and SDK lifecycle.
-// @servers.url            http://localhost:8080/api/v1
+// @servers.url            http://localhost:9090/api/v1
 // @servers.description    Local dev (HTTP)
-// @servers.url            https://localhost:8080/api/v1
+// @servers.url            https://localhost:9090/api/v1
 // @servers.description    Local dev (HTTPS)
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -42,7 +42,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	// Configuration from environment variables.
-	addr := envOr("MANTEION_ADDR", ":8080")
+	addr := envOr("MANTEION_ADDR", ":9090")
 	dsn := envOr("MANTEION_DATABASE_URL",
 		"postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable")
 	zeusURL := envOr("ZEUS_URL", "http://archer:8080")
@@ -115,8 +115,12 @@ func main() {
 
 	// Start server in a goroutine.
 	go func() {
+		displayAddr := addr
+		if displayAddr[0] == ':' {
+			displayAddr = "localhost" + displayAddr
+		}
 		logger.Info("manteion starting",
-			"addr", addr,
+			"url", "http://"+displayAddr,
 			"zeus_url", zeusURL,
 		)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
