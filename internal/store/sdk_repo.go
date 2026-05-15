@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"manteion-go/internal/model"
 )
@@ -18,23 +19,46 @@ func NewSDKRepo(db *sql.DB) *SDKRepo {
 	return &SDKRepo{db: db}
 }
 
+// statusExpr computes status from last_poll_at and poll_interval_ms:
+//   alive: within 2× poll interval
+//   stale: between 2× and 5× poll interval
+//   dead:  beyond 5× poll interval
+const statusExpr = `CASE
+	WHEN EXTRACT(EPOCH FROM now() - last_poll_at) * 1000 > poll_interval_ms * 5 THEN 'dead'
+	WHEN EXTRACT(EPOCH FROM now() - last_poll_at) * 1000 > poll_interval_ms * 2 THEN 'stale'
+	ELSE 'alive'
+END`
+
+// selectColumns is the column list used by all read queries.
+// Status is computed, not stored.
+var selectColumns = fmt.Sprintf(
+	`id, service, version, address, poll_interval_ms, registered_at, last_poll_at, %s AS status`,
+	statusExpr,
+)
+
 // Register inserts or re-registers an SDK instance (upsert).
-// On conflict, updates service/version/address and resets timestamps.
+// On conflict, updates service/version/address/poll_interval_ms and resets timestamps.
 func (r *SDKRepo) Register(ctx context.Context, inst *model.SDKInstance) error {
 	if err := inst.Validate(); err != nil {
 		return err
 	}
 
+	pollMs := inst.PollIntervalMs
+	if pollMs <= 0 {
+		pollMs = 10000 // default 10s
+	}
+
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO sdk_instances (id, service, version, address, registered_at, last_poll_at)
-		VALUES ($1, $2, $3, $4, now(), now())
+		INSERT INTO sdk_instances (id, service, version, address, poll_interval_ms, registered_at, last_poll_at)
+		VALUES ($1, $2, $3, $4, $5, now(), now())
 		ON CONFLICT (id) DO UPDATE SET
 			service = EXCLUDED.service,
 			version = EXCLUDED.version,
 			address = EXCLUDED.address,
+			poll_interval_ms = EXCLUDED.poll_interval_ms,
 			registered_at = now(),
 			last_poll_at = now()`,
-		inst.ID, inst.Service, inst.Version, inst.Address,
+		inst.ID, inst.Service, inst.Version, inst.Address, pollMs,
 	)
 	if err != nil {
 		return fmt.Errorf("register sdk instance: %w", err)
@@ -55,28 +79,37 @@ func (r *SDKRepo) Deregister(ctx context.Context, id string) error {
 	return nil
 }
 
+// scanInstance scans a row into an SDKInstance (matches selectColumns order).
+func scanInstance(sc interface{ Scan(...any) error }) (*model.SDKInstance, error) {
+	var inst model.SDKInstance
+	if err := sc.Scan(
+		&inst.ID, &inst.Service, &inst.Version, &inst.Address,
+		&inst.PollIntervalMs, &inst.RegisteredAt, &inst.LastPollAt, &inst.Status,
+	); err != nil {
+		return nil, err
+	}
+	return &inst, nil
+}
+
 // Get returns an SDK instance by ID, or ErrNotFound.
 func (r *SDKRepo) Get(ctx context.Context, id string) (*model.SDKInstance, error) {
-	var inst model.SDKInstance
-	err := r.db.QueryRowContext(ctx, `
-		SELECT id, service, version, address, registered_at, last_poll_at
-		FROM sdk_instances WHERE id = $1`, id,
-	).Scan(&inst.ID, &inst.Service, &inst.Version, &inst.Address,
-		&inst.RegisteredAt, &inst.LastPollAt)
+	row := r.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM sdk_instances WHERE id = $1`, selectColumns), id,
+	)
+	inst, err := scanInstance(row)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get sdk instance: %w", err)
 	}
-	return &inst, nil
+	return inst, nil
 }
 
-// List returns all registered SDK instances.
+// List returns all registered SDK instances with computed status.
 func (r *SDKRepo) List(ctx context.Context) ([]*model.SDKInstance, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, service, version, address, registered_at, last_poll_at
-		FROM sdk_instances ORDER BY service, id`)
+	rows, err := r.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM sdk_instances ORDER BY service, id`, selectColumns))
 	if err != nil {
 		return nil, fmt.Errorf("list sdk instances: %w", err)
 	}
@@ -84,21 +117,21 @@ func (r *SDKRepo) List(ctx context.Context) ([]*model.SDKInstance, error) {
 
 	var result []*model.SDKInstance
 	for rows.Next() {
-		var inst model.SDKInstance
-		if err := rows.Scan(&inst.ID, &inst.Service, &inst.Version, &inst.Address,
-			&inst.RegisteredAt, &inst.LastPollAt); err != nil {
+		inst, err := scanInstance(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan sdk instance: %w", err)
 		}
-		result = append(result, &inst)
+		result = append(result, inst)
 	}
 	return result, rows.Err()
 }
 
 // ForService returns SDK instances for a specific service.
 func (r *SDKRepo) ForService(ctx context.Context, service string) ([]*model.SDKInstance, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, service, version, address, registered_at, last_poll_at
-		FROM sdk_instances WHERE service = $1 ORDER BY id`, service)
+	rows, err := r.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM sdk_instances WHERE service = $1 ORDER BY id`, selectColumns),
+		service,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("sdk instances for service: %w", err)
 	}
@@ -106,12 +139,11 @@ func (r *SDKRepo) ForService(ctx context.Context, service string) ([]*model.SDKI
 
 	var result []*model.SDKInstance
 	for rows.Next() {
-		var inst model.SDKInstance
-		if err := rows.Scan(&inst.ID, &inst.Service, &inst.Version, &inst.Address,
-			&inst.RegisteredAt, &inst.LastPollAt); err != nil {
+		inst, err := scanInstance(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan sdk instance: %w", err)
 		}
-		result = append(result, &inst)
+		result = append(result, inst)
 	}
 	return result, rows.Err()
 }
@@ -124,12 +156,24 @@ func (r *SDKRepo) TouchPoll(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("touch poll: %w", err)
 	}
-	// what if n was < 0? fix other places too if applicable
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// PurgeDead removes instances that have been inactive for (5 * poll_interval) + grace.
+func (r *SDKRepo) PurgeDead(ctx context.Context, grace time.Duration) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+		DELETE FROM sdk_instances 
+		WHERE EXTRACT(EPOCH FROM now() - last_poll_at) * 1000 > (poll_interval_ms * 5) + $1`,
+		grace.Milliseconds(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("purge dead instances: %w", err)
+	}
+	return res.RowsAffected()
 }
 
 // Count returns the total number of registered instances.

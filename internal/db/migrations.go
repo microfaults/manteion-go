@@ -199,6 +199,10 @@ ALTER TABLE rules
         start_policy IN ('deduplicate_by_rule', 'always_start')
     );
 `},
+	{18, "add sdk_instances poll_interval_ms for computed status", `
+ALTER TABLE sdk_instances
+    ADD COLUMN IF NOT EXISTS poll_interval_ms BIGINT NOT NULL DEFAULT 10000;
+`},
 }
 
 // Migrate applies any pending migrations to the database.
