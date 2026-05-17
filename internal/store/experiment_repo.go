@@ -119,11 +119,7 @@ func (r *ExperimentRepo) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("delete experiment: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // --- ExperimentRun ---
@@ -347,11 +343,7 @@ func (r *ExperimentRepo) UpdateRunStatus(ctx context.Context, id, status string)
 	if err != nil {
 		return fmt.Errorf("update run status: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // UpdateRunZeusAttacks stores the primary and all attack IDs for multi-workflow runs.
@@ -459,11 +451,7 @@ func (r *ExperimentRepo) UpdateStatus(ctx context.Context, id, status string) er
 	if err != nil {
 		return fmt.Errorf("update experiment status: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // ListWorkflowResults returns all workflow-level latency results for a run.

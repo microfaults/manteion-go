@@ -142,11 +142,7 @@ func (r *FaultRepo) DeleteSpec(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("delete fault_spec: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // --- FaultComposition ---
@@ -262,11 +258,7 @@ func (r *FaultRepo) DeleteComposition(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("delete fault_composition: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // SpecResolver returns a FaultSpecResolver backed by this repository.

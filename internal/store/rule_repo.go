@@ -105,11 +105,9 @@ func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 		if err != nil {
 			return fmt.Errorf("update rule: %w", err)
 		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			return ErrNotFound
+		if err := affectedOrNotFound(res); err != nil {
+			return err
 		}
-
 		return r.bumpVersion(ctx, tx)
 	})
 }
@@ -121,11 +119,9 @@ func (r *RuleRepo) Delete(ctx context.Context, id string) error {
 		if err != nil {
 			return fmt.Errorf("delete rule: %w", err)
 		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			return ErrNotFound
+		if err := affectedOrNotFound(res); err != nil {
+			return err
 		}
-
 		return r.bumpVersion(ctx, tx)
 	})
 }

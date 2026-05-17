@@ -14,6 +14,23 @@ import (
 // ErrNotFound is returned when a Get/Delete finds no matching row.
 var ErrNotFound = errors.New("store: not found")
 
+// affectedOrNotFound returns ErrNotFound when res affected zero rows,
+// or wraps any RowsAffected error. The canonical post-Exec check for
+// UPDATE/DELETE by primary key. pgx never returns a negative count
+// (the int64 return is just sql/driver-interface compliance), so the
+// only failure shapes are (a) the driver itself errored, or (b) the
+// row didn't exist.
+func affectedOrNotFound(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // execTx runs fn inside a database transaction. It commits on success
 // and rolls back on error or panic.
 func execTx(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) error {

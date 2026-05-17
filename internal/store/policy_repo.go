@@ -117,11 +117,7 @@ func (r *PolicyRepo) SetEnabled(ctx context.Context, id string, enabled bool) er
 	if err != nil {
 		return fmt.Errorf("set policy enabled: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // Delete removes a policy rule by ID.
@@ -130,11 +126,7 @@ func (r *PolicyRepo) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("delete policy_rule: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 func (r *PolicyRepo) scanPolicyRules(rows *sql.Rows) ([]*model.PolicyRule, error) {

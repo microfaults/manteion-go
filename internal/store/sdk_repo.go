@@ -48,11 +48,7 @@ func (r *SDKRepo) Deregister(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("deregister sdk instance: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // Get returns an SDK instance by ID, or ErrNotFound.
@@ -124,12 +120,7 @@ func (r *SDKRepo) TouchPoll(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("touch poll: %w", err)
 	}
-	// what if n was < 0? fix other places too if applicable
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return affectedOrNotFound(res)
 }
 
 // Count returns the total number of registered instances.
