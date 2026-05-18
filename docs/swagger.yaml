@@ -6,6 +6,16 @@ components:
           example: validation failed
           type: string
       type: object
+    model.CacheBoxRuleConfig:
+      description: when type=cachebox
+      properties:
+        key_strategy:
+          description: '"exact" | "exact_with_host" | "exact_with_body"'
+          type: string
+        mode:
+          description: '"passthrough" | "replay" | "replay_with_delay"'
+          type: string
+      type: object
     model.Direction:
       description: '"upstream", "downstream", "" (non-network)'
       enum:
@@ -62,23 +72,30 @@ components:
         category:
           description: '"inline", "network", "resource"'
           type: string
-        config:
-          description: type-specific parameters
-          items:
-            type: integer
-          type: array
-          uniqueItems: false
         created_at:
+          type: string
+        description:
+          description: human-readable notes
           type: string
         duration_ms:
           type: integer
         fault_type:
           description: e.g. "error", "blackhole", "cpu"
           type: string
+        host:
+          type: string
         id:
           type: string
         name:
           type: string
+        network:
+          $ref: '#/components/schemas/model.NetworkEnvelope'
+        params:
+          description: type-specific parameters
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
         ramp_down_ms:
           type: integer
         ramp_up_ms:
@@ -95,16 +112,23 @@ components:
           description: AND semantics
           type: object
       type: object
+    model.NetworkEnvelope:
+      properties:
+        direction:
+          type: string
+        scope:
+          type: number
+        target:
+          type: string
+      type: object
     model.Rule:
       properties:
+        action:
+          $ref: '#/components/schemas/model.RuleAction'
         created_at:
           type: string
         enabled:
           type: boolean
-        fault_composition_id:
-          type: string
-        fault_spec_id:
-          type: string
         id:
           type: string
         match:
@@ -118,7 +142,24 @@ components:
           type: integer
         service:
           type: string
+        start_policy:
+          description: '"deduplicate_by_rule" (default) | "always_start"'
+          type: string
         updated_at:
+          type: string
+      type: object
+    model.RuleAction:
+      properties:
+        cachebox:
+          $ref: '#/components/schemas/model.CacheBoxRuleConfig'
+        fault_composition_id:
+          description: when type=fault_composition
+          type: string
+        fault_spec_id:
+          description: when type=fault_spec
+          type: string
+        type:
+          description: '"fault_spec" | "fault_composition" | "cachebox"'
           type: string
       type: object
     model.SDKInstance:
@@ -379,6 +420,58 @@ paths:
       summary: Get fault spec
       tags:
       - faults
+    put:
+      description: 'Replace all mutable fields of an existing fault spec. The body
+
+        is validated identically to creation; id is taken from the URL
+
+        and created_at is preserved from the stored record.'
+      parameters:
+      - description: Fault spec ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/model.FaultSpec'
+                description: Updated fault spec
+                summary: spec
+        description: Updated fault spec
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/model.FaultSpec'
+          description: OK
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: invalid JSON or validation error
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: spec not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: Update fault spec
+      tags:
+      - faults
   /healthz:
     get:
       description: Returns 200 if the process is running. No dependency checks.
@@ -437,11 +530,8 @@ paths:
       tags:
       - rules
     post:
-      description: 'Persist a new rule. The store layer validates the rule per
-
-        model.Rule.Validate() (id/name/service required, exactly one of
-
-        fault_spec_id or fault_composition_id, mode in {inline,background}).'
+      description: "Persist a new rule. Action.Type discriminates between fault_spec,\n\
+        fault_composition, and cachebox \u2014 exactly one payload must be set."
       requestBody:
         content:
           application/json:
@@ -746,6 +836,6 @@ paths:
       - health
 servers:
 - description: Local dev (HTTP)
-  url: http://localhost:8080/api/v1
+  url: http://localhost:9090/api/v1
 - description: Local dev (HTTPS)
-  url: https://localhost:8080/api/v1
+  url: https://localhost:9090/api/v1

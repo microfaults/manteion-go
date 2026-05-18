@@ -199,6 +199,10 @@ ALTER TABLE rules
         start_policy IN ('deduplicate_by_rule', 'always_start')
     );
 `},
+	{18, "add fault_specs.description", `
+ALTER TABLE fault_specs
+    ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+`},
 }
 
 // Migrate applies any pending migrations to the database.

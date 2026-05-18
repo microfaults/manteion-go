@@ -96,6 +96,53 @@ func (s *Server) handleGetFaultSpec(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, spec)
 }
 
+// handleUpdateFaultSpec replaces all mutable fields of an existing fault spec.
+// The id in the path overrides any id in the body; created_at is preserved
+// from the stored record (not updated). Mirrors handleCreateFaultSpec's
+// validation pattern.
+//
+// @Summary      Update fault spec
+// @Description  Replace all mutable fields of an existing fault spec. The body
+// @Description  is validated identically to creation; id is taken from the URL
+// @Description  and created_at is preserved from the stored record.
+// @Tags         faults
+// @Accept       json
+// @Produce      json
+// @Param        id    path      string           true  "Fault spec ID"
+// @Param        spec  body      model.FaultSpec  true  "Updated fault spec"
+// @Success      200   {object}  model.FaultSpec
+// @Failure      400   {object}  api.ErrorResponse  "invalid JSON or validation error"
+// @Failure      404   {object}  api.ErrorResponse  "spec not found"
+// @Failure      500   {object}  api.ErrorResponse
+// @Router       /faults/specs/{id} [put]
+func (s *Server) handleUpdateFaultSpec(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var spec model.FaultSpec
+	if err := readJSON(r, &spec); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	spec.ID = id
+
+	if err := spec.Validate(); err != nil {
+		s.logger.Warn("fault spec validation failed", "id", spec.ID, "error", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := s.faultStore.UpdateSpec(r.Context(), &spec); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "spec not found")
+			return
+		}
+		s.logger.Error("update fault spec failed", "id", spec.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to update spec")
+		return
+	}
+	s.logger.Info("fault spec updated", "id", spec.ID, "category", spec.Category, "type", spec.FaultType)
+	writeJSON(w, http.StatusOK, spec)
+}
+
 // handleDeleteFaultSpec removes a fault spec.
 //
 // @Summary      Delete fault spec

@@ -137,6 +137,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/faults/specs", s.handleCreateFaultSpec)
 	mux.HandleFunc("GET /api/v1/faults/specs", s.handleListFaultSpecs)
 	mux.HandleFunc("GET /api/v1/faults/specs/{id}", s.handleGetFaultSpec)
+	mux.HandleFunc("PUT /api/v1/faults/specs/{id}", s.handleUpdateFaultSpec)
 	mux.HandleFunc("DELETE /api/v1/faults/specs/{id}", s.handleDeleteFaultSpec)
 
 	// Fault composition CRUD (validates depth, directions, incompatibilities

@@ -55,6 +55,20 @@ func (f *fakeFaultRepo) ListSpecs(ctx context.Context) ([]*model.FaultSpec, erro
 	return out, nil
 }
 
+func (f *fakeFaultRepo) UpdateSpec(ctx context.Context, spec *model.FaultSpec) error {
+	if f.err != nil {
+		return f.err
+	}
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	if _, ok := f.specs[spec.ID]; !ok {
+		return errFakeNotFound
+	}
+	f.specs[spec.ID] = spec
+	return nil
+}
+
 func (f *fakeFaultRepo) DeleteSpec(ctx context.Context, id string) error {
 	if _, ok := f.specs[id]; !ok {
 		return errFakeNotFound
@@ -315,6 +329,126 @@ func TestHandleDeleteFaultSpec_NotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleUpdateFaultSpec_Success(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.specs["spec-1"] = &model.FaultSpec{
+		ID: "spec-1", Name: "old", Category: "inline", FaultType: "latency",
+		Params: json.RawMessage(`{"delay":"50ms"}`),
+	}
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/faults/specs/{id}", s.handleUpdateFaultSpec)
+
+	body := `{
+		"name":"renamed",
+		"category":"inline",
+		"fault_type":"latency",
+		"params":{"delay":"200ms"},
+		"description":"slower"
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/faults/specs/spec-1", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	got := repo.specs["spec-1"]
+	if got.Name != "renamed" {
+		t.Errorf("name not updated: %q", got.Name)
+	}
+	if got.Description != "slower" {
+		t.Errorf("description not updated: %q", got.Description)
+	}
+	if got.ID != "spec-1" {
+		t.Errorf("id overwritten: %q", got.ID)
+	}
+}
+
+func TestHandleUpdateFaultSpec_PathIDOverridesBody(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.specs["spec-1"] = &model.FaultSpec{
+		ID: "spec-1", Name: "old", Category: "inline", FaultType: "latency",
+		Params: json.RawMessage(`{"delay":"50ms"}`),
+	}
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/faults/specs/{id}", s.handleUpdateFaultSpec)
+
+	// Body claims a different id; URL must win.
+	body := `{
+		"id":"spec-999",
+		"name":"renamed",
+		"category":"inline",
+		"fault_type":"latency",
+		"params":{"delay":"200ms"}
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/faults/specs/spec-1", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if _, ghost := repo.specs["spec-999"]; ghost {
+		t.Error("body id should not have created a new spec")
+	}
+	if repo.specs["spec-1"].Name != "renamed" {
+		t.Error("URL-id spec was not updated")
+	}
+}
+
+func TestHandleUpdateFaultSpec_NotFound(t *testing.T) {
+	repo := newFakeFaultRepo()
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/faults/specs/{id}", s.handleUpdateFaultSpec)
+
+	body := `{
+		"name":"x",
+		"category":"inline",
+		"fault_type":"latency",
+		"params":{"delay":"50ms"}
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/faults/specs/ghost", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleUpdateFaultSpec_ValidationError(t *testing.T) {
+	repo := newFakeFaultRepo()
+	repo.specs["spec-1"] = &model.FaultSpec{
+		ID: "spec-1", Name: "old", Category: "inline", FaultType: "latency",
+		Params: json.RawMessage(`{"delay":"50ms"}`),
+	}
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/faults/specs/{id}", s.handleUpdateFaultSpec)
+
+	// Bogus fault_type for category=inline.
+	body := `{
+		"name":"x",
+		"category":"inline",
+		"fault_type":"nonsense",
+		"params":{}
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/faults/specs/spec-1", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
+	}
+	if repo.specs["spec-1"].Name == "x" {
+		t.Error("validation failure must not mutate the stored spec")
 	}
 }
 

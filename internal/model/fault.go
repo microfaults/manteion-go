@@ -56,17 +56,18 @@ func (d Direction) IsValid() bool {
 // NetworkEnvelope (Target/Direction/Scope) is only populated for
 // category="network"; enforced by DB CHECK constraint.
 type FaultSpec struct {
-	ID         string           `json:"id"`
-	Name       string           `json:"name"`
-	Category   string           `json:"category"`   // "inline", "network", "resource"
-	FaultType  string           `json:"fault_type"` // e.g. "error", "blackhole", "cpu"
-	Host       string           `json:"host,omitempty"`
-	Network    *NetworkEnvelope `json:"network,omitempty"`
-	Params     json.RawMessage  `json:"params"` // type-specific parameters
-	DurationMs int64            `json:"duration_ms,omitempty"`
-	RampUpMs   int64            `json:"ramp_up_ms,omitempty"`
-	RampDownMs int64            `json:"ramp_down_ms,omitempty"`
-	CreatedAt  time.Time        `json:"created_at"`
+	ID          string           `json:"id"`
+	Name        string           `json:"name"`
+	Category    string           `json:"category"`   // "inline", "network", "resource"
+	FaultType   string           `json:"fault_type"` // e.g. "error", "blackhole", "cpu"
+	Host        string           `json:"host,omitempty"`
+	Network     *NetworkEnvelope `json:"network,omitempty"`
+	Params      json.RawMessage  `json:"params"`                // type-specific parameters
+	Description string           `json:"description,omitempty"` // human-readable notes
+	DurationMs  int64            `json:"duration_ms,omitempty"`
+	RampUpMs    int64            `json:"ramp_up_ms,omitempty"`
+	RampDownMs  int64            `json:"ramp_down_ms,omitempty"`
+	CreatedAt   time.Time        `json:"created_at"`
 }
 
 // NetworkEnvelope holds network-category-only envelope fields that select

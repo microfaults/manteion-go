@@ -12,6 +12,7 @@ type FaultStore interface {
 	CreateSpec(ctx context.Context, spec *model.FaultSpec) error
 	GetSpec(ctx context.Context, id string) (*model.FaultSpec, error)
 	ListSpecs(ctx context.Context) ([]*model.FaultSpec, error)
+	UpdateSpec(ctx context.Context, spec *model.FaultSpec) error
 	DeleteSpec(ctx context.Context, id string) error
 
 	CreateComposition(ctx context.Context, c *model.FaultComposition) error
