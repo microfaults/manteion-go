@@ -9,14 +9,16 @@ import (
 
 // TraceAnchor is a pointer into an external trace/metrics backend.
 // Manteion stores when and where to look up trace data, not the data itself.
+//
+// Anchored at a phase (per migration #19 — previously experiment_run_id).
 type TraceAnchor struct {
-	ID              string          `json:"id"`
-	ExperimentRunID string          `json:"experiment_run_id"`
-	MetaTraceID     string          `json:"meta_trace_id"`
-	Service         string          `json:"service"`
-	Backend         string          `json:"backend"` // "jaeger", "prometheus", "tempo"
-	QueryHint       json.RawMessage `json:"query_hint"`
-	CollectedAt     time.Time       `json:"collected_at"`
+	ID          string          `json:"id"`
+	PhaseID     string          `json:"phase_id"`
+	MetaTraceID string          `json:"meta_trace_id"`
+	Service     string          `json:"service"`
+	Backend     string          `json:"backend"` // "jaeger", "prometheus", "tempo"
+	QueryHint   json.RawMessage `json:"query_hint"`
+	CollectedAt time.Time       `json:"collected_at"`
 }
 
 var validBackends = map[string]bool{
@@ -27,8 +29,8 @@ func (t *TraceAnchor) Validate() error {
 	if t.ID == "" {
 		return errors.New("trace anchor: id required")
 	}
-	if t.ExperimentRunID == "" {
-		return errors.New("trace anchor: experiment_run_id required")
+	if t.PhaseID == "" {
+		return errors.New("trace anchor: phase_id required")
 	}
 	if t.MetaTraceID == "" {
 		return errors.New("trace anchor: meta_trace_id required")

@@ -26,10 +26,10 @@ func (r *TraceRepo) Create(ctx context.Context, anchor *model.TraceAnchor) error
 	}
 
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO trace_anchors (id, experiment_run_id, meta_trace_id,
+		INSERT INTO trace_anchors (id, phase_id, meta_trace_id,
 			service, backend, query_hint, collected_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		anchor.ID, anchor.ExperimentRunID, anchor.MetaTraceID,
+		anchor.ID, anchor.PhaseID, anchor.MetaTraceID,
 		anchor.Service, anchor.Backend, anchor.QueryHint, anchor.CollectedAt,
 	)
 	if err != nil {
@@ -38,13 +38,13 @@ func (r *TraceRepo) Create(ctx context.Context, anchor *model.TraceAnchor) error
 	return nil
 }
 
-// ListByRun returns all trace anchors for a given experiment run.
-func (r *TraceRepo) ListByRun(ctx context.Context, runID string) ([]*model.TraceAnchor, error) {
+// ListByPhase returns all trace anchors for a given experiment phase.
+func (r *TraceRepo) ListByPhase(ctx context.Context, phaseID string) ([]*model.TraceAnchor, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, experiment_run_id, meta_trace_id,
+		SELECT id, phase_id, meta_trace_id,
 			service, backend, query_hint, collected_at
-		FROM trace_anchors WHERE experiment_run_id = $1
-		ORDER BY service, backend`, runID)
+		FROM trace_anchors WHERE phase_id = $1
+		ORDER BY service, backend`, phaseID)
 	if err != nil {
 		return nil, fmt.Errorf("list trace_anchors: %w", err)
 	}
@@ -54,7 +54,7 @@ func (r *TraceRepo) ListByRun(ctx context.Context, runID string) ([]*model.Trace
 	for rows.Next() {
 		var a model.TraceAnchor
 		if err := rows.Scan(
-			&a.ID, &a.ExperimentRunID, &a.MetaTraceID,
+			&a.ID, &a.PhaseID, &a.MetaTraceID,
 			&a.Service, &a.Backend, &a.QueryHint, &a.CollectedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan trace_anchor: %w", err)

@@ -61,16 +61,16 @@ func TestTraceAnchor_Validate(t *testing.T) {
 	}{
 		{
 			"valid jaeger",
-			TraceAnchor{ID: "t1", ExperimentRunID: "r1", MetaTraceID: "m1", Service: "frontend", Backend: "jaeger"},
+			TraceAnchor{ID: "t1", PhaseID: "p1", MetaTraceID: "m1", Service: "frontend", Backend: "jaeger"},
 			false,
 		},
 		{
 			"valid prometheus",
-			TraceAnchor{ID: "t2", ExperimentRunID: "r1", MetaTraceID: "m1", Service: "frontend", Backend: "prometheus"},
+			TraceAnchor{ID: "t2", PhaseID: "p1", MetaTraceID: "m1", Service: "frontend", Backend: "prometheus"},
 			false,
 		},
-		{"invalid backend", TraceAnchor{ID: "t3", ExperimentRunID: "r1", MetaTraceID: "m1", Service: "frontend", Backend: "bad"}, true},
-		{"missing service", TraceAnchor{ID: "t4", ExperimentRunID: "r1", MetaTraceID: "m1", Backend: "jaeger"}, true},
+		{"invalid backend", TraceAnchor{ID: "t3", PhaseID: "p1", MetaTraceID: "m1", Service: "frontend", Backend: "bad"}, true},
+		{"missing service", TraceAnchor{ID: "t4", PhaseID: "p1", MetaTraceID: "m1", Backend: "jaeger"}, true},
 	}
 
 	for _, tt := range tests {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrNotFound is returned when a Get/Delete finds no matching row.
@@ -94,4 +95,23 @@ func nullInt(n int) sql.NullInt32 {
 		return sql.NullInt32{}
 	}
 	return sql.NullInt32{Int32: int32(n), Valid: true}
+}
+
+// nullFloat returns nil for zero (so the driver writes NULL), or the value.
+// Used for optional float columns like phase_workflows.rate_rps.
+func nullFloat(v float64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// nullTimeToPtr converts sql.NullTime into *time.Time for model fields
+// that are optional timestamps.
+func nullTimeToPtr(t sql.NullTime) *time.Time {
+	if !t.Valid {
+		return nil
+	}
+	tt := t.Time
+	return &tt
 }

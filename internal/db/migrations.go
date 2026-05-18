@@ -203,6 +203,192 @@ ALTER TABLE rules
 ALTER TABLE fault_specs
     ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
 `},
+	{19, "phase-first experiment model + sdk routes + result rebuild", `
+-- =====================================================================
+-- Migration #19 rebuilds the experiment domain around phases as first-
+-- class rows. Legacy tables (experiment_runs, workflow_run_results,
+-- service_run_results, contribution_results) are dropped — there is no
+-- production data to preserve, and the old shape cannot represent the
+-- new model cleanly (singular "primary_workflow_id", in-run sub-phases,
+-- per-class nullable result columns).
+--
+-- Also salvages sdk_instances.routes from the flows-catalog-personas-apis
+-- branch so the workflow-builder catalog can aggregate live SDK routes.
+-- =====================================================================
+
+-- ---------- Salvage: SDK route inventory column ----------
+ALTER TABLE sdk_instances ADD COLUMN IF NOT EXISTS routes JSONB;
+
+-- ---------- Tear down legacy experiment domain ----------
+ALTER TABLE attacks DROP CONSTRAINT IF EXISTS fk_attacks_experiment_run;
+ALTER TABLE attacks DROP COLUMN IF EXISTS experiment_run_id;
+
+-- Re-point trace_anchors at phases. The FK and column rename happen
+-- together so we never leave a dangling reference.
+ALTER TABLE trace_anchors DROP CONSTRAINT IF EXISTS trace_anchors_experiment_run_id_fkey;
+ALTER TABLE trace_anchors RENAME COLUMN experiment_run_id TO phase_id;
+DROP INDEX IF EXISTS idx_trace_anchors_run;
+
+DROP TABLE IF EXISTS contribution_results;
+DROP TABLE IF EXISTS workflow_run_results;
+DROP TABLE IF EXISTS service_run_results;
+DROP TABLE IF EXISTS experiment_runs;
+
+ALTER TABLE experiments DROP COLUMN IF EXISTS primary_workflow_id;
+ALTER TABLE experiments DROP COLUMN IF EXISTS target_url;
+ALTER TABLE experiments DROP COLUMN IF EXISTS target_method;
+ALTER TABLE experiments DROP COLUMN IF EXISTS rate;
+ALTER TABLE experiments DROP COLUMN IF EXISTS duration_sec;
+ALTER TABLE experiments ADD COLUMN IF NOT EXISTS hypothesis TEXT;
+ALTER TABLE experiments ADD COLUMN IF NOT EXISTS created_by  TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_experiments_status_created
+    ON experiments(status, created_at DESC);
+
+-- ---------- Build the new experiment domain ----------
+
+-- Flat M:N experiment <-> zeus workflow. workflow_id is the zeus-owned
+-- workflow id (opaque to manteion, no FK).
+CREATE TABLE IF NOT EXISTS experiment_workflows (
+    experiment_id TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    workflow_id   TEXT NOT NULL,
+    position      INT  NOT NULL,
+    PRIMARY KEY (experiment_id, workflow_id)
+);
+ALTER TABLE experiment_workflows
+    ADD CONSTRAINT experiment_workflows_position_unique
+    UNIQUE (experiment_id, position) DEFERRABLE INITIALLY DEFERRED;
+CREATE INDEX IF NOT EXISTS idx_experiment_workflows_workflow
+    ON experiment_workflows(workflow_id);
+
+-- Phases: first-class rows. Replaces experiment_runs entirely.
+-- frozen_services encodes the experimental method (empty = baseline;
+-- one or more entries = isolation / combined). persist_cache opts the
+-- phase into cache-ingest mode (typically baseline).
+CREATE TABLE IF NOT EXISTS experiment_phases (
+    id              TEXT PRIMARY KEY,
+    experiment_id   TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    position        INT  NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','running','paused','completed','failed','skipped')),
+    frozen_services JSONB NOT NULL DEFAULT '[]',
+    persist_cache   BOOLEAN NOT NULL DEFAULT FALSE,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    UNIQUE (experiment_id, name)
+);
+ALTER TABLE experiment_phases
+    ADD CONSTRAINT experiment_phases_position_unique
+    UNIQUE (experiment_id, position) DEFERRABLE INITIALLY DEFERRED;
+CREATE INDEX IF NOT EXISTS idx_experiment_phases_experiment
+    ON experiment_phases(experiment_id, position);
+CREATE INDEX IF NOT EXISTS idx_experiment_phases_running
+    ON experiment_phases(status) WHERE status IN ('running','paused');
+
+-- Per-(phase, workflow) attack config. The orchestrator reads this to
+-- decide "for phase P, drive zeus workflow W at V vus for D seconds".
+CREATE TABLE IF NOT EXISTS phase_workflows (
+    phase_id       TEXT   NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    workflow_id    TEXT   NOT NULL,
+    vus            INT    NOT NULL CHECK (vus > 0),
+    rate_rps       DOUBLE PRECISION,
+    duration_sec   INT    NOT NULL CHECK (duration_sec > 0),
+    target_url     TEXT,
+    target_method  TEXT,
+    zeus_attack_id TEXT,
+    PRIMARY KEY (phase_id, workflow_id)
+);
+CREATE INDEX IF NOT EXISTS idx_phase_workflows_workflow ON phase_workflows(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_phase_workflows_zeus_attack
+    ON phase_workflows(zeus_attack_id) WHERE zeus_attack_id IS NOT NULL;
+
+-- Rules active during a phase.
+CREATE TABLE IF NOT EXISTS phase_rules (
+    phase_id TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    rule_id  TEXT NOT NULL REFERENCES rules(id) ON DELETE RESTRICT,
+    position INT  NOT NULL,
+    PRIMARY KEY (phase_id, rule_id)
+);
+ALTER TABLE phase_rules
+    ADD CONSTRAINT phase_rules_position_unique
+    UNIQUE (phase_id, position) DEFERRABLE INITIALLY DEFERRED;
+CREATE INDEX IF NOT EXISTS idx_phase_rules_rule ON phase_rules(rule_id);
+
+-- ---------- Results tables (all keyed by phase_id) ----------
+
+-- Per-(phase, workflow) end-to-end latency. The bread-and-butter row.
+CREATE TABLE IF NOT EXISTS phase_workflow_results (
+    phase_id        TEXT   NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    workflow_id     TEXT   NOT NULL,
+    request_count   BIGINT NOT NULL,
+    error_count     BIGINT NOT NULL DEFAULT 0,
+    error_rate      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    throughput_rps  DOUBLE PRECISION NOT NULL,
+    latency_p50_us  BIGINT NOT NULL,
+    latency_p95_us  BIGINT NOT NULL,
+    latency_p99_us  BIGINT NOT NULL,
+    latency_p999_us BIGINT NOT NULL,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    raw_metrics     JSONB,
+    PRIMARY KEY (phase_id, workflow_id)
+);
+
+-- Per-(phase, service[, workflow]) latency. Empty workflow_id = service-wide.
+CREATE TABLE IF NOT EXISTS phase_service_latency (
+    phase_id        TEXT   NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    service         TEXT   NOT NULL,
+    workflow_id     TEXT   NOT NULL DEFAULT '',
+    latency_p50_us  BIGINT NOT NULL,
+    latency_p95_us  BIGINT NOT NULL,
+    latency_p99_us  BIGINT NOT NULL,
+    request_count   BIGINT NOT NULL,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, service, workflow_id)
+);
+
+-- Per-(phase, service) resource utilization.
+CREATE TABLE IF NOT EXISTS phase_service_resources (
+    phase_id       TEXT   NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    service        TEXT   NOT NULL,
+    cpu_millicores BIGINT NOT NULL,
+    memory_mb      BIGINT NOT NULL,
+    computed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, service)
+);
+
+-- Per-(phase, service) cache-box metrics. Row presence == cache engaged.
+CREATE TABLE IF NOT EXISTS phase_service_cache (
+    phase_id          TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    service           TEXT NOT NULL,
+    cache_hit_rate    DOUBLE PRECISION NOT NULL,
+    cache_exact_match DOUBLE PRECISION NOT NULL,
+    cache_staleness   DOUBLE PRECISION NOT NULL,
+    computed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, service)
+);
+
+-- Experiment-level rollup. Recomputed on phase status transitions and
+-- on terminal experiment status changes.
+CREATE TABLE IF NOT EXISTS experiment_results (
+    experiment_id         TEXT PRIMARY KEY REFERENCES experiments(id) ON DELETE CASCADE,
+    phase_count           INT     NOT NULL,
+    completed_phase_count INT     NOT NULL,
+    total_request_count   BIGINT  NOT NULL,
+    total_error_count     BIGINT  NOT NULL,
+    overall_error_rate    DOUBLE PRECISION NOT NULL,
+    -- worst_p99 / best_p99 are the max / min of per-phase p99s. Not a
+    -- true experiment-level percentile (would require histograms); see
+    -- the data-model doc's "percentile-aggregation caveat" section.
+    worst_p99_us          BIGINT  NOT NULL,
+    worst_p99_phase_id    TEXT    NOT NULL REFERENCES experiment_phases(id),
+    best_p99_us           BIGINT  NOT NULL,
+    best_p99_phase_id     TEXT    NOT NULL REFERENCES experiment_phases(id),
+    computed_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_anchors_phase ON trace_anchors(phase_id);
+`},
 }
 
 // Migrate applies any pending migrations to the database.
