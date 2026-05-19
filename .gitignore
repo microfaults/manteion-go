@@ -1,0 +1,7 @@
+# Compiled binary
+manteion
+
+# Local go.work overlay (if you ever opt into one for plain `go build`).
+# The docker build uses parent context + replace directive and doesn't need it.
+go.work
+go.work.sum

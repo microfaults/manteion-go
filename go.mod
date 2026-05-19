@@ -8,15 +8,11 @@ require (
 	github.com/jackc/pgx/v5 v5.7.4
 )
 
-// Pinned past v0.0.7 to atropos-go/develop @ a1ba3ac6313f. The slim
-// FaultRequest landed after v0.0.7 — Delay/Jitter/Duration/StatusCode/Message
-// moved into Config (json.RawMessage), and FaultStatus.Fault became
-// FaultStatus.Faults []*FaultRequest. Bump the require + the matching test
-// fixtures together (internal/atropos/client_test.go and
-// internal/atrocontrol/controller_test.go).
-//
-// Keep local replace for dev iteration; CI/production also uses ../atropos-go
-// (the sibling checkout is part of the build context).
+// Both repos live as siblings under faults-lab/ in dev, VM, and CI. The build
+// (skaffold + Dockerfile) uses the parent directory as Docker context so this
+// replace resolves identically everywhere. Bump the require pseudoversion in
+// lockstep with breaking atropos-go API changes (see commit history for the
+// FaultRequest slim and similar transitions).
 replace git.ucsc.edu/microfaults/atropos-go => ../atropos-go
 
 require (

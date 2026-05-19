@@ -1,11 +1,23 @@
 # Build stage
-FROM golang:1.25-alpine AS builder
+# Define a default value so it's not empty if the builder fails to provide it
+ARG BUILDPLATFORM=linux/amd64
 
-WORKDIR /app
-COPY go.mod go.sum* ./
-RUN go mod download 2>/dev/null || true
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /manteion ./cmd/manteion
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /workspace
+
+# The docker build context is the PARENT directory (set via skaffold.yaml
+# `context: ..`), so we copy both sibling repos in. This matches the
+# `replace git.ucsc.edu/microfaults/atropos-go => ../atropos-go` in go.mod
+# and avoids the need for SSH/GOPRIVATE inside the container.
+COPY atropos-go/ ./atropos-go/
+COPY manteion-go/ ./manteion-go/
+
+WORKDIR /workspace/manteion-go
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
+    go build -ldflags="-s -w" -o /manteion ./cmd/manteion
 
 # Runtime stage
 FROM alpine:3.21

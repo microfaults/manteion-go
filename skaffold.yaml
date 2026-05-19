@@ -5,10 +5,19 @@ metadata:
 build:
   artifacts:
     - image: manteion
+      # Parent dir so the Dockerfile can COPY both ./atropos-go and
+      # ./manteion-go. The go.mod's `replace => ../atropos-go` resolves
+      # identically inside and outside the container this way.
+      context: ..
       docker:
-        dockerfile: Dockerfile
+        dockerfile: manteion-go/Dockerfile
   local:
-    push: false
+    # Push to the cluster registry (e.g. localhost:5000 via --default-repo) so
+    # k3s/containerd can pull. With push:false the image lands only in the
+    # local docker daemon and k3s gets ImagePullBackOff.
+    push: true
+    useDockerCLI: true
+    useBuildkit: true
 manifests:
   kustomize:
     paths:
