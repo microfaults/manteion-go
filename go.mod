@@ -3,13 +3,20 @@ module manteion-go
 go 1.25.5
 
 require (
-	git.ucsc.edu/microfaults/atropos-go v0.0.6
+	git.ucsc.edu/microfaults/atropos-go v0.0.8-0.20260518024008-a1ba3ac6313f
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.4
 )
 
-// Keep local replace for dev iteration; CI/production resolves v0.0.6 from
-// git.ucsc.edu (requires GOPRIVATE + creds).
+// Pinned past v0.0.7 to atropos-go/develop @ a1ba3ac6313f. The slim
+// FaultRequest landed after v0.0.7 — Delay/Jitter/Duration/StatusCode/Message
+// moved into Config (json.RawMessage), and FaultStatus.Fault became
+// FaultStatus.Faults []*FaultRequest. Bump the require + the matching test
+// fixtures together (internal/atropos/client_test.go and
+// internal/atrocontrol/controller_test.go).
+//
+// Keep local replace for dev iteration; CI/production also uses ../atropos-go
+// (the sibling checkout is part of the build context).
 replace git.ucsc.edu/microfaults/atropos-go => ../atropos-go
 
 require (

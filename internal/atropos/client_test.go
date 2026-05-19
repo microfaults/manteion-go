@@ -2,6 +2,7 @@ package atropos
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -50,10 +51,12 @@ func TestFaultRoundtrip(t *testing.T) {
 		t.Fatal("expected inactive initially")
 	}
 
-	// POST a latency fault
+	// POST a latency fault. Post-v0.0.7 slim API: typed Delay/Jitter/...
+	// fields moved into the opaque Config blob the SDK unmarshals per
+	// fault type (see atropos-go/admin.go buildInlineFault).
 	postStatus, err := c.PostFault(ctx, srv.URL, atroposdk.FaultRequest{
-		Type:  "latency",
-		Delay: "100ms",
+		Type:   "latency",
+		Config: json.RawMessage(`{"delay":"100ms"}`),
 	})
 	if err != nil {
 		t.Fatalf("PostFault: %v", err)
@@ -61,8 +64,8 @@ func TestFaultRoundtrip(t *testing.T) {
 	if !postStatus.Active {
 		t.Fatal("expected active after POST")
 	}
-	if postStatus.Fault == nil || postStatus.Fault.Type != "latency" {
-		t.Fatal("expected latency fault in response")
+	if len(postStatus.Faults) == 0 || postStatus.Faults[0].Type != "latency" {
+		t.Fatalf("expected latency fault in response, got %+v", postStatus.Faults)
 	}
 
 	// GET should show active
