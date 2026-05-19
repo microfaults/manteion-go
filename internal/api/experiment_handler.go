@@ -35,40 +35,55 @@ import (
 //   }
 // =========================================================================
 
+// Wire-shape naming convention:
+//   - `_ids` suffix when the field is a list of bare references that the
+//     server resolves to join-table rows (e.g. workflow_ids, rule_ids).
+//   - plural-object name when each item carries data of its own
+//     (e.g. phase-level `workflows` is `[]PhaseWorkflow` with vus, duration,
+//     target_url, ... — not just an id list).
+//
+// This keeps the JSON shape semantically aligned with the Go field types:
+// a reader sees `workflow_ids: ["a"]` (refs) vs `workflows: [{...}]`
+// (configs) and immediately knows whether to expect an id string or a
+// structured object.
+
 // createPhaseRequest is the per-phase shape inside POST /experiments and
-// PATCH /experiments/{id}/phases.
+// POST /experiments/{id}/phases.
 type createPhaseRequest struct {
 	Name           string                 `json:"name"`
 	Position       int                    `json:"position"`
 	FrozenServices []model.CacheBoxConfig `json:"frozen_services"`
 	PersistCache   bool                   `json:"persist_cache"`
-	Workflows      []model.PhaseWorkflow  `json:"workflows"`
-	Rules          []string               `json:"rules"`
+	// Workflows carries full PhaseWorkflow attack config per (phase, workflow).
+	Workflows []model.PhaseWorkflow `json:"workflows"`
+	// RuleIDs is a bare-reference list resolved to phase_rules rows.
+	RuleIDs []string `json:"rule_ids"`
 }
 
 type createExperimentRequest struct {
-	ID          string               `json:"id,omitempty"`
-	Name        string               `json:"name"`
-	Description string               `json:"description,omitempty"`
-	Hypothesis  string               `json:"hypothesis,omitempty"`
-	CreatedBy   string               `json:"created_by,omitempty"`
-	Workflows   []string             `json:"workflows"`
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Hypothesis  string `json:"hypothesis,omitempty"`
+	CreatedBy   string `json:"created_by,omitempty"`
+	// WorkflowIDs is a bare-reference list resolved to experiment_workflows rows.
+	WorkflowIDs []string             `json:"workflow_ids"`
 	Phases      []createPhaseRequest `json:"phases"`
 }
 
 // experimentDetailResponse is the GET /experiments/{id} payload — the full
-// plan: experiment row + workflow ids + phase rows (each with their
-// workflow assignments and rule ids).
+// plan: experiment row + associated workflow ids + phase rows (each with
+// their per-(phase, workflow) configs and rule ids).
 type experimentDetailResponse struct {
 	*model.Experiment
-	Workflows []string      `json:"workflows"`
-	Phases    []phaseDetail `json:"phases"`
+	WorkflowIDs []string      `json:"workflow_ids"`
+	Phases      []phaseDetail `json:"phases"`
 }
 
 type phaseDetail struct {
 	*model.ExperimentPhase
 	Workflows []model.PhaseWorkflow `json:"workflows"`
-	Rules     []string              `json:"rules"`
+	RuleIDs   []string              `json:"rule_ids"`
 }
 
 func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) {
@@ -101,8 +116,8 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if len(req.Workflows) > 0 {
-		if err := s.experiments.AttachWorkflows(ctx, exp.ID, req.Workflows); err != nil {
+	if len(req.WorkflowIDs) > 0 {
+		if err := s.experiments.AttachWorkflows(ctx, exp.ID, req.WorkflowIDs); err != nil {
 			s.logger.Error("attach workflows failed", "error", err, "experiment_id", exp.ID)
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -134,8 +149,8 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 		}
-		if len(ph.Rules) > 0 {
-			if err := s.experiments.AttachPhaseRules(ctx, phase.ID, ph.Rules); err != nil {
+		if len(ph.RuleIDs) > 0 {
+			if err := s.experiments.AttachPhaseRules(ctx, phase.ID, ph.RuleIDs); err != nil {
 				s.logger.Error("attach phase rules failed", "error", err, "phase_id", phase.ID)
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
@@ -267,8 +282,8 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(req.Rules) > 0 {
-		if err := s.experiments.AttachPhaseRules(ctx, phase.ID, req.Rules); err != nil {
+	if len(req.RuleIDs) > 0 {
+		if err := s.experiments.AttachPhaseRules(ctx, phase.ID, req.RuleIDs); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -404,7 +419,7 @@ func (s *Server) composeExperimentDetail(ctx context.Context, id string) (*exper
 	if err != nil {
 		return nil, err
 	}
-	out := &experimentDetailResponse{Experiment: exp, Workflows: workflowIDsOf(wfs)}
+	out := &experimentDetailResponse{Experiment: exp, WorkflowIDs: workflowIDsOf(wfs)}
 	out.Phases = make([]phaseDetail, 0, len(phases))
 	for _, p := range phases {
 		out.Phases = append(out.Phases, *s.composePhaseDetail(ctx, p))
@@ -419,7 +434,7 @@ func (s *Server) composePhaseDetail(ctx context.Context, p *model.ExperimentPhas
 	for i, pr := range prs {
 		ruleIDs[i] = pr.RuleID
 	}
-	return &phaseDetail{ExperimentPhase: p, Workflows: pws, Rules: ruleIDs}
+	return &phaseDetail{ExperimentPhase: p, Workflows: pws, RuleIDs: ruleIDs}
 }
 
 func workflowIDsOf(rows []model.ExperimentWorkflow) []string {
