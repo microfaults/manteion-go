@@ -607,16 +607,16 @@ func (o *Orchestrator) startOneAttack(ctx context.Context, run *model.Experiment
 	if method == "" {
 		method = "GET"
 	}
-	duration := fmt.Sprintf("%ds", exp.DurationSec)
-	if exp.DurationSec <= 0 {
-		duration = "30s"
+	durationS := exp.DurationSec
+	if durationS <= 0 {
+		durationS = 30
 	}
 
 	zeusID, err := o.zeusClient.StartAttack(ctx, zeus.AttackRequest{
 		ID:            attackID,
 		Target:        zeus.AttackTargetSpec{URL: exp.TargetURL, Method: method},
 		Rate:          exp.Rate,
-		Duration:      duration,
+		DurationS:     durationS,
 		MetaTraceID:   run.MetaTraceID,
 		ExperimentID:  exp.ID,
 		WorkflowLabel: exp.PrimaryWorkflowID,

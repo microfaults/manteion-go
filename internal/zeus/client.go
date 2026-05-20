@@ -81,18 +81,40 @@ type AttackTargetSpec struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
+// AttackDedupBypass selects a per-request uniquification strategy. Mirrors
+// zeus's attacker.DedupBypassSpec. Strategy is "header" or "query"; Source is
+// the header name or query param name to randomize. Omit Source to use zeus's
+// strategy-specific default (X-Idempotency-Key / nonce).
+type AttackDedupBypass struct {
+	Strategy string `json:"strategy"`
+	Source   string `json:"source,omitempty"`
+}
+
 // AttackRequest matches zeus's attacker.AttackConfig JSON schema.
 // ID is an optional client-generated correlation ID for crash recovery.
+//
+// Wire-format breaking change vs. prior versions of this client:
+//   - Duration (Go duration string) → DurationS (integer seconds)
+//   - DedupBypass (string)          → DedupBypass (*AttackDedupBypass)
+//
+// The optional Timeout/MaxConnections/MaxBody/Redirects fields are vegeta
+// tuning knobs on zeus; omit (zero) to use vegeta defaults.
 type AttackRequest struct {
-	ID            string           `json:"id,omitempty"`
-	Target        AttackTargetSpec `json:"target"`
-	Rate          int              `json:"rate"`
-	Duration      string           `json:"duration"` // Go duration string: "30s", "5m"
-	DedupBypass   string           `json:"dedup_bypass,omitempty"`
-	MetaTraceID   string           `json:"meta_trace_id,omitempty"`
-	ExperimentID  string           `json:"experiment_id,omitempty"`
-	RunRef        string           `json:"run_ref,omitempty"`
-	WorkflowLabel string           `json:"workflow_label,omitempty"`
+	ID        string           `json:"id,omitempty"`
+	Target    AttackTargetSpec `json:"target"`
+	Rate      int              `json:"rate"`
+	DurationS int              `json:"duration_s"`
+
+	TimeoutS       int   `json:"timeout_s,omitempty"`
+	MaxConnections int   `json:"max_connections,omitempty"`
+	MaxBodyBytes   int64 `json:"max_body_bytes,omitempty"`
+	Redirects      int   `json:"redirects,omitempty"`
+
+	DedupBypass   *AttackDedupBypass `json:"dedup_bypass,omitempty"`
+	MetaTraceID   string             `json:"meta_trace_id,omitempty"`
+	ExperimentID  string             `json:"experiment_id,omitempty"`
+	RunRef        string             `json:"run_ref,omitempty"`
+	WorkflowLabel string             `json:"workflow_label,omitempty"`
 }
 
 // AttackResponse is the body returned by POST /api/v1/attacks.
