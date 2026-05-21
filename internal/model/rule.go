@@ -24,6 +24,7 @@ type Rule struct {
 	Match       MatchCriteria `json:"match"`
 	Action      RuleAction    `json:"action"`
 	Mode        string        `json:"mode"`                   // "inline" or "background"
+	MatchExpr   string        `json:"match_expr,omitempty"`   // Opaque OPA-rego text. Not validated, not evaluated by SDK.
 	StartPolicy string        `json:"start_policy,omitempty"` // "deduplicate_by_rule" (default) | "always_start"
 	CreatedAt   time.Time     `json:"created_at"`
 	UpdatedAt   time.Time     `json:"updated_at"`

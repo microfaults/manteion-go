@@ -206,6 +206,9 @@ ALTER TABLE fault_specs
 	{19, "rename fault_specs.config → params (fix missing DDL after code rename caused /faults/specs 500)", `
 ALTER TABLE fault_specs RENAME COLUMN config TO params;
 `},
+	{20, "add rules.match_expr for opa-rego forward compat", `
+ALTER TABLE rules ADD COLUMN IF NOT EXISTS match_expr TEXT NOT NULL DEFAULT '';
+`},
 }
 
 // Migrate applies any pending migrations to the database.

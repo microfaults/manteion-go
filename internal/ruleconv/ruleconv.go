@@ -30,6 +30,7 @@ type CompiledRule struct {
 	Mode           string               `json:"mode"`
 	Priority       int                  `json:"priority"`
 	StartPolicy    string               `json:"start_policy,omitempty"`
+	MatchExpr      string               `json:"match_expr,omitempty"` // Forwarded to SDKs; currently ignored by atropos-go's evaluator.
 	Fault          *CompiledFault       `json:"fault,omitempty"`
 	Composition    *CompiledComposition `json:"composition,omitempty"`
 	CacheBox       *CompiledCacheBox    `json:"cachebox,omitempty"`
@@ -125,6 +126,7 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 		Mode:           r.Mode,
 		Priority:       r.Priority,
 		StartPolicy:    r.StartPolicy,
+		MatchExpr:      r.MatchExpr,
 	}
 
 	switch r.Action.Type {

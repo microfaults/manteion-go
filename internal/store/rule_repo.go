@@ -36,14 +36,16 @@ func (r *RuleRepo) Create(ctx context.Context, rule *model.Rule) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO rules (id, name, service, enabled, priority, injection_point,
 				match_labels, action_type, fault_spec_id, fault_composition_id,
-				cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+				cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at,
+				match_expr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 			rule.ID, rule.Name, rule.Service, rule.Enabled, rule.Priority,
 			nullString(rule.Match.InjectionPoint), labels,
 			rule.Action.Type,
 			nullString(rule.Action.FaultSpecID), nullString(rule.Action.FaultCompID),
 			nullCacheBoxMode(rule.Action.CacheBox), nullCacheBoxKeyStrategy(rule.Action.CacheBox),
 			rule.Mode, rule.StartPolicy, rule.CreatedAt, rule.UpdatedAt,
+			rule.MatchExpr,
 		)
 		if err != nil {
 			return fmt.Errorf("insert rule: %w", err)
@@ -72,7 +74,8 @@ func (r *RuleRepo) Get(ctx context.Context, id string) (*model.Rule, error) {
 	row := r.db.QueryRowContext(ctx, `
 		SELECT id, name, service, enabled, priority, injection_point,
 			match_labels, action_type, fault_spec_id, fault_composition_id,
-			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
+			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at,
+			match_expr
 		FROM rules WHERE id = $1`, id)
 
 	return r.scanRule(row)
@@ -93,7 +96,8 @@ func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE rules SET name=$2, service=$3, enabled=$4, priority=$5, injection_point=$6,
 				match_labels=$7, action_type=$8, fault_spec_id=$9, fault_composition_id=$10,
-				cachebox_mode=$11, cachebox_key_strategy=$12, mode=$13, start_policy=$14, updated_at=$15
+				cachebox_mode=$11, cachebox_key_strategy=$12, mode=$13, start_policy=$14, updated_at=$15,
+				match_expr=$16
 			WHERE id = $1`,
 			rule.ID, rule.Name, rule.Service, rule.Enabled, rule.Priority,
 			nullString(rule.Match.InjectionPoint), labels,
@@ -101,6 +105,7 @@ func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 			nullString(rule.Action.FaultSpecID), nullString(rule.Action.FaultCompID),
 			nullCacheBoxMode(rule.Action.CacheBox), nullCacheBoxKeyStrategy(rule.Action.CacheBox),
 			rule.Mode, rule.StartPolicy, time.Now(),
+			rule.MatchExpr,
 		)
 		if err != nil {
 			return fmt.Errorf("update rule: %w", err)
@@ -131,7 +136,8 @@ func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, name, service, enabled, priority, injection_point,
 			match_labels, action_type, fault_spec_id, fault_composition_id,
-			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
+			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at,
+			match_expr
 		FROM rules ORDER BY priority DESC, created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list rules: %w", err)
@@ -146,7 +152,8 @@ func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rul
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, name, service, enabled, priority, injection_point,
 			match_labels, action_type, fault_spec_id, fault_composition_id,
-			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
+			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at,
+			match_expr
 		FROM rules WHERE service = $1 AND enabled = true
 		ORDER BY priority DESC`, service)
 	if err != nil {
@@ -197,7 +204,8 @@ func (r *RuleRepo) scanRule(row *sql.Row) (*model.Rule, error) {
 	err := row.Scan(
 		&rule.ID, &rule.Name, &rule.Service, &rule.Enabled, &rule.Priority,
 		&injPoint, &labelsJSON, &rule.Action.Type, &faultSpecID, &faultCompID,
-		&cbMode, &cbKeyStrategy, &rule.Mode, &rule.CreatedAt, &rule.UpdatedAt,
+		&cbMode, &cbKeyStrategy, &rule.Mode, &rule.StartPolicy, &rule.CreatedAt, &rule.UpdatedAt,
+		&rule.MatchExpr,
 	)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -230,6 +238,7 @@ func (r *RuleRepo) scanRules(rows *sql.Rows) ([]*model.Rule, error) {
 			&rule.ID, &rule.Name, &rule.Service, &rule.Enabled, &rule.Priority,
 			&injPoint, &labelsJSON, &rule.Action.Type, &faultSpecID, &faultCompID,
 			&cbMode, &cbKeyStrategy, &rule.Mode, &rule.StartPolicy, &rule.CreatedAt, &rule.UpdatedAt,
+			&rule.MatchExpr,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan rule row: %w", err)
