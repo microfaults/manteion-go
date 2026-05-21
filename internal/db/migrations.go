@@ -203,6 +203,9 @@ ALTER TABLE rules
 ALTER TABLE fault_specs
     ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
 `},
+	{19, "rename fault_specs.config → params (fix missing DDL after code rename caused /faults/specs 500)", `
+ALTER TABLE fault_specs RENAME COLUMN config TO params;
+`},
 }
 
 // Migrate applies any pending migrations to the database.

@@ -280,6 +280,26 @@ func TestHandleListFaultSpecs(t *testing.T) {
 	}
 }
 
+func TestHandleListFaultSpecs_EmptyReturnsArray(t *testing.T) {
+	repo := newFakeFaultRepo()
+	// No specs inserted.
+	s := &Server{faultStore: repo, logger: discardLogger()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/faults/specs", s.handleListFaultSpecs)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/faults/specs", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if body != "[]\n" && body != "[]" {
+		t.Errorf("body = %q, want %q", body, "[]")
+	}
+}
+
 func TestHandleGetFaultSpec_NotFound(t *testing.T) {
 	repo := newFakeFaultRepo()
 	s := &Server{faultStore: repo, logger: discardLogger()}
