@@ -24,7 +24,7 @@ spec:
             - name: MANTEION_ADDR
               value: ":8080"
             - name: ZEUS_URL
-              value: "http://archer:8080"
+              value: "https://2262-cse115b-02.be.ucsc.edu/zeus"
             - name: MANTEION_DATABASE_URL
               valueFrom:
                 secretKeyRef:
