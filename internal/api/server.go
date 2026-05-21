@@ -40,6 +40,7 @@ type Server struct {
 	faultStore  FaultStore
 	sdk         *store.SDKRepo
 	experiments *store.ExperimentRepo
+	workflows   *store.WorkflowRepo
 	workloads   *store.WorkloadRepo
 	policies    *store.PolicyRepo
 	traces      *store.TraceRepo
@@ -59,6 +60,7 @@ func NewServer(
 	faultStore FaultStore,
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
+	workflows *store.WorkflowRepo,
 	workloads *store.WorkloadRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
@@ -77,6 +79,7 @@ func NewServer(
 		faultStore:  faultStore,
 		sdk:         sdk,
 		experiments: experiments,
+		workflows:   workflows,
 		workloads:   workloads,
 		policies:    policies,
 		traces:      traces,
@@ -146,6 +149,24 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/faults/compositions", s.handleListFaultCompositions)
 	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
 	mux.HandleFunc("DELETE /api/v1/faults/compositions/{id}", s.handleDeleteFaultComposition)
+
+	// Workflow definitions (manteion-owned). Zeus owns execution; the
+	// UI fans out two parallel queries on the detail page (manteion DB
+	// for the definition, zeus proxy for live run state). Validate and
+	// run-start inline the definition into the proxied call.
+	mux.HandleFunc("POST /api/v1/workflows", s.handleCreateWorkflow)
+	mux.HandleFunc("GET /api/v1/workflows", s.handleListWorkflows)
+	mux.HandleFunc("GET /api/v1/workflows/{id}", s.handleGetWorkflow)
+	mux.HandleFunc("PUT /api/v1/workflows/{id}", s.handleUpdateWorkflow)
+	mux.HandleFunc("DELETE /api/v1/workflows/{id}", s.handleDeleteWorkflow)
+	mux.HandleFunc("POST /api/v1/workflows/{id}/validate", s.handleValidateWorkflow)
+	mux.HandleFunc("POST /api/v1/workflows/{id}/runs", s.handleStartWorkflowRun)
+
+	// Workflow-builder catalog: live SDK route inventory aggregated
+	// from sdk_instances.routes. 30-second handler cache; 2-minute
+	// liveness window. No curated demo fallback — empty SDK fleet
+	// returns an empty list with a hint.
+	mux.HandleFunc("GET /api/v1/catalog/endpoints", s.handleListCatalogEndpoints)
 
 	// Experiment CRUD + lifecycle
 	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)

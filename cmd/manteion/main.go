@@ -65,6 +65,7 @@ func main() {
 	faultRepo := store.NewFaultRepo(database)
 	sdkRepo := store.NewSDKRepo(database)
 	experimentRepo := store.NewExperimentRepo(database)
+	workflowRepo := store.NewWorkflowRepo(database)
 	workloadRepo := store.NewWorkloadRepo(database)
 	traceRepo := store.NewTraceRepo(database)
 
@@ -98,7 +99,7 @@ func main() {
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, sdkRepo,
-		experimentRepo, workloadRepo, traceRepo,
+		experimentRepo, workflowRepo, workloadRepo, traceRepo,
 		zeusClient, controller.IntentReader(), orch, cs, policyRepo,
 	)
 

@@ -95,3 +95,12 @@ func nullInt(n int) sql.NullInt32 {
 	}
 	return sql.NullInt32{Int32: int32(n), Valid: true}
 }
+
+// Page is the pagination request shape consumed by repos that return
+// paginated lists. Mirror of the api/pagination.go envelope so handlers
+// can pass the parsed limit/offset through unchanged. The repo is
+// responsible for clamping (limit > 200, offset < 0, etc.).
+type Page struct {
+	Limit  int
+	Offset int
+}

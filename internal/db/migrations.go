@@ -209,6 +209,43 @@ ALTER TABLE fault_specs RENAME COLUMN config TO params;
 	{20, "add rules.match_expr for opa-rego forward compat", `
 ALTER TABLE rules ADD COLUMN IF NOT EXISTS match_expr TEXT NOT NULL DEFAULT '';
 `},
+	{21, "workflow definitions + sdk route inventory", `
+-- =====================================================================
+-- Manteion owns workflow DEFINITIONS (the DSL spec). Zeus owns workflow
+-- EXECUTION (run state, attack lifecycle, validation). When a workflow
+-- is started, manteion inlines the definition into the proxied call so
+-- zeus does not need a credentialed callback to manteion.
+--
+-- The UI fans out two parallel queries for the workflow-detail view:
+--   GET  /api/v1/workflows/{id}        manteion DB — the definition
+--   GET  /api/v1/zeus/runs?workflow_id manteion proxy → zeus — live runs
+--
+-- This migration also salvages sdk_instances.routes from the
+-- flows-catalog-personas-apis branch so the workflow-builder catalog
+-- can aggregate live SDK route inventories without a curated fallback.
+-- =====================================================================
+
+-- ---------- SDK route inventory (salvage) ----------
+ALTER TABLE sdk_instances ADD COLUMN IF NOT EXISTS routes JSONB;
+
+-- ---------- Workflow definitions ----------
+CREATE TABLE IF NOT EXISTS workflows (
+    id                    TEXT PRIMARY KEY,
+    name                  TEXT NOT NULL,
+    description           TEXT,
+    targets               JSONB NOT NULL DEFAULT '[]',
+    estimated_rps_per_vu  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- DSL v2 tree. Opaque to manteion — zeus parses + validates at run
+    -- start. Storing as JSONB keeps node-shape changes out of the
+    -- migration pipeline.
+    steps                 JSONB NOT NULL,
+    thresholds            JSONB,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_workflows_name        ON workflows(name);
+CREATE INDEX IF NOT EXISTS idx_workflows_created_at  ON workflows(created_at DESC);
+`},
 }
 
 // Migrate applies any pending migrations to the database.
