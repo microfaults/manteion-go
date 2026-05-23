@@ -20,8 +20,27 @@ func NewSDKRepo(db *sql.DB) *SDKRepo {
 	return &SDKRepo{db: db}
 }
 
+// statusExpr computes liveness from last_poll_at and poll_interval_ms:
+//
+//	alive: within 2× poll interval
+//	stale: between 2× and 5× poll interval
+//	dead:  beyond 5× poll interval
+const statusExpr = `CASE
+	WHEN EXTRACT(EPOCH FROM now() - last_poll_at) * 1000 > poll_interval_ms * 5 THEN 'dead'
+	WHEN EXTRACT(EPOCH FROM now() - last_poll_at) * 1000 > poll_interval_ms * 2 THEN 'stale'
+	ELSE 'alive'
+END`
+
+// selectColumns is the column list shared by all read queries. Status is
+// computed from poll staleness, not stored.
+var selectColumns = fmt.Sprintf(
+	`id, service, version, address, poll_interval_ms, routes, registered_at, last_poll_at, %s AS status`,
+	statusExpr,
+)
+
 // Register inserts or re-registers an SDK instance (upsert).
-// On conflict, updates service/version/address/routes and resets timestamps.
+// On conflict, updates service/version/address/routes/poll_interval_ms and
+// resets timestamps.
 func (r *SDKRepo) Register(ctx context.Context, inst *model.SDKInstance) error {
 	if err := inst.Validate(); err != nil {
 		return err
@@ -38,17 +57,23 @@ func (r *SDKRepo) Register(ctx context.Context, inst *model.SDKInstance) error {
 		routesJSON = b
 	}
 
+	pollMs := inst.PollIntervalMs
+	if pollMs <= 0 {
+		pollMs = 10000 // default 10s
+	}
+
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO sdk_instances (id, service, version, address, routes, registered_at, last_poll_at)
-		VALUES ($1, $2, $3, $4, $5, now(), now())
+		INSERT INTO sdk_instances (id, service, version, address, poll_interval_ms, routes, registered_at, last_poll_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now(), now())
 		ON CONFLICT (id) DO UPDATE SET
 			service = EXCLUDED.service,
 			version = EXCLUDED.version,
 			address = EXCLUDED.address,
+			poll_interval_ms = EXCLUDED.poll_interval_ms,
 			routes = EXCLUDED.routes,
 			registered_at = now(),
 			last_poll_at = now()`,
-		inst.ID, inst.Service, inst.Version, inst.Address, routesJSON,
+		inst.ID, inst.Service, inst.Version, inst.Address, pollMs, routesJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("register sdk instance: %w", err)
@@ -66,7 +91,8 @@ func (r *SDKRepo) Deregister(ctx context.Context, id string) error {
 }
 
 // scanInstance scans one sdk_instances row including the nullable routes
-// JSONB. Shared by Get/List/ForService/ListLive.
+// JSONB and the computed status. Shared by Get/List/ForService/ListLive;
+// column order must match selectColumns.
 func scanInstance(scanner interface {
 	Scan(dest ...any) error
 }) (*model.SDKInstance, error) {
@@ -75,7 +101,7 @@ func scanInstance(scanner interface {
 		routesRaw []byte
 	)
 	if err := scanner.Scan(&inst.ID, &inst.Service, &inst.Version, &inst.Address,
-		&routesRaw, &inst.RegisteredAt, &inst.LastPollAt); err != nil {
+		&inst.PollIntervalMs, &routesRaw, &inst.RegisteredAt, &inst.LastPollAt, &inst.Status); err != nil {
 		return nil, err
 	}
 	if len(routesRaw) > 0 {
@@ -88,9 +114,8 @@ func scanInstance(scanner interface {
 
 // Get returns an SDK instance by ID, or ErrNotFound.
 func (r *SDKRepo) Get(ctx context.Context, id string) (*model.SDKInstance, error) {
-	inst, err := scanInstance(r.db.QueryRowContext(ctx, `
-		SELECT id, service, version, address, routes, registered_at, last_poll_at
-		FROM sdk_instances WHERE id = $1`, id))
+	inst, err := scanInstance(r.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM sdk_instances WHERE id = $1`, selectColumns), id))
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -103,9 +128,8 @@ func (r *SDKRepo) Get(ctx context.Context, id string) (*model.SDKInstance, error
 // List returns all registered SDK instances (no liveness filter — callers
 // that need only fresh instances should use ListLive).
 func (r *SDKRepo) List(ctx context.Context) ([]*model.SDKInstance, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, service, version, address, routes, registered_at, last_poll_at
-		FROM sdk_instances ORDER BY service, id`)
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM sdk_instances ORDER BY service, id`, selectColumns))
 	if err != nil {
 		return nil, fmt.Errorf("list sdk instances: %w", err)
 	}
@@ -130,11 +154,10 @@ func (r *SDKRepo) ListLive(ctx context.Context, freshness time.Duration) ([]*mod
 	if seconds < 1 {
 		seconds = 1
 	}
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, service, version, address, routes, registered_at, last_poll_at
-		FROM sdk_instances
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM sdk_instances
 		WHERE last_poll_at > now() - make_interval(secs => $1)
-		ORDER BY service, id`, seconds)
+		ORDER BY service, id`, selectColumns), seconds)
 	if err != nil {
 		return nil, fmt.Errorf("list live sdk instances: %w", err)
 	}
@@ -153,9 +176,8 @@ func (r *SDKRepo) ListLive(ctx context.Context, freshness time.Duration) ([]*mod
 
 // ForService returns SDK instances for a specific service.
 func (r *SDKRepo) ForService(ctx context.Context, service string) ([]*model.SDKInstance, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, service, version, address, routes, registered_at, last_poll_at
-		FROM sdk_instances WHERE service = $1 ORDER BY id`, service)
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM sdk_instances WHERE service = $1 ORDER BY id`, selectColumns), service)
 	if err != nil {
 		return nil, fmt.Errorf("sdk instances for service: %w", err)
 	}
@@ -181,6 +203,19 @@ func (r *SDKRepo) TouchPoll(ctx context.Context, id string) error {
 		return fmt.Errorf("touch poll: %w", err)
 	}
 	return affectedOrNotFound(res)
+}
+
+// PurgeDead removes instances inactive for longer than (5× poll_interval) + grace.
+func (r *SDKRepo) PurgeDead(ctx context.Context, grace time.Duration) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+		DELETE FROM sdk_instances
+		WHERE EXTRACT(EPOCH FROM now() - last_poll_at) * 1000 > (poll_interval_ms * 5) + $1`,
+		grace.Milliseconds(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("purge dead instances: %w", err)
+	}
+	return res.RowsAffected()
 }
 
 // Count returns the total number of registered instances.

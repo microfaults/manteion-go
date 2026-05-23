@@ -114,6 +114,29 @@ func main() {
 	// Start policy engine as background goroutine.
 	go policyEngine.Run(ctx)
 
+	// Start SDK reaper — purges instances dead for > 10 minutes. Opt-in via
+	// MANTEION_SDK_PURGE_ENABLED (default false) so dead pods can linger on the
+	// dashboard for postmortem unless an operator wants them auto-cleaned.
+	if envOr("MANTEION_SDK_PURGE_ENABLED", "false") == "true" {
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					n, err := sdkRepo.PurgeDead(ctx, 10*time.Minute)
+					if err != nil {
+						logger.Error("sdk reaper: purge failed", "error", err)
+					} else if n > 0 {
+						logger.Info("sdk reaper: purged dead instances", "count", n)
+					}
+				}
+			}
+		}()
+	}
+
 	// Start server in a goroutine.
 	go func() {
 		displayAddr := addr

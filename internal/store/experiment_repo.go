@@ -346,6 +346,25 @@ func (r *ExperimentRepo) UpdateRunStatus(ctx context.Context, id, status string)
 	return affectedOrNotFound(res)
 }
 
+// FinalizeRunStatus atomically transitions a run to a terminal state, but only
+// if it is not already terminal. Returns true if it transitioned, false if the
+// run was already completed/failed. This makes terminal transitions race-safe:
+// the first terminal status wins, so a late async auto-complete cannot overwrite
+// an explicit failure (or vice versa).
+func (r *ExperimentRepo) FinalizeRunStatus(ctx context.Context, id, status string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiment_runs SET status = $2, completed_at = now()
+		WHERE id = $1 AND status NOT IN ('completed','failed')`, id, status)
+	if err != nil {
+		return false, fmt.Errorf("finalize run status: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("finalize run status rows: %w", err)
+	}
+	return n > 0, nil
+}
+
 // UpdateRunZeusAttacks stores the primary and all attack IDs for multi-workflow runs.
 func (r *ExperimentRepo) UpdateRunZeusAttacks(ctx context.Context, id string, attackIDs []string) error {
 	idsJSON, err := jsonbMarshal(attackIDs)

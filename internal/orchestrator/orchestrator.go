@@ -545,6 +545,13 @@ func (o *Orchestrator) StopRun(ctx context.Context, runID string, status string)
 		return err
 	}
 
+	// Idempotent on terminal states. A run that already reached completed/failed
+	// must not be transitioned again — this is what stops the async auto-complete
+	// in StartRun from overwriting an explicit failure (and vice versa).
+	if run.Status == "completed" || run.Status == "failed" {
+		return nil
+	}
+
 	for _, svc := range o.collectServices(run) {
 		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
 			o.logger.Warn("orchestrator: clear rules failed on stop",
@@ -569,8 +576,14 @@ func (o *Orchestrator) StopRun(ctx context.Context, runID string, status string)
 		o.HarvestResults(ctx, run)
 	}
 
-	if err := o.experiments.UpdateRunStatus(ctx, runID, status); err != nil {
+	// Atomic terminal transition: if a concurrent caller already finalized this
+	// run, we lost the race — skip the redundant advance rather than double-fire.
+	transitioned, err := o.experiments.FinalizeRunStatus(ctx, runID, status)
+	if err != nil {
 		return err
+	}
+	if !transitioned {
+		return nil
 	}
 
 	go o.advanceExperiment(context.Background(), run.ExperimentID)

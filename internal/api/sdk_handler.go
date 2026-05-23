@@ -137,6 +137,15 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Touch poll timestamp for the instance (best-effort, don't fail the poll).
+	// Must run BEFORE the 304 check — most polls are no-change, and last_poll_at
+	// drives the computed liveness status.
+	if instanceID := r.URL.Query().Get("instance_id"); instanceID != "" {
+		if touchErr := s.sdk.TouchPoll(ctx, instanceID); touchErr != nil {
+			s.logger.Warn("touch poll failed", "instance_id", instanceID, "error", touchErr)
+		}
+	}
+
 	// Check current rule version.
 	currentVersion, err := s.rules.Version(ctx)
 	if err != nil {
@@ -157,13 +166,6 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("fetch rules for service failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to fetch rules")
 		return
-	}
-
-	// Touch poll timestamp for the instance (best-effort, don't fail the poll).
-	if instanceID := r.URL.Query().Get("instance_id"); instanceID != "" {
-		if touchErr := s.sdk.TouchPoll(ctx, instanceID); touchErr != nil {
-			s.logger.Warn("touch poll failed", "instance_id", instanceID, "error", touchErr)
-		}
 	}
 
 	if rules == nil {

@@ -246,6 +246,10 @@ CREATE TABLE IF NOT EXISTS workflows (
 CREATE INDEX IF NOT EXISTS idx_workflows_name        ON workflows(name);
 CREATE INDEX IF NOT EXISTS idx_workflows_created_at  ON workflows(created_at DESC);
 `},
+	{22, "add sdk_instances.poll_interval_ms for computed liveness status", `
+ALTER TABLE sdk_instances
+    ADD COLUMN IF NOT EXISTS poll_interval_ms BIGINT NOT NULL DEFAULT 10000;
+`},
 }
 
 // Migrate applies any pending migrations to the database.
