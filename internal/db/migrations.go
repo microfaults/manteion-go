@@ -250,6 +250,33 @@ CREATE INDEX IF NOT EXISTS idx_workflows_created_at  ON workflows(created_at DES
 ALTER TABLE sdk_instances
     ADD COLUMN IF NOT EXISTS poll_interval_ms BIGINT NOT NULL DEFAULT 10000;
 `},
+	{23, "add fault_configs for long-running manual faults", `
+CREATE TABLE IF NOT EXISTS fault_configs (
+    id                   TEXT        PRIMARY KEY,
+    name                 TEXT        NOT NULL,
+    description          TEXT        NOT NULL DEFAULT '',
+    service              TEXT        NOT NULL,
+    category             TEXT        NOT NULL CHECK (category IN ('inline','network','resource')),
+    fault_type           TEXT        NOT NULL,
+    fault_request        JSONB,
+    fault_composition_id TEXT        REFERENCES fault_compositions(id) ON DELETE SET NULL,
+    duration_ms          BIGINT      NOT NULL DEFAULT 0,
+    experiment_run_id    TEXT        REFERENCES experiment_runs(id) ON DELETE SET NULL,
+    status               TEXT        NOT NULL DEFAULT 'ready'
+                         CHECK (status IN ('ready','active','completed','cancelled')),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    fired_at             TIMESTAMPTZ,
+    completed_at         TIMESTAMPTZ,
+    CONSTRAINT fault_request_or_composition CHECK (
+        fault_request IS NOT NULL OR fault_composition_id IS NOT NULL
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_fault_configs_active_service
+    ON fault_configs(service) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_fault_configs_reaper
+    ON fault_configs(fired_at) WHERE status = 'active' AND duration_ms > 0;
+`},
 }
 
 // Migrate applies any pending migrations to the database.

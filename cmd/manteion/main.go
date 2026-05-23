@@ -96,9 +96,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	faultConfigRepo := store.NewFaultConfigRepo(database)
+
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
-		ruleRepo, faultRepo, faultRepo, sdkRepo,
+		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, workflowRepo, workloadRepo, traceRepo,
 		zeusClient, controller.IntentReader(), orch, cs, policyRepo,
 	)
@@ -113,6 +115,10 @@ func main() {
 
 	// Start policy engine as background goroutine.
 	go policyEngine.Run(ctx)
+
+	// Complete expired long-running fault configs (status bookkeeping +
+	// version bump; the SDK reconciles them away).
+	srv.StartFaultConfigReaper(ctx, 30*time.Second)
 
 	// Start SDK reaper — purges instances dead for > 10 minutes. Opt-in via
 	// MANTEION_SDK_PURGE_ENABLED (default false) so dead pods can linger on the

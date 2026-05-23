@@ -1,22 +1,63 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/model"
 	"manteion-go/internal/ruleconv"
 	"manteion-go/internal/store"
 )
 
+// activeFaultsForService returns the faults a service should currently apply,
+// plus its freeze config — the desired-state set the SDK reconciles against on
+// each poll. It unions manual long-running fault configs with any experiment-
+// driven intent fault. Each entry carries a stable unique ID so the SDK keys
+// its slots correctly.
+func (s *Server) activeFaultsForService(ctx context.Context, service string) ([]atroposdk.FaultRequest, *atroposdk.DelayRequest) {
+	var faults []atroposdk.FaultRequest
+
+	if s.faultConfigs != nil {
+		configs, err := s.faultConfigs.ListActiveForService(ctx, service)
+		if err != nil {
+			s.logger.Error("active faults: list manual failed", "service", service, "error", err)
+		}
+		for _, c := range configs {
+			if len(c.FaultReq) == 0 {
+				continue // composition configs aren't deliverable yet
+			}
+			faults = append(faults, atroposdk.FaultRequest{
+				ID:         c.ID,
+				Category:   c.Category,
+				Type:       c.FaultType,
+				DurationMs: c.DurationMs,
+				Config:     c.FaultReq,
+			})
+		}
+	}
+
+	var freeze *atroposdk.DelayRequest
+	if s.intent != nil {
+		if intent, ok := s.intent.Get(service); ok {
+			if intent.ActiveFault != nil {
+				faults = append(faults, *intent.ActiveFault)
+			}
+			freeze = intent.FreezeCfg
+		}
+	}
+	return faults, freeze
+}
+
 // handleRegister registers (or re-registers) an SDK instance.
 //
 // @Summary      Register SDK instance
 // @Description  Registers an atropos-go SDK process. The 201 response carries
-// @Description  status="registered" and may include initial intent payload
-// @Description  (rules, active_fault, freeze_cfg) when an IntentReader is
-// @Description  configured for the service.
+// @Description  status="registered" and may include the initial desired state
+// @Description  (rules, active_faults, freeze_cfg) so the SDK converges before
+// @Description  its first poll.
 // @Tags         sdk
 // @Accept       json
 // @Produce      json
@@ -41,17 +82,18 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{"status": "registered"}
 	if s.intent != nil {
-		if intent, ok := s.intent.Get(inst.Service); ok {
-			if intent.Rules != nil {
-				resp["rules"] = intent.Rules
-			}
-			if intent.ActiveFault != nil {
-				resp["active_fault"] = intent.ActiveFault
-			}
-			if intent.FreezeCfg != nil {
-				resp["freeze_cfg"] = intent.FreezeCfg
-			}
+		if intent, ok := s.intent.Get(inst.Service); ok && intent.Rules != nil {
+			resp["rules"] = intent.Rules
 		}
+	}
+	// Deliver the current desired fault set (manual + experiment) and freeze
+	// config so a freshly-registered SDK converges before its first poll.
+	faults, freeze := s.activeFaultsForService(r.Context(), inst.Service)
+	if len(faults) > 0 {
+		resp["active_faults"] = faults
+	}
+	if freeze != nil {
+		resp["freeze_cfg"] = freeze
 	}
 	writeJSON(w, http.StatusCreated, resp)
 }
@@ -111,16 +153,17 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 //
 // @Summary      Poll for rule updates
 // @Description  SDKs send their last-known rule version via the version query param.
-// @Description  Returns 304 if unchanged, 200 with the current rule set otherwise.
-// @Description  The 200 body wraps the version and the compiled rule list:
-// @Description  {"version": uint64, "rules": []ruleconv.CompiledRule}.
+// @Description  Returns 304 if unchanged, else 200 with the desired state the SDK
+// @Description  reconciles against: {"version": uint64, "rules": []CompiledRule,
+// @Description  "active_faults": []FaultRequest, "freeze_cfg": DelayRequest}.
+// @Description  Manual fault add/remove bumps the version so it rides this path.
 // @Description  Optional instance_id query param triggers a best-effort poll-timestamp touch.
 // @Tags         sdk
 // @Produce      json
 // @Param        service      query     string  true   "service name"
 // @Param        version      query     integer false  "last known rule version (uint64); omit on first poll"
 // @Param        instance_id  query     string  false  "SDK instance ID for poll-timestamp tracking"
-// @Success      200          {object}  map[string]any  "{version, rules: []ruleconv.CompiledRule}"
+// @Success      200          {object}  map[string]any  "{version, rules, active_faults, freeze_cfg}"
 // @Success      304          "no rule changes since requested version"
 // @Failure      400          {object}  api.ErrorResponse  "service query parameter required"
 // @Failure      500          {object}  api.ErrorResponse
@@ -154,10 +197,19 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 304 Not Modified — client already has the latest rules.
+	// 304 Not Modified — client already has the latest desired state. Fault
+	// config changes bump the rule version, so add/remove of manual faults is
+	// delivered through this same fast-path (a 200 follows the bump).
 	if requestedVersion == currentVersion {
 		w.WriteHeader(http.StatusNotModified)
 		return
+	}
+
+	// Desired fault set for this service (manual long-running + experiment) and
+	// freeze config — the SDK reconciles its applied faults against this list.
+	activeFaults, freezeCfg := s.activeFaultsForService(ctx, service)
+	if activeFaults == nil {
+		activeFaults = []atroposdk.FaultRequest{}
 	}
 
 	// Fetch rules for this service.
@@ -178,15 +230,19 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Error("compile rules failed", "service", service, "error", err)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"version": currentVersion,
-			"rules":   rules,
+			"version":       currentVersion,
+			"rules":         rules,
+			"active_faults": activeFaults,
+			"freeze_cfg":    freezeCfg,
 		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version": currentVersion,
-		"rules":   compiled,
+		"version":       currentVersion,
+		"rules":         compiled,
+		"active_faults": activeFaults,
+		"freeze_cfg":    freezeCfg,
 	})
 }
 

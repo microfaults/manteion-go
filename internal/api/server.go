@@ -31,24 +31,25 @@ type ruleVersioner interface {
 
 // Server holds all dependencies for the manteion API.
 type Server struct {
-	logger      *slog.Logger
-	db          *sql.DB
-	dbPing      dbPinger // same as db; separate field so tests can inject a fake
-	rules       *store.RuleRepo
-	rulever     ruleVersioner // same as rules; separate field so tests can inject a fake
-	faults      *store.FaultRepo
-	faultStore  FaultStore
-	sdk         *store.SDKRepo
-	experiments *store.ExperimentRepo
-	workflows   *store.WorkflowRepo
-	workloads   *store.WorkloadRepo
-	policies    *store.PolicyRepo
-	traces      *store.TraceRepo
-	zeus        *zeus.Client
-	intent      atrocontrol.IntentReader
-	orch        *orchestrator.Orchestrator
-	cacheStore  *cachestore.Store
-	broker      *EventBroker
+	logger       *slog.Logger
+	db           *sql.DB
+	dbPing       dbPinger // same as db; separate field so tests can inject a fake
+	rules        *store.RuleRepo
+	rulever      ruleVersioner // same as rules; separate field so tests can inject a fake
+	faults       *store.FaultRepo
+	faultStore   FaultStore
+	faultConfigs *store.FaultConfigRepo
+	sdk          *store.SDKRepo
+	experiments  *store.ExperimentRepo
+	workflows    *store.WorkflowRepo
+	workloads    *store.WorkloadRepo
+	policies     *store.PolicyRepo
+	traces       *store.TraceRepo
+	zeus         *zeus.Client
+	intent       atrocontrol.IntentReader
+	orch         *orchestrator.Orchestrator
+	cacheStore   *cachestore.Store
+	broker       *EventBroker
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -58,6 +59,7 @@ func NewServer(
 	rules *store.RuleRepo,
 	faults *store.FaultRepo,
 	faultStore FaultStore,
+	faultConfigs *store.FaultConfigRepo,
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
 	workflows *store.WorkflowRepo,
@@ -70,24 +72,25 @@ func NewServer(
 	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
-		logger:      logger,
-		db:          db,
-		dbPing:      db,
-		rules:       rules,
-		rulever:     rules,
-		faults:      faults,
-		faultStore:  faultStore,
-		sdk:         sdk,
-		experiments: experiments,
-		workflows:   workflows,
-		workloads:   workloads,
-		policies:    policies,
-		traces:      traces,
-		zeus:        zeusClient,
-		intent:      intent,
-		orch:        orch,
-		cacheStore:  cs,
-		broker:      NewEventBroker(),
+		logger:       logger,
+		db:           db,
+		dbPing:       db,
+		rules:        rules,
+		rulever:      rules,
+		faults:       faults,
+		faultStore:   faultStore,
+		faultConfigs: faultConfigs,
+		sdk:          sdk,
+		experiments:  experiments,
+		workflows:    workflows,
+		workloads:    workloads,
+		policies:     policies,
+		traces:       traces,
+		zeus:         zeusClient,
+		intent:       intent,
+		orch:         orch,
+		cacheStore:   cs,
+		broker:       NewEventBroker(),
 	}
 }
 
@@ -149,6 +152,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/faults/compositions", s.handleListFaultCompositions)
 	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
 	mux.HandleFunc("DELETE /api/v1/faults/compositions/{id}", s.handleDeleteFaultComposition)
+
+	// Long-running manual faults (side channel to rule-attached faults).
+	// Fired explicitly, delivered to SDKs via the poll active_faults set,
+	// reconciled and watchdog-reaped SDK-side.
+	mux.HandleFunc("POST /api/v1/faults/configs", s.handleCreateFaultConfig)
+	mux.HandleFunc("GET /api/v1/faults/configs", s.handleListFaultConfigs)
+	mux.HandleFunc("DELETE /api/v1/faults/configs/{id}", s.handleDeleteFaultConfig)
+	mux.HandleFunc("POST /api/v1/faults/configs/{id}/fire", s.handleFireFaultConfig)
+	mux.HandleFunc("POST /api/v1/faults/configs/{id}/cancel", s.handleCancelFaultConfig)
 
 	// Workflow definitions (manteion-owned). Zeus owns execution; the
 	// UI fans out two parallel queries on the detail page (manteion DB

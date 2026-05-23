@@ -185,6 +185,19 @@ func (r *RuleRepo) Version(ctx context.Context) (uint64, error) {
 	return v, nil
 }
 
+// BumpVersion increments the rule store version out of band. Used when the
+// desired SDK state changes without a rule mutation — e.g. a long-running fault
+// config is fired, cancelled, or expires — so the next poll returns 200 and the
+// SDK reconciles its active_faults set instead of getting a 304.
+func (r *RuleRepo) BumpVersion(ctx context.Context) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE rule_version SET version = version + 1 WHERE id = 1`)
+	if err != nil {
+		return fmt.Errorf("bump rule_version: %w", err)
+	}
+	return nil
+}
+
 // bumpVersion increments the rule_version counter within a transaction.
 func (r *RuleRepo) bumpVersion(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx,

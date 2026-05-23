@@ -48,6 +48,7 @@ func truncateAll(conn *sql.DB) {
 		"workflow_run_results",
 		"attacks",
 		"attack_results",
+		"fault_configs",
 		"experiment_runs",
 		"experiments",
 		"policy_rules",
