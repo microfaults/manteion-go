@@ -12,13 +12,16 @@ const (
 	defaultMaxPollDuration = 30 * time.Minute
 )
 
-// pollZeusStatus runs as a background goroutine for each active run.
-// It polls Zeus for the status of all attack IDs associated with the run.
-// When all attacks have completed (fixed-duration), it harvests results and
-// transitions the run to "completed". If Zeus reports an unexpected failure
-// the run is marked "failed". The poller gives up after maxPollDuration as
-// a safety net against permanently stuck or unreachable attacks.
-func (o *Orchestrator) pollZeusStatus(ctx context.Context, run *model.ExperimentRun) {
+// pollZeusStatus runs as a background goroutine for each active run, polling
+// Zeus for the status of the run's attack IDs. When all attacks complete it
+// finishes the run "completed" (finishRun harvests exactly once); an unexpected
+// failure or the maxPollDuration safety-net finishes it "failed". It re-fetches
+// the run each tick so attack-ID changes (e.g. after resume) are picked up.
+//
+// Terminal calls pass context.Background(): finishRun cancels this poller's ctx
+// via cancelAll, so the run's cleanup must not run on the about-to-be-cancelled
+// poll context.
+func (o *Orchestrator) pollZeusStatus(ctx context.Context, runID string) {
 	ticker := time.NewTicker(zeusPollingInterval)
 	defer ticker.Stop()
 
@@ -30,26 +33,24 @@ func (o *Orchestrator) pollZeusStatus(ctx context.Context, run *model.Experiment
 			return
 		case <-deadline:
 			o.logger.Error("orchestrator: zeus poll timeout exceeded; marking run failed",
-				"run_id", run.ID, "timeout", defaultMaxPollDuration)
-			o.StopRun(ctx, run.ID, "failed")
+				"run_id", runID, "timeout", defaultMaxPollDuration)
+			o.finishRun(context.Background(), runID, "failed", "running")
 			return
 		case <-ticker.C:
+			run, err := o.experiments.GetRun(ctx, runID)
+			if err != nil {
+				o.logger.Warn("orchestrator: poll: get run failed", "run_id", runID, "error", err)
+				continue
+			}
 			done, failed := o.checkAttackStatuses(ctx, run)
 			if failed {
-				o.logger.Warn("orchestrator: zeus attack failed unexpectedly",
-					"run_id", run.ID)
-				o.StopRun(ctx, run.ID, "failed")
+				o.logger.Warn("orchestrator: zeus attack failed unexpectedly", "run_id", runID)
+				o.finishRun(context.Background(), runID, "failed", "running")
 				return
 			}
 			if done {
-				o.logger.Info("orchestrator: zeus attacks completed naturally",
-					"run_id", run.ID)
-				// Re-fetch to get latest attack IDs before harvesting.
-				latest, err := o.experiments.GetRun(ctx, run.ID)
-				if err == nil {
-					o.HarvestResults(ctx, latest)
-				}
-				o.StopRun(ctx, run.ID, "completed")
+				o.logger.Info("orchestrator: zeus attacks completed naturally", "run_id", runID)
+				o.finishRun(context.Background(), runID, "completed", "running")
 				return
 			}
 		}

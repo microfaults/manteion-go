@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,17 +118,23 @@ func newOrchestrator(t *testing.T) *Orchestrator {
 	t.Helper()
 	cs := cachestore.New(t.TempDir())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	return New(
+	orc := New(
 		testExperRepo,
 		testRuleRepo,
 		testFaultRepo,
 		testWorkRepo,
 		newNoOpController(),
-		nil, // promql.Client — not needed for FSM tests
 		nil, // zeus.Client — not needed for FSM tests
 		cs,
 		logger,
 	)
+	// FSM tests drive runs manually; without a Zeus poller a started run would
+	// otherwise auto-complete and race the test's explicit Pause/Stop. Tests that
+	// specifically exercise auto-complete (DAG fan-out, crash recovery) re-enable it.
+	// autoComplete is unexported; in-package tests set it directly so the toggle
+	// never leaks into the production API surface.
+	orc.autoComplete = false
+	return orc
 }
 
 // seedMinimalExperiment inserts a minimal experiment with a workflow reference.
@@ -420,6 +427,7 @@ func seedRunWithDeps(t *testing.T, ctx context.Context, exp *model.Experiment, r
 func TestRecover_RunningRunRestored(t *testing.T) {
 	ctx := context.Background()
 	orc := newOrchestrator(t)
+	orc.autoComplete = true // this test asserts the orphan auto-completes
 
 	exp := seedMinimalExperiment(t, ctx)
 	run := seedRun(t, ctx, exp)
@@ -469,6 +477,7 @@ func TestRecover_PausedRunLeftAlone(t *testing.T) {
 func TestAdvanceExperiment_DAGSequencing(t *testing.T) {
 	ctx := context.Background()
 	orc := newOrchestrator(t)
+	orc.autoComplete = true // DAG fan-out relies on driver-less runs auto-completing
 
 	exp := seedMinimalExperiment(t, ctx)
 
@@ -508,6 +517,13 @@ func TestAdvanceExperiment_FailureCascade(t *testing.T) {
 		Service: "svc", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny",
 	}}
 	isolation := seedRunWithDeps(t, ctx, exp, "isolation", []string{baseline.ID}, frozen)
+
+	// The cascade runs inside advanceExperiment, which only acts on a running
+	// experiment — mark it running without StartExperiment (which would auto-walk
+	// the DAG) so we can drive the baseline failure explicitly.
+	if err := testExperRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+		t.Fatalf("set experiment running: %v", err)
+	}
 
 	// Start baseline, then fail it.
 	if err := orc.StartRun(ctx, baseline.ID); err != nil {
@@ -554,6 +570,72 @@ func TestFullCycle_PauseResumeThenStop(t *testing.T) {
 	// running → completed
 	if err := orc.StopRun(ctx, run.ID, "completed"); err != nil {
 		t.Fatalf("StopRun: %v", err)
+	}
+	assertRunStatus(t, ctx, run.ID, "completed")
+}
+
+// TestStartRun_ConcurrentNoDoubleStart verifies the atomic pending→running
+// claim: many concurrent StartRun calls on the same pending run yield exactly
+// one success (the rest get "not pending"), so a run is never double-started
+// (which previously spawned duplicate goroutines + duplicate Zeus attacks when
+// two advanceExperiment goroutines raced).
+func TestStartRun_ConcurrentNoDoubleStart(t *testing.T) {
+	ctx := context.Background()
+	orc := newOrchestrator(t)
+
+	exp := seedMinimalExperiment(t, ctx)
+	run := seedRun(t, ctx, exp)
+	t.Cleanup(func() { _ = orc.StopRun(context.Background(), run.ID, "completed") })
+
+	const n = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successes := 0
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if err := orc.StartRun(ctx, run.ID); err == nil {
+				mu.Lock()
+				successes++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 successful StartRun, got %d", successes)
+	}
+	assertRunStatus(t, ctx, run.ID, "running")
+}
+
+// TestFinishRun_RespectsFromStates verifies the from-aware terminal guard: the
+// auto-complete path (finishRun from "running") must not complete a paused run,
+// so a pause is never clobbered by a racing auto-complete.
+func TestFinishRun_RespectsFromStates(t *testing.T) {
+	ctx := context.Background()
+	orc := newOrchestrator(t)
+
+	exp := seedMinimalExperiment(t, ctx)
+	run := seedRun(t, ctx, exp)
+
+	if err := orc.StartRun(ctx, run.ID); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if err := orc.PauseRun(ctx, run.ID); err != nil {
+		t.Fatalf("PauseRun: %v", err)
+	}
+
+	// Auto-complete semantics: from {running} only — must not touch a paused run.
+	if orc.finishRun(ctx, run.ID, "completed", "running") {
+		t.Fatal("finishRun(from=running) should not have transitioned a paused run")
+	}
+	assertRunStatus(t, ctx, run.ID, "paused")
+
+	// Operator stop allows {running,paused} → terminal.
+	if !orc.finishRun(ctx, run.ID, "completed", "running", "paused") {
+		t.Fatal("finishRun(from=running,paused) should have completed the paused run")
 	}
 	assertRunStatus(t, ctx, run.ID, "completed")
 }

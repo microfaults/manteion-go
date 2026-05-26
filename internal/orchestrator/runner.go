@@ -2,92 +2,40 @@ package orchestrator
 
 import (
 	"context"
-	"time"
+	"fmt"
 
-	"manteion-go/internal/conditions"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
 )
 
-const watchInterval = 10 * time.Second
-
-func (o *Orchestrator) watchPhase(ctx context.Context, run *model.ExperimentRun) {
-	cond := run.TransitionCond
-	ticker := time.NewTicker(watchInterval)
-	defer ticker.Stop()
-
-	var condHeldSince time.Time
-	condHeld := false
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			value, err := o.prom.QueryInstant(ctx, cond.Metric)
-			if err != nil {
-				o.logger.Warn("orchestrator: condition query failed",
-					"run_id", run.ID, "error", err)
-				condHeld = false
-				condHeldSince = time.Time{}
-				continue
-			}
-
-			if conditions.Met(value, cond.Operator, cond.Threshold) {
-				if !condHeld {
-					condHeld = true
-					condHeldSince = time.Now()
-				} else if time.Since(condHeldSince) >= cond.Window {
-					o.advancePhase(ctx, run)
-					return
-				}
-			} else {
-				condHeld = false
-				condHeldSince = time.Time{}
-			}
-		}
+// AdvancePhase moves a running run to its next phase and applies that phase's
+// rules; if the run is already on its last phase it finishes as completed.
+//
+// This is the procedural seam for a future generic phase-advance callback hook.
+// Metric-driven (promQL) advancement was removed, so nothing invokes this
+// automatically today: a run applies phase 0 at StartRun and is driven to
+// completion by the Zeus poller (or auto-completes when it has no attacks).
+func (o *Orchestrator) AdvancePhase(ctx context.Context, runID string) error {
+	run, err := o.experiments.GetRun(ctx, runID)
+	if err != nil {
+		return err
 	}
-}
-
-func (o *Orchestrator) advancePhase(ctx context.Context, run *model.ExperimentRun) {
-	nextPhase := run.CurrentPhase + 1
-	o.logger.Info("orchestrator: advancing phase",
-		"run_id", run.ID, "from", run.CurrentPhase, "to", nextPhase)
-
-	if nextPhase >= len(run.PhaseRules) {
-		o.StopRun(ctx, run.ID, "completed")
-		return
+	if run.Status != "running" {
+		return fmt.Errorf("run %q is not running (status=%s)", runID, run.Status)
 	}
 
-	if err := o.enterPhase(ctx, run, nextPhase); err != nil {
+	next := run.CurrentPhase + 1
+	if next >= len(run.PhaseRules) {
+		o.finishRun(ctx, runID, "completed", "running")
+		return nil
+	}
+	if err := o.enterPhase(ctx, run, next); err != nil {
 		o.logger.Error("orchestrator: enter phase failed",
-			"run_id", run.ID, "phase", nextPhase, "error", err)
-		o.StopRun(ctx, run.ID, "failed")
-		return
+			"run_id", runID, "phase", next, "error", err)
+		o.finishRun(ctx, runID, "failed", "running")
+		return fmt.Errorf("enter phase %d: %w", next, err)
 	}
-
-	run.CurrentPhase = nextPhase
-	o.experiments.UpdateRunPhase(ctx, run.ID, nextPhase, "running")
-
-	if nextPhase+1 < len(run.PhaseRules) && run.TransitionCond != nil {
-		watchCtx, watchCancel := context.WithCancel(context.Background())
-		o.mu.Lock()
-		if handles, ok := o.running[run.ID]; ok {
-			// Cancel the previous watcher (this goroutine) and rebind. The
-			// poller stays alive across phase advances — its lifetime is
-			// StartRun→StopRun/PauseRun, not per-phase.
-			if handles.watcher != nil {
-				handles.watcher()
-			}
-			handles.watcher = watchCancel
-		} else {
-			// Run was stopped concurrently; cancel the new watcher we just
-			// created so it exits immediately.
-			watchCancel()
-		}
-		o.mu.Unlock()
-		go o.watchPhase(watchCtx, run)
-	}
+	return o.experiments.UpdateRunPhase(ctx, runID, next, "running")
 }
 
 // enterPhase pushes the rules for the given phase to all target services.

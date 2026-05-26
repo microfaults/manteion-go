@@ -346,21 +346,66 @@ func (r *ExperimentRepo) UpdateRunStatus(ctx context.Context, id, status string)
 	return affectedOrNotFound(res)
 }
 
-// FinalizeRunStatus atomically transitions a run to a terminal state, but only
-// if it is not already terminal. Returns true if it transitioned, false if the
-// run was already completed/failed. This makes terminal transitions race-safe:
-// the first terminal status wins, so a late async auto-complete cannot overwrite
-// an explicit failure (or vice versa).
-func (r *ExperimentRepo) FinalizeRunStatus(ctx context.Context, id, status string) (bool, error) {
-	res, err := r.db.ExecContext(ctx, `
-		UPDATE experiment_runs SET status = $2, completed_at = now()
-		WHERE id = $1 AND status NOT IN ('completed','failed')`, id, status)
+// TransitionRun atomically moves a run to `to` only if its current status is one
+// of `from`. Returns true if it transitioned; callers that get false either lost
+// a concurrent transition or the run was not in an allowed source state
+// (first-writer-wins). Sets started_at on entry to running and completed_at on a
+// terminal status. This is the single race-safe primitive for every run-state
+// change (start/pause/resume/complete/fail/cancel).
+func (r *ExperimentRepo) TransitionRun(ctx context.Context, id, to string, from ...string) (bool, error) {
+	if len(from) == 0 {
+		return false, fmt.Errorf("transition run: from states required")
+	}
+	args := []any{id, to}
+	ph := make([]string, len(from))
+	for i, s := range from {
+		ph[i] = fmt.Sprintf("$%d", i+3)
+		args = append(args, s)
+	}
+	q := fmt.Sprintf(`
+		UPDATE experiment_runs SET
+			status       = $2,
+			started_at   = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
+			completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now() ELSE completed_at END
+		WHERE id = $1 AND status IN (%s)`, strings.Join(ph, ","))
+	res, err := r.db.ExecContext(ctx, q, args...)
 	if err != nil {
-		return false, fmt.Errorf("finalize run status: %w", err)
+		return false, fmt.Errorf("transition run to %s: %w", to, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("finalize run status rows: %w", err)
+		return false, fmt.Errorf("transition run rows: %w", err)
+	}
+	return n > 0, nil
+}
+
+// TransitionExperiment is the experiment-level analogue of TransitionRun: it
+// moves an experiment to `to` only if its current status is one of `from`,
+// returning whether it transitioned. Used for race-safe finalize and the
+// pause/resume/cancel lifecycle.
+func (r *ExperimentRepo) TransitionExperiment(ctx context.Context, id, to string, from ...string) (bool, error) {
+	if len(from) == 0 {
+		return false, fmt.Errorf("transition experiment: from states required")
+	}
+	args := []any{id, to}
+	ph := make([]string, len(from))
+	for i, s := range from {
+		ph[i] = fmt.Sprintf("$%d", i+3)
+		args = append(args, s)
+	}
+	q := fmt.Sprintf(`
+		UPDATE experiments SET
+			status       = $2,
+			started_at   = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
+			completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now() ELSE completed_at END
+		WHERE id = $1 AND status IN (%s)`, strings.Join(ph, ","))
+	res, err := r.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return false, fmt.Errorf("transition experiment to %s: %w", to, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("transition experiment rows: %w", err)
 	}
 	return n > 0, nil
 }

@@ -12,7 +12,6 @@ import (
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/model"
-	"manteion-go/internal/promql"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
 )
@@ -23,31 +22,28 @@ type Orchestrator struct {
 	faults      *store.FaultRepo
 	workloads   *store.WorkloadRepo
 	controller  *atrocontrol.Controller
-	prom        *promql.Client
 	zeusClient  *zeus.Client
 	cacheStore  *cachestore.Store
 	logger      *slog.Logger
 
 	maxPollDuration time.Duration
+	autoComplete    bool // auto-complete driver-less runs (off in FSM unit tests)
 
-	mu      sync.Mutex
-	running map[string]*runHandles // run ID → cancel funcs
+	mu       sync.Mutex
+	running  map[string]*runHandles // run ID → cancel funcs
+	expLocks map[string]*sync.Mutex // experiment ID → advanceExperiment serializer
 }
 
-// runHandles tracks the per-run goroutine cancel funcs.
-// watcher is rebound on each phase advance; poller's lifetime spans
-// StartRun→StopRun/PauseRun (one poller per run, never replaced mid-run).
+// runHandles tracks the per-run goroutine cancel funcs. Only the Zeus poller
+// remains (metric-driven phase watching was removed); its lifetime spans
+// StartRun→terminal/PauseRun.
 type runHandles struct {
-	watcher context.CancelFunc
-	poller  context.CancelFunc
+	poller context.CancelFunc
 }
 
 func (h *runHandles) cancelAll() {
 	if h == nil {
 		return
-	}
-	if h.watcher != nil {
-		h.watcher()
 	}
 	if h.poller != nil {
 		h.poller()
@@ -60,7 +56,6 @@ func New(
 	faults *store.FaultRepo,
 	workloads *store.WorkloadRepo,
 	controller *atrocontrol.Controller,
-	prom *promql.Client,
 	zeusClient *zeus.Client,
 	cs *cachestore.Store,
 	logger *slog.Logger,
@@ -71,13 +66,27 @@ func New(
 		faults:          faults,
 		workloads:       workloads,
 		controller:      controller,
-		prom:            prom,
 		zeusClient:      zeusClient,
 		cacheStore:      cs,
 		logger:          logger,
 		maxPollDuration: defaultMaxPollDuration,
+		autoComplete:    true,
 		running:         make(map[string]*runHandles),
+		expLocks:        make(map[string]*sync.Mutex),
 	}
+}
+
+// experimentLock returns the per-experiment mutex that serializes
+// advanceExperiment so concurrent run completions can't race the DAG scheduler.
+func (o *Orchestrator) experimentLock(experimentID string) *sync.Mutex {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	lk, ok := o.expLocks[experimentID]
+	if !ok {
+		lk = &sync.Mutex{}
+		o.expLocks[experimentID] = lk
+	}
+	return lk
 }
 
 // WithMaxPollDuration overrides the default Zeus poll timeout.
@@ -131,34 +140,25 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 		}
 
 		handles := &runHandles{}
-		if run.CurrentPhase+1 < len(run.PhaseRules) && run.TransitionCond != nil {
-			watchCtx, watchCancel := context.WithCancel(context.Background())
-			handles.watcher = watchCancel
-			go o.watchPhase(watchCtx, run)
-		}
 		if len(run.ZeusAttackIDs) > 0 || run.ZeusAttackID != "" {
 			pollCtx, pollCancel := context.WithCancel(context.Background())
 			handles.poller = pollCancel
-			go o.pollZeusStatus(pollCtx, run)
+			go o.pollZeusStatus(pollCtx, run.ID)
 		}
 
 		o.mu.Lock()
 		o.running[run.ID] = handles
 		o.mu.Unlock()
 
-		if handles.watcher == nil && handles.poller == nil {
-			// A 'running' row in the DB with no driver — the run was probably
-			// orphaned by a crash before any work began. Auto-complete to
-			// release it instead of leaving it stuck.
-			o.logger.Info("orchestrator: recover: run has no watcher or poller; auto-completing",
-				"run_id", run.ID)
-			runID := run.ID
-			go func() {
-				if err := o.StopRun(context.Background(), runID, "completed"); err != nil {
-					o.logger.Warn("orchestrator: recover auto-complete failed",
-						"run_id", runID, "error", err)
-				}
-			}()
+		if handles.poller == nil {
+			// A 'running' row in the DB with no driver — orphaned by a crash
+			// before any work began. Auto-complete to release it (only from
+			// 'running', so a concurrent pause/stop wins the race).
+			if o.autoComplete {
+				o.logger.Info("orchestrator: recover: run has no poller; auto-completing",
+					"run_id", run.ID)
+				go o.finishRun(context.Background(), run.ID, "completed", "running")
+			}
 			continue
 		}
 
@@ -223,8 +223,17 @@ func (o *Orchestrator) StartRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	if run.Status != "pending" {
-		return fmt.Errorf("run %q is not pending (status=%s)", runID, run.Status)
+
+	// Atomically claim the run: pending → running. If it doesn't transition the
+	// run isn't pending — already started, or a concurrent StartRun (e.g. two
+	// advanceExperiment goroutines) won the race — so abort rather than
+	// double-start goroutines and Zeus attacks.
+	claimed, err := o.experiments.TransitionRun(ctx, runID, "running", "pending")
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return fmt.Errorf("run %q is not pending", runID)
 	}
 
 	if run.RunType != "baseline" {
@@ -235,11 +244,9 @@ func (o *Orchestrator) StartRun(ctx context.Context, runID string) error {
 	}
 
 	if err := o.enterPhase(ctx, run, 0); err != nil {
+		// Run was already claimed as running; finalize it failed so it isn't stuck.
+		o.finishRun(ctx, runID, "failed", "running")
 		return fmt.Errorf("enter phase 0: %w", err)
-	}
-
-	if err := o.experiments.UpdateRunStatus(ctx, runID, "running"); err != nil {
-		return err
 	}
 
 	// Start Zeus load generation for all workloads.
@@ -258,35 +265,25 @@ func (o *Orchestrator) StartRun(ctx context.Context, runID string) error {
 	}
 
 	handles := &runHandles{}
-	if len(run.PhaseRules) > 1 && run.TransitionCond != nil {
-		watchCtx, watchCancel := context.WithCancel(context.Background())
-		handles.watcher = watchCancel
-		go o.watchPhase(watchCtx, run)
-	}
 	// Only poll Zeus when the run actually has attacks; otherwise the poller
 	// would loop forever returning (false, false) and the run would hang.
 	if len(run.ZeusAttackIDs) > 0 || run.ZeusAttackID != "" {
 		pollCtx, pollCancel := context.WithCancel(context.Background())
 		handles.poller = pollCancel
-		go o.pollZeusStatus(pollCtx, run)
+		go o.pollZeusStatus(pollCtx, runID)
 	}
 
 	o.mu.Lock()
 	o.running[runID] = handles
 	o.mu.Unlock()
 
-	// If neither watcher nor poller is driving this run, there is nothing to
-	// take it to a terminal state. Auto-complete now (configured-no-op runs
-	// are valid — e.g., a placeholder run waiting on its dependents to fan out).
-	if handles.watcher == nil && handles.poller == nil {
-		o.logger.Info("orchestrator: run has no watcher or poller; auto-completing",
-			"run_id", runID)
-		go func() {
-			if err := o.StopRun(context.Background(), runID, "completed"); err != nil {
-				o.logger.Warn("orchestrator: auto-complete failed",
-					"run_id", runID, "error", err)
-			}
-		}()
+	// No poller driving this run → nothing takes it to a terminal state.
+	// Auto-complete (configured-no-op runs are valid — e.g. a placeholder run
+	// fanning out to dependents). Only from 'running', so a concurrent
+	// PauseRun/StopRun wins instead of being clobbered.
+	if o.autoComplete && handles.poller == nil {
+		o.logger.Info("orchestrator: run has no poller; auto-completing", "run_id", runID)
+		go o.finishRun(context.Background(), runID, "completed", "running")
 		return nil
 	}
 
@@ -301,8 +298,15 @@ func (o *Orchestrator) PauseRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	if run.Status != "running" {
-		return fmt.Errorf("run %q is not running (status=%s)", runID, run.Status)
+
+	// Atomically claim running → paused; if it loses (a concurrent
+	// completion/stop won), abort and leave the terminal status intact.
+	paused, err := o.experiments.TransitionRun(ctx, runID, "paused", "running")
+	if err != nil {
+		return err
+	}
+	if !paused {
+		return fmt.Errorf("run %q is not running", runID)
 	}
 
 	o.mu.Lock()
@@ -326,7 +330,7 @@ func (o *Orchestrator) PauseRun(ctx context.Context, runID string) error {
 	}
 
 	o.logger.Info("orchestrator: run paused", "run_id", runID)
-	return o.experiments.UpdateRunStatus(ctx, runID, "paused")
+	return nil
 }
 
 // ResumeRun restarts a paused run from its current phase.
@@ -335,16 +339,19 @@ func (o *Orchestrator) ResumeRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	if run.Status != "paused" {
-		return fmt.Errorf("run %q is not paused (status=%s)", runID, run.Status)
+
+	// Atomically claim paused → running.
+	resumed, err := o.experiments.TransitionRun(ctx, runID, "running", "paused")
+	if err != nil {
+		return err
+	}
+	if !resumed {
+		return fmt.Errorf("run %q is not paused", runID)
 	}
 
 	if err := o.enterPhase(ctx, run, run.CurrentPhase); err != nil {
+		o.finishRun(ctx, runID, "failed", "running")
 		return fmt.Errorf("re-enter phase %d: %w", run.CurrentPhase, err)
-	}
-
-	if err := o.experiments.UpdateRunStatus(ctx, runID, "running"); err != nil {
-		return err
 	}
 
 	// Restart Zeus attacks.
@@ -363,30 +370,19 @@ func (o *Orchestrator) ResumeRun(ctx context.Context, runID string) error {
 	}
 
 	handles := &runHandles{}
-	if run.CurrentPhase+1 < len(run.PhaseRules) && run.TransitionCond != nil {
-		watchCtx, watchCancel := context.WithCancel(context.Background())
-		handles.watcher = watchCancel
-		go o.watchPhase(watchCtx, run)
-	}
 	if len(run.ZeusAttackIDs) > 0 || run.ZeusAttackID != "" {
 		pollCtx, pollCancel := context.WithCancel(context.Background())
 		handles.poller = pollCancel
-		go o.pollZeusStatus(pollCtx, run)
+		go o.pollZeusStatus(pollCtx, runID)
 	}
 
 	o.mu.Lock()
 	o.running[runID] = handles
 	o.mu.Unlock()
 
-	if handles.watcher == nil && handles.poller == nil {
-		o.logger.Info("orchestrator: resumed run has no watcher or poller; auto-completing",
-			"run_id", runID)
-		go func() {
-			if err := o.StopRun(context.Background(), runID, "completed"); err != nil {
-				o.logger.Warn("orchestrator: resume auto-complete failed",
-					"run_id", runID, "error", err)
-			}
-		}()
+	if o.autoComplete && handles.poller == nil {
+		o.logger.Info("orchestrator: resumed run has no poller; auto-completing", "run_id", runID)
+		go o.finishRun(context.Background(), runID, "completed", "running")
 		return nil
 	}
 
@@ -436,6 +432,25 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 // Called from StartExperiment (initial walk) and StopRun (after each terminal
 // transition). Idempotent — safe to call repeatedly.
 func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID string) {
+	// Serialize per experiment so concurrent run completions can't race the
+	// scheduler on a stale snapshot (which previously allowed double-starts).
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+	defer lk.Unlock()
+
+	// Only advance a running experiment — paused/cancelled/terminal experiments
+	// must not start or cascade runs. This is what makes Pause/CancelExperiment
+	// actually halt the DAG.
+	exp, err := o.experiments.Get(ctx, experimentID)
+	if err != nil {
+		o.logger.Warn("orchestrator: advance: get experiment failed",
+			"experiment_id", experimentID, "error", err)
+		return
+	}
+	if exp.Status != "running" {
+		return
+	}
+
 	runs, err := o.experiments.ListRunsByExperiment(ctx, experimentID)
 	if err != nil {
 		o.logger.Warn("orchestrator: list runs for advance failed",
@@ -516,49 +531,57 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 	if anyFailed {
 		newStatus = "failed"
 	}
-	if err := o.experiments.UpdateStatus(ctx, experimentID, newStatus); err != nil {
+	// Guard against finalizing a non-running experiment (e.g. cancelled
+	// concurrently): only running → terminal wins.
+	if ok, err := o.experiments.TransitionExperiment(ctx, experimentID, newStatus, "running"); err != nil {
 		o.logger.Warn("orchestrator: finalize experiment status failed",
 			"experiment_id", experimentID, "status", newStatus, "error", err)
+		return
+	} else if !ok {
 		return
 	}
 	o.logger.Info("orchestrator: experiment finalized",
 		"experiment_id", experimentID, "status", newStatus)
 }
 
-// StopRun halts an active run, clears rules from SDK instances, harvests results,
-// and marks the run with the given terminal status ("completed" or "failed").
-func (o *Orchestrator) StopRun(ctx context.Context, runID string, status string) error {
-	if status != "completed" && status != "failed" {
-		return fmt.Errorf("StopRun: status must be \"completed\" or \"failed\", got %q", status)
+// finishRun is the single race-safe terminal path for a run. It atomically
+// transitions runID to `status` only if the run's current status is one of
+// `from`; ONLY the caller that wins that transition runs the side effects
+// (tear down goroutines, clear injected rules, stop Zeus attacks, harvest once
+// for "completed", advance the experiment DAG). Losers are a no-op, which is
+// what makes auto-complete, the poller, StopRun, and cancellation safe to race.
+// Returns whether this call performed the transition.
+func (o *Orchestrator) finishRun(ctx context.Context, runID, status string, from ...string) bool {
+	// Snapshot run details (services, attack IDs, experiment ID) before the flip.
+	run, err := o.experiments.GetRun(ctx, runID)
+	if err != nil {
+		o.logger.Error("orchestrator: finish run: get run failed", "run_id", runID, "error", err)
+		return false
+	}
+
+	transitioned, err := o.experiments.TransitionRun(ctx, runID, status, from...)
+	if err != nil {
+		o.logger.Error("orchestrator: finish run: transition failed",
+			"run_id", runID, "status", status, "error", err)
+		return false
+	}
+	if !transitioned {
+		return false // lost the race / not in an allowed source state
 	}
 
 	o.mu.Lock()
-	handles, active := o.running[runID]
-	if active {
+	if handles, ok := o.running[runID]; ok {
 		handles.cancelAll()
 		delete(o.running, runID)
 	}
 	o.mu.Unlock()
 
-	run, err := o.experiments.GetRun(ctx, runID)
-	if err != nil {
-		return err
-	}
-
-	// Idempotent on terminal states. A run that already reached completed/failed
-	// must not be transitioned again — this is what stops the async auto-complete
-	// in StartRun from overwriting an explicit failure (and vice versa).
-	if run.Status == "completed" || run.Status == "failed" {
-		return nil
-	}
-
 	for _, svc := range o.collectServices(run) {
 		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
-			o.logger.Warn("orchestrator: clear rules failed on stop",
+			o.logger.Warn("orchestrator: clear rules failed on finish",
 				"service", svc, "error", err)
 		}
 	}
-
 	if o.zeusClient != nil {
 		attackIDs := run.ZeusAttackIDs
 		if len(attackIDs) == 0 && run.ZeusAttackID != "" {
@@ -571,22 +594,23 @@ func (o *Orchestrator) StopRun(ctx context.Context, runID string, status string)
 			}
 		}
 	}
-
 	if status == "completed" {
-		o.HarvestResults(ctx, run)
+		o.HarvestResults(ctx, run) // exactly once — only the transition winner reaches here
 	}
 
-	// Atomic terminal transition: if a concurrent caller already finalized this
-	// run, we lost the race — skip the redundant advance rather than double-fire.
-	transitioned, err := o.experiments.FinalizeRunStatus(ctx, runID, status)
-	if err != nil {
-		return err
-	}
-	if !transitioned {
-		return nil
-	}
-
+	o.logger.Info("orchestrator: run finished", "run_id", runID, "status", status)
 	go o.advanceExperiment(context.Background(), run.ExperimentID)
+	return true
+}
+
+// StopRun is the operator/external terminal entry point: finalize a running or
+// paused run as completed/failed. Idempotent — a no-op if the run already
+// reached a terminal state.
+func (o *Orchestrator) StopRun(ctx context.Context, runID string, status string) error {
+	if status != "completed" && status != "failed" {
+		return fmt.Errorf("StopRun: status must be \"completed\" or \"failed\", got %q", status)
+	}
+	o.finishRun(ctx, runID, status, "running", "paused")
 	return nil
 }
 
