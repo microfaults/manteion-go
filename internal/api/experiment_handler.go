@@ -210,6 +210,48 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
 }
 
+func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.PauseExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("pause experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+}
+
+func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.ResumeExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("resume experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
+}
+
+func (s *Server) handleCancelExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.CancelExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("cancel experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
 func (s *Server) handleListRunResults(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("runId")
 	results, err := s.experiments.ListWorkflowResults(r.Context(), runID)

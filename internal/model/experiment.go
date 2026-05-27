@@ -47,7 +47,7 @@ type Experiment struct {
 }
 
 var validExperimentStatuses = map[string]bool{
-	"planned": true, "running": true, "completed": true, "failed": true, "cancelled": true,
+	"planned": true, "running": true, "paused": true, "completed": true, "failed": true, "cancelled": true,
 }
 
 func (e *Experiment) Validate() error {
@@ -75,6 +75,7 @@ func (e *Experiment) Validate() error {
 //
 //	running → paused → running (resume)
 //	running → failed
+//	{pending,running,paused} → cancelled (when the experiment is cancelled)
 //
 // Run-to-run sequencing is declarative via DependsOn: a run only starts when
 // every run ID it lists has reached status='completed'. Runs with empty
@@ -116,7 +117,7 @@ var validRunTypes = map[string]bool{
 }
 
 var validRunStatuses = map[string]bool{
-	"pending": true, "running": true, "paused": true, "completed": true, "failed": true,
+	"pending": true, "running": true, "paused": true, "completed": true, "failed": true, "cancelled": true,
 }
 
 func (r *ExperimentRun) Validate() error {

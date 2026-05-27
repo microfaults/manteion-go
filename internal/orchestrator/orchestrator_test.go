@@ -639,3 +639,61 @@ func TestFinishRun_RespectsFromStates(t *testing.T) {
 	}
 	assertRunStatus(t, ctx, run.ID, "completed")
 }
+
+// assertExperimentStatus fetches the experiment and checks its status.
+func assertExperimentStatus(t *testing.T, ctx context.Context, expID, want string) {
+	t.Helper()
+	got, err := testExperRepo.Get(ctx, expID)
+	if err != nil {
+		t.Fatalf("assertExperimentStatus: Get(%q): %v", expID, err)
+	}
+	if got.Status != want {
+		t.Fatalf("experiment %q: expected status %q, got %q", expID, want, got.Status)
+	}
+}
+
+// TestExperimentLifecycle_PauseResumeCancel verifies experiment-level pause/
+// resume/cancel and their propagation to child runs: pause pauses running runs,
+// resume resumes them, and cancel terminates all non-terminal runs as
+// "cancelled" (running and pending alike).
+func TestExperimentLifecycle_PauseResumeCancel(t *testing.T) {
+	ctx := context.Background()
+	orc := newOrchestrator(t) // auto-complete off → baseline stays running without a poller
+
+	exp := seedMinimalExperiment(t, ctx)
+	baseline := seedRunWithDeps(t, ctx, exp, "baseline", nil, nil)
+	frozen := []model.CacheBoxConfig{{
+		Service: "svc", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny",
+	}}
+	dependent := seedRunWithDeps(t, ctx, exp, "isolation", []string{baseline.ID}, frozen)
+
+	if err := testExperRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+		t.Fatalf("set experiment running: %v", err)
+	}
+	if err := orc.StartRun(ctx, baseline.ID); err != nil {
+		t.Fatalf("StartRun(baseline): %v", err)
+	}
+	assertRunStatus(t, ctx, baseline.ID, "running")
+
+	// Pause → experiment + running baseline paused.
+	if err := orc.PauseExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("PauseExperiment: %v", err)
+	}
+	assertExperimentStatus(t, ctx, exp.ID, "paused")
+	assertRunStatus(t, ctx, baseline.ID, "paused")
+
+	// Resume → experiment + baseline running again.
+	if err := orc.ResumeExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("ResumeExperiment: %v", err)
+	}
+	assertExperimentStatus(t, ctx, exp.ID, "running")
+	assertRunStatus(t, ctx, baseline.ID, "running")
+
+	// Cancel → experiment cancelled; running baseline + pending dependent cancelled.
+	if err := orc.CancelExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("CancelExperiment: %v", err)
+	}
+	assertExperimentStatus(t, ctx, exp.ID, "cancelled")
+	assertRunStatus(t, ctx, baseline.ID, "cancelled")
+	assertRunStatus(t, ctx, dependent.ID, "cancelled")
+}

@@ -425,6 +425,113 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 	return nil
 }
 
+// PauseExperiment pauses a running experiment: it transitions running → paused
+// (which gates advanceExperiment from starting new runs) and pauses every
+// currently-running child run, preserving their phase for resume.
+func (o *Orchestrator) PauseExperiment(ctx context.Context, experimentID string) error {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+	defer lk.Unlock()
+
+	paused, err := o.experiments.TransitionExperiment(ctx, experimentID, "paused", "running")
+	if err != nil {
+		return err
+	}
+	if !paused {
+		return fmt.Errorf("experiment %q is not running", experimentID)
+	}
+
+	runs, err := o.experiments.ListRunsByExperiment(ctx, experimentID)
+	if err != nil {
+		return err
+	}
+	for _, r := range runs {
+		if r.Status == "running" {
+			if err := o.PauseRun(ctx, r.ID); err != nil {
+				o.logger.Warn("orchestrator: pause experiment: pause run failed",
+					"run_id", r.ID, "error", err)
+			}
+		}
+	}
+	o.logger.Info("orchestrator: experiment paused", "experiment_id", experimentID)
+	return nil
+}
+
+// ResumeExperiment resumes a paused experiment: it transitions paused → running,
+// resumes every paused child run, then re-walks the DAG to start any newly-ready
+// runs.
+func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string) error {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+
+	resumed, err := o.experiments.TransitionExperiment(ctx, experimentID, "running", "paused")
+	if err != nil {
+		lk.Unlock()
+		return err
+	}
+	if !resumed {
+		lk.Unlock()
+		return fmt.Errorf("experiment %q is not paused", experimentID)
+	}
+
+	runs, err := o.experiments.ListRunsByExperiment(ctx, experimentID)
+	if err != nil {
+		lk.Unlock()
+		return err
+	}
+	for _, r := range runs {
+		if r.Status == "paused" {
+			if err := o.ResumeRun(ctx, r.ID); err != nil {
+				o.logger.Warn("orchestrator: resume experiment: resume run failed",
+					"run_id", r.ID, "error", err)
+			}
+		}
+	}
+	o.logger.Info("orchestrator: experiment resumed", "experiment_id", experimentID)
+	lk.Unlock()
+
+	// Re-walk the DAG (acquires the lock itself).
+	o.advanceExperiment(ctx, experimentID)
+	return nil
+}
+
+// CancelExperiment cancels a planned/running/paused experiment and terminates
+// all its non-terminal runs as "cancelled" (tearing down any in-flight
+// goroutines, rules, and Zeus attacks). The experiment is then terminal.
+func (o *Orchestrator) CancelExperiment(ctx context.Context, experimentID string) error {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+	defer lk.Unlock()
+
+	cancelled, err := o.experiments.TransitionExperiment(ctx, experimentID, "cancelled",
+		"planned", "running", "paused")
+	if err != nil {
+		return err
+	}
+	if !cancelled {
+		return fmt.Errorf("experiment %q is already terminal", experimentID)
+	}
+
+	runs, err := o.experiments.ListRunsByExperiment(ctx, experimentID)
+	if err != nil {
+		return err
+	}
+	for _, r := range runs {
+		switch r.Status {
+		case "running", "paused":
+			// finishRun tears down goroutines, clears rules, stops attacks.
+			o.finishRun(ctx, r.ID, "cancelled", "running", "paused")
+		case "pending":
+			if _, err := o.experiments.TransitionRun(ctx, r.ID, "cancelled", "pending"); err != nil {
+				o.logger.Warn("orchestrator: cancel experiment: cancel pending run failed",
+					"run_id", r.ID, "error", err)
+			}
+		}
+	}
+	o.logger.Info("orchestrator: experiment cancelled", "experiment_id", experimentID)
+	return nil
+}
+
 // advanceExperiment is the run-to-run scheduler. It cascades failures down the
 // dependency graph, then starts any newly-ready pending run, and finalizes the
 // experiment status when no runs remain in flight or runnable.

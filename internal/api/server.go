@@ -186,6 +186,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/experiments/{id}", s.handleGetExperiment)
 	mux.HandleFunc("DELETE /api/v1/experiments/{id}", s.handleDeleteExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/start", s.handleStartExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/pause", s.handlePauseExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/resume", s.handleResumeExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/cancel", s.handleCancelExperiment)
 	mux.HandleFunc("GET /api/v1/experiments/{id}/contributions", s.handleListContributions)
 
 	// Run CRUD + FSM

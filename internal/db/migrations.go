@@ -277,6 +277,16 @@ CREATE INDEX IF NOT EXISTS idx_fault_configs_active_service
 CREATE INDEX IF NOT EXISTS idx_fault_configs_reaper
     ON fault_configs(fired_at) WHERE status = 'active' AND duration_ms > 0;
 `},
+	{24, "add 'cancelled' to experiment_runs.status (experiment-level cancel)", `
+ALTER TABLE experiment_runs DROP CONSTRAINT IF EXISTS experiment_runs_status_check;
+ALTER TABLE experiment_runs ADD CONSTRAINT experiment_runs_status_check
+    CHECK (status IN ('pending','running','paused','completed','failed','cancelled'));
+`},
+	{25, "add 'paused' to experiments.status (experiment-level pause)", `
+ALTER TABLE experiments DROP CONSTRAINT IF EXISTS experiments_status_check;
+ALTER TABLE experiments ADD CONSTRAINT experiments_status_check
+    CHECK (status IN ('planned','running','paused','completed','failed','cancelled'));
+`},
 }
 
 // Migrate applies any pending migrations to the database.
