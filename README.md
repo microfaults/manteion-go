@@ -1,5 +1,11 @@
 # manteion-go
 
+<p align="center">
+  <img src="docs/assets/manteion.png" alt="Manteion — the oracle that decides what to run and when" width="220">
+</p>
+
+<p align="center"><em>The control plane of faults-lab: the oracle that decides what to run and when.</em></p>
+
 Central coordination controller for the atropos fault-injection ecosystem.
 
 ## What It Does
