@@ -180,26 +180,24 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// returns an empty list with a hint.
 	mux.HandleFunc("GET /api/v1/catalog/endpoints", s.handleListCatalogEndpoints)
 
-	// Experiment CRUD + lifecycle
+	// Experiment CRUD + lifecycle (phase-first model).
+	// /runs and /contributions endpoints were retired; phases are the run
+	// unit. Pause/resume/cancel return with the phase-aware FSM port.
 	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)
 	mux.HandleFunc("GET /api/v1/experiments", s.handleListExperiments)
 	mux.HandleFunc("GET /api/v1/experiments/{id}", s.handleGetExperiment)
 	mux.HandleFunc("DELETE /api/v1/experiments/{id}", s.handleDeleteExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/start", s.handleStartExperiment)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/pause", s.handlePauseExperiment)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/resume", s.handleResumeExperiment)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/cancel", s.handleCancelExperiment)
-	mux.HandleFunc("GET /api/v1/experiments/{id}/contributions", s.handleListContributions)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/stop", s.handleStopExperiment)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/results", s.handleExperimentResults)
 
-	// Run CRUD + FSM
-	mux.HandleFunc("POST /api/v1/experiments/{id}/runs", s.handleCreateRun)
-	mux.HandleFunc("GET /api/v1/experiments/{id}/runs", s.handleListRuns)
-	mux.HandleFunc("GET /api/v1/experiments/{id}/runs/{runId}", s.handleGetRun)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/start", s.handleStartRun)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/stop", s.handleStopRun)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/pause", s.handlePauseRun)
-	mux.HandleFunc("POST /api/v1/experiments/{id}/runs/{runId}/resume", s.handleResumeRun)
-	mux.HandleFunc("GET /api/v1/experiments/{id}/runs/{runId}/results", s.handleListRunResults)
+	// Phase CRUD + lifecycle.
+	mux.HandleFunc("POST /api/v1/experiments/{id}/phases", s.handleCreatePhase)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/phases/{phaseId}", s.handleGetPhase)
+	mux.HandleFunc("DELETE /api/v1/experiments/{id}/phases/{phaseId}", s.handleDeletePhase)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/phases/{phaseId}/start", s.handleStartPhase)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/phases/{phaseId}/stop", s.handleStopPhase)
+	mux.HandleFunc("GET /api/v1/experiments/{id}/phases/{phaseId}/results", s.handlePhaseResults)
 
 	// Policy CRUD + enable/disable
 	mux.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)

@@ -7,47 +7,55 @@ import (
 	"time"
 )
 
-// PhaseTransition defines when a run should advance to its next phase.
-type PhaseTransition struct {
-	Metric    string        `json:"metric"`
-	Operator  string        `json:"operator"` // gt, gte, lt, lte, eq
-	Threshold float64       `json:"threshold"`
-	Window    time.Duration `json:"window_ns"`
-}
-
-// PhaseRuleSet is the fault rules active during one phase of a run.
-type PhaseRuleSet struct {
-	Phase       int      `json:"phase"`
-	Description string   `json:"description"`
-	RuleIDs     []string `json:"rule_ids"`
-}
-
-// Experiment is an experiment plan for quantifying per-service contribution
-// to workflow latency. The experiment's behavior is fully determined by its
-// runs' FrozenServices and each cache-box's Mode — there is no separate
-// "type" discriminator.
+// =====================================================================
+// Experiment domain — phase-first model (migration #19).
 //
-// PrimaryWorkflowID identifies the zeus workflow being measured.
-type Experiment struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	Description       string     `json:"description,omitempty"`
-	PrimaryWorkflowID string     `json:"primary_workflow_id"`
-	Status            string     `json:"status"`
-	CreatedAt         time.Time  `json:"created_at"`
-	StartedAt         *time.Time `json:"started_at,omitempty"`
-	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+// Hierarchy:
+//
+//   Experiment
+//     ├── ExperimentWorkflow[]   (flat M:N to zeus workflow ids; ordered)
+//     └── ExperimentPhase[]      (sequential; first-class run unit)
+//           ├── PhaseWorkflow[]   (per-(phase, workflow) attack config)
+//           ├── PhaseRule[]       (rules active during the phase)
+//           └── results: PhaseWorkflowResult, PhaseServiceLatency,
+//                        PhaseServiceResources, PhaseServiceCache
+//
+//   ExperimentResults                (rollup row, recomputed on transitions)
+//
+// Phases are ordered by position (0-based). A future iteration will
+// support a phase DAG via depends_on; until then the orchestrator runs
+// phases in position order. See docs/figma-changes.md for the UI note.
+// =====================================================================
 
-	// Attack config for load generation. Used by the orchestrator to build
-	// zeus attack requests. Optional — if empty, no attacks are launched.
-	TargetURL    string `json:"target_url,omitempty"`
-	TargetMethod string `json:"target_method,omitempty"`
-	Rate         int    `json:"rate,omitempty"`
-	DurationSec  int    `json:"duration_sec,omitempty"`
+// ---------- Experiment ----------
+
+// Experiment is a control-plane plan: metadata + an ordered list of
+// associated workflows (zeus-owned) and phases. The plan carries NO
+// attack config and NO measurement target — those live on the phases.
+type Experiment struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Hypothesis  string     `json:"hypothesis,omitempty"`
+	Status      string     `json:"status"`
+	CreatedBy   string     `json:"created_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 }
 
 var validExperimentStatuses = map[string]bool{
-	"planned": true, "running": true, "paused": true, "completed": true, "failed": true, "cancelled": true,
+	"planned": true, "running": true, "completed": true, "failed": true, "cancelled": true,
+}
+
+// ValidExperimentStatuses returns the set of allowed status values
+// (exposed so the API layer can validate query params).
+func ValidExperimentStatuses() map[string]bool {
+	out := make(map[string]bool, len(validExperimentStatuses))
+	for k, v := range validExperimentStatuses {
+		out[k] = v
+	}
+	return out
 }
 
 func (e *Experiment) Validate() error {
@@ -57,330 +65,277 @@ func (e *Experiment) Validate() error {
 	if e.Name == "" {
 		return errors.New("experiment: name required")
 	}
-	if e.PrimaryWorkflowID == "" {
-		return errors.New("experiment: primary_workflow_id required")
-	}
 	if !validExperimentStatuses[e.Status] {
 		return fmt.Errorf("experiment: invalid status %q", e.Status)
 	}
 	return nil
 }
 
-// ExperimentRun is one execution phase within an experiment.
-// An attribution experiment has 1 baseline + N isolation + C(N,2) combination runs.
-// Isolation runs CAN overlap (they freeze different services). If any run fails,
-// the experiment aborts. Partial results from completed runs are preserved.
-//
-// Run FSM: pending → running → completed
-//
-//	running → paused → running (resume)
-//	running → failed
-//	{pending,running,paused} → cancelled (when the experiment is cancelled)
-//
-// Run-to-run sequencing is declarative via DependsOn: a run only starts when
-// every run ID it lists has reached status='completed'. Runs with empty
-// DependsOn are entry points (started by StartExperiment). The orchestrator —
-// not the policy engine — is the single authority that advances the DAG.
-type ExperimentRun struct {
-	ID             string            `json:"id"`
-	ExperimentID   string            `json:"experiment_id"`
-	RunType        string            `json:"run_type"` // "baseline", "isolation", "combination"
-	RunIndex       int               `json:"run_index"`
-	FrozenServices []CacheBoxConfig  `json:"frozen_services,omitempty"`
-	MetaTraceID    string            `json:"meta_trace_id"`
-	Status         string            `json:"status"` // pending, running, paused, completed, failed
-	NodePlacement  map[string]string `json:"node_placement,omitempty"`
-	StartedAt      *time.Time        `json:"started_at,omitempty"`
-	CompletedAt    *time.Time        `json:"completed_at,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
-	PhaseRules     []PhaseRuleSet    `json:"phase_rules,omitempty"`
-	TransitionCond *PhaseTransition  `json:"transition_condition,omitempty"`
-	CurrentPhase   int               `json:"current_phase"`
-	// DependsOn lists run IDs that must reach 'completed' before this run starts.
-	// Empty for entry-point runs (typically baseline). Cycles and cross-experiment
-	// references are rejected by ValidateRunGraph.
-	DependsOn []string `json:"depends_on,omitempty"`
-	// PersistCache opts the run into accepting cache-box entry ingestion via
-	// POST /api/v1/cache/ingest. Default false. Typically true on baseline
-	// runs whose cache will be replayed by isolation runs that depend on them.
-	PersistCache bool `json:"persist_cache,omitempty"`
-	// ZeusAttackID is the primary Zeus attack ID (first/only for single-workflow runs).
-	ZeusAttackID string `json:"zeus_attack_id,omitempty"`
-	// WorkflowIDs lists zeus workflows to drive for this run; falls back to Experiment.PrimaryWorkflowID if empty.
-	WorkflowIDs []string `json:"workflow_ids,omitempty"`
-	// ZeusAttackIDs holds all attack IDs for multi-workflow runs.
-	ZeusAttackIDs []string `json:"zeus_attack_ids,omitempty"`
+// ExperimentWorkflow is one row of the experiment ↔ zeus-workflow join.
+// WorkflowID is an opaque zeus identifier; manteion never validates it
+// (zeus owns workflow storage). Position is the display order.
+type ExperimentWorkflow struct {
+	ExperimentID string `json:"experiment_id"`
+	WorkflowID   string `json:"workflow_id"`
+	Position     int    `json:"position"`
 }
 
-var validRunTypes = map[string]bool{
-	"baseline": true, "isolation": true, "combination": true,
+func (w *ExperimentWorkflow) Validate() error {
+	if w.ExperimentID == "" {
+		return errors.New("experiment workflow: experiment_id required")
+	}
+	if w.WorkflowID == "" {
+		return errors.New("experiment workflow: workflow_id required")
+	}
+	if w.Position < 0 {
+		return errors.New("experiment workflow: position must be >= 0")
+	}
+	return nil
 }
 
-var validRunStatuses = map[string]bool{
-	"pending": true, "running": true, "paused": true, "completed": true, "failed": true, "cancelled": true,
+// ---------- Phase ----------
+
+// ExperimentPhase is one ordered step of an experiment. The phase encodes
+// the experimental method via FrozenServices:
+//
+//   - empty FrozenServices         → baseline (no isolation)
+//   - one entry                    → single-service isolation
+//   - two or more entries          → multi-service / combined isolation
+//
+// There is no separate "run_type" discriminator. The old baseline /
+// isolation / combination typology is derived from FrozenServices; the
+// orchestrator and the UI agree to read the JSON shape, not a string tag.
+type ExperimentPhase struct {
+	ID             string           `json:"id"`
+	ExperimentID   string           `json:"experiment_id"`
+	Name           string           `json:"name"` // free-form (e.g. "baseline", "isolation-productcatalog")
+	Position       int              `json:"position"`
+	Status         string           `json:"status"`
+	FrozenServices []CacheBoxConfig `json:"frozen_services"`
+	PersistCache   bool             `json:"persist_cache"`
+	StartedAt      *time.Time       `json:"started_at,omitempty"`
+	CompletedAt    *time.Time       `json:"completed_at,omitempty"`
 }
 
-func (r *ExperimentRun) Validate() error {
-	if r.ID == "" {
-		return errors.New("experiment run: id required")
+var validPhaseStatuses = map[string]bool{
+	"pending": true, "running": true, "paused": true,
+	"completed": true, "failed": true, "skipped": true,
+}
+
+func (p *ExperimentPhase) Validate() error {
+	if p.ID == "" {
+		return errors.New("experiment phase: id required")
 	}
-	if r.ExperimentID == "" {
-		return errors.New("experiment run: experiment_id required")
+	if p.ExperimentID == "" {
+		return errors.New("experiment phase: experiment_id required")
 	}
-	if !validRunTypes[r.RunType] {
-		return fmt.Errorf("experiment run: invalid run_type %q", r.RunType)
+	if p.Name == "" {
+		return errors.New("experiment phase: name required")
 	}
-	if !validRunStatuses[r.Status] {
-		return fmt.Errorf("experiment run: invalid status %q", r.Status)
+	if p.Position < 0 {
+		return errors.New("experiment phase: position must be >= 0")
 	}
-	if r.RunType == "baseline" && len(r.FrozenServices) > 0 {
-		return errors.New("experiment run: baseline run must not have frozen services")
+	if !validPhaseStatuses[p.Status] {
+		return fmt.Errorf("experiment phase: invalid status %q", p.Status)
 	}
-	if (r.RunType == "isolation" || r.RunType == "combination") && len(r.FrozenServices) == 0 {
-		return errors.New("experiment run: isolation/combination run requires frozen services")
-	}
-	for i, cfg := range r.FrozenServices {
-		if err := cfg.Validate(); err != nil {
-			return fmt.Errorf("experiment run: frozen_services[%d]: %w", i, err)
-		}
-	}
-	if r.TransitionCond != nil {
-		if r.TransitionCond.Metric == "" {
-			return errors.New("experiment run: transition_condition.metric required")
-		}
-		switch r.TransitionCond.Operator {
-		case "gt", "gte", "lt", "lte", "eq":
-		default:
-			return fmt.Errorf("experiment run: transition_condition.operator %q invalid", r.TransitionCond.Operator)
-		}
-		if r.TransitionCond.Window <= 0 {
-			return errors.New("experiment run: transition_condition.window_ns must be > 0")
-		}
-	}
-	for i, ps := range r.PhaseRules {
-		if ps.Phase != i {
-			return fmt.Errorf("experiment run: phase_rules[%d].phase must be %d (sequential from 0)", i, i)
-		}
-	}
-	for _, dep := range r.DependsOn {
-		if dep == r.ID {
-			return errors.New("experiment run: depends_on must not include own id")
-		}
-		if dep == "" {
-			return errors.New("experiment run: depends_on must not contain empty id")
+	for i, cfg := range p.FrozenServices {
+		c := cfg
+		if err := c.Validate(); err != nil {
+			return fmt.Errorf("experiment phase: frozen_services[%d]: %w", i, err)
 		}
 	}
 	return nil
 }
 
-// ValidateRunGraph checks the cross-run dependency graph for an experiment.
-// It rejects:
-//   - cycles in DependsOn,
-//   - dependencies on run IDs not present in the experiment,
-//   - dependencies that span experiments.
-//
-// Call this once at experiment-start time before any StartRun is issued.
-func ValidateRunGraph(runs []*ExperimentRun) error {
-	byID := make(map[string]*ExperimentRun, len(runs))
-	for _, r := range runs {
-		byID[r.ID] = r
+// PhaseWorkflow is the per-(phase, workflow) attack configuration.
+// VUs and DurationSec are required; RateRPS, TargetURL, TargetMethod
+// are overrides for vegeta-style precision attacks (optional — defaults
+// come from the zeus workflow definition). ZeusAttackID is populated by
+// the orchestrator once the attack starts.
+type PhaseWorkflow struct {
+	PhaseID      string  `json:"phase_id"`
+	WorkflowID   string  `json:"workflow_id"`
+	VUs          int     `json:"vus"`
+	RateRPS      float64 `json:"rate_rps,omitempty"`
+	DurationSec  int     `json:"duration_sec"`
+	TargetURL    string  `json:"target_url,omitempty"`
+	TargetMethod string  `json:"target_method,omitempty"`
+	ZeusAttackID string  `json:"zeus_attack_id,omitempty"`
+}
+
+func (pw *PhaseWorkflow) Validate() error {
+	if pw.PhaseID == "" {
+		return errors.New("phase workflow: phase_id required")
 	}
-
-	visited := make(map[string]bool, len(runs))
-	onPath := make(map[string]bool, len(runs))
-
-	var dfs func(id string) error
-	dfs = func(id string) error {
-		if onPath[id] {
-			return fmt.Errorf("experiment runs: dependency cycle through run %q", id)
-		}
-		if visited[id] {
-			return nil
-		}
-		onPath[id] = true
-		run := byID[id]
-		for _, dep := range run.DependsOn {
-			depRun, ok := byID[dep]
-			if !ok {
-				return fmt.Errorf("experiment run %q: depends_on references unknown run %q", id, dep)
-			}
-			if depRun.ExperimentID != run.ExperimentID {
-				return fmt.Errorf("experiment run %q: depends_on %q is in a different experiment", id, dep)
-			}
-			if err := dfs(dep); err != nil {
-				return err
-			}
-		}
-		onPath[id] = false
-		visited[id] = true
-		return nil
+	if pw.WorkflowID == "" {
+		return errors.New("phase workflow: workflow_id required")
 	}
-
-	for _, r := range runs {
-		if err := dfs(r.ID); err != nil {
-			return err
-		}
+	if pw.VUs <= 0 {
+		return errors.New("phase workflow: vus must be > 0")
 	}
-
-	// Non-baseline runs with frozen services (cache-box replay) must
-	// transitively depend on at least one baseline run. Without this,
-	// preloadCacheEntries silently skips and the isolation run produces
-	// meaningless results.
-	for _, r := range runs {
-		if r.RunType == "baseline" || len(r.FrozenServices) == 0 {
-			continue
-		}
-		if !hasBaselineAncestor(r.ID, byID) {
-			return fmt.Errorf("experiment run %q (%s): has frozen_services but no baseline run in its dependency chain", r.ID, r.RunType)
-		}
+	if pw.DurationSec <= 0 {
+		return errors.New("phase workflow: duration_sec must be > 0")
+	}
+	if pw.RateRPS < 0 {
+		return errors.New("phase workflow: rate_rps must be >= 0")
 	}
 	return nil
 }
 
-func hasBaselineAncestor(id string, byID map[string]*ExperimentRun) bool {
-	seen := make(map[string]bool)
-	var walk func(string) bool
-	walk = func(cur string) bool {
-		if seen[cur] {
-			return false
-		}
-		seen[cur] = true
-		r := byID[cur]
-		if r.RunType == "baseline" {
-			return true
-		}
-		for _, dep := range r.DependsOn {
-			if walk(dep) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, dep := range byID[id].DependsOn {
-		if walk(dep) {
-			return true
-		}
-	}
-	return false
+// PhaseRule links a phase to a rule that applies during execution.
+// Position determines apply order within the phase.
+type PhaseRule struct {
+	PhaseID  string `json:"phase_id"`
+	RuleID   string `json:"rule_id"`
+	Position int    `json:"position"`
 }
 
-// WorkflowRunResult stores end-to-end workflow latency for one run.
-// One row per (run, workflow) pair. This is the measurement the delta formula
-// operates on — what the load generator observes at the workflow entry point.
-//
-// Source: aggregated from AttackResults of primary-role attacks, or from
-// k6 summary output for broad-traffic workloads.
-type WorkflowRunResult struct {
-	ID              string          `json:"id"`
-	ExperimentRunID string          `json:"experiment_run_id"`
-	Workflow        string          `json:"workflow"`
-	LatencyP50Us    int64           `json:"latency_p50_us"`
-	LatencyP95Us    int64           `json:"latency_p95_us"`
-	LatencyP99Us    int64           `json:"latency_p99_us"`
-	LatencyP999Us   int64           `json:"latency_p999_us"`
-	RequestCount    int64           `json:"request_count"`
-	ErrorRate       float64         `json:"error_rate"`
-	ThroughputRPS   float64         `json:"throughput_rps"`
-	RawMetrics      json.RawMessage `json:"raw_metrics,omitempty"`
-}
-
-func (r *WorkflowRunResult) Validate() error {
-	if r.ID == "" {
-		return errors.New("workflow run result: id required")
+func (pr *PhaseRule) Validate() error {
+	if pr.PhaseID == "" {
+		return errors.New("phase rule: phase_id required")
 	}
-	if r.ExperimentRunID == "" {
-		return errors.New("workflow run result: experiment_run_id required")
+	if pr.RuleID == "" {
+		return errors.New("phase rule: rule_id required")
 	}
-	if r.Workflow == "" {
-		return errors.New("workflow run result: workflow required")
+	if pr.Position < 0 {
+		return errors.New("phase rule: position must be >= 0")
 	}
 	return nil
 }
 
-// ServiceRunResult stores per-service metrics for one service in one run.
-// One row per (run, service, workflow) triple. Source: trace backends
-// (Jaeger/Tempo for per-service latency), Prometheus (resource utilization),
-// and cache-box internals (fidelity metrics for frozen services).
-type ServiceRunResult struct {
-	ID              string          `json:"id"`
-	ExperimentRunID string          `json:"experiment_run_id"`
-	Service         string          `json:"service"`
-	Workflow        string          `json:"workflow,omitempty"`
-	LatencyP50Us    *int64          `json:"latency_p50_us,omitempty"`
-	LatencyP95Us    *int64          `json:"latency_p95_us,omitempty"`
-	LatencyP99Us    *int64          `json:"latency_p99_us,omitempty"`
-	CPUMillicores   *int64          `json:"cpu_millicores,omitempty"`
-	MemoryMB        *int64          `json:"memory_mb,omitempty"`
-	CacheHitRate    *float64        `json:"cache_hit_rate,omitempty"`
-	CacheExactMatch *float64        `json:"cache_exact_match,omitempty"`
-	CacheStaleness  *float64        `json:"cache_staleness_ms,omitempty"`
-	RawMetrics      json.RawMessage `json:"raw_metrics,omitempty"`
+// ---------- Results ----------
+
+// PhaseWorkflowResult is the end-to-end latency and throughput for one
+// (phase, workflow) pair. Every field is required; null/optional fields
+// of the old shape were the source of "is this row populated?" ambiguity.
+type PhaseWorkflowResult struct {
+	PhaseID       string          `json:"phase_id"`
+	WorkflowID    string          `json:"workflow_id"`
+	RequestCount  int64           `json:"request_count"`
+	ErrorCount    int64           `json:"error_count"`
+	ErrorRate     float64         `json:"error_rate"`
+	ThroughputRPS float64         `json:"throughput_rps"`
+	LatencyP50Us  int64           `json:"latency_p50_us"`
+	LatencyP95Us  int64           `json:"latency_p95_us"`
+	LatencyP99Us  int64           `json:"latency_p99_us"`
+	LatencyP999Us int64           `json:"latency_p999_us"`
+	ComputedAt    time.Time       `json:"computed_at"`
+	RawMetrics    json.RawMessage `json:"raw_metrics,omitempty"`
 }
 
-func (r *ServiceRunResult) Validate() error {
-	if r.ID == "" {
-		return errors.New("service run result: id required")
+func (r *PhaseWorkflowResult) Validate() error {
+	if r.PhaseID == "" {
+		return errors.New("phase workflow result: phase_id required")
 	}
-	if r.ExperimentRunID == "" {
-		return errors.New("service run result: experiment_run_id required")
+	if r.WorkflowID == "" {
+		return errors.New("phase workflow result: workflow_id required")
+	}
+	if r.RequestCount < 0 {
+		return errors.New("phase workflow result: request_count must be >= 0")
+	}
+	if r.ErrorCount < 0 {
+		return errors.New("phase workflow result: error_count must be >= 0")
+	}
+	return nil
+}
+
+// PhaseServiceLatency is per-(phase, service[, workflow]) request-side
+// latency. WorkflowID == "" means service-wide (all workflows combined).
+// Row presence is the existence signal — every metric column is required.
+type PhaseServiceLatency struct {
+	PhaseID      string    `json:"phase_id"`
+	Service      string    `json:"service"`
+	WorkflowID   string    `json:"workflow_id"`
+	LatencyP50Us int64     `json:"latency_p50_us"`
+	LatencyP95Us int64     `json:"latency_p95_us"`
+	LatencyP99Us int64     `json:"latency_p99_us"`
+	RequestCount int64     `json:"request_count"`
+	ComputedAt   time.Time `json:"computed_at"`
+}
+
+func (r *PhaseServiceLatency) Validate() error {
+	if r.PhaseID == "" {
+		return errors.New("phase service latency: phase_id required")
 	}
 	if r.Service == "" {
-		return errors.New("service run result: service required")
+		return errors.New("phase service latency: service required")
 	}
 	return nil
 }
 
-// ContributionResult is derived by comparing workflow-level latency between
-// a baseline run and an isolation run.
-// Computed: delta_service = baseline_workflow_latency - isolated_workflow_latency.
-//
-// CacheBoxMode distinguishes two isolation types:
-//   - "replay":            removes ALL contribution (contention + intrinsic)
-//   - "replay_with_delay": preserves intrinsic timing, removes contention only
-//
-// Intrinsic cost = total_delta (replay) - contention_delta (replay_with_delay).
-type ContributionResult struct {
-	ID             string `json:"id"`
-	ExperimentID   string `json:"experiment_id"`
-	Service        string `json:"service"`
-	Workflow       string `json:"workflow"`
-	CacheBoxMode   string `json:"cachebox_mode"` // "replay" or "replay_with_delay"
-	BaselineRunID  string `json:"baseline_run_id"`
-	IsolationRunID string `json:"isolation_run_id"`
-
-	DeltaP50Us int64 `json:"delta_p50_us"`
-	DeltaP95Us int64 `json:"delta_p95_us"`
-	DeltaP99Us int64 `json:"delta_p99_us"`
-
-	InteractionEffect *float64 `json:"interaction_effect,omitempty"`
-	CombinationRunID  string   `json:"combination_run_id,omitempty"`
+// PhaseServiceResources is per-(phase, service) CPU / memory utilization.
+type PhaseServiceResources struct {
+	PhaseID       string    `json:"phase_id"`
+	Service       string    `json:"service"`
+	CPUMillicores int64     `json:"cpu_millicores"`
+	MemoryMB      int64     `json:"memory_mb"`
+	ComputedAt    time.Time `json:"computed_at"`
 }
 
-var validCacheBoxModeContribution = map[string]bool{
-	"replay": true, "replay_with_delay": true,
+func (r *PhaseServiceResources) Validate() error {
+	if r.PhaseID == "" {
+		return errors.New("phase service resources: phase_id required")
+	}
+	if r.Service == "" {
+		return errors.New("phase service resources: service required")
+	}
+	return nil
 }
 
-func (c *ContributionResult) Validate() error {
-	if c.ID == "" {
-		return errors.New("contribution result: id required")
+// PhaseServiceCache is per-(phase, service) cache-box fidelity stats.
+// Row presence implies the service was frozen in replay mode during this
+// phase. Callers that don't engage cache-box never write to this table.
+type PhaseServiceCache struct {
+	PhaseID         string    `json:"phase_id"`
+	Service         string    `json:"service"`
+	CacheHitRate    float64   `json:"cache_hit_rate"`
+	CacheExactMatch float64   `json:"cache_exact_match"`
+	CacheStaleness  float64   `json:"cache_staleness"`
+	ComputedAt      time.Time `json:"computed_at"`
+}
+
+func (r *PhaseServiceCache) Validate() error {
+	if r.PhaseID == "" {
+		return errors.New("phase service cache: phase_id required")
 	}
-	if c.ExperimentID == "" {
-		return errors.New("contribution result: experiment_id required")
+	if r.Service == "" {
+		return errors.New("phase service cache: service required")
 	}
-	if c.Service == "" {
-		return errors.New("contribution result: service required")
+	return nil
+}
+
+// ExperimentResults is the per-experiment rollup. Recomputed when any
+// phase transitions to a terminal status, or when the experiment itself
+// reaches a terminal status.
+//
+// WorstP99 / BestP99 are the max / min of per-phase p99s, NOT a true
+// experiment-level p99 (which would require the underlying histograms,
+// not just precomputed percentiles). The "worst phase" framing is more
+// honest than a wrong-but-precise aggregate; see the data-model doc's
+// "percentile-aggregation caveat" section.
+type ExperimentResults struct {
+	ExperimentID        string    `json:"experiment_id"`
+	PhaseCount          int       `json:"phase_count"`
+	CompletedPhaseCount int       `json:"completed_phase_count"`
+	TotalRequestCount   int64     `json:"total_request_count"`
+	TotalErrorCount     int64     `json:"total_error_count"`
+	OverallErrorRate    float64   `json:"overall_error_rate"`
+	WorstP99Us          int64     `json:"worst_p99_us"`
+	WorstP99PhaseID     string    `json:"worst_p99_phase_id"`
+	BestP99Us           int64     `json:"best_p99_us"`
+	BestP99PhaseID      string    `json:"best_p99_phase_id"`
+	ComputedAt          time.Time `json:"computed_at"`
+}
+
+func (r *ExperimentResults) Validate() error {
+	if r.ExperimentID == "" {
+		return errors.New("experiment results: experiment_id required")
 	}
-	if c.Workflow == "" {
-		return errors.New("contribution result: workflow required")
+	if r.PhaseCount < 0 || r.CompletedPhaseCount < 0 {
+		return errors.New("experiment results: counts must be >= 0")
 	}
-	if !validCacheBoxModeContribution[c.CacheBoxMode] {
-		return fmt.Errorf("contribution result: invalid cachebox_mode %q", c.CacheBoxMode)
-	}
-	if c.BaselineRunID == "" {
-		return errors.New("contribution result: baseline_run_id required")
-	}
-	if c.IsolationRunID == "" {
-		return errors.New("contribution result: isolation_run_id required")
+	if r.CompletedPhaseCount > r.PhaseCount {
+		return errors.New("experiment results: completed_phase_count > phase_count")
 	}
 	return nil
 }

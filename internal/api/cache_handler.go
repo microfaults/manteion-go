@@ -15,21 +15,21 @@ const maxIngestBody = 64 << 20 // 64 MiB — cache batches can be large
 
 // ingestEnvelope is the request body for POST /api/v1/cache/ingest.
 //
-// RunID is caller-supplied: SDKs target a specific run rather than relying on
-// implicit "current baseline" state. The run must have persist_cache=true and
-// be in status=running for the ingest to be accepted. This generalizes ingest
-// to non-baseline runs (e.g., a chaos run that wants to capture cache state)
-// without coupling new use cases to baseline-specific server logic.
+// PhaseID identifies the experiment phase the SDK is contributing cache
+// entries to. The phase must have persist_cache=true and be in
+// status=running for the ingest to be accepted. Per migration #19 this
+// field replaces the legacy run_id; the cachestore key is opaque so the
+// underlying storage layout is unchanged.
 type ingestEnvelope struct {
 	Service  string                        `json:"service"`
 	Instance string                        `json:"instance"`
-	RunID    string                        `json:"run_id"`
+	PhaseID  string                        `json:"phase_id"`
 	Entries  []atroposdk.CacheBoxWireEntry `json:"entries"`
 }
 
 // handleCacheIngest receives cache-box entries from SDK instances and persists
-// them under the run identified by RunID. Rejects runs that have not opted
-// into cache persistence (run.PersistCache=false) or that are not currently
+// them under the phase identified by PhaseID. Rejects phases that have not
+// opted into cache persistence (PersistCache=false) or that are not currently
 // running.
 func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 	var env ingestEnvelope
@@ -42,8 +42,8 @@ func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "service required")
 		return
 	}
-	if env.RunID == "" {
-		writeError(w, http.StatusBadRequest, "run_id required")
+	if env.PhaseID == "" {
+		writeError(w, http.StatusBadRequest, "phase_id required")
 		return
 	}
 	if len(env.Entries) == 0 {
@@ -51,27 +51,27 @@ func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := s.experiments.GetRun(r.Context(), env.RunID)
+	phase, err := s.experiments.GetPhase(r.Context(), env.PhaseID)
 	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "run not found")
+		writeError(w, http.StatusNotFound, "phase not found")
 		return
 	}
 	if err != nil {
-		s.logger.Error("cache ingest: get run failed", "run_id", env.RunID, "error", err)
+		s.logger.Error("cache ingest: get phase failed", "phase_id", env.PhaseID, "error", err)
 		writeError(w, http.StatusInternalServerError, "lookup failed")
 		return
 	}
-	if !run.PersistCache {
-		writeError(w, http.StatusConflict, "run does not accept cache ingestion (persist_cache=false)")
+	if !phase.PersistCache {
+		writeError(w, http.StatusConflict, "phase does not accept cache ingestion (persist_cache=false)")
 		return
 	}
-	if run.Status != "running" {
-		writeError(w, http.StatusConflict, "run is not running (status="+run.Status+")")
+	if phase.Status != "running" {
+		writeError(w, http.StatusConflict, "phase is not running (status="+phase.Status+")")
 		return
 	}
 
-	if err := s.cacheStore.Write(env.RunID, env.Service, env.Entries); err != nil {
-		s.logger.Error("cache ingest: write failed", "run_id", env.RunID, "error", err)
+	if err := s.cacheStore.Write(env.PhaseID, env.Service, env.Entries); err != nil {
+		s.logger.Error("cache ingest: write failed", "phase_id", env.PhaseID, "error", err)
 		writeError(w, http.StatusInternalServerError, "write failed")
 		return
 	}
@@ -81,20 +81,20 @@ func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 // handleCacheEntries serves stored cache entries for a service, used by SDK
 // instances to seed their cache on startup.
 //
-// Query param: service (required)
+// Query params: service (required), phase_id (required)
 func (s *Server) handleCacheEntries(w http.ResponseWriter, r *http.Request) {
 	service := r.URL.Query().Get("service")
 	if service == "" {
 		writeError(w, http.StatusBadRequest, "service query param required")
 		return
 	}
-	runID := r.URL.Query().Get("run_id")
-	if runID == "" {
-		writeError(w, http.StatusBadRequest, "run_id query param required")
+	phaseID := r.URL.Query().Get("phase_id")
+	if phaseID == "" {
+		writeError(w, http.StatusBadRequest, "phase_id query param required")
 		return
 	}
 
-	entries, err := s.cacheStore.Read(runID, service)
+	entries, err := s.cacheStore.Read(phaseID, service)
 	if err != nil {
 		s.logger.Error("cache entries: read failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "read failed")

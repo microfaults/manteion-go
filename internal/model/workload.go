@@ -9,19 +9,21 @@ import (
 // Attack represents a vegeta precision load targeting a specific endpoint.
 // Manteion is the source of truth for trigger config + results.
 // Zeus handles execution state (running → completed/failed).
+//
+// Migration #19 dropped Attack.ExperimentRunID — phase-driven attacks are
+// addressed via phase_workflows.zeus_attack_id instead.
 type Attack struct {
-	ID              string            `json:"id"`
-	ExperimentRunID string            `json:"experiment_run_id,omitempty"`
-	PolicyRuleID    string            `json:"policy_rule_id,omitempty"`
-	Service         string            `json:"service"`
-	TargetURL       string            `json:"target_url"`
-	TargetMethod    string            `json:"target_method"`
-	TargetHeaders   map[string]string `json:"target_headers,omitempty"`
-	Rate            int               `json:"rate"`
-	DurationMs      int64             `json:"duration_ms"`
-	DedupBypass     string            `json:"dedup_bypass,omitempty"`
-	MetaTraceID     string            `json:"meta_trace_id,omitempty"`
-	ZeusAttackID    string            `json:"zeus_attack_id,omitempty"`
+	ID            string            `json:"id"`
+	PolicyRuleID  string            `json:"policy_rule_id,omitempty"`
+	Service       string            `json:"service"`
+	TargetURL     string            `json:"target_url"`
+	TargetMethod  string            `json:"target_method"`
+	TargetHeaders map[string]string `json:"target_headers,omitempty"`
+	Rate          int               `json:"rate"`
+	DurationMs    int64             `json:"duration_ms"`
+	DedupBypass   string            `json:"dedup_bypass,omitempty"`
+	MetaTraceID   string            `json:"meta_trace_id,omitempty"`
+	ZeusAttackID  string            `json:"zeus_attack_id,omitempty"`
 
 	// Result fields — populated on completion callback from zeus.
 	LatencyP50Us  int64          `json:"latency_p50_us,omitempty"`

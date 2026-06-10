@@ -10,7 +10,9 @@ import (
 
 // WorkloadRepo provides persistence for attacks and attack results backed
 // by PostgreSQL. Flow/Persona/Workload tables have been removed — zeus's
-// Workflow/Run/Dataset are canonical.
+// Workflow/Run/Dataset are canonical. Per migration #19 the attacks table
+// no longer carries experiment_run_id; phase-driven attacks are tracked
+// via phase_workflows.zeus_attack_id instead.
 type WorkloadRepo struct {
 	db *sql.DB
 }
@@ -34,12 +36,12 @@ func (r *WorkloadRepo) CreateAttack(ctx context.Context, a *model.Attack) error 
 	}
 
 	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO attacks (id, experiment_run_id, policy_rule_id,
+		INSERT INTO attacks (id, policy_rule_id,
 			service, target_url, target_method, target_headers,
 			rate, duration_ms, dedup_bypass, meta_trace_id, zeus_attack_id,
-			status, created_at, completed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14)`,
-		a.ID, nullString(a.ExperimentRunID), nullString(a.PolicyRuleID),
+			created_at, completed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		a.ID, nullString(a.PolicyRuleID),
 		a.Service, a.TargetURL, a.TargetMethod, headersJSON,
 		a.Rate, a.DurationMs, nullString(a.DedupBypass), nullString(a.MetaTraceID),
 		nullString(a.ZeusAttackID),
@@ -54,17 +56,17 @@ func (r *WorkloadRepo) CreateAttack(ctx context.Context, a *model.Attack) error 
 // GetAttack returns an attack by ID, or ErrNotFound.
 func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack, error) {
 	var a model.Attack
-	var expRunID, policyRuleID, dedup, metaTrace, zeusID sql.NullString
+	var policyRuleID, dedup, metaTrace, zeusID sql.NullString
 	var headersJSON []byte
 
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, experiment_run_id, policy_rule_id,
+		SELECT id, policy_rule_id,
 			service, target_url, target_method, target_headers,
 			rate, duration_ms, dedup_bypass, meta_trace_id, zeus_attack_id,
 			created_at, completed_at
 		FROM attacks WHERE id = $1`, id,
 	).Scan(
-		&a.ID, &expRunID, &policyRuleID,
+		&a.ID, &policyRuleID,
 		&a.Service, &a.TargetURL, &a.TargetMethod, &headersJSON,
 		&a.Rate, &a.DurationMs, &dedup, &metaTrace, &zeusID,
 		&a.CreatedAt, &a.CompletedAt,
@@ -75,7 +77,6 @@ func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack,
 	if err != nil {
 		return nil, fmt.Errorf("get attack: %w", err)
 	}
-	a.ExperimentRunID = fromNullString(expRunID)
 	a.PolicyRuleID = fromNullString(policyRuleID)
 	a.DedupBypass = fromNullString(dedup)
 	a.MetaTraceID = fromNullString(metaTrace)
@@ -86,46 +87,42 @@ func (r *WorkloadRepo) GetAttack(ctx context.Context, id string) (*model.Attack,
 	return &a, nil
 }
 
-// ListAttacksByRun returns all attacks for an experiment run.
-func (r *WorkloadRepo) ListAttacksByRun(ctx context.Context, runID string) ([]*model.Attack, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, experiment_run_id, policy_rule_id,
+// GetAttackByZeusID returns the manteion-side Attack record matching a zeus
+// attack id (set on the phase_workflows row by the orchestrator).
+func (r *WorkloadRepo) GetAttackByZeusID(ctx context.Context, zeusID string) (*model.Attack, error) {
+	if zeusID == "" {
+		return nil, ErrNotFound
+	}
+	var a model.Attack
+	var policyRuleID, dedup, metaTrace, scannedZeusID sql.NullString
+	var headersJSON []byte
+
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id, policy_rule_id,
 			service, target_url, target_method, target_headers,
 			rate, duration_ms, dedup_bypass, meta_trace_id, zeus_attack_id,
 			created_at, completed_at
-		FROM attacks WHERE experiment_run_id = $1
-		ORDER BY created_at`, runID)
+		FROM attacks WHERE zeus_attack_id = $1`, zeusID,
+	).Scan(
+		&a.ID, &policyRuleID,
+		&a.Service, &a.TargetURL, &a.TargetMethod, &headersJSON,
+		&a.Rate, &a.DurationMs, &dedup, &metaTrace, &scannedZeusID,
+		&a.CreatedAt, &a.CompletedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list attacks by run: %w", err)
+		return nil, fmt.Errorf("get attack by zeus id: %w", err)
 	}
-	defer rows.Close()
-
-	var result []*model.Attack
-	for rows.Next() {
-		var a model.Attack
-		var expRunID, policyRuleID, dedup, metaTrace, zeusID sql.NullString
-		var headersJSON []byte
-
-		err := rows.Scan(
-			&a.ID, &expRunID, &policyRuleID,
-			&a.Service, &a.TargetURL, &a.TargetMethod, &headersJSON,
-			&a.Rate, &a.DurationMs, &dedup, &metaTrace, &zeusID,
-			&a.CreatedAt, &a.CompletedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("scan attack: %w", err)
-		}
-		a.ExperimentRunID = fromNullString(expRunID)
-		a.PolicyRuleID = fromNullString(policyRuleID)
-		a.DedupBypass = fromNullString(dedup)
-		a.MetaTraceID = fromNullString(metaTrace)
-		a.ZeusAttackID = fromNullString(zeusID)
-		if err := jsonbScan(headersJSON, &a.TargetHeaders); err != nil {
-			return nil, fmt.Errorf("unmarshal target_headers: %w", err)
-		}
-		result = append(result, &a)
+	a.PolicyRuleID = fromNullString(policyRuleID)
+	a.DedupBypass = fromNullString(dedup)
+	a.MetaTraceID = fromNullString(metaTrace)
+	a.ZeusAttackID = fromNullString(scannedZeusID)
+	if err := jsonbScan(headersJSON, &a.TargetHeaders); err != nil {
+		return nil, fmt.Errorf("unmarshal target_headers: %w", err)
 	}
-	return result, rows.Err()
+	return &a, nil
 }
 
 // CreateAttackResult inserts attack outcome metrics.
