@@ -170,14 +170,40 @@ components:
           type: string
         last_poll_at:
           type: string
+        poll_interval_ms:
+          description: SDK's configured poll cadence
+          type: integer
         registered_at:
           type: string
+        routes:
+          description: "Routes is the HTTP route inventory the service published at\n\
+            registration. Optional \u2014 services may register without routes\n(e.g.\
+            \ gRPC services). Aggregated across instances by the\nworkflow-builder\
+            \ catalog handler."
+          items:
+            $ref: '#/components/schemas/model.SDKRoute'
+          type: array
+          uniqueItems: false
         service:
           type: string
         status:
-          description: "\"alive\",\"stale\",\"dead\" \u2014 computed, not persisted"
+          description: "\"alive\",\"stale\",\"dead\" \u2014 computed from poll staleness"
           type: string
         version:
+          type: string
+      type: object
+    model.SDKRoute:
+      properties:
+        depends_on:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        description:
+          type: string
+        method:
+          type: string
+        path:
           type: string
       type: object
 info:
@@ -188,6 +214,24 @@ info:
   version: '1.0'
 openapi: 3.1.0
 paths:
+  /faults/catalog:
+    get:
+      description: 'Lists every supported (category, fault_type) pair with its
+
+        params field metadata (name/type/required/default) so
+
+        clients can render fault forms without hardcoding the vocab.'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties: {}
+                type: object
+          description: '{catalog: []faultcatalog.Entry}'
+      summary: Fault catalogue
+      tags:
+      - faults
   /faults/compositions:
     get:
       description: Returns all fault compositions in creation order.
@@ -704,11 +748,11 @@ paths:
     post:
       description: 'Registers an atropos-go SDK process. The 201 response carries
 
-        status="registered" and may include initial intent payload
+        status="registered" and may include the initial desired state
 
-        (rules, active_fault, freeze_cfg) when an IntentReader is
+        (rules, active_faults, freeze_cfg) so the SDK converges before
 
-        configured for the service.'
+        its first poll.'
       requestBody:
         content:
           application/json:
@@ -769,11 +813,13 @@ paths:
       description: 'SDKs send their last-known rule version via the version query
         param.
 
-        Returns 304 if unchanged, 200 with the current rule set otherwise.
+        Returns 304 if unchanged, else 200 with the desired state the SDK
 
-        The 200 body wraps the version and the compiled rule list:
+        reconciles against: {"version": uint64, "rules": []CompiledRule,
 
-        {"version": uint64, "rules": []ruleconv.CompiledRule}.
+        "active_faults": []FaultRequest, "freeze_cfg": DelayRequest}.
+
+        Manual fault add/remove bumps the version so it rides this path.
 
         Optional instance_id query param triggers a best-effort poll-timestamp touch.'
       parameters:
@@ -800,7 +846,7 @@ paths:
               schema:
                 additionalProperties: {}
                 type: object
-          description: '{version, rules: []ruleconv.CompiledRule}'
+          description: '{version, rules, active_faults, freeze_cfg}'
         '304':
           description: no rule changes since requested version
         '400':
