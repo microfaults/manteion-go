@@ -1,3 +1,21 @@
+// Package orchestrator drives experiment execution on the phase-first
+// (epoch-2) model: experiments → experiment_phases → phase_workflows.
+//
+// The phase is the FSM unit (pending → running ⇄ paused → completed |
+// failed | skipped). Race safety rests on three primitives ported from the
+// legacy run FSM (commits e81fdb0, 5153d5f):
+//
+//  1. compare-and-swap status transitions in SQL (store.TransitionPhase /
+//     TransitionExperiment) — exactly one of N racing callers wins;
+//  2. a per-experiment lock serializing the phase scheduler
+//     (advanceExperiment) so concurrent phase completions can't double-start;
+//  3. a single terminal path (finishPhase, runner.go) whose CAS winner runs
+//     all side effects — teardown, harvest, rollup — exactly once.
+//
+// Experiment-level pause is DERIVED state: the experiment_status enum has no
+// 'paused' label (phase_status does, deliberately). PauseExperiment pauses
+// the running phase(s) and leaves the experiment 'running'; a paused phase
+// blocks the scheduler, which is what makes the pause stick.
 package orchestrator
 
 import (
@@ -16,15 +34,8 @@ import (
 )
 
 // Orchestrator drives experiment execution: starting/stopping phases,
-// pushing rules, supervising zeus attacks, harvesting results, and
-// updating phase status as the experiment progresses.
-//
-// Migration #19 collapsed the legacy ExperimentRun shape into phases as
-// first-class rows. The orchestrator surface in this file is a thin
-// stub that compiles against the new model and persists status changes;
-// the rich run/watcher/poller machinery that used to live here will be
-// rebuilt phase-aware in a follow-up. The handler layer can rely on the
-// stub for happy-path status transitions today.
+// pushing rules, freezing cache-box services, supervising zeus attacks,
+// harvesting results, and updating phase status as the experiment progresses.
 type Orchestrator struct {
 	experiments *store.ExperimentRepo
 	rules       *store.RuleRepo
@@ -32,18 +43,19 @@ type Orchestrator struct {
 	workloads   *store.WorkloadRepo
 	workflows   *store.WorkflowRepo
 	controller  *atrocontrol.Controller
-	prom        *promql.Client
+	prom        *promql.Client // reserved for metric-driven transitions (see policy-engine freeze decision)
 	zeusClient  *zeus.Client
 	cacheStore  *cachestore.Store
 	logger      *slog.Logger
 
 	maxPollDuration time.Duration
+	pollInterval    time.Duration
+	autoComplete    bool // auto-complete driver-less phases (off in FSM unit tests)
 
-	mu      sync.Mutex
-	running map[string]context.CancelFunc // experiment_id → cancel
+	mu       sync.Mutex
+	running  map[string]context.CancelFunc // phase ID → poller cancel
+	expLocks map[string]*sync.Mutex        // experiment ID → scheduler serializer
 }
-
-const defaultMaxPollDuration = 30 * time.Minute
 
 // New constructs an Orchestrator.
 func New(
@@ -70,7 +82,10 @@ func New(
 		cacheStore:      cs,
 		logger:          logger,
 		maxPollDuration: defaultMaxPollDuration,
+		pollInterval:    defaultZeusPollInterval,
+		autoComplete:    true,
 		running:         make(map[string]context.CancelFunc),
+		expLocks:        make(map[string]*sync.Mutex),
 	}
 }
 
@@ -79,25 +94,29 @@ func (o *Orchestrator) WithMaxPollDuration(d time.Duration) {
 	o.maxPollDuration = d
 }
 
-// Recover is a no-op stub for the migration-#19 model. Phase-aware
-// recovery (resuming in-flight phases by reattaching to zeus attacks
-// and rebuilding rule state on services) is a follow-up.
-func (o *Orchestrator) Recover(ctx context.Context) error {
-	o.logger.Info("orchestrator: recover skipped — phase-aware orchestration is a follow-up")
-	return nil
+// WithPollInterval overrides the Zeus poll tick (test seam).
+func (o *Orchestrator) WithPollInterval(d time.Duration) {
+	o.pollInterval = d
 }
 
-// StartExperiment marks the experiment as running and starts the first
-// pending phase. Returns an error if the experiment has no phases.
-func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string) error {
-	exp, err := o.experiments.Get(ctx, experimentID)
-	if err != nil {
-		return fmt.Errorf("orchestrator: load experiment: %w", err)
+// experimentLock returns the per-experiment mutex that serializes
+// advanceExperiment so concurrent phase completions can't race the
+// scheduler on a stale snapshot.
+func (o *Orchestrator) experimentLock(experimentID string) *sync.Mutex {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	lk, ok := o.expLocks[experimentID]
+	if !ok {
+		lk = &sync.Mutex{}
+		o.expLocks[experimentID] = lk
 	}
-	if exp.Status == "running" {
-		return errors.New("orchestrator: experiment already running")
-	}
+	return lk
+}
 
+// StartExperiment transitions an experiment from "planned" to "running" and
+// starts its first pending phase via the scheduler. Returns an error if the
+// experiment has no phases or is not planned.
+func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string) error {
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
 	if err != nil {
 		return fmt.Errorf("orchestrator: list phases: %w", err)
@@ -106,127 +125,388 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 		return errors.New("orchestrator: experiment has no phases")
 	}
 
-	if err := o.experiments.UpdateStatus(ctx, experimentID, "running"); err != nil {
-		return fmt.Errorf("orchestrator: update experiment status: %w", err)
+	// Atomically claim planned → running so two concurrent starts can't both
+	// walk the scheduler believing they own the kickoff.
+	claimed, err := o.experiments.TransitionExperiment(ctx, experimentID, "running", "planned")
+	if err != nil {
+		return fmt.Errorf("orchestrator: claim experiment: %w", err)
 	}
-	// Kick the first pending phase.
-	for _, p := range phases {
-		if p.Status == "pending" {
-			if err := o.StartPhase(ctx, p.ID); err != nil {
-				o.logger.Error("orchestrator: start first phase failed",
-					"experiment_id", experimentID, "phase_id", p.ID, "error", err)
-				_ = o.experiments.UpdateStatus(ctx, experimentID, "failed")
-				return err
-			}
-			break
-		}
+	if !claimed {
+		return fmt.Errorf("orchestrator: experiment %q is not planned", experimentID)
 	}
+
+	o.advanceExperiment(ctx, experimentID)
+	o.logger.Info("orchestrator: experiment started",
+		"experiment_id", experimentID, "phases", len(phases))
 	return nil
 }
 
-// StopExperiment marks the experiment and any running phase as cancelled.
-func (o *Orchestrator) StopExperiment(ctx context.Context, experimentID, finalStatus string) error {
-	if finalStatus == "" {
-		finalStatus = "cancelled"
+// PauseExperiment pauses a running experiment by pausing its running
+// phase(s). The experiment row stays 'running' (the status enum has no
+// 'paused'); the paused phase gates the scheduler, which is what halts
+// progression. Returns an error when nothing was pausable.
+func (o *Orchestrator) PauseExperiment(ctx context.Context, experimentID string) error {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+	defer lk.Unlock()
+
+	exp, err := o.experiments.Get(ctx, experimentID)
+	if err != nil {
+		return err
+	}
+	if exp.Status != "running" {
+		return fmt.Errorf("orchestrator: experiment %q is not running (status=%s)", experimentID, exp.Status)
 	}
 
-	o.mu.Lock()
-	if cancel, ok := o.running[experimentID]; ok {
-		cancel()
-		delete(o.running, experimentID)
+	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: list phases: %w", err)
 	}
-	o.mu.Unlock()
+	paused := 0
+	for _, p := range phases {
+		if p.Status != "running" {
+			continue
+		}
+		if err := o.PausePhase(ctx, p.ID); err != nil {
+			o.logger.Warn("orchestrator: pause experiment: pause phase failed",
+				"phase_id", p.ID, "error", err)
+			continue
+		}
+		paused++
+	}
+	if paused == 0 {
+		return fmt.Errorf("orchestrator: experiment %q has no running phase to pause", experimentID)
+	}
+	o.logger.Info("orchestrator: experiment paused", "experiment_id", experimentID)
+	return nil
+}
+
+// ResumeExperiment resumes a paused experiment: every paused phase is
+// restarted (rules re-pushed, attacks re-launched, poller respawned), then
+// the scheduler re-walks in case the experiment stalled between phases.
+func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string) error {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+
+	exp, err := o.experiments.Get(ctx, experimentID)
+	if err != nil {
+		lk.Unlock()
+		return err
+	}
+	if exp.Status != "running" {
+		lk.Unlock()
+		return fmt.Errorf("orchestrator: experiment %q is not running (status=%s)", experimentID, exp.Status)
+	}
+
+	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
+	if err != nil {
+		lk.Unlock()
+		return fmt.Errorf("orchestrator: list phases: %w", err)
+	}
+	resumed := 0
+	for _, p := range phases {
+		if p.Status != "paused" {
+			continue
+		}
+		if err := o.StartPhase(ctx, p.ID); err != nil {
+			o.logger.Warn("orchestrator: resume experiment: resume phase failed",
+				"phase_id", p.ID, "error", err)
+			continue
+		}
+		resumed++
+	}
+	if resumed == 0 {
+		lk.Unlock()
+		return fmt.Errorf("orchestrator: experiment %q has no paused phase to resume", experimentID)
+	}
+	o.logger.Info("orchestrator: experiment resumed", "experiment_id", experimentID)
+	lk.Unlock()
+
+	// Re-walk the scheduler (acquires the lock itself) to heal any stall.
+	o.advanceExperiment(ctx, experimentID)
+	return nil
+}
+
+// CancelExperiment cancels a planned/running experiment: every non-terminal
+// phase is finalized as "skipped" (tearing down rules, freezes, and zeus
+// attacks) and the experiment becomes 'cancelled'.
+func (o *Orchestrator) CancelExperiment(ctx context.Context, experimentID string) error {
+	return o.terminateExperiment(ctx, experimentID, "cancelled")
+}
+
+// StopExperiment is the operator terminal entry point kept for the /stop
+// endpoint: finalize the experiment as completed/failed/cancelled (default
+// cancelled), skipping all non-terminal phases.
+func (o *Orchestrator) StopExperiment(ctx context.Context, experimentID, finalStatus string) error {
+	switch finalStatus {
+	case "":
+		finalStatus = "cancelled"
+	case "completed", "failed", "cancelled":
+	default:
+		return fmt.Errorf("orchestrator: invalid final status %q", finalStatus)
+	}
+	return o.terminateExperiment(ctx, experimentID, finalStatus)
+}
+
+// terminateExperiment is the shared cancel/stop path: CAS the experiment to
+// the terminal status, then finalize every non-terminal phase as "skipped".
+func (o *Orchestrator) terminateExperiment(ctx context.Context, experimentID, finalStatus string) error {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+	defer lk.Unlock()
+
+	terminated, err := o.experiments.TransitionExperiment(ctx, experimentID, finalStatus,
+		"planned", "running")
+	if err != nil {
+		return err
+	}
+	if !terminated {
+		return fmt.Errorf("orchestrator: experiment %q is already terminal", experimentID)
+	}
 
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
 	if err != nil {
 		return fmt.Errorf("orchestrator: list phases: %w", err)
 	}
 	for _, p := range phases {
-		if p.Status == "running" || p.Status == "paused" {
-			if err := o.experiments.UpdatePhaseStatus(ctx, p.ID, "skipped"); err != nil {
-				o.logger.Warn("orchestrator: skip phase failed",
+		switch p.Status {
+		case "running", "paused":
+			// finishPhase tears down the poller, rules, freezes, and attacks.
+			o.finishPhase(ctx, p.ID, "skipped", "running", "paused")
+		case "pending":
+			if _, err := o.experiments.TransitionPhase(ctx, p.ID, "skipped", "pending"); err != nil {
+				o.logger.Warn("orchestrator: terminate: skip pending phase failed",
 					"phase_id", p.ID, "error", err)
 			}
 		}
 	}
-	return o.experiments.UpdateStatus(ctx, experimentID, finalStatus)
-}
-
-// StartPhase materializes the phase's workflow definitions into zeus and
-// marks the phase running. The rest of the execution machinery (push rules,
-// trigger zeus runs, watch transition conditions, harvest results) is the
-// phase-aware FSM follow-up — but materialize-before-run lands here so zeus
-// always holds the current definitions before anything starts them.
-func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
-	p, err := o.experiments.GetPhase(ctx, phaseID)
-	if err != nil {
-		return fmt.Errorf("orchestrator: load phase: %w", err)
-	}
-	if p.Status != "pending" && p.Status != "paused" {
-		return fmt.Errorf("orchestrator: phase %q not startable from status %q", phaseID, p.Status)
-	}
-
-	if err := o.materializePhaseWorkflows(ctx, phaseID); err != nil {
-		return fmt.Errorf("orchestrator: materialize workflows: %w", err)
-	}
-
-	if err := o.experiments.UpdatePhaseStatus(ctx, phaseID, "running"); err != nil {
-		return fmt.Errorf("orchestrator: update phase status: %w", err)
-	}
-	o.logger.Info("orchestrator: phase started (workflows materialized; run trigger is the FSM follow-up)",
-		"phase_id", phaseID)
+	o.logger.Info("orchestrator: experiment terminated",
+		"experiment_id", experimentID, "status", finalStatus)
 	return nil
 }
 
-// materializePhaseWorkflows pushes every workflow definition attached to the
-// phase into zeus: best-effort delete of any stale copy under the same id
-// (covers renames, where overwrite-by-name would miss), then register with
-// overwrite. Zeus's in-memory store is a cache of manteion's workflows table.
-func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID string) error {
+// advanceExperiment is the sequential phase scheduler. Phases run one at a
+// time in position order; a failed phase skips everything after it (the
+// sequential analogue of the old DAG failure cascade); when no phase remains
+// startable the experiment is finalized. Idempotent — safe to call
+// repeatedly; called from StartExperiment, ResumeExperiment, finishPhase,
+// and Recover.
+func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID string) {
+	lk := o.experimentLock(experimentID)
+	lk.Lock()
+	defer lk.Unlock()
+
+	// Only advance a running experiment — cancelled/terminal experiments must
+	// not start phases. (Pause is phase-level: a paused phase returns below.)
+	exp, err := o.experiments.Get(ctx, experimentID)
+	if err != nil {
+		o.logger.Warn("orchestrator: advance: get experiment failed",
+			"experiment_id", experimentID, "error", err)
+		return
+	}
+	if exp.Status != "running" {
+		return
+	}
+
+	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
+	if err != nil {
+		o.logger.Warn("orchestrator: advance: list phases failed",
+			"experiment_id", experimentID, "error", err)
+		return
+	}
+
+	anyFailed := false
+	for _, p := range phases {
+		switch p.Status {
+		case "running", "paused":
+			// A phase in flight (or paused by the operator) blocks the
+			// scheduler — sequential execution, and the pause gate.
+			return
+		case "failed":
+			anyFailed = true
+		}
+	}
+
+	// Failure cascade: later phases assume their predecessors ran, so a
+	// failed phase invalidates everything still pending.
+	if anyFailed {
+		for _, p := range phases {
+			if p.Status != "pending" {
+				continue
+			}
+			if _, err := o.experiments.TransitionPhase(ctx, p.ID, "skipped", "pending"); err != nil {
+				o.logger.Warn("orchestrator: advance: cascade-skip phase failed",
+					"phase_id", p.ID, "error", err)
+			} else {
+				o.logger.Info("orchestrator: phase skipped (earlier phase failed)",
+					"phase_id", p.ID)
+			}
+		}
+		o.finalizeExperiment(ctx, experimentID, "failed")
+		return
+	}
+
+	// Start the first pending phase.
+	for _, p := range phases {
+		if p.Status != "pending" {
+			continue
+		}
+		if err := o.StartPhase(ctx, p.ID); err != nil {
+			// StartPhase finalizes the phase as failed on enter-sequence
+			// errors; the resulting finishPhase re-advances asynchronously
+			// and the cascade above collapses the rest.
+			o.logger.Error("orchestrator: advance: start phase failed",
+				"experiment_id", experimentID, "phase_id", p.ID, "error", err)
+		}
+		return
+	}
+
+	// Nothing pending, running, or paused — every phase is terminal.
+	o.finalizeExperiment(ctx, experimentID, "completed")
+}
+
+// finalizeExperiment CASes running → terminal so a concurrent cancel/stop
+// wins instead of being clobbered, then recomputes the rollup.
+func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, status string) {
+	ok, err := o.experiments.TransitionExperiment(ctx, experimentID, status, "running")
+	if err != nil {
+		o.logger.Warn("orchestrator: finalize experiment failed",
+			"experiment_id", experimentID, "status", status, "error", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	if _, err := o.experiments.RecomputeExperimentResults(ctx, experimentID); err != nil {
+		o.logger.Warn("orchestrator: finalize: recompute results failed",
+			"experiment_id", experimentID, "error", err)
+	}
+	o.logger.Info("orchestrator: experiment finalized",
+		"experiment_id", experimentID, "status", status)
+}
+
+// Recover restores in-memory state from the DB after a process restart.
+// For every 'running' experiment:
+//
+//   - 'running' phases get their zeus attacks reconciled (GetAttack with
+//     retries). All attacks lost → the phase is finalized 'failed'; survivors
+//     → the poller goroutine is respawned; no attacks configured → the phase
+//     auto-completes (it has no driver).
+//   - 'paused' phases are left alone; they wait for an explicit resume.
+//
+// Finally the scheduler re-walks each experiment to cover a crash that
+// landed between phases. Recover must be called before the API server
+// starts accepting requests.
+func (o *Orchestrator) Recover(ctx context.Context) error {
+	exps, _, err := o.experiments.List(ctx,
+		store.ExperimentFilter{Status: "running"}, store.Page{Limit: 200})
+	if err != nil {
+		return fmt.Errorf("recover: list running experiments: %w", err)
+	}
+	if len(exps) == 0 {
+		o.logger.Info("orchestrator: recover: no in-flight experiments")
+		return nil
+	}
+
+	for _, exp := range exps {
+		phases, err := o.experiments.ListPhasesForExperiment(ctx, exp.ID)
+		if err != nil {
+			o.logger.Error("orchestrator: recover: list phases failed",
+				"experiment_id", exp.ID, "error", err)
+			continue
+		}
+		for _, p := range phases {
+			switch p.Status {
+			case "paused":
+				o.logger.Info("orchestrator: recover: paused phase left in place",
+					"phase_id", p.ID)
+			case "running":
+				o.recoverRunningPhase(ctx, p.ID)
+			}
+		}
+		// Heal a crash between phases (nothing in flight, next never started).
+		o.advanceExperiment(ctx, exp.ID)
+	}
+	return nil
+}
+
+// recoverRunningPhase reattaches to a phase that was running when the
+// process died: reconcile its persisted attack IDs against zeus and either
+// fail it (all lost), respawn its poller (survivors), or auto-complete it
+// (no attacks were ever configured — a driver-less phase).
+func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) {
 	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
 	if err != nil {
-		return fmt.Errorf("list phase workflows: %w", err)
+		o.logger.Error("orchestrator: recover: list phase workflows failed",
+			"phase_id", phaseID, "error", err)
+		return
 	}
+
+	var attackIDs []string
+	var maxDur time.Duration
 	for _, pw := range pws {
-		wf, err := o.workflows.Get(ctx, pw.WorkflowID)
-		if err != nil {
-			return fmt.Errorf("load workflow %q: %w", pw.WorkflowID, err)
+		if pw.ZeusAttackID != "" {
+			attackIDs = append(attackIDs, pw.ZeusAttackID)
 		}
-		if err := o.zeusClient.DeleteWorkflow(ctx, wf.ID); err != nil {
-			o.logger.Warn("orchestrator: stale zeus workflow delete failed; proceeding",
-				"workflow_id", wf.ID, "error", err)
+		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
+			maxDur = d
 		}
-		if err := o.zeusClient.RegisterWorkflow(ctx, wf.DSL); err != nil {
-			return fmt.Errorf("register workflow %q in zeus: %w", wf.ID, err)
-		}
-		o.logger.Info("orchestrator: workflow materialized into zeus",
-			"phase_id", phaseID, "workflow_id", wf.ID)
 	}
-	return nil
+
+	if len(attackIDs) == 0 {
+		if o.autoComplete {
+			o.logger.Info("orchestrator: recover: phase has no attacks; auto-completing",
+				"phase_id", phaseID)
+			go o.finishPhase(context.Background(), phaseID, "completed", "running")
+		}
+		return
+	}
+
+	if o.zeusClient != nil {
+		lost := 0
+		for _, id := range attackIDs {
+			if !o.reconcileOneAttack(ctx, phaseID, id) {
+				lost++
+			}
+		}
+		if lost == len(attackIDs) {
+			o.logger.Warn("orchestrator: recover: all zeus attacks lost; marking phase failed",
+				"phase_id", phaseID)
+			o.finishPhase(ctx, phaseID, "failed", "running")
+			return
+		}
+		if lost > 0 {
+			o.logger.Warn("orchestrator: recover: some zeus attacks lost; continuing with survivors",
+				"phase_id", phaseID, "lost", lost, "total", len(attackIDs))
+		}
+	}
+
+	o.spawnPoller(phaseID, maxDur)
+	o.logger.Info("orchestrator: recover: running phase restored",
+		"phase_id", phaseID, "attacks", len(attackIDs))
 }
 
-// StopPhase marks the phase with a terminal status. finalStatus must be
-// one of "completed", "failed", "skipped".
-func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus string) error {
-	if finalStatus == "" {
-		finalStatus = "completed"
-	}
-	if err := o.experiments.UpdatePhaseStatus(ctx, phaseID, finalStatus); err != nil {
-		return fmt.Errorf("orchestrator: update phase status: %w", err)
-	}
-	// Recompute rollup; ignore "no measurements yet" cases.
-	p, err := o.experiments.GetPhase(ctx, phaseID)
-	if err == nil {
-		if _, err := o.experiments.RecomputeExperimentResults(ctx, p.ExperimentID); err != nil {
-			o.logger.Warn("orchestrator: recompute results failed",
-				"experiment_id", p.ExperimentID, "error", err)
-		}
-	}
-	return nil
+const reconcileRetries = 3
+
+var reconcileBackoff = [reconcileRetries]time.Duration{
+	100 * time.Millisecond, 500 * time.Millisecond, 2 * time.Second,
 }
 
-// PausePhase puts a running phase into the paused state. Resume via
-// StartPhase (which accepts both pending and paused).
-func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
-	return o.experiments.UpdatePhaseStatus(ctx, phaseID, "paused")
+// reconcileOneAttack calls Zeus.GetAttack with retries to tolerate transient
+// errors. Reports whether zeus still knows the attack.
+func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID string) bool {
+	var lastErr error
+	for attempt := 0; attempt < reconcileRetries; attempt++ {
+		_, err := o.zeusClient.GetAttack(ctx, attackID)
+		if err == nil {
+			return true
+		}
+		lastErr = err
+		if attempt < reconcileRetries-1 {
+			time.Sleep(reconcileBackoff[attempt])
+		}
+	}
+	o.logger.Warn("orchestrator: recover: zeus attack not found after retries",
+		"phase_id", phaseID, "attack_id", attackID, "error", lastErr)
+	return false
 }

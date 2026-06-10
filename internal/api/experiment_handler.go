@@ -219,6 +219,52 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
+// handlePauseExperiment pauses the experiment's running phase(s). The
+// experiment row stays 'running' — pause lives on the phase (phase_status
+// has a 'paused' label; experiment_status deliberately does not), and a
+// paused phase gates the orchestrator's scheduler.
+func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.PauseExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("pause experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+}
+
+func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.ResumeExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("resume experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
+}
+
+func (s *Server) handleCancelExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.CancelExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("cancel experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
 func (s *Server) handleStopExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	finalStatus := r.URL.Query().Get("status")

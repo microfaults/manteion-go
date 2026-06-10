@@ -186,12 +186,17 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	// Experiment CRUD + lifecycle (phase-first model).
 	// /runs and /contributions endpoints were retired; phases are the run
-	// unit. Pause/resume/cancel return with the phase-aware FSM port.
+	// unit. Pause is phase-level state: the experiment row stays 'running'
+	// while its current phase is 'paused' (the experiment_status enum has no
+	// paused label) — /pause, /resume, and /cancel drive the orchestrator FSM.
 	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)
 	mux.HandleFunc("GET /api/v1/experiments", s.handleListExperiments)
 	mux.HandleFunc("GET /api/v1/experiments/{id}", s.handleGetExperiment)
 	mux.HandleFunc("DELETE /api/v1/experiments/{id}", s.handleDeleteExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/start", s.handleStartExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/pause", s.handlePauseExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/resume", s.handleResumeExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/cancel", s.handleCancelExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/stop", s.handleStopExperiment)
 	mux.HandleFunc("GET /api/v1/experiments/{id}/results", s.handleExperimentResults)
 

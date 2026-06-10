@@ -56,12 +56,15 @@ verify: build
 	@echo "=== go test ==="
 	go test ./...
 
+# -p 1 serializes package execution: the DB-gated suites (store,
+# orchestrator) share one Postgres, and testutil.TestDB's cleanup truncates
+# every table — parallel packages would wipe each other's fixtures mid-test.
 integration:
-	MANTEION_INTEGRATION=1 MANTEION_TEST_DB=1 go test -count=1 -timeout 180s ./...
+	MANTEION_INTEGRATION=1 MANTEION_TEST_DB=1 go test -count=1 -timeout 300s -p 1 ./...
 
 e2e:
 	docker-compose up -d
 	MANTEION_E2E=1 \
 	MANTEION_INTEGRATION=1 \
 	MANTEION_DATABASE_URL=postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable \
-		go test -count=1 -timeout 300s ./...
+		go test -count=1 -timeout 300s -p 1 ./...
