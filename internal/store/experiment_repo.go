@@ -155,7 +155,7 @@ func (r *ExperimentRepo) Delete(ctx context.Context, id string) error {
 func (r *ExperimentRepo) UpdateStatus(ctx context.Context, id, status string) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE experiments SET
-			status       = $2,
+			status       = $2::experiment_status,
 			started_at   = CASE WHEN $2 = 'running'                            AND started_at IS NULL THEN now() ELSE started_at END,
 			completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now()              ELSE completed_at END
 		WHERE id = $1`, id, status)
@@ -163,6 +163,70 @@ func (r *ExperimentRepo) UpdateStatus(ctx context.Context, id, status string) er
 		return fmt.Errorf("update experiment status: %w", err)
 	}
 	return affectedOrNotFound(res)
+}
+
+// TransitionExperiment atomically moves the experiment to `to` only when its
+// current status is one of `from`. Returns whether the transition happened —
+// the orchestrator FSM's compare-and-swap primitive: exactly one of N racing
+// callers wins, and only the winner runs side effects. Timestamps are stamped
+// like UpdateStatus.
+func (r *ExperimentRepo) TransitionExperiment(ctx context.Context, id, to string, from ...string) (bool, error) {
+	guard, args, err := fromStatusGuard(id, to, from)
+	if err != nil {
+		return false, fmt.Errorf("transition experiment: %w", err)
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiments SET
+			status       = $2::experiment_status,
+			started_at   = CASE WHEN $2 = 'running'                            AND started_at IS NULL THEN now() ELSE started_at END,
+			completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now()              ELSE completed_at END
+		WHERE id = $1 AND status::text IN `+guard, args...)
+	if err != nil {
+		return false, fmt.Errorf("transition experiment: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("transition experiment: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// TransitionPhase is the phase-level CAS twin of TransitionExperiment.
+func (r *ExperimentRepo) TransitionPhase(ctx context.Context, id, to string, from ...string) (bool, error) {
+	guard, args, err := fromStatusGuard(id, to, from)
+	if err != nil {
+		return false, fmt.Errorf("transition phase: %w", err)
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiment_phases SET
+			status       = $2::phase_status,
+			started_at   = CASE WHEN $2 = 'running'                              AND started_at IS NULL THEN now() ELSE started_at END,
+			completed_at = CASE WHEN $2 IN ('completed','failed','skipped') THEN now()                  ELSE completed_at END
+		WHERE id = $1 AND status::text IN `+guard, args...)
+	if err != nil {
+		return false, fmt.Errorf("transition phase: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("transition phase: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// fromStatusGuard builds the parameterized "($3, $4, ...)" from-set guard and
+// the full args slice (id, to, from...) for the Transition* CAS updates.
+func fromStatusGuard(id, to string, from []string) (string, []any, error) {
+	if len(from) == 0 {
+		return "", nil, fmt.Errorf("empty from-set")
+	}
+	args := make([]any, 0, len(from)+2)
+	args = append(args, id, to)
+	ph := make([]string, len(from))
+	for i, f := range from {
+		ph[i] = fmt.Sprintf("$%d", i+3)
+		args = append(args, f)
+	}
+	return "(" + strings.Join(ph, ", ") + ")", args, nil
 }
 
 // UpdateMetadata edits non-state fields. Empty arguments are no-ops.
@@ -298,7 +362,7 @@ func (r *ExperimentRepo) DeletePhase(ctx context.Context, id string) error {
 func (r *ExperimentRepo) UpdatePhaseStatus(ctx context.Context, id, status string) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE experiment_phases SET
-			status       = $2,
+			status       = $2::phase_status,
 			started_at   = CASE WHEN $2 = 'running'                              AND started_at IS NULL THEN now() ELSE started_at END,
 			completed_at = CASE WHEN $2 IN ('completed','failed','skipped') THEN now()                  ELSE completed_at END
 		WHERE id = $1`, id, status)
