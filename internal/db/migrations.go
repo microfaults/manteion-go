@@ -16,277 +16,20 @@ type migration struct {
 
 // migrations is the ordered list of schema migrations.
 // New migrations are appended; existing entries must never be modified.
+//
+// SCHEMA EPOCH 2 (2026-06): the v1 history (migrations 1–25) was consolidated
+// into a single schema definition and the version counter reset. The platform
+// was pre-production with no data to preserve; the old migration list lives in
+// git history (internal/db/migrations.go prior to this commit). Databases
+// created under epoch 1 must be dropped and recreated — Migrate refuses to
+// run against them (see the epoch guard below).
+//
+// Epoch 2 consolidates the phase-first experiment model, manteion-owned
+// workflow definitions, the attacks definition/execution split, native enum
+// types for stable vocabularies, and the unified fault wire schema
+// (params + network JSONB mirroring atropos-go's FaultRequest).
 var migrations = []migration{
-	{1, "initial schema", initialSchema},
-	{2, "add trace_anchors index", `CREATE INDEX IF NOT EXISTS idx_trace_anchors_run ON trace_anchors(experiment_run_id);`},
-	{3, "drop experiments.experiment_type", `ALTER TABLE experiments DROP COLUMN IF EXISTS experiment_type;`},
-	{4, "add fault_composition duration/ramp columns", `
-ALTER TABLE fault_compositions
-    ADD COLUMN IF NOT EXISTS duration_ms BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS ramp_up_ms BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS ramp_down_ms BIGINT DEFAULT 0;
-`},
-	{5, "add experiment_run phase columns", `
-ALTER TABLE experiment_runs
-    ADD COLUMN IF NOT EXISTS phase_rules        JSONB    NOT NULL DEFAULT '[]',
-    ADD COLUMN IF NOT EXISTS transition_cond    JSONB,
-    ADD COLUMN IF NOT EXISTS current_phase      INTEGER  NOT NULL DEFAULT 0;
-`},
-	{6, "add experiment_run zeus_attack_id", `ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS zeus_attack_id TEXT;`},
-	{7, "add paused status to experiment_runs", `
-ALTER TABLE experiment_runs DROP CONSTRAINT IF EXISTS experiment_runs_status_check;
-ALTER TABLE experiment_runs ADD CONSTRAINT experiment_runs_status_check
-    CHECK (status IN ('pending','running','paused','completed','failed'));
-`},
-	{8, "add workload_ids and zeus_attack_ids to experiment_runs", `
-ALTER TABLE experiment_runs
-    ADD COLUMN IF NOT EXISTS workload_ids    JSONB,
-    ADD COLUMN IF NOT EXISTS zeus_attack_ids JSONB;
-`},
-	{9, "add hot-path indexes", `
-CREATE INDEX IF NOT EXISTS idx_experiment_runs_baseline
-    ON experiment_runs(experiment_id, run_type, status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_experiment_runs_status
-    ON experiment_runs(status)
-    WHERE status IN ('running','paused');
-CREATE INDEX IF NOT EXISTS idx_contribution_results_baseline_run
-    ON contribution_results(baseline_run_id);
-CREATE INDEX IF NOT EXISTS idx_contribution_results_isolation_run
-    ON contribution_results(isolation_run_id);
-CREATE INDEX IF NOT EXISTS idx_service_run_results_run
-    ON service_run_results(experiment_run_id);
-CREATE INDEX IF NOT EXISTS idx_workflow_run_results_run
-    ON workflow_run_results(experiment_run_id);
-CREATE INDEX IF NOT EXISTS idx_policy_rules_enabled
-    ON policy_rules(id) WHERE enabled = true;
-`},
-	{10, "add experiment_run depends_on for declarative DAG", `
-ALTER TABLE experiment_runs
-    ADD COLUMN IF NOT EXISTS depends_on JSONB NOT NULL DEFAULT '[]';
-CREATE INDEX IF NOT EXISTS idx_experiment_runs_depends_on
-    ON experiment_runs USING GIN (depends_on);
-`},
-	{11, "add experiment_run persist_cache opt-in flag", `
-ALTER TABLE experiment_runs
-    ADD COLUMN IF NOT EXISTS persist_cache BOOLEAN NOT NULL DEFAULT FALSE;
-`},
-	{12, "add rule action_type and cachebox columns", `
-ALTER TABLE rules
-    ADD COLUMN IF NOT EXISTS action_type          TEXT NOT NULL DEFAULT 'fault_spec',
-    ADD COLUMN IF NOT EXISTS cachebox_mode         TEXT,
-    ADD COLUMN IF NOT EXISTS cachebox_key_strategy  TEXT;
-
-UPDATE rules SET action_type = 'fault_composition' WHERE fault_composition_id IS NOT NULL;
-
-DO $$
-DECLARE
-    con_name TEXT;
-BEGIN
-    SELECT conname INTO con_name
-    FROM pg_constraint
-    WHERE conrelid = 'rules'::regclass
-      AND contype = 'c'
-      AND pg_get_constraintdef(oid) LIKE '%fault_spec_id IS NOT NULL AND fault_composition_id IS NULL%';
-    IF con_name IS NOT NULL THEN
-        EXECUTE format('ALTER TABLE rules DROP CONSTRAINT %I', con_name);
-    END IF;
-END $$;
-
-ALTER TABLE rules ADD CONSTRAINT rules_action_check CHECK (
-    CASE action_type
-        WHEN 'fault_spec'        THEN fault_spec_id IS NOT NULL AND fault_composition_id IS NULL AND cachebox_mode IS NULL
-        WHEN 'fault_composition' THEN fault_composition_id IS NOT NULL AND fault_spec_id IS NULL AND cachebox_mode IS NULL
-        WHEN 'cachebox'          THEN cachebox_mode IS NOT NULL AND fault_spec_id IS NULL AND fault_composition_id IS NULL
-    END
-);
-
-ALTER TABLE rules ALTER COLUMN fault_spec_id DROP NOT NULL;
-ALTER TABLE rules ALTER COLUMN fault_composition_id DROP NOT NULL;
-`},
-	{13, "remove transitional workload models and slim attacks", `
--- Drop FK references before dropping tables.
-ALTER TABLE attacks DROP CONSTRAINT IF EXISTS attacks_workload_id_fkey;
-ALTER TABLE experiments DROP CONSTRAINT IF EXISTS experiments_primary_workload_id_fkey;
-
--- Slim attacks: remove transitional columns, add zeus_attack_id.
-ALTER TABLE attacks
-    DROP COLUMN IF EXISTS workload_id,
-    DROP COLUMN IF EXISTS auto_rule_id,
-    DROP COLUMN IF EXISTS role,
-    DROP COLUMN IF EXISTS status,
-    DROP COLUMN IF EXISTS started_at,
-    ADD COLUMN IF NOT EXISTS zeus_attack_id TEXT;
-
--- Drop role/status CHECK constraints (auto-named).
-DO $$
-DECLARE
-    con_name TEXT;
-BEGIN
-    FOR con_name IN
-        SELECT conname FROM pg_constraint
-        WHERE conrelid = 'attacks'::regclass
-          AND contype = 'c'
-          AND (pg_get_constraintdef(oid) LIKE '%role%' OR pg_get_constraintdef(oid) LIKE '%status%')
-    LOOP
-        EXECUTE format('ALTER TABLE attacks DROP CONSTRAINT IF EXISTS %I', con_name);
-    END LOOP;
-END $$;
-
--- Rename experiment columns.
-ALTER TABLE experiments RENAME COLUMN primary_workload_id TO primary_workflow_id;
-ALTER TABLE experiment_runs RENAME COLUMN workload_ids TO workflow_ids;
-
--- Drop FK on primary_workflow_id (it pointed at workloads; now references zeus workflow IDs).
-ALTER TABLE experiments DROP CONSTRAINT IF EXISTS experiments_primary_workload_id_fkey;
-
--- Now safe to drop tables.
-DROP TABLE IF EXISTS workloads;
-DROP TABLE IF EXISTS personas;
-DROP TABLE IF EXISTS flows;
-`},
-	{14, "add experiment attack config columns", `
-ALTER TABLE experiments
-    ADD COLUMN IF NOT EXISTS target_url     TEXT,
-    ADD COLUMN IF NOT EXISTS target_method  TEXT,
-    ADD COLUMN IF NOT EXISTS rate           INT,
-    ADD COLUMN IF NOT EXISTS duration_sec   INT;
-`},
-	{15, "rename network:loss fault_type → retransmit_delay", `
-UPDATE fault_specs
-   SET fault_type = 'retransmit_delay'
- WHERE category = 'network' AND fault_type = 'loss';
-`},
-	{16, "add fault_specs.host + network envelope columns", `
-ALTER TABLE fault_specs
-    ADD COLUMN IF NOT EXISTS host             TEXT;
-
--- The network envelope (only meaningful for category='network').
--- Stored as nullable columns rather than a single JSONB to make UI
--- form validation, indexing, and constraint enforcement first-class.
-ALTER TABLE fault_specs
-    ADD COLUMN IF NOT EXISTS network_target    TEXT,
-    ADD COLUMN IF NOT EXISTS network_direction TEXT,
-    ADD COLUMN IF NOT EXISTS network_scope     DOUBLE PRECISION;
-
--- Default existing rows: network → proxy; inline/resource → process
--- (process = inline-host for resource faults, just a label).
-UPDATE fault_specs SET host = 'proxy'   WHERE category = 'network' AND host IS NULL;
-UPDATE fault_specs SET host = 'process' WHERE category IN ('inline', 'resource') AND host IS NULL;
-
--- Enforce host vocab. Network envelope columns must be NULL on non-network.
-ALTER TABLE fault_specs
-    ADD CONSTRAINT fault_specs_host_check CHECK (
-        host IN ('proxy', 'inline', 'process')
-    );
-ALTER TABLE fault_specs
-    ADD CONSTRAINT fault_specs_envelope_check CHECK (
-        category = 'network' OR (
-            network_target IS NULL AND
-            network_direction IS NULL AND
-            network_scope IS NULL
-        )
-    );
-ALTER TABLE fault_specs
-    ADD CONSTRAINT fault_specs_direction_check CHECK (
-        network_direction IS NULL OR network_direction IN ('upstream', 'downstream')
-    );
-`},
-	{17, "add rules.start_policy", `
-ALTER TABLE rules
-    ADD COLUMN IF NOT EXISTS start_policy TEXT NOT NULL DEFAULT 'deduplicate_by_rule';
-ALTER TABLE rules
-    ADD CONSTRAINT rules_start_policy_check CHECK (
-        start_policy IN ('deduplicate_by_rule', 'always_start')
-    );
-`},
-	{18, "add fault_specs.description", `
-ALTER TABLE fault_specs
-    ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
-`},
-	{19, "rename fault_specs.config → params (fix missing DDL after code rename caused /faults/specs 500)", `
-ALTER TABLE fault_specs RENAME COLUMN config TO params;
-`},
-	{20, "add rules.match_expr for opa-rego forward compat", `
-ALTER TABLE rules ADD COLUMN IF NOT EXISTS match_expr TEXT NOT NULL DEFAULT '';
-`},
-	{21, "workflow definitions + sdk route inventory", `
--- =====================================================================
--- Manteion owns workflow DEFINITIONS (the DSL spec). Zeus owns workflow
--- EXECUTION (run state, attack lifecycle, validation). When a workflow
--- is started, manteion inlines the definition into the proxied call so
--- zeus does not need a credentialed callback to manteion.
---
--- The UI fans out two parallel queries for the workflow-detail view:
---   GET  /api/v1/workflows/{id}        manteion DB — the definition
---   GET  /api/v1/zeus/runs?workflow_id manteion proxy → zeus — live runs
---
--- This migration also salvages sdk_instances.routes from the
--- flows-catalog-personas-apis branch so the workflow-builder catalog
--- can aggregate live SDK route inventories without a curated fallback.
--- =====================================================================
-
--- ---------- SDK route inventory (salvage) ----------
-ALTER TABLE sdk_instances ADD COLUMN IF NOT EXISTS routes JSONB;
-
--- ---------- Workflow definitions ----------
-CREATE TABLE IF NOT EXISTS workflows (
-    id                    TEXT PRIMARY KEY,
-    name                  TEXT NOT NULL,
-    description           TEXT,
-    targets               JSONB NOT NULL DEFAULT '[]',
-    estimated_rps_per_vu  DOUBLE PRECISION NOT NULL DEFAULT 0,
-    -- DSL v2 tree. Opaque to manteion — zeus parses + validates at run
-    -- start. Storing as JSONB keeps node-shape changes out of the
-    -- migration pipeline.
-    steps                 JSONB NOT NULL,
-    thresholds            JSONB,
-    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_workflows_name        ON workflows(name);
-CREATE INDEX IF NOT EXISTS idx_workflows_created_at  ON workflows(created_at DESC);
-`},
-	{22, "add sdk_instances.poll_interval_ms for computed liveness status", `
-ALTER TABLE sdk_instances
-    ADD COLUMN IF NOT EXISTS poll_interval_ms BIGINT NOT NULL DEFAULT 10000;
-`},
-	{23, "add fault_configs for long-running manual faults", `
-CREATE TABLE IF NOT EXISTS fault_configs (
-    id                   TEXT        PRIMARY KEY,
-    name                 TEXT        NOT NULL,
-    description          TEXT        NOT NULL DEFAULT '',
-    service              TEXT        NOT NULL,
-    category             TEXT        NOT NULL CHECK (category IN ('inline','network','resource')),
-    fault_type           TEXT        NOT NULL,
-    fault_request        JSONB,
-    fault_composition_id TEXT        REFERENCES fault_compositions(id) ON DELETE SET NULL,
-    duration_ms          BIGINT      NOT NULL DEFAULT 0,
-    experiment_run_id    TEXT        REFERENCES experiment_runs(id) ON DELETE SET NULL,
-    status               TEXT        NOT NULL DEFAULT 'ready'
-                         CHECK (status IN ('ready','active','completed','cancelled')),
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    fired_at             TIMESTAMPTZ,
-    completed_at         TIMESTAMPTZ,
-    CONSTRAINT fault_request_or_composition CHECK (
-        fault_request IS NOT NULL OR fault_composition_id IS NOT NULL
-    )
-);
-CREATE INDEX IF NOT EXISTS idx_fault_configs_active_service
-    ON fault_configs(service) WHERE status = 'active';
-CREATE INDEX IF NOT EXISTS idx_fault_configs_reaper
-    ON fault_configs(fired_at) WHERE status = 'active' AND duration_ms > 0;
-`},
-	{24, "add 'cancelled' to experiment_runs.status (experiment-level cancel)", `
-ALTER TABLE experiment_runs DROP CONSTRAINT IF EXISTS experiment_runs_status_check;
-ALTER TABLE experiment_runs ADD CONSTRAINT experiment_runs_status_check
-    CHECK (status IN ('pending','running','paused','completed','failed','cancelled'));
-`},
-	{25, "add 'paused' to experiments.status (experiment-level pause)", `
-ALTER TABLE experiments DROP CONSTRAINT IF EXISTS experiments_status_check;
-ALTER TABLE experiments ADD CONSTRAINT experiments_status_check
-    CHECK (status IN ('planned','running','paused','completed','failed','cancelled'));
-`},
+	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -300,6 +43,26 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		)
 	`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	// Epoch guard: a database whose recorded history extends past this
+	// binary's migration list was created under a previous schema epoch.
+	// Its version 1 is a DIFFERENT migration than our version 1, so the
+	// skip-if-applied logic below would silently leave the old schema in
+	// place. Refuse loudly instead.
+	var maxApplied sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		`SELECT max(version) FROM schema_migrations`,
+	).Scan(&maxApplied); err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+	if maxApplied.Valid && maxApplied.Int64 > int64(len(migrations)) {
+		return fmt.Errorf(
+			"schema epoch mismatch: database has migration %d applied but this binary's history ends at %d "+
+				"(epoch 2 consolidated reset, 2026-06); drop and recreate the database "+
+				"(DROP SCHEMA public CASCADE; CREATE SCHEMA public;)",
+			maxApplied.Int64, len(migrations),
+		)
 	}
 
 	for _, m := range migrations {
@@ -343,153 +106,333 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// initialSchema is the full DDL for manteion-go v1.
-const initialSchema = `
+// schemaV2 is the consolidated epoch-2 schema.
+//
+// Conventions:
+//   - IDs are server-minted "{prefix}-{uuidv7}" TEXT (internal/id). Ids that
+//     reference zeus-minted objects (zeus_attack_id) stay opaque TEXT.
+//   - Stable vocabularies are native enum types; fault_type stays TEXT and is
+//     validated by the Go fault catalog (it grows with atropos releases).
+//   - Timestamps are TIMESTAMPTZ; created_at/computed_at default to now().
+//   - Hard deletes only; lifecycle is status columns + FK ON DELETE policy.
+//   - Single-tenant by design: service is the only scoping dimension
+//     (see docs/decisions/2026-06-no-multitenancy.md).
+const schemaV2 = `
+-- ========== ENUM TYPES ==========
+
+CREATE TYPE experiment_status     AS ENUM ('planned','running','completed','failed','cancelled');
+CREATE TYPE phase_status          AS ENUM ('pending','running','paused','completed','failed','skipped');
+CREATE TYPE fault_category        AS ENUM ('inline','network','resource');
+CREATE TYPE fault_host            AS ENUM ('proxy','inline','process');
+CREATE TYPE network_direction     AS ENUM ('upstream','downstream');
+CREATE TYPE injection_point       AS ENUM ('ingress','egress','transient','custom');
+CREATE TYPE rule_mode             AS ENUM ('inline','background');
+CREATE TYPE rule_action_type      AS ENUM ('fault_spec','fault_composition','cachebox');
+CREATE TYPE start_policy          AS ENUM ('deduplicate_by_rule','always_start');
+CREATE TYPE cachebox_mode         AS ENUM ('passthrough','replay','replay_with_delay');
+CREATE TYPE cachebox_key_strategy AS ENUM ('exact','exact_with_host','exact_with_body');
+CREATE TYPE execution_mode        AS ENUM ('parallel','sequential');
+CREATE TYPE trace_backend         AS ENUM ('jaeger','prometheus','tempo');
+CREATE TYPE fault_config_status   AS ENUM ('ready','active','completed','cancelled');
+-- fault_type intentionally stays TEXT: the Go fault catalog (backed by
+-- atropos-go/faultparams) is the validator, so new atropos fault types do
+-- not require a migration.
+
 -- ========== FAULT DOMAIN ==========
 
-CREATE TABLE IF NOT EXISTS fault_specs (
-    id           TEXT PRIMARY KEY,
+-- Atomic fault definition mapping to exactly one atropos fault type.
+-- Common knobs (durations, ramps, host) are first-class columns; the
+-- network envelope and type-specific params are JSONB validated by the
+-- Go fault catalog — mirroring the wire shape (atropos FaultRequest).
+CREATE TABLE fault_specs (
+    id           TEXT PRIMARY KEY,                  -- 'spec-<uuidv7>'
     name         TEXT NOT NULL,
-    category     TEXT NOT NULL CHECK (category IN ('inline','network','resource')),
+    description  TEXT NOT NULL DEFAULT '',
+    category     fault_category NOT NULL,
     fault_type   TEXT NOT NULL,
-    config       JSONB NOT NULL,
+    host         fault_host,
+    params       JSONB NOT NULL,                    -- per-(category,fault_type); faultparams schema
+    network      JSONB,                             -- {target, direction, scope}; network category only
     duration_ms  BIGINT,
     ramp_up_ms   BIGINT,
     ramp_down_ms BIGINT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT fault_specs_network_check CHECK (category = 'network' OR network IS NULL),
+    CONSTRAINT fault_specs_network_direction_check CHECK (
+        network IS NULL
+        OR network->>'direction' IS NULL
+        OR network->>'direction' IN ('upstream','downstream'))
 );
 
-CREATE TABLE IF NOT EXISTS fault_compositions (
-    id             TEXT PRIMARY KEY,
+-- Groups faults for parallel/sequential execution; max tree depth 3
+-- (enforced in model.ValidateComposition and ruleconv).
+CREATE TABLE fault_compositions (
+    id             TEXT PRIMARY KEY,                -- 'comp-<uuidv7>'
     name           TEXT NOT NULL,
-    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('parallel','sequential')),
+    execution_mode execution_mode NOT NULL,
+    duration_ms    BIGINT DEFAULT 0,
+    ramp_up_ms     BIGINT DEFAULT 0,
+    ramp_down_ms   BIGINT DEFAULT 0,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS fault_composition_members (
+-- One ordered slot in a composition: exactly one of fault_spec / child
+-- composition. BIGSERIAL is the schema's only surrogate auto-increment key —
+-- members are positional rows with no natural identity.
+CREATE TABLE fault_composition_members (
     id                   BIGSERIAL PRIMARY KEY,
     composition_id       TEXT NOT NULL REFERENCES fault_compositions(id) ON DELETE CASCADE,
     position             INT NOT NULL,
     fault_spec_id        TEXT REFERENCES fault_specs(id),
     child_composition_id TEXT REFERENCES fault_compositions(id),
-    direction            TEXT CHECK (direction IN ('upstream','downstream')),
+    direction            network_direction,
+    UNIQUE (composition_id, position),
     CHECK (
         (fault_spec_id IS NOT NULL AND child_composition_id IS NULL) OR
         (fault_spec_id IS NULL AND child_composition_id IS NOT NULL)
-    ),
-    UNIQUE (composition_id, position)
+    )
 );
 
 -- ========== RULE DOMAIN ==========
 
-CREATE TABLE IF NOT EXISTS rules (
-    id                   TEXT PRIMARY KEY,
-    name                 TEXT NOT NULL,
-    service              TEXT NOT NULL,
-    enabled              BOOLEAN NOT NULL DEFAULT true,
-    priority             INT NOT NULL DEFAULT 0,
-    injection_point      TEXT CHECK (injection_point IN ('ingress','egress','transient','custom')),
-    match_labels         JSONB,
-    fault_spec_id        TEXT REFERENCES fault_specs(id),
-    fault_composition_id TEXT REFERENCES fault_compositions(id),
-    mode                 TEXT NOT NULL CHECK (mode IN ('inline','background')),
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (
-        (fault_spec_id IS NOT NULL AND fault_composition_id IS NULL) OR
-        (fault_spec_id IS NULL AND fault_composition_id IS NOT NULL)
+-- Binds an action (fault spec / composition / cachebox) to a service +
+-- match criteria. The action is a 3-way discriminated union enforced by
+-- rules_action_check.
+CREATE TABLE rules (
+    id                    TEXT PRIMARY KEY,         -- 'rule-<uuidv7>'
+    name                  TEXT NOT NULL,
+    service               TEXT NOT NULL,
+    enabled               BOOLEAN NOT NULL DEFAULT true,
+    priority              INT NOT NULL DEFAULT 0,
+    injection_point       injection_point,
+    match_labels          JSONB,                    -- map[string]string, AND semantics
+    action_type           rule_action_type NOT NULL DEFAULT 'fault_spec',
+    fault_spec_id         TEXT REFERENCES fault_specs(id),
+    fault_composition_id  TEXT REFERENCES fault_compositions(id),
+    cachebox_mode         cachebox_mode,
+    cachebox_key_strategy cachebox_key_strategy,
+    mode                  rule_mode NOT NULL,
+    start_policy          start_policy NOT NULL DEFAULT 'deduplicate_by_rule',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT rules_action_check CHECK (
+        CASE action_type
+            WHEN 'fault_spec'        THEN fault_spec_id IS NOT NULL AND fault_composition_id IS NULL AND cachebox_mode IS NULL
+            WHEN 'fault_composition' THEN fault_composition_id IS NOT NULL AND fault_spec_id IS NULL AND cachebox_mode IS NULL
+            WHEN 'cachebox'          THEN cachebox_mode IS NOT NULL AND fault_spec_id IS NULL AND fault_composition_id IS NULL
+        END
     )
 );
-CREATE INDEX IF NOT EXISTS idx_rules_service ON rules(service);
-CREATE INDEX IF NOT EXISTS idx_rules_enabled ON rules(enabled) WHERE enabled = true;
+CREATE INDEX idx_rules_service ON rules(service);
+CREATE INDEX idx_rules_enabled ON rules(enabled) WHERE enabled = true;
 
--- Rule store versioning: bumps on every rule mutation.
--- SDK polling reads this to decide 304 vs 200.
-CREATE TABLE IF NOT EXISTS rule_version (
+-- Singleton monotonic counter bumped in-tx on every rule mutation; the SDK
+-- poll compares it for 304-vs-200. A store-wide invalidation token, not
+-- per-row optimistic locking.
+CREATE TABLE rule_version (
     id      INT PRIMARY KEY CHECK (id = 1),
     version BIGINT NOT NULL DEFAULT 0
 );
-INSERT INTO rule_version (id, version) VALUES (1, 0) ON CONFLICT DO NOTHING;
+INSERT INTO rule_version (id, version) VALUES (1, 0);
 
--- ========== SDK DOMAIN ==========
+-- ========== SDK REGISTRY ==========
 
-CREATE TABLE IF NOT EXISTS sdk_instances (
-    id            TEXT PRIMARY KEY,
-    service       TEXT NOT NULL,
-    version       TEXT NOT NULL DEFAULT '',
-    address       TEXT NOT NULL DEFAULT '',
-    registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_poll_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+-- Registered atropos-go SDK instances (one per service pod). Liveness is
+-- computed from last_poll_at vs poll_interval_ms; the reaper purges dead
+-- rows. routes is the instance's published HTTP route inventory feeding
+-- the workflow-builder catalog.
+CREATE TABLE sdk_instances (
+    id               TEXT PRIMARY KEY,              -- SDK-minted: "{hostname}-{8hex}"
+    service          TEXT NOT NULL,
+    version          TEXT NOT NULL DEFAULT '',
+    address          TEXT NOT NULL DEFAULT '',
+    poll_interval_ms BIGINT NOT NULL DEFAULT 10000,
+    routes           JSONB,                         -- []SDKRoute
+    registered_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_poll_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_sdk_instances_service ON sdk_instances(service);
+CREATE INDEX idx_sdk_instances_service ON sdk_instances(service);
 
--- ========== WORKLOAD DOMAIN ==========
+-- ========== LONG-RUNNING MANUAL FAULTS ==========
 
-CREATE TABLE IF NOT EXISTS flows (
-    id                   TEXT PRIMARY KEY,
+-- Fired explicitly (UI/API), delivered to SDKs via the poll active_faults
+-- set, reconciled and watchdog-reaped SDK-side. Mirrors the unified fault
+-- wire shape: params + network JSONB, durations/ramps first-class.
+-- duration_ms = 0 means "until cancelled".
+CREATE TABLE fault_configs (
+    id                   TEXT PRIMARY KEY,          -- 'fc-<uuidv7>'
     name                 TEXT NOT NULL,
-    description          TEXT,
-    targets              JSONB NOT NULL,
-    estimated_rps_per_vu DOUBLE PRECISION,
-    steps                JSONB NOT NULL,
-    thresholds           JSONB,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    description          TEXT NOT NULL DEFAULT '',
+    service              TEXT NOT NULL,
+    category             fault_category NOT NULL,
+    fault_type           TEXT NOT NULL,
+    params               JSONB,                     -- per-(category,fault_type); faultparams schema
+    network              JSONB,                     -- {target, direction, scope}; network category only
+    fault_composition_id TEXT REFERENCES fault_compositions(id) ON DELETE SET NULL,
+    duration_ms          BIGINT NOT NULL DEFAULT 0,
+    ramp_up_ms           BIGINT NOT NULL DEFAULT 0,
+    ramp_down_ms         BIGINT NOT NULL DEFAULT 0,
+    phase_id             TEXT,                      -- FK added after experiment_phases below
+    status               fault_config_status NOT NULL DEFAULT 'ready',
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    fired_at             TIMESTAMPTZ,
+    completed_at         TIMESTAMPTZ,
+    CONSTRAINT fault_configs_payload_check CHECK (
+        params IS NOT NULL OR fault_composition_id IS NOT NULL
+    ),
+    CONSTRAINT fault_configs_network_check CHECK (category = 'network' OR network IS NULL)
+);
+CREATE INDEX idx_fault_configs_active_service
+    ON fault_configs(service) WHERE status = 'active';
+CREATE INDEX idx_fault_configs_reaper
+    ON fault_configs(fired_at) WHERE status = 'active' AND duration_ms > 0;
+
+-- ========== POLICY DOMAIN (WIP-frozen) ==========
+
+-- Metric-triggered actions. The evaluation engine is deprecated/disabled by
+-- default (MANTEION_POLICY_ENGINE=off); schema and CRUD endpoints are kept
+-- for the eventual rebuild. See docs/decisions/2026-06-policy-engine-freeze.md.
+CREATE TABLE policy_rules (
+    id          TEXT PRIMARY KEY,                   -- 'policy-<uuidv7>'
+    name        TEXT NOT NULL,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    condition   JSONB NOT NULL,                     -- {metric, operator, threshold}
+    action      JSONB NOT NULL,                     -- discriminated union on action_type
+    cooldown_ns BIGINT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS personas (
-    id             TEXT PRIMARY KEY,
-    name           TEXT NOT NULL,
-    description    TEXT,
-    explore_prob   DOUBLE PRECISION NOT NULL DEFAULT 0,
-    engage_prob    DOUBLE PRECISION NOT NULL DEFAULT 0,
-    commit_prob    DOUBLE PRECISION NOT NULL DEFAULT 0,
-    repeat_prob    DOUBLE PRECISION NOT NULL DEFAULT 0,
-    think_time_min INT NOT NULL DEFAULT 0,
-    think_time_max INT NOT NULL DEFAULT 0
+-- ========== WORKFLOW DEFINITIONS (manteion-owned) ==========
+
+-- The durable home of the zeus DSL v2 document. zeus is the validation +
+-- execution runtime: create/update validate the doc against zeus's
+-- stateless validate endpoint; phase start materializes it into zeus
+-- (register with overwrite) before triggering runs. The whole document
+-- lives in dsl — splitting fields into columns proved lossy (the epoch-1
+-- workflows table silently dropped base_url/data_schema/default_delay).
+CREATE TABLE workflows (
+    id          TEXT PRIMARY KEY,                   -- 'wf-<uuidv7>'
+    name        TEXT NOT NULL UNIQUE,
+    version     TEXT NOT NULL DEFAULT '2',
+    description TEXT NOT NULL DEFAULT '',
+    dsl         JSONB NOT NULL,                     -- full zeus DSL v2 doc (id/name injected)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_workflows_created_at ON workflows(created_at DESC);
+
+-- ========== EXPERIMENT DOMAIN (phase-first) ==========
+
+-- Control-plane plan: metadata + ordered phases. Attack config and
+-- measurement targets live on phases, not here.
+CREATE TABLE experiments (
+    id           TEXT PRIMARY KEY,                  -- 'exp-<uuidv7>'
+    name         TEXT NOT NULL,
+    description  TEXT,
+    hypothesis   TEXT,
+    created_by   TEXT,
+    status       experiment_status NOT NULL DEFAULT 'planned',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at   TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_experiments_status_created ON experiments(status, created_at DESC);
+
+-- First-class ordered run unit. frozen_services ([]CacheBoxConfig JSONB)
+-- encodes the experimental method: empty = baseline; entries = which
+-- services run frozen (cache-box) and how. The position unique is
+-- DEFERRABLE so the delete-all-then-reinsert attach pattern works in one tx.
+CREATE TABLE experiment_phases (
+    id              TEXT PRIMARY KEY,               -- 'phase-<uuidv7>'
+    experiment_id   TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    position        INT NOT NULL,
+    status          phase_status NOT NULL DEFAULT 'pending',
+    frozen_services JSONB NOT NULL DEFAULT '[]',
+    persist_cache   BOOLEAN NOT NULL DEFAULT FALSE,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    UNIQUE (experiment_id, name),
+    CONSTRAINT experiment_phases_position_unique
+        UNIQUE (experiment_id, position) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE INDEX idx_experiment_phases_experiment ON experiment_phases(experiment_id, position);
+CREATE INDEX idx_experiment_phases_running ON experiment_phases(status)
+    WHERE status IN ('running','paused');
+
+-- Now that experiment_phases exists, tie long-running fault configs to the
+-- phase they (optionally) ran in.
+ALTER TABLE fault_configs
+    ADD CONSTRAINT fault_configs_phase_id_fkey
+    FOREIGN KEY (phase_id) REFERENCES experiment_phases(id) ON DELETE SET NULL;
+
+-- Per-(phase, workflow) attack config the orchestrator reads: "drive
+-- workflow W at V vus for D sec". Association-with-attributes, not a pure
+-- join. NOTE: no experiment-level workflow join table — the experiment's
+-- workflow list is derivable (SELECT DISTINCT via phases).
+CREATE TABLE phase_workflows (
+    phase_id       TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    workflow_id    TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+    vus            INT NOT NULL CHECK (vus > 0),
+    rate_rps       DOUBLE PRECISION,
+    duration_sec   INT NOT NULL CHECK (duration_sec > 0),
+    target_url     TEXT,
+    target_method  TEXT,
+    zeus_attack_id TEXT,                            -- zeus-minted execution handle
+    PRIMARY KEY (phase_id, workflow_id)
+);
+CREATE INDEX idx_phase_workflows_workflow ON phase_workflows(workflow_id);
+CREATE INDEX idx_phase_workflows_zeus_attack ON phase_workflows(zeus_attack_id)
+    WHERE zeus_attack_id IS NOT NULL;
+
+-- Rules active during a phase. RESTRICT protects experiment provenance:
+-- a rule referenced by any phase cannot be deleted.
+CREATE TABLE phase_rules (
+    phase_id TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    rule_id  TEXT NOT NULL REFERENCES rules(id) ON DELETE RESTRICT,
+    position INT NOT NULL,
+    PRIMARY KEY (phase_id, rule_id),
+    CONSTRAINT phase_rules_position_unique
+        UNIQUE (phase_id, position) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE INDEX idx_phase_rules_rule ON phase_rules(rule_id);
+
+-- ========== ATTACK DOMAIN (definition / execution split) ==========
+
+-- Reusable attack definition (vegeta precision load). Carries no execution
+-- state and no experiment association — triggering one creates an
+-- attack_results row.
+CREATE TABLE attacks (
+    id             TEXT PRIMARY KEY,                -- 'atk-<uuidv7>'
+    name           TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    service        TEXT NOT NULL,
+    target_url     TEXT NOT NULL,
+    target_method  TEXT NOT NULL,
+    target_headers JSONB,                           -- map[string]string
+    rate           INT NOT NULL,
+    duration_ms    BIGINT NOT NULL,
+    dedup_bypass   TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS workloads (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    flow_id       TEXT NOT NULL REFERENCES flows(id),
-    persona_id    TEXT NOT NULL REFERENCES personas(id),
-    vus           INT NOT NULL,
-    rate          DOUBLE PRECISION NOT NULL DEFAULT 0,
-    meta_trace_id TEXT,
-    status        TEXT NOT NULL CHECK (status IN ('pending','running','completed','stopped','failed')),
-    started_at    TIMESTAMPTZ,
-    completed_at  TIMESTAMPTZ,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS attacks (
-    id                TEXT PRIMARY KEY,
-    workload_id       TEXT REFERENCES workloads(id),
-    experiment_run_id TEXT,
-    policy_rule_id    TEXT,
-    service           TEXT NOT NULL,
-    role              TEXT NOT NULL CHECK (role IN ('primary','background')),
-    target_url        TEXT NOT NULL,
-    target_method     TEXT NOT NULL,
-    target_headers    JSONB,
-    rate              INT NOT NULL,
-    duration_ms       BIGINT NOT NULL,
-    dedup_bypass      TEXT,
-    meta_trace_id     TEXT,
-    status            TEXT NOT NULL CHECK (status IN ('pending','running','completed','stopped')),
-    started_at        TIMESTAMPTZ,
-    completed_at      TIMESTAMPTZ,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS attack_results (
-    attack_id       TEXT PRIMARY KEY REFERENCES attacks(id) ON DELETE CASCADE,
+-- One execution of an attack definition (N per attack). phase_id is the
+-- optional "ran during this phase" tag — SET NULL keeps the result when
+-- the phase goes away.
+CREATE TABLE attack_results (
+    id              TEXT PRIMARY KEY,               -- 'atkres-<uuidv7>'
+    attack_id       TEXT NOT NULL REFERENCES attacks(id) ON DELETE CASCADE,
+    phase_id        TEXT REFERENCES experiment_phases(id) ON DELETE SET NULL,
+    zeus_attack_id  TEXT,
+    meta_trace_id   TEXT,
     service         TEXT NOT NULL,
     total_requests  BIGINT NOT NULL,
     duration_ms     BIGINT NOT NULL,
     rate_actual     DOUBLE PRECISION NOT NULL,
     success_rate    DOUBLE PRECISION NOT NULL,
-    status_codes    JSONB,
+    status_codes    JSONB,                          -- map[status]count
     latency_p50_us  BIGINT NOT NULL,
     latency_p90_us  BIGINT NOT NULL,
     latency_p95_us  BIGINT NOT NULL,
@@ -498,114 +441,92 @@ CREATE TABLE IF NOT EXISTS attack_results (
     latency_max_us  BIGINT NOT NULL,
     bytes_in_total  BIGINT NOT NULL DEFAULT 0,
     bytes_out_total BIGINT NOT NULL DEFAULT 0,
-    errors          JSONB,
-    completed_at    TIMESTAMPTZ NOT NULL
-);
-
--- ========== EXPERIMENT DOMAIN ==========
-
-CREATE TABLE IF NOT EXISTS experiments (
-    id                  TEXT PRIMARY KEY,
-    name                TEXT NOT NULL,
-    description         TEXT,
-    primary_workload_id TEXT NOT NULL REFERENCES workloads(id),
-    status              TEXT NOT NULL CHECK (status IN
-        ('planned','running','completed','failed','cancelled')),
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    started_at          TIMESTAMPTZ,
-    completed_at        TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS experiment_runs (
-    id              TEXT PRIMARY KEY,
-    experiment_id   TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
-    run_type        TEXT NOT NULL CHECK (run_type IN ('baseline','isolation','combination')),
-    run_index       INT NOT NULL,
-    frozen_services JSONB,
-    meta_trace_id   TEXT NOT NULL,
-    status          TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
-    node_placement  JSONB,
+    errors          JSONB,                          -- []string
     started_at      TIMESTAMPTZ,
-    completed_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    completed_at    TIMESTAMPTZ
+);
+CREATE INDEX idx_attack_results_attack ON attack_results(attack_id);
+CREATE INDEX idx_attack_results_phase ON attack_results(phase_id)
+    WHERE phase_id IS NOT NULL;
+
+-- ========== PHASE RESULTS ==========
+
+-- Per-(phase, workflow) end-to-end latency & throughput; upserted by the
+-- result harvester (ON CONFLICT DO UPDATE, idempotent recompute).
+CREATE TABLE phase_workflow_results (
+    phase_id        TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    workflow_id     TEXT NOT NULL,
+    request_count   BIGINT NOT NULL,
+    error_count     BIGINT NOT NULL DEFAULT 0,
+    error_rate      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    throughput_rps  DOUBLE PRECISION NOT NULL,
+    latency_p50_us  BIGINT NOT NULL,
+    latency_p95_us  BIGINT NOT NULL,
+    latency_p99_us  BIGINT NOT NULL,
+    latency_p999_us BIGINT NOT NULL,
+    raw_metrics     JSONB,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, workflow_id)
 );
 
--- Deferred FK from attacks to experiment_runs.
-ALTER TABLE attacks
-    ADD CONSTRAINT fk_attacks_experiment_run
-    FOREIGN KEY (experiment_run_id) REFERENCES experiment_runs(id);
-
-CREATE TABLE IF NOT EXISTS workflow_run_results (
-    id                TEXT PRIMARY KEY,
-    experiment_run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
-    workflow          TEXT NOT NULL,
-    latency_p50_us    BIGINT NOT NULL,
-    latency_p95_us    BIGINT NOT NULL,
-    latency_p99_us    BIGINT NOT NULL,
-    latency_p999_us   BIGINT NOT NULL,
-    request_count     BIGINT NOT NULL,
-    error_rate        DOUBLE PRECISION NOT NULL DEFAULT 0,
-    throughput_rps    DOUBLE PRECISION NOT NULL DEFAULT 0,
-    raw_metrics       JSONB
+-- Per-(phase, service[, workflow]) request-side latency. workflow_id '' is
+-- the service-wide row (PK members cannot be NULL).
+CREATE TABLE phase_service_latency (
+    phase_id       TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    service        TEXT NOT NULL,
+    workflow_id    TEXT NOT NULL DEFAULT '',
+    latency_p50_us BIGINT NOT NULL,
+    latency_p95_us BIGINT NOT NULL,
+    latency_p99_us BIGINT NOT NULL,
+    request_count  BIGINT NOT NULL,
+    computed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, service, workflow_id)
 );
 
-CREATE TABLE IF NOT EXISTS service_run_results (
-    id                TEXT PRIMARY KEY,
-    experiment_run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
+-- Per-(phase, service) cache-box fidelity; row presence == cache engaged.
+-- NOTE: phase_service_resources (cpu/mem) was dropped in the epoch reset —
+-- it had no writers; re-add together with the metrics harvester if needed.
+CREATE TABLE phase_service_cache (
+    phase_id          TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
     service           TEXT NOT NULL,
-    workflow          TEXT,
-    latency_p50_us    BIGINT,
-    latency_p95_us    BIGINT,
-    latency_p99_us    BIGINT,
-    cpu_millicores    BIGINT,
-    memory_mb         BIGINT,
-    cache_hit_rate    DOUBLE PRECISION,
-    cache_exact_match DOUBLE PRECISION,
-    cache_staleness   DOUBLE PRECISION,
-    raw_metrics       JSONB
+    cache_hit_rate    DOUBLE PRECISION NOT NULL,
+    cache_exact_match DOUBLE PRECISION NOT NULL,
+    cache_staleness   DOUBLE PRECISION NOT NULL,
+    computed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, service)
 );
 
-CREATE TABLE IF NOT EXISTS contribution_results (
-    id                 TEXT PRIMARY KEY,
-    experiment_id      TEXT NOT NULL REFERENCES experiments(id),
-    service            TEXT NOT NULL,
-    workflow           TEXT NOT NULL,
-    cachebox_mode      TEXT NOT NULL CHECK (cachebox_mode IN ('replay','replay_with_delay')),
-    baseline_run_id    TEXT NOT NULL REFERENCES experiment_runs(id),
-    isolation_run_id   TEXT NOT NULL REFERENCES experiment_runs(id),
-    delta_p50_us       BIGINT NOT NULL,
-    delta_p95_us       BIGINT NOT NULL,
-    delta_p99_us       BIGINT NOT NULL,
-    interaction_effect DOUBLE PRECISION,
-    combination_run_id TEXT REFERENCES experiment_runs(id)
+-- Per-experiment rollup, recomputed on phase/experiment terminal
+-- transitions. worst/best p99 are max/min of per-phase p99s — NOT a true
+-- experiment-level percentile (that would need merged histograms). The
+-- phase FKs cascade like the experiment FK: the rollup is derived data,
+-- recomputed after any deletion.
+CREATE TABLE experiment_results (
+    experiment_id         TEXT PRIMARY KEY REFERENCES experiments(id) ON DELETE CASCADE,
+    phase_count           INT NOT NULL,
+    completed_phase_count INT NOT NULL,
+    total_request_count   BIGINT NOT NULL,
+    total_error_count     BIGINT NOT NULL,
+    overall_error_rate    DOUBLE PRECISION NOT NULL,
+    worst_p99_us          BIGINT NOT NULL,
+    worst_p99_phase_id    TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    best_p99_us           BIGINT NOT NULL,
+    best_p99_phase_id     TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    computed_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ========== TRACE DOMAIN ==========
+-- ========== OBSERVABILITY POINTERS ==========
 
-CREATE TABLE IF NOT EXISTS trace_anchors (
-    id                TEXT PRIMARY KEY,
-    experiment_run_id TEXT NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
-    meta_trace_id     TEXT NOT NULL,
-    service           TEXT NOT NULL,
-    backend           TEXT NOT NULL CHECK (backend IN ('jaeger','prometheus','tempo')),
-    query_hint        JSONB,
-    collected_at      TIMESTAMPTZ NOT NULL
+-- Pointer into an external trace/metrics backend (when+where to look, not
+-- the data). Phase-scoped: anchors die with their phase.
+CREATE TABLE trace_anchors (
+    id            TEXT PRIMARY KEY,                 -- 'anchor-<uuidv7>'
+    phase_id      TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    meta_trace_id TEXT NOT NULL,
+    service       TEXT NOT NULL,
+    backend       trace_backend NOT NULL,
+    query_hint    JSONB,
+    collected_at  TIMESTAMPTZ NOT NULL
 );
-
--- ========== POLICY DOMAIN ==========
-
-CREATE TABLE IF NOT EXISTS policy_rules (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    enabled     BOOLEAN NOT NULL DEFAULT true,
-    condition   JSONB NOT NULL,
-    action      JSONB NOT NULL,
-    cooldown_ns BIGINT NOT NULL DEFAULT 0,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Deferred FK from attacks to policy_rules.
-ALTER TABLE attacks
-    ADD CONSTRAINT fk_attacks_policy_rule
-    FOREIGN KEY (policy_rule_id) REFERENCES policy_rules(id);
+CREATE INDEX idx_trace_anchors_phase ON trace_anchors(phase_id);
 `
