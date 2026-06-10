@@ -41,27 +41,6 @@ func TestExperiment_Validate(t *testing.T) {
 	}
 }
 
-func TestExperimentWorkflow_Validate(t *testing.T) {
-	tests := []struct {
-		name    string
-		row     ExperimentWorkflow
-		wantErr bool
-	}{
-		{"valid", ExperimentWorkflow{ExperimentID: "e1", WorkflowID: "w1", Position: 0}, false},
-		{"missing experiment_id", ExperimentWorkflow{WorkflowID: "w1", Position: 0}, true},
-		{"missing workflow_id", ExperimentWorkflow{ExperimentID: "e1", Position: 0}, true},
-		{"negative position", ExperimentWorkflow{ExperimentID: "e1", WorkflowID: "w1", Position: -1}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.row.Validate()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Validate() err = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
 func TestExperimentPhase_Validate(t *testing.T) {
 	base := func() ExperimentPhase {
 		return ExperimentPhase{

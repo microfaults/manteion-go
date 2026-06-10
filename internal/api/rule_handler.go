@@ -1,13 +1,12 @@
 package api
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
 
+	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
 )
@@ -200,9 +199,7 @@ func (s *Server) broadcastRulesChanged(r *http.Request, service string) {
 	})
 }
 
-// generateID creates a prefixed random hex ID.
+// generateID mints a "{prefix}-{uuidv7}" entity id (see internal/id).
 func generateID(prefix string) string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return prefix + "-" + hex.EncodeToString(b)
+	return id.New(prefix)
 }

@@ -65,22 +65,23 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestRuleRepo_MatchExprRoundTrip inserts a rule with a non-empty match_expr,
-// reads it back via Get, and asserts the field round-trips intact. Verifies
-// the opaque OPA-rego text storage added by migration 20.
-func TestRuleRepo_MatchExprRoundTrip(t *testing.T) {
+// TestRuleRepo_GetScansEveryColumn inserts a rule with every optional field
+// populated and asserts Get round-trips them. Guards the scan-arity bug
+// class: a column added to the SELECT list without a matching Scan
+// destination makes single-row Get fail at runtime while List keeps working.
+func TestRuleRepo_GetScansEveryColumn(t *testing.T) {
 	ctx := context.Background()
 
 	// Use unique IDs derived from the test name so reruns don't PK-collide
 	// and parallel sub-tests stay isolated.
-	tag := fmt.Sprintf("mxrt-%d", time.Now().UnixNano())
+	tag := fmt.Sprintf("scanrt-%d", time.Now().UnixNano())
 	specID := "spec-" + tag
 	ruleID := "rule-" + tag
 
 	// Seed a fault_spec to satisfy the rules.fault_spec_id FK.
 	spec := &model.FaultSpec{
 		ID:        specID,
-		Name:      "match-expr-rt-spec",
+		Name:      "scan-rt-spec",
 		Category:  "inline",
 		FaultType: "latency",
 		Host:      "process",
@@ -95,15 +96,18 @@ func TestRuleRepo_MatchExprRoundTrip(t *testing.T) {
 	})
 
 	rule := &model.Rule{
-		ID:        ruleID,
-		Name:      "match-expr-rt",
-		Service:   "svc-" + tag,
-		Enabled:   true,
-		Priority:  50,
-		Mode:      "inline",
-		Action:    model.RuleAction{Type: "fault_spec", FaultSpecID: specID},
-		Match:     model.MatchCriteria{Labels: map[string]string{"k": "v"}},
-		MatchExpr: "package atropos.rules\ndefault allow := false",
+		ID:          ruleID,
+		Name:        "scan-rt",
+		Service:     "svc-" + tag,
+		Enabled:     true,
+		Priority:    50,
+		Mode:        "background",
+		StartPolicy: "always_start",
+		Action:      model.RuleAction{Type: "fault_spec", FaultSpecID: specID},
+		Match: model.MatchCriteria{
+			InjectionPoint: "ingress",
+			Labels:         map[string]string{"atropos.workflow": "browse"},
+		},
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -118,7 +122,19 @@ func TestRuleRepo_MatchExprRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get rule: %v", err)
 	}
-	if got.MatchExpr != rule.MatchExpr {
-		t.Errorf("MatchExpr roundtrip mismatch:\n got = %q\nwant = %q", got.MatchExpr, rule.MatchExpr)
+	if got.StartPolicy != rule.StartPolicy {
+		t.Errorf("StartPolicy roundtrip mismatch: got %q want %q", got.StartPolicy, rule.StartPolicy)
+	}
+	if got.Mode != rule.Mode {
+		t.Errorf("Mode roundtrip mismatch: got %q want %q", got.Mode, rule.Mode)
+	}
+	if got.Match.InjectionPoint != rule.Match.InjectionPoint {
+		t.Errorf("InjectionPoint roundtrip mismatch: got %q want %q", got.Match.InjectionPoint, rule.Match.InjectionPoint)
+	}
+	if got.Match.Labels["atropos.workflow"] != "browse" {
+		t.Errorf("Labels roundtrip mismatch: got %v", got.Match.Labels)
+	}
+	if got.Action.FaultSpecID != specID {
+		t.Errorf("FaultSpecID roundtrip mismatch: got %q want %q", got.Action.FaultSpecID, specID)
 	}
 }

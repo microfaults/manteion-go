@@ -55,19 +55,24 @@ manteion-go (Controller)
 
 | Package | Role |
 |---|---|
-| `internal/model/` | Domain types: `Rule`, `FaultSpec`, `FaultComposition`, `Experiment`, `ExperimentRun`, `Workload`, `Policy`, `SDKInstance`, `Trace`. All `Validate()` methods live here. |
+| `internal/model/` | Domain types: `Rule`, `FaultSpec`, `FaultComposition`, `FaultConfig`, `Experiment`, `ExperimentPhase`, `Workflow`, `Attack`/`AttackResult`, `PolicyRule`, `SDKInstance`, `TraceAnchor`. All `Validate()` methods live here; `enums.go` is the Go source of truth for the native PG enum vocabularies. |
 | `internal/store/` | PostgreSQL repositories — one `*Repo` per entity, backed by `database/sql` + pgx driver. |
-| `internal/db/` | Connection pool init (`db.Open`) and sequential schema migrations (`db.Migrate`). Migrations append-only in `migrations.go`. |
-| `internal/ruleconv/` | Compiles `model.Rule` + `FaultSpec`/`FaultComposition` into `CompiledRule` wire format for SDK polling. Max composition depth = 3. |
+| `internal/db/` | Connection pool init (`db.Open`) and sequential schema migrations (`db.Migrate`). Migrations append-only in `migrations.go` — **schema epoch 2** (2026-06) reset the history to one consolidated definition; epoch-1 databases must be dropped (Migrate refuses them). |
+| `internal/ruleconv/` | Resolves `model.Rule` + `FaultSpec`/`FaultComposition` into the wire format for SDK polling. The wire structs themselves (`CompiledRule`, unified `FaultRequest`, `RuleSync`) are **imported from atropos-go** so both ends share one contract. Max composition depth = 3. |
 | `internal/atrocontrol/` | Experiment orchestration controller. `Controller` fans out push-rules and cache-box freeze commands to all live SDK instances of a service. `IntentTracker` stores last-applied state so late-joining registrations receive it immediately. |
 | `internal/atropos/` | HTTP client for talking to atropos-go SDK instances (`PostRules`, `PostCacheBoxDelay`, `ClearCacheBox`, `PostFault`). |
 | `internal/zeus/` | HTTP client for zeus-go/Archer REST API. |
 | `internal/api/` | HTTP server. `server.go` wires routes; one handler file per domain group. |
+| `internal/faultcatalog/` | Single source of truth for supported faults: vocabulary + typed params validation (backed by `atropos-go/faultparams`) + UI form metadata served at `GET /api/v1/faults/catalog`. |
+| `internal/id/` | Entity id minting: `{prefix}-{uuidv7}` TEXT (`exp- phase- rule- spec- comp- wf- atk- atkres- fc- policy-`). |
 
 ### Key design choices
 
 - **Go 1.22+ routing** — route patterns use `"METHOD /path"` syntax; path params via `r.PathValue("id")`.
 - **`rule.Rule.Fault` is opaque** — stored as `json.RawMessage`; `ruleconv` resolves the pointer to FaultSpec/Composition at poll time so the SDK receives fully inlined config.
+- **Unified fault wire shape** — fault specs, fault configs, and compiled rules all serialize faults as atropos-go's `FaultRequest` ({category, fault_type, duration_ms, ramp_*_ms, network?, params}); params schemas live in `atropos-go/faultparams` and are validated by `internal/faultcatalog`.
+- **Workflows are manteion-owned** — the `workflows` table stores the full zeus DSL v2 document (`dsl JSONB`); zeus validates documents (stateless `POST /workflows/validate`) at create/update and executes after manteion materializes the definition (register-with-overwrite) at run/phase start.
+- **Native PG enums** for the 14 stable vocabularies; `fault_type` stays TEXT (catalog-validated). `internal/store/enum_parity_test.go` pins pg_enum labels to `model.EnumValues`.
 - **Rule version in PostgreSQL** — `rule_version` table (single row, version=1 always) tracks a monotonic counter bumped on every mutation. SDK polling returns 304 when `clientVersion == currentVersion`.
 - **Intent tracker** — `atrocontrol.IntentTracker` is an in-memory map so `POST /api/v1/sdk/register` can piggyback current rules/freeze config in the response without a DB round-trip.
 - **Fanout concurrency** — `atrocontrol.fanout` uses a semaphore (default 16) with per-target timeouts (default 2 s); failures are collected, not fatal.
@@ -90,4 +95,5 @@ manteion-go (Controller)
 |---|---|---|
 | `MANTEION_ADDR` | `:8080` | Listen address |
 | `MANTEION_DATABASE_URL` | `postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable` | PostgreSQL DSN |
+| `MANTEION_POLICY_ENGINE` | `off` | Opt-in for the WIP-frozen policy evaluation loop (`on` to enable) |
 | `ZEUS_URL` | `http://archer:8080` | Archer base URL |

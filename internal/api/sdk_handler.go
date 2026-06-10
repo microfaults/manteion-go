@@ -26,16 +26,26 @@ func (s *Server) activeFaultsForService(ctx context.Context, service string) ([]
 			s.logger.Error("active faults: list manual failed", "service", service, "error", err)
 		}
 		for _, c := range configs {
-			if len(c.FaultReq) == 0 {
+			if len(c.Params) == 0 {
 				continue // composition configs aren't deliverable yet
 			}
-			faults = append(faults, atroposdk.FaultRequest{
+			req := atroposdk.FaultRequest{
 				ID:         c.ID,
 				Category:   c.Category,
-				Type:       c.FaultType,
+				FaultType:  c.FaultType,
 				DurationMs: c.DurationMs,
-				Config:     c.FaultReq,
-			})
+				RampUpMs:   c.RampUpMs,
+				RampDownMs: c.RampDownMs,
+				Params:     c.Params,
+			}
+			if c.Network != nil {
+				req.Network = &atroposdk.NetworkEnvelope{
+					Target:    c.Network.Target,
+					Direction: c.Network.Direction,
+					Scope:     c.Network.Scope,
+				}
+			}
+			faults = append(faults, req)
 		}
 	}
 
@@ -80,21 +90,23 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("sdk registered", "id", inst.ID, "service", inst.Service)
 
-	resp := map[string]any{"status": "registered"}
+	// Typed wire struct shared with the SDK (atroposdk.RegisterResponse
+	// embeds RuleSync) — both ends marshal the same type, so the historical
+	// active_fault-vs-active_faults key drift cannot recur. Deliver the
+	// current desired state so a freshly-registered SDK converges before its
+	// first poll.
+	resp := atroposdk.RegisterResponse{Status: "registered"}
 	if s.intent != nil {
 		if intent, ok := s.intent.Get(inst.Service); ok && intent.Rules != nil {
-			resp["rules"] = intent.Rules
+			resp.Rules = intent.Rules
 		}
 	}
-	// Deliver the current desired fault set (manual + experiment) and freeze
-	// config so a freshly-registered SDK converges before its first poll.
 	faults, freeze := s.activeFaultsForService(r.Context(), inst.Service)
-	if len(faults) > 0 {
-		resp["active_faults"] = faults
+	if faults == nil {
+		faults = []atroposdk.FaultRequest{}
 	}
-	if freeze != nil {
-		resp["freeze_cfg"] = freeze
-	}
+	resp.ActiveFaults = faults
+	resp.FreezeCfg = freeze
 	writeJSON(w, http.StatusCreated, resp)
 }
 
@@ -228,21 +240,19 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	compResolver := &ruleconv.FuncCompositionResolver{Fn: s.faults.CompositionResolver(ctx)}
 	compiled, err := ruleconv.CompileRules(rules, specResolver, compResolver)
 	if err != nil {
+		// Do NOT fall back to raw model rules — that's a wire shape the SDK
+		// can't decode. A 500 makes the SDK keep its stale rules and log
+		// degraded, which is its designed failure mode.
 		s.logger.Error("compile rules failed", "service", service, "error", err)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"version":       currentVersion,
-			"rules":         rules,
-			"active_faults": activeFaults,
-			"freeze_cfg":    freezeCfg,
-		})
+		writeError(w, http.StatusInternalServerError, "failed to compile rules")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"version":       currentVersion,
-		"rules":         compiled,
-		"active_faults": activeFaults,
-		"freeze_cfg":    freezeCfg,
+	writeJSON(w, http.StatusOK, atroposdk.RuleSync{
+		Version:      currentVersion,
+		Rules:        compiled,
+		ActiveFaults: activeFaults,
+		FreezeCfg:    freezeCfg,
 	})
 }
 

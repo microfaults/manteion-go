@@ -153,6 +153,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/faults/compositions/{id}", s.handleGetFaultComposition)
 	mux.HandleFunc("DELETE /api/v1/faults/compositions/{id}", s.handleDeleteFaultComposition)
 
+	// Supported-fault catalogue (vocabulary + params field metadata) for
+	// UI form rendering; backed by atropos-go/faultparams.
+	mux.HandleFunc("GET /api/v1/faults/catalog", s.handleFaultCatalog)
+
 	// Long-running manual faults (side channel to rule-attached faults).
 	// Fired explicitly, delivered to SDKs via the poll active_faults set,
 	// reconciled and watchdog-reaped SDK-side.

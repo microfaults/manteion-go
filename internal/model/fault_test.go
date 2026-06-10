@@ -23,10 +23,13 @@ func TestFaultSpec_Validate(t *testing.T) {
 		{"valid network:blackhole", func(f *FaultSpec) {
 			f.Category = "network"
 			f.FaultType = "blackhole"
+			f.Params = json.RawMessage(`{}`)
+			f.Network = &NetworkEnvelope{Target: "redis"}
 		}, false},
 		{"valid resource:cpu", func(f *FaultSpec) {
 			f.Category = "resource"
 			f.FaultType = "cpu"
+			f.Params = json.RawMessage(`{"target_load":0.7}`)
 		}, false},
 		{"missing id", func(f *FaultSpec) { f.ID = "" }, true},
 		{"missing name", func(f *FaultSpec) { f.Name = "" }, true},
@@ -37,13 +40,23 @@ func TestFaultSpec_Validate(t *testing.T) {
 		}, true},
 		{"hang without duration", func(f *FaultSpec) {
 			f.FaultType = "hang"
+			f.Params = json.RawMessage(`{"duration":"2s"}`)
 		}, true},
 		{"hang with duration", func(f *FaultSpec) {
 			f.FaultType = "hang"
+			f.Params = json.RawMessage(`{"duration":"2s"}`)
 			f.DurationMs = 5000
 		}, false},
-		{"missing params", func(f *FaultSpec) { f.Params = nil }, true},
-		{"null params", func(f *FaultSpec) { f.Params = json.RawMessage("null") }, true},
+		// Empty/absent params are valid when every field has a default —
+		// the catalog decodes them as an all-defaults object (error → 500).
+		{"missing params ok for all-default types", func(f *FaultSpec) { f.Params = nil }, false},
+		{"params rejected by catalog", func(f *FaultSpec) {
+			f.FaultType = "latency"
+			f.Params = json.RawMessage(`{"delay":"bogus"}`)
+		}, true},
+		{"unknown param field rejected", func(f *FaultSpec) {
+			f.Params = json.RawMessage(`{"status_code":500,"xtra":1}`)
+		}, true},
 	}
 
 	for _, tt := range tests {

@@ -151,8 +151,8 @@ func TestInjectFaultFanout(t *testing.T) {
 	ctx := context.Background()
 
 	result, err := ctrl.InjectFault(ctx, "productcatalog", atroposdk.FaultRequest{
-		Type:   "latency",
-		Config: json.RawMessage(`{"delay":"200ms"}`),
+		FaultType: "latency",
+		Params:    json.RawMessage(`{"delay":"200ms"}`),
 	})
 	if err != nil {
 		t.Fatalf("InjectFault: %v", err)
@@ -187,8 +187,8 @@ func TestPartialFailure(t *testing.T) {
 	ctrl = New(tx, resolver, WithDefaultTimeout(1*time.Second))
 
 	result, err := ctrl.InjectFault(ctx, "frontend", atroposdk.FaultRequest{
-		Type:   "error",
-		Config: json.RawMessage(`{"status_code":503,"message":"down"}`),
+		FaultType: "error",
+		Params:    json.RawMessage(`{"status_code":503,"message":"down"}`),
 	})
 	if err != nil {
 		t.Fatalf("InjectFault: %v", err)

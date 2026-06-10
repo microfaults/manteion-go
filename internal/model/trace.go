@@ -21,9 +21,7 @@ type TraceAnchor struct {
 	CollectedAt time.Time       `json:"collected_at"`
 }
 
-var validBackends = map[string]bool{
-	"jaeger": true, "prometheus": true, "tempo": true,
-}
+var validBackends = setOf(TraceBackendValues...)
 
 func (t *TraceAnchor) Validate() error {
 	if t.ID == "" {
@@ -62,9 +60,11 @@ type CacheBoxConfig struct {
 }
 
 var (
-	validCacheBoxModes    = map[string]bool{"passthrough": true, "replay": true, "replay_with_delay": true}
-	validKeyStrategies    = map[string]bool{"exact": true, "exact_with_host": true, "exact_with_body": true}
-	validMutationPolicies = map[string]bool{"deny": true, "allow": true}
+	validCacheBoxModes = setOf(CacheBoxModeValues...)
+	validKeyStrategies = setOf(CacheBoxKeyStrategyValues...)
+	// mutation_policy lives inside the frozen_services JSONB (not a DB
+	// enum), so it is Go-validated only.
+	validMutationPolicies = setOf("deny", "allow")
 )
 
 func (c *CacheBoxConfig) Validate() error {

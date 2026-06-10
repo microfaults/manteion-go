@@ -51,12 +51,11 @@ func TestFaultRoundtrip(t *testing.T) {
 		t.Fatal("expected inactive initially")
 	}
 
-	// POST a latency fault. Post-v0.0.7 slim API: typed Delay/Jitter/...
-	// fields moved into the opaque Config blob the SDK unmarshals per
-	// fault type (see atropos-go/admin.go buildInlineFault).
+	// POST a latency fault using the unified wire shape: first-class
+	// category/fault_type plus a typed params blob (faultparams schema).
 	postStatus, err := c.PostFault(ctx, srv.URL, atroposdk.FaultRequest{
-		Type:   "latency",
-		Config: json.RawMessage(`{"delay":"100ms"}`),
+		FaultType: "latency",
+		Params:    json.RawMessage(`{"delay":"100ms"}`),
 	})
 	if err != nil {
 		t.Fatalf("PostFault: %v", err)
@@ -64,7 +63,7 @@ func TestFaultRoundtrip(t *testing.T) {
 	if !postStatus.Active {
 		t.Fatal("expected active after POST")
 	}
-	if len(postStatus.Faults) == 0 || postStatus.Faults[0].Type != "latency" {
+	if len(postStatus.Faults) == 0 || postStatus.Faults[0].FaultType != "latency" {
 		t.Fatalf("expected latency fault in response, got %+v", postStatus.Faults)
 	}
 
@@ -158,7 +157,7 @@ func TestHTTPError(t *testing.T) {
 	ctx := context.Background()
 
 	// POST invalid fault type -> 400
-	_, err := c.PostFault(ctx, srv.URL, atroposdk.FaultRequest{Type: "explode"})
+	_, err := c.PostFault(ctx, srv.URL, atroposdk.FaultRequest{FaultType: "explode"})
 	if err == nil {
 		t.Fatal("expected error for invalid fault type")
 	}

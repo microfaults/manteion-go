@@ -86,7 +86,7 @@ func main() {
 	// Create promql client, cache store, orchestrator, and policy engine.
 	promClient := promql.NewClient(prometheusURL)
 	cs := cachestore.New(cacheDir)
-	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, controller, promClient, zeusClient, cs, logger)
+	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, logger)
 	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)
 
 	// Restore in-flight runs from the DB. Must run before the API server
@@ -113,8 +113,14 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Start policy engine as background goroutine.
-	go policyEngine.Run(ctx)
+	// Policy engine is WIP-frozen (deprecated until the phase-aware rebuild):
+	// schema and CRUD endpoints stay, the evaluation loop is opt-in.
+	// See docs/decisions/2026-06-policy-engine-freeze.md.
+	if envOr("MANTEION_POLICY_ENGINE", "off") == "on" {
+		go policyEngine.Run(ctx)
+	} else {
+		logger.Info("policy engine disabled (deprecated WIP; set MANTEION_POLICY_ENGINE=on to enable)")
+	}
 
 	// Complete expired long-running fault configs (status bookkeeping +
 	// version bump; the SDK reconciles them away).

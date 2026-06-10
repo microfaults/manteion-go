@@ -27,7 +27,7 @@ func TestFaultConfigRepo_Lifecycle(t *testing.T) {
 			Service:    svc,
 			Category:   "inline",
 			FaultType:  "latency",
-			FaultReq:   json.RawMessage(`{"delay":"100ms"}`),
+			Params:     json.RawMessage(`{"delay":"100ms"}`),
 			DurationMs: dur,
 			Status:     model.FaultConfigReady,
 		}

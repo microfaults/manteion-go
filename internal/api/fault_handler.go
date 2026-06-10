@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"manteion-go/internal/faultcatalog"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
 )
@@ -284,4 +285,22 @@ func (s *Server) handleDeleteFaultComposition(w http.ResponseWriter, r *http.Req
 	}
 	s.logger.Info("composition deleted", "id", id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleFaultCatalog serves the supported-fault catalogue: every
+// (category, fault_type) the platform can execute, with per-field params
+// metadata for UI form rendering. Backed by atropos-go/faultparams via
+// internal/faultcatalog — the same schemas the SDK decoders consume, so
+// the form and the wire contract cannot drift.
+//
+// @Summary      Fault catalogue
+// @Description  Lists every supported (category, fault_type) pair with its
+// @Description  params field metadata (name/type/required/default) so
+// @Description  clients can render fault forms without hardcoding the vocab.
+// @Tags         faults
+// @Produce      json
+// @Success      200  {object}  map[string]any  "{catalog: []faultcatalog.Entry}"
+// @Router       /faults/catalog [get]
+func (s *Server) handleFaultCatalog(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"catalog": faultcatalog.Entries()})
 }

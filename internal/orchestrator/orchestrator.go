@@ -30,6 +30,7 @@ type Orchestrator struct {
 	rules       *store.RuleRepo
 	faults      *store.FaultRepo
 	workloads   *store.WorkloadRepo
+	workflows   *store.WorkflowRepo
 	controller  *atrocontrol.Controller
 	prom        *promql.Client
 	zeusClient  *zeus.Client
@@ -44,13 +45,13 @@ type Orchestrator struct {
 
 const defaultMaxPollDuration = 30 * time.Minute
 
-// New constructs an Orchestrator. The signature is preserved from the
-// pre-migration shape so cmd/manteion/main.go does not need to change.
+// New constructs an Orchestrator.
 func New(
 	experiments *store.ExperimentRepo,
 	rules *store.RuleRepo,
 	faults *store.FaultRepo,
 	workloads *store.WorkloadRepo,
+	workflows *store.WorkflowRepo,
 	controller *atrocontrol.Controller,
 	prom *promql.Client,
 	zeusClient *zeus.Client,
@@ -62,6 +63,7 @@ func New(
 		rules:           rules,
 		faults:          faults,
 		workloads:       workloads,
+		workflows:       workflows,
 		controller:      controller,
 		prom:            prom,
 		zeusClient:      zeusClient,
@@ -150,8 +152,11 @@ func (o *Orchestrator) StopExperiment(ctx context.Context, experimentID, finalSt
 	return o.experiments.UpdateStatus(ctx, experimentID, finalStatus)
 }
 
-// StartPhase marks the phase as running. The full implementation (push
-// rules, launch zeus attacks, watch transition conditions) is a follow-up.
+// StartPhase materializes the phase's workflow definitions into zeus and
+// marks the phase running. The rest of the execution machinery (push rules,
+// trigger zeus runs, watch transition conditions, harvest results) is the
+// phase-aware FSM follow-up — but materialize-before-run lands here so zeus
+// always holds the current definitions before anything starts them.
 func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 	p, err := o.experiments.GetPhase(ctx, phaseID)
 	if err != nil {
@@ -160,10 +165,43 @@ func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 	if p.Status != "pending" && p.Status != "paused" {
 		return fmt.Errorf("orchestrator: phase %q not startable from status %q", phaseID, p.Status)
 	}
+
+	if err := o.materializePhaseWorkflows(ctx, phaseID); err != nil {
+		return fmt.Errorf("orchestrator: materialize workflows: %w", err)
+	}
+
 	if err := o.experiments.UpdatePhaseStatus(ctx, phaseID, "running"); err != nil {
 		return fmt.Errorf("orchestrator: update phase status: %w", err)
 	}
-	o.logger.Info("orchestrator: phase started (status-only stub)", "phase_id", phaseID)
+	o.logger.Info("orchestrator: phase started (workflows materialized; run trigger is the FSM follow-up)",
+		"phase_id", phaseID)
+	return nil
+}
+
+// materializePhaseWorkflows pushes every workflow definition attached to the
+// phase into zeus: best-effort delete of any stale copy under the same id
+// (covers renames, where overwrite-by-name would miss), then register with
+// overwrite. Zeus's in-memory store is a cache of manteion's workflows table.
+func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID string) error {
+	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
+	if err != nil {
+		return fmt.Errorf("list phase workflows: %w", err)
+	}
+	for _, pw := range pws {
+		wf, err := o.workflows.Get(ctx, pw.WorkflowID)
+		if err != nil {
+			return fmt.Errorf("load workflow %q: %w", pw.WorkflowID, err)
+		}
+		if err := o.zeusClient.DeleteWorkflow(ctx, wf.ID); err != nil {
+			o.logger.Warn("orchestrator: stale zeus workflow delete failed; proceeding",
+				"workflow_id", wf.ID, "error", err)
+		}
+		if err := o.zeusClient.RegisterWorkflow(ctx, wf.DSL); err != nil {
+			return fmt.Errorf("register workflow %q in zeus: %w", wf.ID, err)
+		}
+		o.logger.Info("orchestrator: workflow materialized into zeus",
+			"phase_id", phaseID, "workflow_id", wf.ID)
+	}
 	return nil
 }
 

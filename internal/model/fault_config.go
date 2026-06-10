@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"manteion-go/internal/faultcatalog"
 )
 
 // FaultConfigStatus is the lifecycle state of a long-running fault.
@@ -31,12 +33,18 @@ type FaultConfig struct {
 	Category    string `json:"category"`
 	FaultType   string `json:"fault_type"`
 
-	// Exactly one of FaultReq or FaultCompositionID is set.
-	FaultReq           json.RawMessage `json:"fault_request,omitempty"`
-	FaultCompositionID *string         `json:"fault_composition_id,omitempty"`
+	// Exactly one of Params or FaultCompositionID is set. Params + Network
+	// mirror the unified fault wire shape (atropos FaultRequest): Params is
+	// the per-(category,fault_type) faultparams object; Network is the
+	// envelope for network-category faults.
+	Params             json.RawMessage  `json:"params,omitempty"`
+	Network            *NetworkEnvelope `json:"network,omitempty"`
+	FaultCompositionID *string          `json:"fault_composition_id,omitempty"`
 
-	DurationMs      int64   `json:"duration_ms"` // 0 = run until cancelled
-	ExperimentRunID *string `json:"experiment_run_id,omitempty"`
+	DurationMs int64   `json:"duration_ms"` // 0 = run until cancelled
+	RampUpMs   int64   `json:"ramp_up_ms,omitempty"`
+	RampDownMs int64   `json:"ramp_down_ms,omitempty"`
+	PhaseID    *string `json:"phase_id,omitempty"` // optional "fired during this phase" tag
 
 	Status      FaultConfigStatus `json:"status"`
 	CreatedAt   time.Time         `json:"created_at"`
@@ -55,29 +63,22 @@ func (f *FaultConfig) Validate() error {
 	if f.Service == "" {
 		return errors.New("fault config: service required")
 	}
-	types, ok := validFaultTypes[f.Category]
-	if !ok {
-		return fmt.Errorf("fault config: invalid category %q", f.Category)
+	hasParams := len(f.Params) > 0 && string(f.Params) != "null"
+	if hasParams == (f.FaultCompositionID != nil) {
+		return errors.New("fault config: exactly one of params or fault_composition_id required")
 	}
-	valid := false
-	for _, t := range types {
-		if t == f.FaultType {
-			valid = true
-			break
+	if hasParams {
+		if err := faultcatalog.ValidateFault(f.Category, f.FaultType, f.Params, catalogEnvelope("", f.Network)); err != nil {
+			return fmt.Errorf("fault config: %w", err)
 		}
-	}
-	if !valid {
-		return fmt.Errorf("fault config: invalid fault_type %q for category %q", f.FaultType, f.Category)
+	} else if !faultcatalog.Supported(f.Category, f.FaultType) && f.FaultType != "" {
+		return fmt.Errorf("fault config: unsupported fault %s/%s", f.Category, f.FaultType)
 	}
 	if f.Category == "inline" && f.FaultType == "hang" && f.DurationMs <= 0 {
 		return errors.New("fault config: inline:hang requires duration_ms > 0")
 	}
-	hasReq := len(f.FaultReq) > 0 && string(f.FaultReq) != "null"
-	if hasReq == (f.FaultCompositionID != nil) {
-		return errors.New("fault config: exactly one of fault_request or fault_composition_id required")
-	}
-	if f.DurationMs < 0 {
-		return errors.New("fault config: duration_ms must be >= 0")
+	if f.DurationMs < 0 || f.RampUpMs < 0 || f.RampDownMs < 0 {
+		return errors.New("fault config: durations must be >= 0")
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 
 func TestFaultConfig_Validate(t *testing.T) {
 	compID := "comp-1"
+	latParams := json.RawMessage(`{"delay":"100ms"}`)
 
 	tests := []struct {
 		name    string
@@ -15,11 +16,11 @@ func TestFaultConfig_Validate(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "valid request",
+			name: "valid params",
 			cfg: FaultConfig{
 				ID: "fc-1", Name: "t", Service: "svc",
 				Category: "inline", FaultType: "latency",
-				DurationMs: 1000, FaultReq: json.RawMessage(`{"delay":"100ms"}`),
+				DurationMs: 1000, Params: latParams,
 			},
 		},
 		{
@@ -31,54 +32,84 @@ func TestFaultConfig_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "valid network with envelope",
+			cfg: FaultConfig{
+				ID: "fc-3", Name: "t", Service: "svc",
+				Category: "network", FaultType: "latency",
+				DurationMs: 1000, Params: latParams,
+				Network: &NetworkEnvelope{Target: "redis"},
+			},
+		},
+		{
 			name:    "missing id",
-			cfg:     FaultConfig{Name: "t", Service: "svc", Category: "inline", FaultType: "latency", FaultReq: json.RawMessage(`{}`)},
+			cfg:     FaultConfig{Name: "t", Service: "svc", Category: "inline", FaultType: "latency", Params: latParams},
 			wantErr: "id required",
 		},
 		{
 			name:    "missing name",
-			cfg:     FaultConfig{ID: "fc-1", Service: "svc", Category: "inline", FaultType: "latency", FaultReq: json.RawMessage(`{}`)},
+			cfg:     FaultConfig{ID: "fc-1", Service: "svc", Category: "inline", FaultType: "latency", Params: latParams},
 			wantErr: "name required",
 		},
 		{
 			name:    "missing service",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Category: "inline", FaultType: "latency", FaultReq: json.RawMessage(`{}`)},
+			cfg:     FaultConfig{ID: "fc-1", Name: "t", Category: "inline", FaultType: "latency", Params: latParams},
 			wantErr: "service required",
 		},
 		{
 			name:    "invalid category",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "bogus", FaultType: "latency", FaultReq: json.RawMessage(`{}`)},
-			wantErr: "invalid category",
+			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "bogus", FaultType: "latency", Params: latParams},
+			wantErr: "unsupported fault",
 		},
 		{
 			name:    "invalid type for category",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "bogus", FaultReq: json.RawMessage(`{}`)},
-			wantErr: "invalid fault_type",
+			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "bogus", Params: latParams},
+			wantErr: "unsupported fault",
 		},
 		{
 			name:    "stale network:loss rejected",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "network", FaultType: "loss", FaultReq: json.RawMessage(`{}`)},
-			wantErr: "invalid fault_type",
+			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "network", FaultType: "loss", Params: latParams},
+			wantErr: "unsupported fault",
 		},
 		{
-			name:    "inline hang requires duration",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "hang", DurationMs: 0, FaultReq: json.RawMessage(`{}`)},
+			name: "params rejected by catalog",
+			cfg: FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency",
+				Params: json.RawMessage(`{"delay":"not-a-duration"}`)},
+			wantErr: "invalid delay",
+		},
+		{
+			name: "unknown param field rejected",
+			cfg: FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency",
+				Params: json.RawMessage(`{"delay":"100ms","dleay":"oops"}`)},
+			wantErr: "unknown field",
+		},
+		{
+			name: "network envelope on inline rejected",
+			cfg: FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency",
+				Params: latParams, Network: &NetworkEnvelope{Target: "redis"}},
+			wantErr: "network envelope only valid",
+		},
+		{
+			name: "inline hang requires duration",
+			cfg: FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "hang",
+				DurationMs: 0, Params: json.RawMessage(`{"duration":"2s"}`)},
 			wantErr: "inline:hang requires duration",
 		},
 		{
-			name:    "missing req and comp",
+			name:    "missing params and comp",
 			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency"},
 			wantErr: "exactly one",
 		},
 		{
-			name:    "both req and comp",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency", FaultReq: json.RawMessage(`{}`), FaultCompositionID: &compID},
+			name: "both params and comp",
+			cfg: FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency",
+				Params: latParams, FaultCompositionID: &compID},
 			wantErr: "exactly one",
 		},
 		{
-			name:    "negative duration",
-			cfg:     FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency", FaultReq: json.RawMessage(`{}`), DurationMs: -1},
-			wantErr: "duration_ms must be >= 0",
+			name: "negative duration",
+			cfg: FaultConfig{ID: "fc-1", Name: "t", Service: "svc", Category: "inline", FaultType: "latency",
+				Params: latParams, DurationMs: -1},
+			wantErr: "durations must be >= 0",
 		},
 	}
 

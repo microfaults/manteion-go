@@ -41,19 +41,26 @@ func TestDB(t *testing.T) *sql.DB {
 }
 
 func truncateAll(conn *sql.DB) {
+	// Epoch-2 live tables in FK-safe (children-first) order. rule_version
+	// is the singleton counter and stays seeded.
 	tables := []string{
 		"trace_anchors",
-		"contribution_results",
-		"service_run_results",
-		"workflow_run_results",
-		"attacks",
+		"experiment_results",
+		"phase_workflow_results",
+		"phase_service_latency",
+		"phase_service_cache",
+		"phase_rules",
+		"phase_workflows",
 		"attack_results",
+		"attacks",
 		"fault_configs",
-		"experiment_runs",
+		"experiment_phases",
 		"experiments",
+		"workflows",
 		"policy_rules",
 		"sdk_instances",
 		"rules",
+		"fault_composition_members",
 		"fault_compositions",
 		"fault_specs",
 	}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"manteion-go/internal/faultcatalog"
 )
 
 // ExecutionMode controls how composition members coordinate.
@@ -71,18 +73,24 @@ type FaultSpec struct {
 }
 
 // NetworkEnvelope holds network-category-only envelope fields that select
-// which traffic the toxic applies to. Stored as separate columns
-// (network_target, network_direction, network_scope) on fault_specs.
+// which traffic the toxic applies to. Stored as a single `network` JSONB
+// column on fault_specs / fault_configs, mirroring the wire shape.
 type NetworkEnvelope struct {
 	Target    string  `json:"target,omitempty"`
 	Direction string  `json:"direction,omitempty"`
 	Scope     float64 `json:"scope,omitempty"`
 }
 
-var validFaultTypes = map[string][]string{
-	"inline":   {"error", "hang", "latency"},
-	"network":  {"blackhole", "drip", "latency", "retransmit_delay", "rst", "throttle"},
-	"resource": {"cpu", "disk", "io", "memory"},
+// catalogEnvelope adapts a model envelope + host to the fault catalog's view.
+func catalogEnvelope(host string, n *NetworkEnvelope) faultcatalog.Envelope {
+	env := faultcatalog.Envelope{Host: host}
+	if n != nil {
+		env.HasNetwork = true
+		env.Target = n.Target
+		env.Direction = n.Direction
+		env.Scope = n.Scope
+	}
+	return env
 }
 
 func (f *FaultSpec) Validate() error {
@@ -92,58 +100,15 @@ func (f *FaultSpec) Validate() error {
 	if f.Name == "" {
 		return errors.New("fault spec: name required")
 	}
-	types, ok := validFaultTypes[f.Category]
-	if !ok {
-		return fmt.Errorf("fault spec: invalid category %q", f.Category)
-	}
-	valid := false
-	for _, t := range types {
-		if t == f.FaultType {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		return fmt.Errorf("fault spec: invalid fault_type %q for category %q", f.FaultType, f.Category)
+	// Vocabulary, typed params (strict), host/category coupling and the
+	// network envelope rules all live in the fault catalog — one source of
+	// truth shared with FaultConfig and aligned with atropos's decoders.
+	if err := faultcatalog.ValidateFault(f.Category, f.FaultType, f.Params, catalogEnvelope(f.Host, f.Network)); err != nil {
+		return fmt.Errorf("fault spec: %w", err)
 	}
 	if f.Category == "inline" && f.FaultType == "hang" && f.DurationMs <= 0 {
 		return errors.New("fault spec: inline:hang requires duration_ms > 0")
 	}
-	if len(f.Params) == 0 || string(f.Params) == "null" {
-		return errors.New("fault spec: params required")
-	}
-
-	// Host vocabulary + category coupling.
-	if f.Host != "" {
-		switch f.Host {
-		case "proxy", "inline":
-			if f.Category != "network" {
-				return fmt.Errorf("fault spec: host=%q only valid for network category, got %q", f.Host, f.Category)
-			}
-		case "process":
-			if f.Category == "network" {
-				return errors.New("fault spec: host=process invalid for network category")
-			}
-		default:
-			return fmt.Errorf("fault spec: invalid host %q", f.Host)
-		}
-	}
-
-	// NetworkEnvelope is forbidden for non-network categories.
-	if f.Network != nil {
-		if f.Category != "network" {
-			return fmt.Errorf("fault spec: network envelope only valid for network category, got %q", f.Category)
-		}
-		if f.Network.Direction != "" &&
-			f.Network.Direction != "upstream" &&
-			f.Network.Direction != "downstream" {
-			return fmt.Errorf("fault spec: invalid direction %q", f.Network.Direction)
-		}
-		if f.Network.Scope < 0 || f.Network.Scope > 1.0 {
-			return fmt.Errorf("fault spec: scope %.2f out of [0,1]", f.Network.Scope)
-		}
-	}
-
 	return nil
 }
 

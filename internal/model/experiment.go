@@ -13,12 +13,11 @@ import (
 // Hierarchy:
 //
 //   Experiment
-//     ├── ExperimentWorkflow[]   (flat M:N to zeus workflow ids; ordered)
 //     └── ExperimentPhase[]      (sequential; first-class run unit)
 //           ├── PhaseWorkflow[]   (per-(phase, workflow) attack config)
 //           ├── PhaseRule[]       (rules active during the phase)
 //           └── results: PhaseWorkflowResult, PhaseServiceLatency,
-//                        PhaseServiceResources, PhaseServiceCache
+//                        PhaseServiceCache
 //
 //   ExperimentResults                (rollup row, recomputed on transitions)
 //
@@ -44,9 +43,7 @@ type Experiment struct {
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
 }
 
-var validExperimentStatuses = map[string]bool{
-	"planned": true, "running": true, "completed": true, "failed": true, "cancelled": true,
-}
+var validExperimentStatuses = setOf(ExperimentStatusValues...)
 
 // ValidExperimentStatuses returns the set of allowed status values
 // (exposed so the API layer can validate query params).
@@ -67,28 +64,6 @@ func (e *Experiment) Validate() error {
 	}
 	if !validExperimentStatuses[e.Status] {
 		return fmt.Errorf("experiment: invalid status %q", e.Status)
-	}
-	return nil
-}
-
-// ExperimentWorkflow is one row of the experiment ↔ zeus-workflow join.
-// WorkflowID is an opaque zeus identifier; manteion never validates it
-// (zeus owns workflow storage). Position is the display order.
-type ExperimentWorkflow struct {
-	ExperimentID string `json:"experiment_id"`
-	WorkflowID   string `json:"workflow_id"`
-	Position     int    `json:"position"`
-}
-
-func (w *ExperimentWorkflow) Validate() error {
-	if w.ExperimentID == "" {
-		return errors.New("experiment workflow: experiment_id required")
-	}
-	if w.WorkflowID == "" {
-		return errors.New("experiment workflow: workflow_id required")
-	}
-	if w.Position < 0 {
-		return errors.New("experiment workflow: position must be >= 0")
 	}
 	return nil
 }
@@ -117,10 +92,7 @@ type ExperimentPhase struct {
 	CompletedAt    *time.Time       `json:"completed_at,omitempty"`
 }
 
-var validPhaseStatuses = map[string]bool{
-	"pending": true, "running": true, "paused": true,
-	"completed": true, "failed": true, "skipped": true,
-}
+var validPhaseStatuses = setOf(PhaseStatusValues...)
 
 func (p *ExperimentPhase) Validate() error {
 	if p.ID == "" {
@@ -259,25 +231,6 @@ func (r *PhaseServiceLatency) Validate() error {
 	}
 	if r.Service == "" {
 		return errors.New("phase service latency: service required")
-	}
-	return nil
-}
-
-// PhaseServiceResources is per-(phase, service) CPU / memory utilization.
-type PhaseServiceResources struct {
-	PhaseID       string    `json:"phase_id"`
-	Service       string    `json:"service"`
-	CPUMillicores int64     `json:"cpu_millicores"`
-	MemoryMB      int64     `json:"memory_mb"`
-	ComputedAt    time.Time `json:"computed_at"`
-}
-
-func (r *PhaseServiceResources) Validate() error {
-	if r.PhaseID == "" {
-		return errors.New("phase service resources: phase_id required")
-	}
-	if r.Service == "" {
-		return errors.New("phase service resources: service required")
 	}
 	return nil
 }

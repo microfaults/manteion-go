@@ -66,18 +66,18 @@ type createExperimentRequest struct {
 	Description string `json:"description,omitempty"`
 	Hypothesis  string `json:"hypothesis,omitempty"`
 	CreatedBy   string `json:"created_by,omitempty"`
-	// WorkflowIDs is a bare-reference list resolved to experiment_workflows rows.
-	WorkflowIDs []string             `json:"workflow_ids"`
-	Phases      []createPhaseRequest `json:"phases"`
+	// Workflows are attached per-phase (phase_workflows); the experiment's
+	// workflow list is derivable as the union across phases.
+	Phases []createPhaseRequest `json:"phases"`
 }
 
 // experimentDetailResponse is the GET /experiments/{id} payload — the full
-// plan: experiment row + associated workflow ids + phase rows (each with
-// their per-(phase, workflow) configs and rule ids).
+// plan: experiment row + phase rows (each with their per-(phase, workflow)
+// configs and rule ids). The experiment-level workflow list is derivable
+// from the phases; clients compose it from phase.workflows.
 type experimentDetailResponse struct {
 	*model.Experiment
-	WorkflowIDs []string      `json:"workflow_ids"`
-	Phases      []phaseDetail `json:"phases"`
+	Phases []phaseDetail `json:"phases"`
 }
 
 type phaseDetail struct {
@@ -115,13 +115,6 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		s.logger.Error("create experiment failed", "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	if len(req.WorkflowIDs) > 0 {
-		if err := s.experiments.AttachWorkflows(ctx, exp.ID, req.WorkflowIDs); err != nil {
-			s.logger.Error("attach workflows failed", "error", err, "experiment_id", exp.ID)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
 	}
 	for i, ph := range req.Phases {
 		phase := &model.ExperimentPhase{
@@ -342,10 +335,9 @@ func (s *Server) handleStopPhase(w http.ResponseWriter, r *http.Request) {
 // =========================================================================
 
 type phaseResultsResponse struct {
-	WorkflowResults  []*model.PhaseWorkflowResult   `json:"workflow_results"`
-	ServiceLatency   []*model.PhaseServiceLatency   `json:"service_latency"`
-	ServiceResources []*model.PhaseServiceResources `json:"service_resources"`
-	ServiceCache     []*model.PhaseServiceCache     `json:"service_cache"`
+	WorkflowResults []*model.PhaseWorkflowResult `json:"workflow_results"`
+	ServiceLatency  []*model.PhaseServiceLatency `json:"service_latency"`
+	ServiceCache    []*model.PhaseServiceCache   `json:"service_cache"`
 }
 
 func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
@@ -362,11 +354,6 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load service latency")
 		return
 	}
-	svcRes, err := s.experiments.ListServiceResourcesForPhase(ctx, phaseID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load service resources")
-		return
-	}
 	svcCache, err := s.experiments.ListServiceCacheForPhase(ctx, phaseID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load service cache")
@@ -374,10 +361,9 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, phaseResultsResponse{
-		WorkflowResults:  nilToEmpty(wfRes),
-		ServiceLatency:   nilToEmpty(svcLat),
-		ServiceResources: nilToEmpty(svcRes),
-		ServiceCache:     nilToEmpty(svcCache),
+		WorkflowResults: nilToEmpty(wfRes),
+		ServiceLatency:  nilToEmpty(svcLat),
+		ServiceCache:    nilToEmpty(svcCache),
 	})
 }
 
@@ -404,14 +390,10 @@ func (s *Server) handleExperimentResults(w http.ResponseWriter, r *http.Request)
 // helpers
 // =========================================================================
 
-// composeExperimentDetail loads the full plan view (experiment + workflows
-// + phases each with their workflows + rules). Returns ErrNotFound on miss.
+// composeExperimentDetail loads the full plan view (experiment + phases
+// each with their workflows + rules). Returns ErrNotFound on miss.
 func (s *Server) composeExperimentDetail(ctx context.Context, id string) (*experimentDetailResponse, error) {
 	exp, err := s.experiments.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	wfs, err := s.experiments.ListWorkflowsForExperiment(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +401,7 @@ func (s *Server) composeExperimentDetail(ctx context.Context, id string) (*exper
 	if err != nil {
 		return nil, err
 	}
-	out := &experimentDetailResponse{Experiment: exp, WorkflowIDs: workflowIDsOf(wfs)}
+	out := &experimentDetailResponse{Experiment: exp}
 	out.Phases = make([]phaseDetail, 0, len(phases))
 	for _, p := range phases {
 		out.Phases = append(out.Phases, *s.composePhaseDetail(ctx, p))
@@ -435,14 +417,6 @@ func (s *Server) composePhaseDetail(ctx context.Context, p *model.ExperimentPhas
 		ruleIDs[i] = pr.RuleID
 	}
 	return &phaseDetail{ExperimentPhase: p, Workflows: pws, RuleIDs: ruleIDs}
-}
-
-func workflowIDsOf(rows []model.ExperimentWorkflow) []string {
-	out := make([]string, len(rows))
-	for i, r := range rows {
-		out[i] = r.WorkflowID
-	}
-	return out
 }
 
 // nilToEmpty replaces a nil slice with an empty slice so the JSON

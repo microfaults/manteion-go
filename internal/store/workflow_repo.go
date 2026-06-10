@@ -3,17 +3,28 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"manteion-go/internal/model"
 )
 
+// ErrInUse is returned when a delete is blocked by a RESTRICT foreign key —
+// e.g. a workflow referenced by phase_workflows, or a rule referenced by
+// phase_rules. Handlers map it to 409 Conflict.
+var ErrInUse = errors.New("store: in use")
+
+// ErrDuplicateName is returned when a unique name constraint is violated.
+var ErrDuplicateName = errors.New("store: duplicate name")
+
 // WorkflowRepo provides persistence for manteion-owned workflow definitions.
 //
-// Manteion holds the DEFINITION (the DSL spec); zeus holds EXECUTION
-// (runs, attacks, validation). When a workflow is started the API layer
-// inlines this definition into the proxied call to zeus.
+// Manteion holds the DEFINITION (the full DSL v2 document); zeus validates
+// and executes. Phase start materializes the definition into zeus before
+// triggering runs, so zeus's in-memory store is a cache of this table.
 type WorkflowRepo struct {
 	db *sql.DB
 }
@@ -30,28 +41,24 @@ type WorkflowFilter struct {
 	NameContains string
 }
 
-// Page is the pagination request shape — same shape as ExperimentRepo
-// so the api layer's pagination helper can drive both.
-type WorkflowPage = Page
+const workflowColumns = `id, name, version, description, dsl, created_at, updated_at`
 
 // Create inserts a new workflow definition.
 func (r *WorkflowRepo) Create(ctx context.Context, wf *model.Workflow) error {
 	if err := wf.Validate(); err != nil {
 		return err
 	}
-	targetsJSON, err := json.Marshal(wf.Targets)
-	if err != nil {
-		return fmt.Errorf("marshal targets: %w", err)
+	if wf.Version == "" {
+		wf.Version = "2"
 	}
-	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO workflows (id, name, description, targets,
-			estimated_rps_per_vu, steps, thresholds, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)`,
-		wf.ID, wf.Name, nullString(wf.Description), targetsJSON,
-		wf.EstimatedRPSPerVU,
-		jsonbBytes(wf.Steps), jsonbBytesOrNull(wf.Thresholds),
-		wf.CreatedAt,
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO workflows (id, name, version, description, dsl, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+		wf.ID, wf.Name, wf.Version, wf.Description, []byte(wf.DSL), wf.CreatedAt,
 	)
+	if isUniqueViolation(err) {
+		return fmt.Errorf("workflow name %q: %w", wf.Name, ErrDuplicateName)
+	}
 	if err != nil {
 		return fmt.Errorf("insert workflow: %w", err)
 	}
@@ -60,11 +67,9 @@ func (r *WorkflowRepo) Create(ctx context.Context, wf *model.Workflow) error {
 
 // Get returns a workflow definition by ID, or ErrNotFound.
 func (r *WorkflowRepo) Get(ctx context.Context, id string) (*model.Workflow, error) {
-	wf, err := scanWorkflowRow(r.db.QueryRowContext(ctx, `
-		SELECT id, name, description, targets, estimated_rps_per_vu,
-			steps, thresholds, created_at, updated_at
-		FROM workflows WHERE id = $1`, id))
-	if err == sql.ErrNoRows {
+	wf, err := scanWorkflow(r.db.QueryRowContext(ctx,
+		`SELECT `+workflowColumns+` FROM workflows WHERE id = $1`, id))
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -73,7 +78,7 @@ func (r *WorkflowRepo) Get(ctx context.Context, id string) (*model.Workflow, err
 	return wf, nil
 }
 
-// List returns a page of workflows + total count.
+// List returns a page of workflows + total count, newest first.
 func (r *WorkflowRepo) List(ctx context.Context, f WorkflowFilter, p Page) ([]*model.Workflow, int, error) {
 	if p.Limit <= 0 {
 		p.Limit = 20
@@ -86,9 +91,7 @@ func (r *WorkflowRepo) List(ctx context.Context, f WorkflowFilter, p Page) ([]*m
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, description, targets, estimated_rps_per_vu,
-			steps, thresholds, created_at, updated_at,
-			COUNT(*) OVER () AS total_count
+		SELECT `+workflowColumns+`, COUNT(*) OVER () AS total_count
 		FROM workflows
 		ORDER BY created_at DESC, id
 		LIMIT $1 OFFSET $2`, p.Limit, p.Offset)
@@ -102,137 +105,74 @@ func (r *WorkflowRepo) List(ctx context.Context, f WorkflowFilter, p Page) ([]*m
 		total int
 	)
 	for rows.Next() {
-		wf, t, err := scanWorkflowRowWithTotal(rows)
-		if err != nil {
-			return nil, 0, err
+		var wf model.Workflow
+		var dsl []byte
+		if err := rows.Scan(&wf.ID, &wf.Name, &wf.Version, &wf.Description, &dsl,
+			&wf.CreatedAt, &wf.UpdatedAt, &total); err != nil {
+			return nil, 0, fmt.Errorf("scan workflow row: %w", err)
 		}
-		total = t
-		out = append(out, wf)
+		wf.DSL = dsl
+		out = append(out, &wf)
 	}
 	return out, total, rows.Err()
 }
 
-// Update edits an existing workflow definition. Empty fields on the input
-// (other than Steps/Thresholds, which always overwrite) are treated as
-// "no change" so callers can PATCH without re-sending the whole row.
+// Update replaces the definition (name, version, description, dsl) and bumps
+// updated_at.
 func (r *WorkflowRepo) Update(ctx context.Context, wf *model.Workflow) error {
-	if wf.ID == "" {
-		return fmt.Errorf("update workflow: id required")
+	if err := wf.Validate(); err != nil {
+		return err
 	}
-	if len(wf.Steps) == 0 {
-		return fmt.Errorf("update workflow: steps required")
-	}
-	if len(wf.Targets) == 0 {
-		return fmt.Errorf("update workflow: targets required")
-	}
-	targetsJSON, err := json.Marshal(wf.Targets)
-	if err != nil {
-		return fmt.Errorf("marshal targets: %w", err)
+	if wf.Version == "" {
+		wf.Version = "2"
 	}
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE workflows SET
-			name                 = $2,
-			description          = $3,
-			targets              = $4,
-			estimated_rps_per_vu = $5,
-			steps                = $6,
-			thresholds           = $7,
-			updated_at           = now()
+		UPDATE workflows SET name=$2, version=$3, description=$4, dsl=$5, updated_at=$6
 		WHERE id = $1`,
-		wf.ID, wf.Name, nullString(wf.Description), targetsJSON,
-		wf.EstimatedRPSPerVU,
-		jsonbBytes(wf.Steps), jsonbBytesOrNull(wf.Thresholds),
+		wf.ID, wf.Name, wf.Version, wf.Description, []byte(wf.DSL), time.Now(),
 	)
+	if isUniqueViolation(err) {
+		return fmt.Errorf("workflow name %q: %w", wf.Name, ErrDuplicateName)
+	}
 	if err != nil {
 		return fmt.Errorf("update workflow: %w", err)
 	}
 	return affectedOrNotFound(res)
 }
 
-// Delete removes a workflow definition.
+// Delete removes a workflow definition. Returns ErrInUse when the workflow
+// is still referenced by phase_workflows (FK RESTRICT) — the experimental
+// record protects its provenance.
 func (r *WorkflowRepo) Delete(ctx context.Context, id string) error {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM workflows WHERE id = $1`, id)
+	if isFKViolation(err) {
+		return fmt.Errorf("workflow %q referenced by experiment phases: %w", id, ErrInUse)
+	}
 	if err != nil {
 		return fmt.Errorf("delete workflow: %w", err)
 	}
 	return affectedOrNotFound(res)
 }
 
-func scanWorkflowRow(scanner interface {
-	Scan(dest ...any) error
-}) (*model.Workflow, error) {
-	var (
-		wf           model.Workflow
-		desc         sql.NullString
-		targetsRaw   []byte
-		stepsRaw     []byte
-		thresholdRaw []byte
-	)
-	if err := scanner.Scan(
-		&wf.ID, &wf.Name, &desc, &targetsRaw, &wf.EstimatedRPSPerVU,
-		&stepsRaw, &thresholdRaw, &wf.CreatedAt, &wf.UpdatedAt,
-	); err != nil {
+func scanWorkflow(row *sql.Row) (*model.Workflow, error) {
+	var wf model.Workflow
+	var dsl []byte
+	if err := row.Scan(&wf.ID, &wf.Name, &wf.Version, &wf.Description, &dsl,
+		&wf.CreatedAt, &wf.UpdatedAt); err != nil {
 		return nil, err
 	}
-	wf.Description = fromNullString(desc)
-	if len(targetsRaw) > 0 {
-		if err := json.Unmarshal(targetsRaw, &wf.Targets); err != nil {
-			return nil, fmt.Errorf("decode targets: %w", err)
-		}
-	}
-	if len(stepsRaw) > 0 {
-		wf.Steps = json.RawMessage(stepsRaw)
-	}
-	if len(thresholdRaw) > 0 {
-		wf.Thresholds = json.RawMessage(thresholdRaw)
-	}
+	wf.DSL = dsl
 	return &wf, nil
 }
 
-func scanWorkflowRowWithTotal(rows *sql.Rows) (*model.Workflow, int, error) {
-	var (
-		wf           model.Workflow
-		desc         sql.NullString
-		targetsRaw   []byte
-		stepsRaw     []byte
-		thresholdRaw []byte
-		total        int
-	)
-	if err := rows.Scan(
-		&wf.ID, &wf.Name, &desc, &targetsRaw, &wf.EstimatedRPSPerVU,
-		&stepsRaw, &thresholdRaw, &wf.CreatedAt, &wf.UpdatedAt, &total,
-	); err != nil {
-		return nil, 0, fmt.Errorf("scan workflow: %w", err)
-	}
-	wf.Description = fromNullString(desc)
-	if len(targetsRaw) > 0 {
-		if err := json.Unmarshal(targetsRaw, &wf.Targets); err != nil {
-			return nil, 0, fmt.Errorf("decode targets: %w", err)
-		}
-	}
-	if len(stepsRaw) > 0 {
-		wf.Steps = json.RawMessage(stepsRaw)
-	}
-	if len(thresholdRaw) > 0 {
-		wf.Thresholds = json.RawMessage(thresholdRaw)
-	}
-	return &wf, total, nil
+// isUniqueViolation reports whether err is a Postgres unique_violation (23505).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
-// jsonbBytes returns the raw JSON bytes as-is for postgres JSONB inserts.
-// json.RawMessage already satisfies driver.Valuer, but we make the intent
-// explicit (postgres will reject empty bytes).
-func jsonbBytes(raw json.RawMessage) []byte {
-	if len(raw) == 0 {
-		return []byte("null")
-	}
-	return raw
-}
-
-// jsonbBytesOrNull returns SQL NULL when the input is empty.
-func jsonbBytesOrNull(raw json.RawMessage) any {
-	if len(raw) == 0 {
-		return nil
-	}
-	return []byte(raw)
+// isFKViolation reports whether err is a Postgres foreign_key_violation (23503).
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }

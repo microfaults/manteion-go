@@ -17,7 +17,6 @@ import (
 // Hierarchy:
 //
 //	experiments
-//	  ├── experiment_workflows  (M:N to zeus workflow ids)
 //	  └── experiment_phases     (ordered by position)
 //	        ├── phase_workflows  (per-(phase, workflow) attack config)
 //	        ├── phase_rules      (rules active during the phase)
@@ -96,7 +95,9 @@ func (r *ExperimentRepo) List(ctx context.Context, f ExperimentFilter, p Page) (
 	args := []any{p.Limit, p.Offset}
 	where := ""
 	if f.Status != "" {
-		where = "WHERE status = $3"
+		// status::text keeps the comparison graceful for unknown filter
+		// values (matches nothing) instead of a 22P02 enum-cast error.
+		where = "WHERE status::text = $3"
 		args = append(args, f.Status)
 	}
 
@@ -217,58 +218,6 @@ func scanExperimentRow(scanner interface {
 	exp.StartedAt = nullTimeToPtr(startedAt)
 	exp.CompletedAt = nullTimeToPtr(completedAt)
 	return &exp, nil
-}
-
-// =========================================================================
-// ExperimentWorkflow (M:N)
-// =========================================================================
-
-// AttachWorkflows replaces the experiment_workflows rows for a given
-// experiment with the supplied list. Position is assigned from slice index.
-// Done in a transaction so callers see an atomic swap.
-func (r *ExperimentRepo) AttachWorkflows(ctx context.Context, experimentID string, workflowIDs []string) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM experiment_workflows WHERE experiment_id = $1`, experimentID); err != nil {
-		return fmt.Errorf("clear experiment_workflows: %w", err)
-	}
-	for i, wf := range workflowIDs {
-		if wf == "" {
-			return fmt.Errorf("attach workflows: empty workflow_id at position %d", i)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO experiment_workflows (experiment_id, workflow_id, position)
-			VALUES ($1, $2, $3)`, experimentID, wf, i); err != nil {
-			return fmt.Errorf("insert experiment_workflow: %w", err)
-		}
-	}
-	return tx.Commit()
-}
-
-// ListWorkflowsForExperiment returns workflow ids in position order.
-func (r *ExperimentRepo) ListWorkflowsForExperiment(ctx context.Context, experimentID string) ([]model.ExperimentWorkflow, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT experiment_id, workflow_id, position
-		FROM experiment_workflows
-		WHERE experiment_id = $1
-		ORDER BY position`, experimentID)
-	if err != nil {
-		return nil, fmt.Errorf("list experiment workflows: %w", err)
-	}
-	defer rows.Close()
-	var out []model.ExperimentWorkflow
-	for rows.Next() {
-		var w model.ExperimentWorkflow
-		if err := rows.Scan(&w.ExperimentID, &w.WorkflowID, &w.Position); err != nil {
-			return nil, fmt.Errorf("scan experiment workflow: %w", err)
-		}
-		out = append(out, w)
-	}
-	return out, rows.Err()
 }
 
 // =========================================================================
@@ -644,53 +593,6 @@ func (r *ExperimentRepo) ListServiceLatencyForPhase(ctx context.Context, phaseID
 			&res.LatencyP99Us, &res.RequestCount, &res.ComputedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan phase_service_latency: %w", err)
-		}
-		out = append(out, &res)
-	}
-	return out, rows.Err()
-}
-
-// UpsertServiceResources inserts or updates a (phase, service) row.
-func (r *ExperimentRepo) UpsertServiceResources(ctx context.Context, res *model.PhaseServiceResources) error {
-	if err := res.Validate(); err != nil {
-		return err
-	}
-	if res.ComputedAt.IsZero() {
-		res.ComputedAt = time.Now()
-	}
-	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO phase_service_resources (phase_id, service, cpu_millicores,
-			memory_mb, computed_at)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (phase_id, service) DO UPDATE SET
-			cpu_millicores = EXCLUDED.cpu_millicores,
-			memory_mb      = EXCLUDED.memory_mb,
-			computed_at    = EXCLUDED.computed_at`,
-		res.PhaseID, res.Service, res.CPUMillicores, res.MemoryMB, res.ComputedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert phase_service_resources: %w", err)
-	}
-	return nil
-}
-
-// ListServiceResourcesForPhase returns per-service resource rows for a phase.
-func (r *ExperimentRepo) ListServiceResourcesForPhase(ctx context.Context, phaseID string) ([]*model.PhaseServiceResources, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT phase_id, service, cpu_millicores, memory_mb, computed_at
-		FROM phase_service_resources WHERE phase_id = $1
-		ORDER BY service`, phaseID)
-	if err != nil {
-		return nil, fmt.Errorf("list phase_service_resources: %w", err)
-	}
-	defer rows.Close()
-	var out []*model.PhaseServiceResources
-	for rows.Next() {
-		var res model.PhaseServiceResources
-		if err := rows.Scan(
-			&res.PhaseID, &res.Service, &res.CPUMillicores, &res.MemoryMB, &res.ComputedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan phase_service_resources: %w", err)
 		}
 		out = append(out, &res)
 	}

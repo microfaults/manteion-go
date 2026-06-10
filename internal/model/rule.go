@@ -24,16 +24,12 @@ type Rule struct {
 	Match       MatchCriteria `json:"match"`
 	Action      RuleAction    `json:"action"`
 	Mode        string        `json:"mode"`                   // "inline" or "background"
-	MatchExpr   string        `json:"match_expr,omitempty"`   // Opaque OPA-rego text. Not validated, not evaluated by SDK.
 	StartPolicy string        `json:"start_policy,omitempty"` // "deduplicate_by_rule" (default) | "always_start"
 	CreatedAt   time.Time     `json:"created_at"`
 	UpdatedAt   time.Time     `json:"updated_at"`
 }
 
-var validStartPolicies = map[string]bool{
-	"deduplicate_by_rule": true,
-	"always_start":        true,
-}
+var validStartPolicies = setOf(StartPolicyValues...)
 
 // RuleAction is a discriminated union: exactly one of FaultSpecID,
 // FaultCompID, or CacheBox must be set, matching Type.
@@ -44,9 +40,7 @@ type RuleAction struct {
 	CacheBox    *CacheBoxRuleConfig `json:"cachebox,omitempty"`             // when type=cachebox
 }
 
-var validRuleActionTypes = map[string]bool{
-	"fault_spec": true, "fault_composition": true, "cachebox": true,
-}
+var validRuleActionTypes = setOf(RuleActionTypeValues...)
 
 func (a *RuleAction) Validate() error {
 	if !validRuleActionTypes[a.Type] {
@@ -87,12 +81,8 @@ type CacheBoxRuleConfig struct {
 }
 
 var (
-	validCacheBoxRuleModes = map[string]bool{
-		"passthrough": true, "replay": true, "replay_with_delay": true,
-	}
-	validCacheBoxKeyStrategies = map[string]bool{
-		"exact": true, "exact_with_host": true, "exact_with_body": true,
-	}
+	validCacheBoxRuleModes     = setOf(CacheBoxModeValues...)
+	validCacheBoxKeyStrategies = setOf(CacheBoxKeyStrategyValues...)
 )
 
 func (c *CacheBoxRuleConfig) Validate() error {
@@ -141,9 +131,8 @@ type MatchCriteria struct {
 	Labels         map[string]string `json:"labels,omitempty"`          // AND semantics
 }
 
-var validInjectionPoints = map[string]bool{
-	"": true, "ingress": true, "egress": true, "transient": true, "custom": true,
-}
+// "" is allowed at the model layer (NULL column = match any point).
+var validInjectionPoints = setOf(append([]string{""}, InjectionPointValues...)...)
 
 func (m *MatchCriteria) Validate() error {
 	if !validInjectionPoints[m.InjectionPoint] {

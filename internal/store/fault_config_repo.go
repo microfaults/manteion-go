@@ -19,18 +19,24 @@ func NewFaultConfigRepo(db *sql.DB) *FaultConfigRepo {
 }
 
 const faultConfigColumns = `id, name, description, service, category, fault_type,
-	fault_request, fault_composition_id, duration_ms, experiment_run_id,
-	status, created_at, updated_at, fired_at, completed_at`
+	params, network, fault_composition_id, duration_ms, ramp_up_ms, ramp_down_ms,
+	phase_id, status, created_at, updated_at, fired_at, completed_at`
 
 func scanFaultConfig(s interface{ Scan(...any) error }) (*model.FaultConfig, error) {
 	var f model.FaultConfig
+	var networkJSON []byte
 	err := s.Scan(
 		&f.ID, &f.Name, &f.Description, &f.Service, &f.Category, &f.FaultType,
-		&f.FaultReq, &f.FaultCompositionID, &f.DurationMs, &f.ExperimentRunID,
-		&f.Status, &f.CreatedAt, &f.UpdatedAt, &f.FiredAt, &f.CompletedAt,
+		&f.Params, &networkJSON, &f.FaultCompositionID, &f.DurationMs, &f.RampUpMs, &f.RampDownMs,
+		&f.PhaseID, &f.Status, &f.CreatedAt, &f.UpdatedAt, &f.FiredAt, &f.CompletedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if networkJSON != nil {
+		if err := jsonbScan(networkJSON, &f.Network); err != nil {
+			return nil, fmt.Errorf("unmarshal fault config network: %w", err)
+		}
 	}
 	return &f, nil
 }
@@ -49,15 +55,24 @@ func scanFaultConfigs(rows *sql.Rows) ([]*model.FaultConfig, error) {
 }
 
 func (r *FaultConfigRepo) Create(ctx context.Context, f *model.FaultConfig) error {
+	var network any
+	if f.Network != nil {
+		b, err := jsonbMarshal(f.Network)
+		if err != nil {
+			return fmt.Errorf("marshal fault config network: %w", err)
+		}
+		network = b
+	}
 	err := r.db.QueryRowContext(ctx, `
 		INSERT INTO fault_configs (
 			id, name, description, service, category, fault_type,
-			fault_request, fault_composition_id, duration_ms, experiment_run_id,
-			status, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now(), now())
+			params, network, fault_composition_id, duration_ms, ramp_up_ms, ramp_down_ms,
+			phase_id, status, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now(), now())
 		RETURNING created_at, updated_at`,
 		f.ID, f.Name, f.Description, f.Service, f.Category, f.FaultType,
-		f.FaultReq, f.FaultCompositionID, f.DurationMs, f.ExperimentRunID, string(f.Status),
+		f.Params, network, f.FaultCompositionID, f.DurationMs, f.RampUpMs, f.RampDownMs,
+		f.PhaseID, string(f.Status),
 	).Scan(&f.CreatedAt, &f.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("create fault config: %w", err)
@@ -83,7 +98,7 @@ func (r *FaultConfigRepo) List(ctx context.Context, service string, status model
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+faultConfigColumns+` FROM fault_configs
 		WHERE ($1 = '' OR service = $1)
-		  AND ($2 = '' OR status = $2)
+		  AND ($2 = '' OR status::text = $2)
 		ORDER BY created_at DESC`,
 		service, string(status),
 	)

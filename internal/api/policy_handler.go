@@ -1,3 +1,7 @@
+// Policy rules are WIP-frozen (deprecated until the phase-aware rebuild):
+// the CRUD endpoints below keep working so definitions survive, but the
+// evaluation engine is disabled by default (MANTEION_POLICY_ENGINE=off).
+// See docs/decisions/2026-06-policy-engine-freeze.md.
 package api
 
 import (

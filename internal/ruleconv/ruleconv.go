@@ -1,10 +1,29 @@
+// Package ruleconv compiles model.Rule + FaultSpec/FaultComposition rows into
+// the wire format served to SDKs. The wire structs themselves are defined in
+// atropos-go (CompiledRule, FaultRequest, NetworkEnvelope, ...) and imported
+// here — both ends of the manteion↔SDK contract marshal the same types, so
+// the field set cannot drift. This package's job is purely resolution:
+// inlining spec/composition references so the SDK constructs evaluator rules
+// without further lookups.
 package ruleconv
 
 import (
-	"encoding/json"
 	"fmt"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/model"
+)
+
+// Wire-type aliases so downstream packages (api, atrocontrol, policy) can
+// keep referring to ruleconv.Compiled* without importing the SDK module.
+type (
+	CompiledRule              = atroposdk.CompiledRule
+	CompiledFault             = atroposdk.CompiledFault // = atroposdk.FaultRequest
+	CompiledCacheBox          = atroposdk.CompiledCacheBox
+	CompiledNetworkEnvelope   = atroposdk.NetworkEnvelope
+	CompiledComposition       = atroposdk.CompiledComposition
+	CompiledCompositionMember = atroposdk.CompiledCompositionMember
 )
 
 // FaultSpecResolver looks up a FaultSpec by ID.
@@ -15,77 +34,6 @@ type FaultSpecResolver interface {
 // FaultCompositionResolver looks up a FaultComposition by ID.
 type FaultCompositionResolver interface {
 	GetFaultComposition(id string) (*model.FaultComposition, error)
-}
-
-// CompiledRule is the wire format for resolved rules served to SDKs.
-// It inlines fault config so the SDK can construct evaluator rules
-// without additional lookups. This exists because atroposdk.StaticRule's
-// Decision.Fault is a Go interface that can't survive JSON roundtrip.
-//
-// Exactly one of Fault, Composition, or CacheBox must be set.
-type CompiledRule struct {
-	Name           string               `json:"name"`
-	InjectionPoint string               `json:"injection_point,omitempty"`
-	Labels         map[string]string    `json:"labels,omitempty"`
-	Mode           string               `json:"mode"`
-	Priority       int                  `json:"priority"`
-	StartPolicy    string               `json:"start_policy,omitempty"`
-	MatchExpr      string               `json:"match_expr,omitempty"` // Forwarded to SDKs; currently ignored by atropos-go's evaluator.
-	Fault          *CompiledFault       `json:"fault,omitempty"`
-	Composition    *CompiledComposition `json:"composition,omitempty"`
-	CacheBox       *CompiledCacheBox    `json:"cachebox,omitempty"`
-}
-
-// CompiledCacheBox is a resolved cache-box action for a rule.
-type CompiledCacheBox struct {
-	Mode        string `json:"mode"`         // "passthrough" | "replay" | "replay_with_delay"
-	KeyStrategy string `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
-}
-
-// CompiledFault is a resolved FaultSpec on the wire.
-//
-// The category determines which sibling field is populated:
-//   - "inline"   → Params holds the toxic-specific params; no envelope.
-//   - "network"  → Network envelope holds host/target/direction/scope;
-//     Params holds the toxic-specific params.
-//   - "resource" → Params holds the toxic-specific params; no envelope.
-type CompiledFault struct {
-	Category   string `json:"category"`
-	FaultType  string `json:"fault_type"`
-	DurationMs int64  `json:"duration_ms,omitempty"`
-	RampUpMs   int64  `json:"ramp_up_ms,omitempty"`
-	RampDownMs int64  `json:"ramp_down_ms,omitempty"`
-
-	Network *CompiledNetworkEnvelope `json:"network,omitempty"`
-	Params  json.RawMessage          `json:"params,omitempty"`
-}
-
-// CompiledNetworkEnvelope is the network-category-only envelope on the wire.
-// Matches atropos-go's NetworkEnvelope.
-type CompiledNetworkEnvelope struct {
-	Host      string  `json:"host"`
-	Target    string  `json:"target,omitempty"`
-	Direction string  `json:"direction,omitempty"`
-	Scope     float64 `json:"scope,omitempty"`
-}
-
-// CompiledComposition is a resolved FaultComposition tree with all specs inlined.
-// ExecutionMode and member Direction are plain strings (not model.ExecutionMode /
-// model.Direction) to decouple the wire contract from internal Go type refactors.
-type CompiledComposition struct {
-	Name          string                      `json:"name"`
-	ExecutionMode string                      `json:"execution_mode"`
-	DurationMs    int64                       `json:"duration_ms,omitempty"`
-	RampUpMs      int64                       `json:"ramp_up_ms,omitempty"`
-	RampDownMs    int64                       `json:"ramp_down_ms,omitempty"`
-	Members       []CompiledCompositionMember `json:"members"`
-}
-
-// CompiledCompositionMember is a resolved member — either a leaf fault or a nested composition.
-type CompiledCompositionMember struct {
-	Direction   string               `json:"direction,omitempty"`
-	Fault       *CompiledFault       `json:"fault,omitempty"`
-	Composition *CompiledComposition `json:"composition,omitempty"`
 }
 
 // CompileRules resolves FaultSpec/Composition references and produces wire-ready compiled rules.
@@ -126,7 +74,6 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 		Mode:           r.Mode,
 		Priority:       r.Priority,
 		StartPolicy:    r.StartPolicy,
-		MatchExpr:      r.MatchExpr,
 	}
 
 	switch r.Action.Type {

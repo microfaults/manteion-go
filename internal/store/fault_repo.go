@@ -20,36 +20,35 @@ func NewFaultRepo(db *sql.DB) *FaultRepo {
 
 // --- FaultSpec ---
 
+// specParams coalesces absent params to the empty object — the column is
+// NOT NULL and an absent params set means "all defaults" (faultcatalog
+// validates the same way).
+func specParams(p []byte) []byte {
+	if len(p) == 0 || string(p) == "null" {
+		return []byte("{}")
+	}
+	return p
+}
+
 // CreateSpec inserts a new atomic fault specification.
 func (r *FaultRepo) CreateSpec(ctx context.Context, spec *model.FaultSpec) error {
 	if err := spec.Validate(); err != nil {
 		return err
 	}
 
-	var target, direction sql.NullString
-	var scope sql.NullFloat64
-	if spec.Network != nil {
-		if spec.Network.Target != "" {
-			target = sql.NullString{String: spec.Network.Target, Valid: true}
-		}
-		if spec.Network.Direction != "" {
-			direction = sql.NullString{String: spec.Network.Direction, Valid: true}
-		}
-		if spec.Network.Scope > 0 {
-			scope = sql.NullFloat64{Float64: spec.Network.Scope, Valid: true}
-		}
+	network, err := networkJSON(spec.Network)
+	if err != nil {
+		return err
 	}
 
-	_, err := r.db.ExecContext(ctx, `
+	_, err = r.db.ExecContext(ctx, `
 		INSERT INTO fault_specs (
-			id, name, category, fault_type, host, params, description,
-			network_target, network_direction, network_scope,
+			id, name, category, fault_type, host, params, description, network,
 			duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		spec.ID, spec.Name, spec.Category, spec.FaultType,
-		nullString(spec.Host), spec.Params, spec.Description,
-		target, direction, scope,
+		nullString(spec.Host), specParams(spec.Params), spec.Description, network,
 		spec.DurationMs, spec.RampUpMs, spec.RampDownMs, spec.CreatedAt,
 	)
 	if err != nil {
@@ -65,30 +64,19 @@ func (r *FaultRepo) UpdateSpec(ctx context.Context, spec *model.FaultSpec) error
 		return err
 	}
 
-	var target, direction sql.NullString
-	var scope sql.NullFloat64
-	if spec.Network != nil {
-		if spec.Network.Target != "" {
-			target = sql.NullString{String: spec.Network.Target, Valid: true}
-		}
-		if spec.Network.Direction != "" {
-			direction = sql.NullString{String: spec.Network.Direction, Valid: true}
-		}
-		if spec.Network.Scope > 0 {
-			scope = sql.NullFloat64{Float64: spec.Network.Scope, Valid: true}
-		}
+	network, err := networkJSON(spec.Network)
+	if err != nil {
+		return err
 	}
 
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE fault_specs SET
 			name=$1, category=$2, fault_type=$3, host=$4, params=$5, description=$6,
-			network_target=$7, network_direction=$8, network_scope=$9,
-			duration_ms=$10, ramp_up_ms=$11, ramp_down_ms=$12
-		WHERE id=$13`,
+			network=$7, duration_ms=$8, ramp_up_ms=$9, ramp_down_ms=$10
+		WHERE id=$11`,
 		spec.Name, spec.Category, spec.FaultType,
-		nullString(spec.Host), spec.Params, spec.Description,
-		target, direction, scope,
-		spec.DurationMs, spec.RampUpMs, spec.RampDownMs,
+		nullString(spec.Host), specParams(spec.Params), spec.Description,
+		network, spec.DurationMs, spec.RampUpMs, spec.RampDownMs,
 		spec.ID,
 	)
 	if err != nil {
@@ -100,16 +88,15 @@ func (r *FaultRepo) UpdateSpec(ctx context.Context, spec *model.FaultSpec) error
 // GetSpec returns a fault spec by ID, or ErrNotFound.
 func (r *FaultRepo) GetSpec(ctx context.Context, id string) (*model.FaultSpec, error) {
 	var spec model.FaultSpec
-	var host, target, direction sql.NullString
-	var scope sql.NullFloat64
+	var host sql.NullString
+	var networkRaw []byte
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, name, category, fault_type, host, params, description,
-			network_target, network_direction, network_scope,
+		SELECT id, name, category, fault_type, host, params, description, network,
 			duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		FROM fault_specs WHERE id = $1`, id,
 	).Scan(
 		&spec.ID, &spec.Name, &spec.Category, &spec.FaultType, &host, &spec.Params, &spec.Description,
-		&target, &direction, &scope,
+		&networkRaw,
 		&spec.DurationMs, &spec.RampUpMs, &spec.RampDownMs, &spec.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -119,15 +106,18 @@ func (r *FaultRepo) GetSpec(ctx context.Context, id string) (*model.FaultSpec, e
 		return nil, fmt.Errorf("get fault_spec: %w", err)
 	}
 	spec.Host = fromNullString(host)
-	hydrateNetworkEnvelope(&spec, target, direction, scope)
+	if networkRaw != nil {
+		if err := jsonbScan(networkRaw, &spec.Network); err != nil {
+			return nil, fmt.Errorf("unmarshal fault_spec network: %w", err)
+		}
+	}
 	return &spec, nil
 }
 
 // ListSpecs returns all fault specifications.
 func (r *FaultRepo) ListSpecs(ctx context.Context) ([]*model.FaultSpec, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, category, fault_type, host, params, description,
-			network_target, network_direction, network_scope,
+		SELECT id, name, category, fault_type, host, params, description, network,
 			duration_ms, ramp_up_ms, ramp_down_ms, created_at
 		FROM fault_specs ORDER BY created_at`)
 	if err != nil {
@@ -138,41 +128,39 @@ func (r *FaultRepo) ListSpecs(ctx context.Context) ([]*model.FaultSpec, error) {
 	var result []*model.FaultSpec
 	for rows.Next() {
 		var spec model.FaultSpec
-		var host, target, direction sql.NullString
-		var scope sql.NullFloat64
+		var host sql.NullString
+		var networkRaw []byte
 		err := rows.Scan(
 			&spec.ID, &spec.Name, &spec.Category, &spec.FaultType, &host, &spec.Params, &spec.Description,
-			&target, &direction, &scope,
+			&networkRaw,
 			&spec.DurationMs, &spec.RampUpMs, &spec.RampDownMs, &spec.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan fault_spec: %w", err)
 		}
 		spec.Host = fromNullString(host)
-		hydrateNetworkEnvelope(&spec, target, direction, scope)
+		if networkRaw != nil {
+			if err := jsonbScan(networkRaw, &spec.Network); err != nil {
+				return nil, fmt.Errorf("unmarshal fault_spec network: %w", err)
+			}
+		}
 		result = append(result, &spec)
 	}
 	return result, rows.Err()
 }
 
-// hydrateNetworkEnvelope populates spec.Network from nullable columns iff
-// any envelope field is set. Keeps Network=nil for non-network specs so
-// JSON omits the field instead of emitting "network":{}.
-func hydrateNetworkEnvelope(spec *model.FaultSpec, target, direction sql.NullString, scope sql.NullFloat64) {
-	if !target.Valid && !direction.Valid && !scope.Valid {
-		return
+// networkJSON marshals an optional network envelope for the JSONB column,
+// returning nil (SQL NULL) when absent so non-network specs keep network
+// IS NULL (the category/network CHECK depends on it).
+func networkJSON(n *model.NetworkEnvelope) (any, error) {
+	if n == nil {
+		return nil, nil
 	}
-	env := &model.NetworkEnvelope{}
-	if target.Valid {
-		env.Target = target.String
+	b, err := jsonbMarshal(n)
+	if err != nil {
+		return nil, fmt.Errorf("marshal network envelope: %w", err)
 	}
-	if direction.Valid {
-		env.Direction = direction.String
-	}
-	if scope.Valid {
-		env.Scope = scope.Float64
-	}
-	spec.Network = env
+	return b, nil
 }
 
 // DeleteSpec removes a fault spec by ID. Fails if referenced by a rule.

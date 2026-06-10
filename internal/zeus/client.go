@@ -74,6 +74,83 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
+// workflowEnvelope is the request body for zeus's workflow register and
+// stateless validate endpoints: {"workflow": <DSL v2 doc>, "overwrite"?: bool}.
+type workflowEnvelope struct {
+	Workflow  json.RawMessage `json:"workflow"`
+	Overwrite bool            `json:"overwrite,omitempty"`
+}
+
+// ValidateWorkflowDoc runs a DSL v2 document through zeus's stateless
+// validator (POST /api/v1/workflows/validate) without registering it.
+// Returns nil when valid; a descriptive error carrying zeus's message when
+// invalid; and a transport error when zeus is unreachable (callers fail
+// closed — zeus owns DSL semantics, manteion does not guess).
+func (c *Client) ValidateWorkflowDoc(ctx context.Context, doc json.RawMessage) error {
+	body, err := json.Marshal(workflowEnvelope{Workflow: doc})
+	if err != nil {
+		return fmt.Errorf("zeus: marshal workflow doc: %w", err)
+	}
+	resp, err := c.Do(ctx, http.MethodPost, "/workflows/validate", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	var ve struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &ve)
+	if ve.Error != "" {
+		return fmt.Errorf("workflow validation failed: %s", ve.Error)
+	}
+	return fmt.Errorf("zeus: validate workflow: status %d: %s", resp.StatusCode, raw)
+}
+
+// RegisterWorkflow materializes a manteion-owned definition into zeus's
+// in-memory store (POST /api/v1/workflows with overwrite). Called before
+// triggering runs so zeus always has the current definition; the document
+// must carry the manteion id/name so both systems share workflow identity.
+func (c *Client) RegisterWorkflow(ctx context.Context, doc json.RawMessage) error {
+	body, err := json.Marshal(workflowEnvelope{Workflow: doc, Overwrite: true})
+	if err != nil {
+		return fmt.Errorf("zeus: marshal workflow doc: %w", err)
+	}
+	resp, err := c.Do(ctx, http.MethodPost, "/workflows", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("zeus: register workflow: status %d: %s", resp.StatusCode, raw)
+	}
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// DeleteWorkflow removes a workflow from zeus's in-memory store. A 404 is
+// tolerated (zeus restarts empty); other failures surface so callers can
+// decide whether materialization may proceed.
+func (c *Client) DeleteWorkflow(ctx context.Context, id string) error {
+	resp, err := c.Do(ctx, http.MethodDelete, "/workflows/"+id, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK, http.StatusNotFound:
+		return nil
+	default:
+		return fmt.Errorf("zeus: delete workflow %q: status %d", id, resp.StatusCode)
+	}
+}
+
 // AttackTargetSpec matches zeus's attacker.TargetSpec JSON schema.
 type AttackTargetSpec struct {
 	URL     string            `json:"url"`

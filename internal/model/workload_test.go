@@ -48,9 +48,10 @@ func TestAttackResult_Validate(t *testing.T) {
 		result  AttackResult
 		wantErr bool
 	}{
-		{"valid", AttackResult{AttackID: "a1", Service: "frontend"}, false},
-		{"missing attack_id", AttackResult{Service: "frontend"}, true},
-		{"missing service", AttackResult{AttackID: "a1"}, true},
+		{"valid", AttackResult{ID: "atkres-1", AttackID: "a1", Service: "frontend"}, false},
+		{"missing id", AttackResult{AttackID: "a1", Service: "frontend"}, true},
+		{"missing attack_id", AttackResult{ID: "atkres-1", Service: "frontend"}, true},
+		{"missing service", AttackResult{ID: "atkres-1", AttackID: "a1"}, true},
 	}
 
 	for _, tt := range tests {
