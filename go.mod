@@ -3,7 +3,7 @@ module manteion-go
 go 1.25.5
 
 require (
-	git.ucsc.edu/microfaults/atropos-go v0.0.8-0.20260518024008-a1ba3ac6313f
+	git.ucsc.edu/microfaults/atropos-go v0.0.8-alpha.a1ba3ac.0.20260610083310-fd494e89b43a
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.4
 )
