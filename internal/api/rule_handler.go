@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -45,7 +46,7 @@ func (s *Server) handleCreateRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("rule created", "id", rule.ID, "service", rule.Service)
-	s.broadcastRulesChanged(r, rule.Service)
+	s.broadcastRulesChanged(r.Context(), rule.Service)
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -131,7 +132,7 @@ func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("rule updated", "id", id)
-	s.broadcastRulesChanged(r, rule.Service)
+	s.broadcastRulesChanged(r.Context(), rule.Service)
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -171,19 +172,25 @@ func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("rule deleted", "id", id)
-	s.broadcastRulesChanged(r, service)
+	s.broadcastRulesChanged(r.Context(), service)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// broadcastRulesChanged reads the current rule version and broadcasts a
-// rules_changed SSE event to all subscribers for service. Best-effort: if
-// Version() fails, no event is sent (the SDK will still catch up on next poll).
-func (s *Server) broadcastRulesChanged(r *http.Request, service string) {
+// broadcastRulesChanged reads the current rule version and pushes a
+// rules_changed SSE event to every subscriber of each given service.
+// Best-effort: if the broker is absent or Version() fails, no event is sent
+// (SDKs still catch up on their next poll). This is the broadcast primitive
+// shared by the rule handlers (which bump the version inside the repo) and the
+// bumpAndBroadcast path (the explicit-bump callers).
+func (s *Server) broadcastRulesChanged(ctx context.Context, services ...string) {
 	if s.broker == nil {
 		s.logger.Warn("broadcastRulesChanged: broker not initialized; rule-change events will not be broadcast")
 		return
 	}
-	newVersion, err := s.rules.Version(r.Context())
+	if len(services) == 0 {
+		return
+	}
+	newVersion, err := s.rules.Version(ctx)
 	if err != nil {
 		s.logger.Warn("broadcastRulesChanged: read version failed", "error", err)
 		return
@@ -193,10 +200,32 @@ func (s *Server) broadcastRulesChanged(r *http.Request, service string) {
 		s.logger.Warn("broadcastRulesChanged: marshal event data failed", "error", err)
 		return
 	}
-	s.broker.Broadcast(service, Event{
-		Type: "rules_changed",
-		Data: string(data),
-	})
+	for _, service := range services {
+		if service == "" {
+			continue
+		}
+		s.broker.Broadcast(service, Event{
+			Type: "rules_changed",
+			Data: string(data),
+		})
+	}
+}
+
+// bumpAndBroadcast increments the desired-state rule_version and then nudges
+// each affected service over SSE. It is the single entry point for the
+// desired-state mutations that bump the version OUTSIDE the rule repo —
+// fault-config fire/cancel and the reaper — so they keep the SSE fast-path
+// consistent with the poll path instead of bumping the version silently.
+// (Rule create/update/delete bump inside the repo and then call
+// broadcastRulesChanged directly; the orchestrator delivers via atrocontrol
+// push fanout and never touches rule_version, so it is out of this path.)
+// Best-effort: failures are logged, not fatal.
+func (s *Server) bumpAndBroadcast(ctx context.Context, services ...string) {
+	if err := s.rules.BumpVersion(ctx); err != nil {
+		s.logger.Warn("bumpAndBroadcast: bump version failed", "error", err)
+		return
+	}
+	s.broadcastRulesChanged(ctx, services...)
 }
 
 // generateID mints a "{prefix}-{uuidv7}" entity id (see internal/id).

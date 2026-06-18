@@ -97,10 +97,9 @@ func (s *Server) handleFireFaultConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Bump the desired-state version so the next poll returns 200 and the SDK
-	// reconciles the new fault into its active set.
-	if err := s.rules.BumpVersion(ctx); err != nil {
-		s.logger.Warn("fire fault config: bump version failed", "id", id, "error", err)
-	}
+	// reconciles the new fault into its active set, and nudge the service's SSE
+	// subscribers so they re-poll immediately instead of waiting for the tick.
+	s.bumpAndBroadcast(ctx, cfg.Service)
 	s.logger.Info("fault config fired", "id", id, "service", cfg.Service)
 
 	fired, err := s.faultConfigs.Get(ctx, id)
@@ -135,9 +134,7 @@ func (s *Server) handleCancelFaultConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to cancel fault config")
 		return
 	}
-	if err := s.rules.BumpVersion(ctx); err != nil {
-		s.logger.Warn("cancel fault config: bump version failed", "id", id, "error", err)
-	}
+	s.bumpAndBroadcast(ctx, cfg.Service)
 	s.logger.Info("fault config cancelled", "id", id, "service", cfg.Service)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": model.FaultConfigCancelled})
 }
