@@ -28,8 +28,27 @@ type migration struct {
 // workflow definitions, the attacks definition/execution split, native enum
 // types for stable vocabularies, and the unified fault wire schema
 // (params + network JSONB mirroring atropos-go's FaultRequest).
+
+// migration2 adds the phase fault-event audit trail (run-details backend).
+const migration2 = `
+CREATE TYPE fault_event_source AS ENUM ('rule', 'cachebox', 'fault_config');
+
+CREATE TABLE phase_fault_events (
+    id         TEXT PRIMARY KEY,
+    phase_id   TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    source     fault_event_source NOT NULL,
+    service    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    detail     JSONB NOT NULL DEFAULT '{}',
+    started_at TIMESTAMPTZ NOT NULL, -- caller-supplied; no default
+    ended_at   TIMESTAMPTZ
+);
+CREATE INDEX idx_phase_fault_events_phase ON phase_fault_events(phase_id, started_at);
+`
+
 var migrations = []migration{
 	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
+	{2, "phase_fault_events audit trail + fault_event_source enum", migration2},
 }
 
 // Migrate applies any pending migrations to the database.
