@@ -46,6 +46,7 @@ type Orchestrator struct {
 	prom        *promql.Client // reserved for metric-driven transitions (see policy-engine freeze decision)
 	zeusClient  *zeus.Client
 	cacheStore  *cachestore.Store
+	faultEvents *store.PhaseFaultEventRepo
 	logger      *slog.Logger
 
 	maxPollDuration time.Duration
@@ -68,6 +69,7 @@ func New(
 	prom *promql.Client,
 	zeusClient *zeus.Client,
 	cs *cachestore.Store,
+	faultEvents *store.PhaseFaultEventRepo,
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
@@ -80,6 +82,7 @@ func New(
 		prom:            prom,
 		zeusClient:      zeusClient,
 		cacheStore:      cs,
+		faultEvents:     faultEvents,
 		logger:          logger,
 		maxPollDuration: defaultMaxPollDuration,
 		pollInterval:    defaultZeusPollInterval,

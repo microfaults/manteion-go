@@ -105,7 +105,7 @@ func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 		zc = zeus.NewClient(zeusURL)
 	}
 	o := New(testExpRepo, testRuleRepo, testFaultRepo, testWorkloadRepo, testWorkflowRepo,
-		controller, nil, zc, cachestore.New(t.TempDir()), logger)
+		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB), logger)
 	o.WithPollInterval(50 * time.Millisecond)
 	o.WithMaxPollDuration(15 * time.Second)
 	return o
@@ -584,5 +584,82 @@ func TestRecover(t *testing.T) {
 	}
 	if got := getExp(t, expB.ID); got.Status != "running" {
 		t.Errorf("B experiment status %q, want running", got.Status)
+	}
+}
+
+func TestPhaseFaultEventsAuditTrail(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "") // no zeus → driver-less phases auto-complete
+	feRepo := store.NewPhaseFaultEventRepo(testDB)
+	exp, _ := mkExperiment(t, 1) // phase 0 is bare (no frozen services)
+
+	// Add a second phase that freezes a service, so enterPhase records a
+	// cachebox event that finishPhase must then close.
+	fp := &model.ExperimentPhase{
+		ID: id.New("phase"), ExperimentID: exp.ID, Name: "frozen", Position: 1, Status: "pending",
+		FrozenServices: []model.CacheBoxConfig{{Service: "frontend", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
+	}
+	if err := testExpRepo.CreatePhase(ctx, fp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attach a cachebox-action rule to fp so recordRuleEvents fires.
+	// A cachebox rule needs no FaultSpec, and ruleKind returns "rule" for it.
+	rule := &model.Rule{
+		ID:      id.New("rule"),
+		Name:    "audit-rule",
+		Service: "frontend",
+		Enabled: true,
+		Match:   model.MatchCriteria{},
+		Action: model.RuleAction{
+			Type:     "cachebox",
+			CacheBox: &model.CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: "exact"},
+		},
+		Mode:      "inline",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := testRuleRepo.Create(ctx, rule); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rule.ID) })
+	if err := testExpRepo.AttachPhaseRules(ctx, fp.ID, []string{rule.ID}); err != nil {
+		t.Fatalf("attach rule: %v", err)
+	}
+
+	if err := o.StartExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor(t, "experiment completed", 10*time.Second, func() bool {
+		return getExp(t, exp.ID).Status == "completed"
+	})
+
+	events, err := feRepo.ListForPhase(ctx, fp.ID)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("expected fault events for frozen phase, got %d err=%v", len(events), err)
+	}
+
+	var hasCachebox, hasRule bool
+	for _, e := range events {
+		if e.Service != "frontend" {
+			t.Errorf("unexpected service on event: %+v", e)
+		}
+		if e.EndedAt == nil {
+			t.Errorf("event %s (source=%s) not closed after phase completion", e.ID, e.Source)
+		}
+		switch e.Source {
+		case "cachebox":
+			hasCachebox = true
+		case "rule":
+			hasRule = true
+		default:
+			t.Errorf("unexpected event source %q: %+v", e.Source, e)
+		}
+	}
+	if !hasCachebox {
+		t.Error("no cachebox event recorded for frozen phase")
+	}
+	if !hasRule {
+		t.Error("no rule event recorded for attached rule")
 	}
 }

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -113,9 +114,15 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	// Freeze is idempotent (intent-tracked), so re-freezing on resume is
 	// safe and re-asserts the desired state.
 	o.freezeServices(ctx, p)
+	if fresh {
+		o.recordFreezeEvents(ctx, p)
+	}
 
 	if err := o.pushPhaseRules(ctx, p); err != nil {
 		return fail(fmt.Errorf("orchestrator: push phase rules: %w", err))
+	}
+	if fresh {
+		o.recordRuleEvents(ctx, p)
 	}
 
 	if err := o.materializePhaseWorkflows(ctx, p.ID); err != nil {
@@ -197,6 +204,12 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 		}
 	}
 	o.thawServices(ctx, p)
+
+	if o.faultEvents != nil {
+		if err := o.faultEvents.EndOpenForPhase(ctx, phaseID, time.Now()); err != nil {
+			o.logger.Warn("orchestrator: close fault events failed", "phase_id", phaseID, "error", err)
+		}
+	}
 
 	if o.zeusClient != nil {
 		for _, pw := range pws {
@@ -528,6 +541,69 @@ func (o *Orchestrator) phaseServices(ctx context.Context, p *model.ExperimentPha
 		add(r.Service)
 	}
 	return svcs
+}
+
+// =========================================================================
+// Fault-event audit trail
+// =========================================================================
+
+// recordFreezeEvents opens a cachebox fault event per frozen service.
+func (o *Orchestrator) recordFreezeEvents(ctx context.Context, p *model.ExperimentPhase) {
+	if o.faultEvents == nil {
+		return
+	}
+	for _, fs := range p.FrozenServices {
+		detail, _ := json.Marshal(map[string]string{"mode": fs.Mode, "key_strategy": fs.KeyStrategy, "mutation_policy": fs.MutationPolicy})
+		ev := &model.PhaseFaultEvent{
+			ID: id.New("fevt"), PhaseID: p.ID, Source: "cachebox", Service: fs.Service,
+			Kind: "cachebox:" + fs.Mode, Detail: detail, StartedAt: time.Now(),
+		}
+		if err := o.faultEvents.Create(ctx, ev); err != nil {
+			o.logger.Warn("orchestrator: record cachebox event failed",
+				"phase_id", p.ID, "service", fs.Service, "error", err)
+		}
+	}
+}
+
+// recordRuleEvents opens a rule fault event per phase rule.
+func (o *Orchestrator) recordRuleEvents(ctx context.Context, p *model.ExperimentPhase) {
+	if o.faultEvents == nil {
+		return
+	}
+	prs, err := o.experiments.ListPhaseRules(ctx, p.ID)
+	if err != nil {
+		o.logger.Warn("orchestrator: record rule events: list rules failed", "phase_id", p.ID, "error", err)
+		return
+	}
+	for _, pr := range prs {
+		r, err := o.rules.Get(ctx, pr.RuleID)
+		if err != nil {
+			o.logger.Warn("orchestrator: record rule event: load rule failed",
+				"phase_id", p.ID, "rule_id", pr.RuleID, "error", err)
+			continue
+		}
+		ev := &model.PhaseFaultEvent{
+			ID: id.New("fevt"), PhaseID: p.ID, Source: "rule", Service: r.Service,
+			Kind: o.ruleKind(ctx, r), StartedAt: time.Now(),
+		}
+		if err := o.faultEvents.Create(ctx, ev); err != nil {
+			o.logger.Warn("orchestrator: record rule event failed",
+				"phase_id", p.ID, "rule_id", r.ID, "error", err)
+		}
+	}
+}
+
+// ruleKind derives "category:fault_type" from a rule's fault spec; falls back
+// to "rule" when the action is not a fault spec or the spec can't be loaded.
+func (o *Orchestrator) ruleKind(ctx context.Context, r *model.Rule) string {
+	if r.Action.FaultSpecID == "" {
+		return "rule"
+	}
+	spec, err := o.faults.GetSpec(ctx, r.Action.FaultSpecID)
+	if err != nil {
+		return "rule"
+	}
+	return spec.Category + ":" + spec.FaultType
 }
 
 // =========================================================================

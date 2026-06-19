@@ -86,7 +86,8 @@ func main() {
 	// Create promql client, cache store, orchestrator, and policy engine.
 	promClient := promql.NewClient(prometheusURL)
 	cs := cachestore.New(cacheDir)
-	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, logger)
+	phaseFaultEventRepo := store.NewPhaseFaultEventRepo(database)
+	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, logger)
 	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)
 
 	// Restore in-flight runs from the DB. Must run before the API server
