@@ -349,6 +349,68 @@ func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experiment
 	return out, rows.Err()
 }
 
+// ListPhasesPaged returns a cross-experiment page of phase list rows (the
+// "runs" list), newest-started first, each with its experiment name, workflow
+// ids, and frozen-service count. workflow_ids is aggregated as JSONB to avoid
+// PG-array scanning.
+func (r *ExperimentRepo) ListPhasesPaged(ctx context.Context, p Page) ([]*model.PhaseListItem, int, error) {
+	if p.Limit <= 0 {
+		p.Limit = 20
+	}
+	if p.Limit > 200 {
+		p.Limit = 200
+	}
+	if p.Offset < 0 {
+		p.Offset = 0
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT p.id, p.experiment_id, e.name, p.name, p.position, p.status,
+			p.started_at, p.completed_at,
+			CASE WHEN jsonb_typeof(p.frozen_services) = 'array'
+				THEN jsonb_array_length(p.frozen_services)
+				ELSE 0
+			END AS frozen_service_count,
+			COALESCE(jsonb_agg(pw.workflow_id ORDER BY pw.workflow_id)
+				FILTER (WHERE pw.workflow_id IS NOT NULL), '[]'::jsonb) AS workflow_ids,
+			COUNT(*) OVER () AS total_count
+		FROM experiment_phases p
+		JOIN experiments e ON e.id = p.experiment_id
+		LEFT JOIN phase_workflows pw ON pw.phase_id = p.id
+		GROUP BY p.id, e.name
+		ORDER BY p.started_at DESC NULLS LAST, p.position
+		LIMIT $1 OFFSET $2`, p.Limit, p.Offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list phases paged: %w", err)
+	}
+	defer rows.Close()
+	var (
+		out   []*model.PhaseListItem
+		total int
+	)
+	for rows.Next() {
+		var (
+			it                     model.PhaseListItem
+			startedAt, completedAt sql.NullTime
+			workflowIDs            []byte
+		)
+		if err := rows.Scan(
+			&it.ID, &it.ExperimentID, &it.ExperimentName, &it.Name, &it.Position, &it.Status,
+			&startedAt, &completedAt, &it.FrozenServiceCount, &workflowIDs, &total,
+		); err != nil {
+			return nil, 0, fmt.Errorf("scan phase list item: %w", err)
+		}
+		it.StartedAt = nullTimeToPtr(startedAt)
+		it.CompletedAt = nullTimeToPtr(completedAt)
+		if len(workflowIDs) > 0 {
+			if err := json.Unmarshal(workflowIDs, &it.WorkflowIDs); err != nil {
+				return nil, 0, fmt.Errorf("decode workflow_ids: %w", err)
+			}
+		}
+		out = append(out, &it)
+	}
+	return out, total, rows.Err()
+}
+
 // DeletePhase removes one phase and cascades to its workflows/rules/results.
 func (r *ExperimentRepo) DeletePhase(ctx context.Context, id string) error {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM experiment_phases WHERE id = $1`, id)
