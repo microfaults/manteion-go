@@ -102,7 +102,7 @@ func main() {
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
-		experimentRepo, workflowRepo, workloadRepo, traceRepo,
+		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
 		zeusClient, controller.IntentReader(), orch, cs, policyRepo,
 	)
 

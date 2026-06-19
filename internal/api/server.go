@@ -31,25 +31,26 @@ type ruleVersioner interface {
 
 // Server holds all dependencies for the manteion API.
 type Server struct {
-	logger       *slog.Logger
-	db           *sql.DB
-	dbPing       dbPinger // same as db; separate field so tests can inject a fake
-	rules        *store.RuleRepo
-	rulever      ruleVersioner // same as rules; separate field so tests can inject a fake
-	faults       *store.FaultRepo
-	faultStore   FaultStore
-	faultConfigs *store.FaultConfigRepo
-	sdk          *store.SDKRepo
-	experiments  *store.ExperimentRepo
-	workflows    *store.WorkflowRepo
-	workloads    *store.WorkloadRepo
-	policies     *store.PolicyRepo
-	traces       *store.TraceRepo
-	zeus         *zeus.Client
-	intent       atrocontrol.IntentReader
-	orch         *orchestrator.Orchestrator
-	cacheStore   *cachestore.Store
-	broker       *EventBroker
+	logger           *slog.Logger
+	db               *sql.DB
+	dbPing           dbPinger // same as db; separate field so tests can inject a fake
+	rules            *store.RuleRepo
+	rulever          ruleVersioner // same as rules; separate field so tests can inject a fake
+	faults           *store.FaultRepo
+	faultStore       FaultStore
+	faultConfigs     *store.FaultConfigRepo
+	sdk              *store.SDKRepo
+	experiments      *store.ExperimentRepo
+	phaseFaultEvents *store.PhaseFaultEventRepo
+	workflows        *store.WorkflowRepo
+	workloads        *store.WorkloadRepo
+	policies         *store.PolicyRepo
+	traces           *store.TraceRepo
+	zeus             *zeus.Client
+	intent           atrocontrol.IntentReader
+	orch             *orchestrator.Orchestrator
+	cacheStore       *cachestore.Store
+	broker           *EventBroker
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -62,6 +63,7 @@ func NewServer(
 	faultConfigs *store.FaultConfigRepo,
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
+	phaseFaultEvents *store.PhaseFaultEventRepo,
 	workflows *store.WorkflowRepo,
 	workloads *store.WorkloadRepo,
 	traces *store.TraceRepo,
@@ -72,25 +74,26 @@ func NewServer(
 	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
-		logger:       logger,
-		db:           db,
-		dbPing:       db,
-		rules:        rules,
-		rulever:      rules,
-		faults:       faults,
-		faultStore:   faultStore,
-		faultConfigs: faultConfigs,
-		sdk:          sdk,
-		experiments:  experiments,
-		workflows:    workflows,
-		workloads:    workloads,
-		policies:     policies,
-		traces:       traces,
-		zeus:         zeusClient,
-		intent:       intent,
-		orch:         orch,
-		cacheStore:   cs,
-		broker:       NewEventBroker(),
+		logger:           logger,
+		db:               db,
+		dbPing:           db,
+		rules:            rules,
+		rulever:          rules,
+		faults:           faults,
+		faultStore:       faultStore,
+		faultConfigs:     faultConfigs,
+		sdk:              sdk,
+		experiments:      experiments,
+		phaseFaultEvents: phaseFaultEvents,
+		workflows:        workflows,
+		workloads:        workloads,
+		policies:         policies,
+		traces:           traces,
+		zeus:             zeusClient,
+		intent:           intent,
+		orch:             orch,
+		cacheStore:       cs,
+		broker:           NewEventBroker(),
 	}
 }
 
@@ -199,6 +202,13 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/experiments/{id}/cancel", s.handleCancelExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/stop", s.handleStopExperiment)
 	mux.HandleFunc("GET /api/v1/experiments/{id}/results", s.handleExperimentResults)
+
+	// Phase-native run-details surface (a "run" = a phase; phaseId is globally
+	// unique so no experiment segment is needed). Live panels (steps/events/
+	// resources) are the v2 follow-on. See docs/specs/2026-06-18-run-details-*.
+	mux.HandleFunc("GET /api/v1/phases", s.handleListPhases)
+	mux.HandleFunc("GET /api/v1/phases/{phaseId}", s.handleGetPhaseDetail)
+	mux.HandleFunc("GET /api/v1/phases/{phaseId}/faults", s.handleGetPhaseFaults)
 
 	// Phase CRUD + lifecycle.
 	mux.HandleFunc("POST /api/v1/experiments/{id}/phases", s.handleCreatePhase)
