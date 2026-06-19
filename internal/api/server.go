@@ -209,6 +209,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/phases", s.handleListPhases)
 	mux.HandleFunc("GET /api/v1/phases/{phaseId}", s.handleGetPhaseDetail)
 	mux.HandleFunc("GET /api/v1/phases/{phaseId}/faults", s.handleGetPhaseFaults)
+	mux.HandleFunc("POST /api/v1/phases/{phaseId}/pause", s.handlePausePhaseFlat)
+	mux.HandleFunc("POST /api/v1/phases/{phaseId}/resume", s.handleResumePhaseFlat)
+	mux.HandleFunc("POST /api/v1/phases/{phaseId}/stop", s.handleStopPhaseFlat)
 
 	// Phase CRUD + lifecycle.
 	mux.HandleFunc("POST /api/v1/experiments/{id}/phases", s.handleCreatePhase)

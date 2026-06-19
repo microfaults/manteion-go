@@ -104,3 +104,41 @@ func (s *Server) handleGetPhaseFaults(w http.ResponseWriter, r *http.Request) {
 		FaultEvents:    nilToEmpty(events),
 	})
 }
+
+func (s *Server) handlePausePhaseFlat(w http.ResponseWriter, r *http.Request) {
+	if err := s.orch.PausePhase(r.Context(), r.PathValue("phaseId")); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "phase not found")
+			return
+		}
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+}
+
+func (s *Server) handleResumePhaseFlat(w http.ResponseWriter, r *http.Request) {
+	// StartPhase resumes a paused phase (and would start a pending one).
+	if err := s.orch.StartPhase(r.Context(), r.PathValue("phaseId")); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "phase not found")
+			return
+		}
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
+}
+
+func (s *Server) handleStopPhaseFlat(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status") // "", completed, failed, skipped
+	if err := s.orch.StopPhase(r.Context(), r.PathValue("phaseId"), status); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "phase not found")
+			return
+		}
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
