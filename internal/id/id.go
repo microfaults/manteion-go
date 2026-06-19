@@ -2,7 +2,7 @@
 // "{prefix}-{uuidv7}" stored as TEXT.
 //
 // The prefix is type-discriminating (exp-, phase-, rule-, spec-, comp-,
-// wf-, atk-, atkres-, fc-, policy-, anchor-) so ids are self-describing in
+// wf-, atk-, atkres-, fc-, policy-, anchor-, fevt-) so ids are self-describing in
 // logs and URLs; UUIDv7 makes them time-ordered, so primary-key indexes
 // stay append-local and creation order sorts lexicographically. Ids that
 // reference zeus-minted objects (zeus attack/run ids) are opaque TEXT and

@@ -28,6 +28,7 @@ var EnumValues = map[string][]string{
 	"execution_mode":        ExecutionModeValues,
 	"trace_backend":         TraceBackendValues,
 	"fault_config_status":   FaultConfigStatusValues,
+	"fault_event_source":    FaultEventSourceValues,
 }
 
 var (
@@ -45,6 +46,7 @@ var (
 	ExecutionModeValues       = []string{"parallel", "sequential"}
 	TraceBackendValues        = []string{"jaeger", "prometheus", "tempo"}
 	FaultConfigStatusValues   = []string{"ready", "active", "completed", "cancelled"}
+	FaultEventSourceValues    = []string{"rule", "cachebox", "fault_config"}
 )
 
 // setOf builds the membership map a Validate() method checks against.
