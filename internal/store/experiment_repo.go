@@ -326,6 +326,28 @@ func (r *ExperimentRepo) GetPhase(ctx context.Context, id string) (*model.Experi
 	return p, nil
 }
 
+// RunningPersistCachePhaseID returns the id of the currently-running phase
+// with persist_cache=true (the active baseline recording phase), or "" when
+// none is running. SDKs receive this via RuleSync.RecordingPhaseID and tag
+// their cache ingests with it. Assumes at most one such phase in flight
+// (phases run sequentially per experiment); if several race, the most recently
+// started wins.
+func (r *ExperimentRepo) RunningPersistCachePhaseID(ctx context.Context) (string, error) {
+	var phaseID sql.NullString
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id FROM experiment_phases
+		WHERE status = 'running' AND persist_cache = true
+		ORDER BY started_at DESC NULLS LAST
+		LIMIT 1`).Scan(&phaseID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("running persist-cache phase: %w", err)
+	}
+	return phaseID.String, nil
+}
+
 // ListPhasesForExperiment returns phases ordered by position.
 func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experimentID string) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `

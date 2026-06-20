@@ -107,6 +107,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.ActiveFaults = faults
 	resp.FreezeCfg = freeze
+	if recordingPhaseID, err := s.experiments.RunningPersistCachePhaseID(r.Context()); err != nil {
+		s.logger.Warn("register: read recording phase failed", "error", err)
+	} else {
+		resp.RecordingPhaseID = recordingPhaseID
+	}
 	writeJSON(w, http.StatusCreated, resp)
 }
 
@@ -248,11 +253,20 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The active baseline recording phase (if any) — the SDK tags its cache
+	// ingests with this. Best-effort: an error leaves it empty (SDK won't
+	// record), never fails the poll.
+	recordingPhaseID, err := s.experiments.RunningPersistCachePhaseID(ctx)
+	if err != nil {
+		s.logger.Warn("poll: read recording phase failed", "error", err)
+	}
+
 	writeJSON(w, http.StatusOK, atroposdk.RuleSync{
-		Version:      currentVersion,
-		Rules:        compiled,
-		ActiveFaults: activeFaults,
-		FreezeCfg:    freezeCfg,
+		Version:          currentVersion,
+		Rules:            compiled,
+		ActiveFaults:     activeFaults,
+		FreezeCfg:        freezeCfg,
+		RecordingPhaseID: recordingPhaseID,
 	})
 }
 

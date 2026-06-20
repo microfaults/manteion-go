@@ -102,6 +102,17 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: load experiment: %w", err))
 	}
 
+	// A baseline (persist_cache) phase becoming active changes which phase SDKs
+	// should record cache INTO. Bump the rule version so SDKs re-poll and pick
+	// up the new RecordingPhaseID (the phase is already 'running' here, so the
+	// poll query returns it). Cleared again on finish.
+	if fresh && p.PersistCache {
+		if err := o.rules.BumpVersion(ctx); err != nil {
+			o.logger.Warn("orchestrator: bump version for recording start failed",
+				"phase_id", p.ID, "error", err)
+		}
+	}
+
 	// Cache preload only on a fresh start: a resume continues with whatever
 	// the cache boxes already hold.
 	if fresh && len(p.FrozenServices) > 0 {
@@ -196,6 +207,16 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 	}
 
 	o.cancelPoller(phaseID)
+
+	// A finished baseline (persist_cache) phase is no longer the recording
+	// phase — bump the rule version so SDKs re-poll and clear RecordingPhaseID
+	// (the phase is now terminal, so the poll query no longer returns it).
+	if p.PersistCache {
+		if err := o.rules.BumpVersion(ctx); err != nil {
+			o.logger.Warn("orchestrator: bump version for recording stop failed",
+				"phase_id", phaseID, "error", err)
+		}
+	}
 
 	for _, svc := range o.phaseServices(ctx, p) {
 		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
