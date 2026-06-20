@@ -46,9 +46,20 @@ CREATE TABLE phase_fault_events (
 CREATE INDEX idx_phase_fault_events_phase ON phase_fault_events(phase_id, started_at);
 `
 
+// migration3 adds cachebox-fidelity coverage columns to phase_service_cache:
+// request_count disambiguates "0 requests served" from "all misses"; and
+// recorded_entry_count is the recording coverage (entries captured on a
+// baseline phase / available to replay on an isolation phase).
+const migration3 = `
+ALTER TABLE phase_service_cache
+    ADD COLUMN request_count        BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN recorded_entry_count BIGINT NOT NULL DEFAULT 0;
+`
+
 var migrations = []migration{
 	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
 	{2, "phase_fault_events audit trail + fault_event_source enum", migration2},
+	{3, "phase_service_cache: request_count + recorded_entry_count (fidelity coverage)", migration3},
 }
 
 // Migrate applies any pending migrations to the database.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
@@ -76,6 +77,31 @@ func (s *Store) Write(runID, service string, entries []atroposdk.CacheBoxWireEnt
 		}
 	}
 	return nil
+}
+
+// Services lists the services that have recorded cache entries for a phase
+// (one {service}.jsonl file each). Returns nil, nil when the phase dir is
+// absent (nothing recorded yet). Used to harvest recording coverage on a
+// baseline phase, where the recording services aren't known up front
+// (no frozen_services to enumerate).
+func (s *Store) Services(runID string) ([]string, error) {
+	dir := filepath.Join(s.root, runID)
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		out = append(out, strings.TrimSuffix(name, ".jsonl"))
+	}
+	return out, nil
 }
 
 // Read returns all entries stored for a (runID, service) pair.

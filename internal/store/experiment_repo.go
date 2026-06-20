@@ -735,14 +735,17 @@ func (r *ExperimentRepo) UpsertServiceCache(ctx context.Context, res *model.Phas
 	}
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO phase_service_cache (phase_id, service, cache_hit_rate,
-			cache_exact_match, cache_staleness, computed_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			cache_exact_match, cache_staleness, request_count, recorded_entry_count, computed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (phase_id, service) DO UPDATE SET
-			cache_hit_rate    = EXCLUDED.cache_hit_rate,
-			cache_exact_match = EXCLUDED.cache_exact_match,
-			cache_staleness   = EXCLUDED.cache_staleness,
-			computed_at       = EXCLUDED.computed_at`,
-		res.PhaseID, res.Service, res.CacheHitRate, res.CacheExactMatch, res.CacheStaleness, res.ComputedAt,
+			cache_hit_rate       = EXCLUDED.cache_hit_rate,
+			cache_exact_match    = EXCLUDED.cache_exact_match,
+			cache_staleness      = EXCLUDED.cache_staleness,
+			request_count        = EXCLUDED.request_count,
+			recorded_entry_count = EXCLUDED.recorded_entry_count,
+			computed_at          = EXCLUDED.computed_at`,
+		res.PhaseID, res.Service, res.CacheHitRate, res.CacheExactMatch, res.CacheStaleness,
+		res.RequestCount, res.RecordedEntryCount, res.ComputedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert phase_service_cache: %w", err)
@@ -753,7 +756,8 @@ func (r *ExperimentRepo) UpsertServiceCache(ctx context.Context, res *model.Phas
 // ListServiceCacheForPhase returns per-service cache rows for a phase.
 func (r *ExperimentRepo) ListServiceCacheForPhase(ctx context.Context, phaseID string) ([]*model.PhaseServiceCache, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT phase_id, service, cache_hit_rate, cache_exact_match, cache_staleness, computed_at
+		SELECT phase_id, service, cache_hit_rate, cache_exact_match, cache_staleness,
+			request_count, recorded_entry_count, computed_at
 		FROM phase_service_cache WHERE phase_id = $1
 		ORDER BY service`, phaseID)
 	if err != nil {
@@ -764,7 +768,8 @@ func (r *ExperimentRepo) ListServiceCacheForPhase(ctx context.Context, phaseID s
 	for rows.Next() {
 		var res model.PhaseServiceCache
 		if err := rows.Scan(
-			&res.PhaseID, &res.Service, &res.CacheHitRate, &res.CacheExactMatch, &res.CacheStaleness, &res.ComputedAt,
+			&res.PhaseID, &res.Service, &res.CacheHitRate, &res.CacheExactMatch, &res.CacheStaleness,
+			&res.RequestCount, &res.RecordedEntryCount, &res.ComputedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan phase_service_cache: %w", err)
 		}

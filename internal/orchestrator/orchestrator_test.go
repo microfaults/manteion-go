@@ -29,6 +29,8 @@ import (
 	"testing"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/cachestore"
@@ -661,5 +663,56 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	}
 	if !hasRule {
 		t.Error("no rule event recorded for attached rule")
+	}
+}
+
+// TestBaselineRecordingCoverage verifies the baseline (persist_cache, no
+// frozen) phase harvests recording coverage: recorded_entry_count per service
+// equals the number of entries the SDK ingested into that phase's cache store.
+func TestBaselineRecordingCoverage(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "") // no zeus → the driver-less baseline phase auto-completes
+	exp := &model.Experiment{ID: id.New("exp"), Name: "cov-" + id.New("n"), Status: "planned", CreatedAt: time.Now()}
+	if err := testExpRepo.Create(ctx, exp); err != nil {
+		t.Fatalf("create exp: %v", err)
+	}
+	bp := &model.ExperimentPhase{
+		ID: id.New("phase"), ExperimentID: exp.ID, Name: "baseline", Position: 0, Status: "pending",
+		PersistCache: true,
+	}
+	if err := testExpRepo.CreatePhase(ctx, bp); err != nil {
+		t.Fatalf("create phase: %v", err)
+	}
+
+	// Simulate SDK cache ingest during the baseline: write recorded entries.
+	front := []atroposdk.CacheBoxWireEntry{{Key: "k1"}, {Key: "k2"}, {Key: "k3"}}
+	cat := []atroposdk.CacheBoxWireEntry{{Key: "k1"}}
+	if err := o.cacheStore.Write(bp.ID, "frontend", front); err != nil {
+		t.Fatalf("write frontend cache: %v", err)
+	}
+	if err := o.cacheStore.Write(bp.ID, "productcatalogservice", cat); err != nil {
+		t.Fatalf("write catalog cache: %v", err)
+	}
+
+	if err := o.StartExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor(t, "experiment completed", 5*time.Second, func() bool {
+		return getExp(t, exp.ID).Status == "completed"
+	})
+
+	rows, err := testExpRepo.ListServiceCacheForPhase(ctx, bp.ID)
+	if err != nil {
+		t.Fatalf("list service cache: %v", err)
+	}
+	got := map[string]int64{}
+	for _, r := range rows {
+		got[r.Service] = r.RecordedEntryCount
+	}
+	if got["frontend"] != 3 {
+		t.Errorf("frontend recorded_entry_count=%d, want 3", got["frontend"])
+	}
+	if got["productcatalogservice"] != 1 {
+		t.Errorf("productcatalogservice recorded_entry_count=%d, want 1", got["productcatalogservice"])
 	}
 }
