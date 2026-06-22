@@ -379,7 +379,6 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 			DurationS:     pw.DurationSec,
 			MetaTraceID:   p.ID,
 			ExperimentID:  exp.ID,
-			RunRef:        p.ID,
 			WorkflowLabel: pw.WorkflowID,
 		})
 		if err != nil {

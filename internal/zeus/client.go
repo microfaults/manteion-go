@@ -173,6 +173,11 @@ type AttackDedupBypass struct {
 // Wire-format breaking change vs. prior versions of this client:
 //   - Duration (Go duration string) → DurationS (integer seconds)
 //   - DedupBypass (string)          → DedupBypass (*AttackDedupBypass)
+//   - RunRef removed — it duplicated MetaTraceID (both carried the phase id)
+//     and nothing consumed it: the atropos SDK tags cache entries by the
+//     workflow_label baggage, manteion attributes results by attack id, and
+//     zeus does not execute runs in the single-URL model. meta_trace_id +
+//     experiment_id + workflow_label carry all correlation.
 //
 // The optional Timeout/MaxConnections/MaxBody/Redirects fields are vegeta
 // tuning knobs on zeus; omit (zero) to use vegeta defaults.
@@ -190,7 +195,6 @@ type AttackRequest struct {
 	DedupBypass   *AttackDedupBypass `json:"dedup_bypass,omitempty"`
 	MetaTraceID   string             `json:"meta_trace_id,omitempty"`
 	ExperimentID  string             `json:"experiment_id,omitempty"`
-	RunRef        string             `json:"run_ref,omitempty"`
 	WorkflowLabel string             `json:"workflow_label,omitempty"`
 }
 
