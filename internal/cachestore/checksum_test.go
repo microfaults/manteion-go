@@ -34,3 +34,27 @@ func TestSetChecksum_OrderIndependent(t *testing.T) {
 		t.Fatal("checksum must not depend on entry order")
 	}
 }
+
+// TestSetChecksum_CrossRepoVector pins the §W5 checksum to a fixed vector.
+// atropos-go/internal/cachebox/checksum_test.go pins the SAME vector: the
+// two implementations are intentionally duplicated (the SDK's lives in an
+// internal/ package this repo cannot import), and the preload commit gate
+// 409s every isolation phase if they ever diverge by a byte. If this test
+// needs a new expected value, the wire spec changed -- update BOTH repos
+// and the spec together.
+func TestSetChecksum_CrossRepoVector(t *testing.T) {
+	entries := []atroposdk.CacheBoxWireEntry{
+		{Key: "v2:alpha", StatusCode: 200, Body: []byte("hello world")},
+		{Key: "v2:beta", StatusCode: 404, Body: nil},
+		{Key: "v2:gamma", StatusCode: 503, Body: []byte{0x00, 0x01, 0xFF}},
+	}
+	const want = "823fb309f1dc167e10405d0f425b06cc48f0e847431b3a57a6e29a3e788d8032"
+
+	if got := SetChecksum(entries); got != want {
+		t.Fatalf("W5 vector drifted:\n got %s\nwant %s", got, want)
+	}
+	shuffled := []atroposdk.CacheBoxWireEntry{entries[2], entries[0], entries[1]}
+	if got := SetChecksum(shuffled); got != want {
+		t.Fatalf("W5 checksum is order-dependent: got %s", got)
+	}
+}
