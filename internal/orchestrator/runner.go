@@ -478,7 +478,7 @@ func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.Experim
 	}
 
 	for _, fs := range p.FrozenServices {
-		entries, err := o.cacheStore.Read(baseline.ID, fs.Service)
+		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, fs.Service)
 		if err != nil {
 			o.logger.Warn("orchestrator: read cache entries failed",
 				"phase_id", p.ID, "baseline_phase_id", baseline.ID,

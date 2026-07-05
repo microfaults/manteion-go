@@ -181,14 +181,14 @@ func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.Experimen
 
 	// Pass 2 — baseline recording coverage.
 	if p.PersistCache && len(p.FrozenServices) == 0 {
-		services, err := o.cacheStore.Services(p.ID)
+		services, err := o.cacheStore.Services(p.ExperimentID, p.ID)
 		if err != nil {
 			o.logger.Warn("orchestrator: cache stats: list recorded services failed",
 				"phase_id", p.ID, "error", err)
 			return
 		}
 		for _, svc := range services {
-			entries, err := o.cacheStore.Read(p.ID, svc)
+			entries, err := o.cacheStore.Read(p.ExperimentID, p.ID, svc)
 			if err != nil {
 				o.logger.Warn("orchestrator: cache stats: read recorded entries failed",
 					"phase_id", p.ID, "service", svc, "error", err)
@@ -216,12 +216,12 @@ func (o *Orchestrator) baselineCoverage(ctx context.Context, experimentID string
 	if err != nil || baseline == nil {
 		return out
 	}
-	services, err := o.cacheStore.Services(baseline.ID)
+	services, err := o.cacheStore.Services(baseline.ExperimentID, baseline.ID)
 	if err != nil {
 		return out
 	}
 	for _, svc := range services {
-		entries, err := o.cacheStore.Read(baseline.ID, svc)
+		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, svc)
 		if err != nil {
 			continue
 		}

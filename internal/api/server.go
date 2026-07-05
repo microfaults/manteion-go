@@ -41,6 +41,7 @@ type Server struct {
 	faultConfigs     *store.FaultConfigRepo
 	sdk              *store.SDKRepo
 	experiments      *store.ExperimentRepo
+	phaseReader      phaseReader // same as experiments; separate field so ingest tests can inject a fake
 	phaseFaultEvents *store.PhaseFaultEventRepo
 	workflows        *store.WorkflowRepo
 	workloads        *store.WorkloadRepo
@@ -84,6 +85,7 @@ func NewServer(
 		faultConfigs:     faultConfigs,
 		sdk:              sdk,
 		experiments:      experiments,
+		phaseReader:      experiments,
 		phaseFaultEvents: phaseFaultEvents,
 		workflows:        workflows,
 		workloads:        workloads,

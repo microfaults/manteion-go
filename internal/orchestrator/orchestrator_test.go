@@ -687,10 +687,10 @@ func TestBaselineRecordingCoverage(t *testing.T) {
 	// Simulate SDK cache ingest during the baseline: write recorded entries.
 	front := []atroposdk.CacheBoxWireEntry{{Key: "k1"}, {Key: "k2"}, {Key: "k3"}}
 	cat := []atroposdk.CacheBoxWireEntry{{Key: "k1"}}
-	if err := o.cacheStore.Write(bp.ID, "frontend", front); err != nil {
+	if err := o.cacheStore.Append(bp.ExperimentID, bp.ID, "frontend", front); err != nil {
 		t.Fatalf("write frontend cache: %v", err)
 	}
-	if err := o.cacheStore.Write(bp.ID, "productcatalogservice", cat); err != nil {
+	if err := o.cacheStore.Append(bp.ExperimentID, bp.ID, "productcatalogservice", cat); err != nil {
 		t.Fatalf("write catalog cache: %v", err)
 	}
 
