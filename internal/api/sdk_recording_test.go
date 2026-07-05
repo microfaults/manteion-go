@@ -110,10 +110,9 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	}
 
 	// svc-a records into experiment A's baseline with the exact strategy.
+	// (Provenance rides only the synthesized rule's CacheBoxContext; the
+	// former ambient recording_phase_id wire field no longer exists.)
 	syncA := poll(svcA)
-	if syncA.RecordingPhaseID != "" {
-		t.Fatalf("RecordingPhaseID must be empty (deleted); got %q", syncA.RecordingPhaseID)
-	}
 	cbA := cb(syncA)
 	if cbA.Mode != "passthrough" {
 		t.Fatalf("svc-a mode=%q, want passthrough (record)", cbA.Mode)

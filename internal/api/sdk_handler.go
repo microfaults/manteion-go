@@ -267,6 +267,15 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		compiled = append(compiled, ruleconv.SynthesizeCacheBoxRule(*cbctx))
 	}
 
+	// The poll is the reconciler, so rules must never serialize as null:
+	// [] is the authoritative "no rules" the SDK clears on (its Apply
+	// treats nil as "no change" but honors an explicit empty list). This
+	// is also what delivers the drain trigger for a baseline-recorded
+	// service, whose set is empty once its recording rule drops out.
+	if compiled == nil {
+		compiled = []atroposdk.CompiledRule{}
+	}
+
 	writeJSON(w, http.StatusOK, atroposdk.RuleSync{
 		Version:      currentVersion,
 		Rules:        compiled,
