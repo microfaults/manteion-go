@@ -17,11 +17,12 @@ type logger interface {
 }
 
 type Controller struct {
-	tx       *atropos.Client
-	resolver InstanceResolver
-	intent   *IntentTracker
-	logger   logger
-	defaults controllerOpts
+	tx        *atropos.Client
+	preloadTx *atropos.Client // dedicated long-timeout transport for staged preload (MANT-1)
+	resolver  InstanceResolver
+	intent    *IntentTracker
+	logger    logger
+	defaults  controllerOpts
 }
 
 func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption) *Controller {
@@ -41,6 +42,10 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 	}
 	if c.defaults.logger != nil {
 		c.logger = c.defaults.logger
+	}
+	c.preloadTx = c.defaults.preloadTx
+	if c.preloadTx == nil {
+		c.preloadTx = tx // fall back to the command transport if no dedicated one is set
 	}
 	return c
 }

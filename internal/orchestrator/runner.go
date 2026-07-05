@@ -8,6 +8,8 @@ import (
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
+	"manteion-go/internal/atrocontrol"
+	"manteion-go/internal/cachestore"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/zeus"
@@ -113,18 +115,24 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		}
 	}
 
-	// Cache preload only on a fresh start: a resume continues with whatever
-	// the cache boxes already hold.
+	// Cache preload is a HARD GATE on a fresh start of a frozen phase (INV-4):
+	// load may only begin against a replay set that every live instance has
+	// verify-committed (byte-exact count + checksum). A missing baseline, a
+	// zero-entry frozen service, or any instance failing/mismatching aborts the
+	// phase here — before freeze and before any load. A resume continues with
+	// whatever the boxes already hold.
 	if fresh && len(p.FrozenServices) > 0 {
 		if err := o.preloadCacheEntries(ctx, p); err != nil {
-			o.logger.Warn("orchestrator: cache preload failed",
-				"phase_id", p.ID, "error", err)
+			return fail(fmt.Errorf("orchestrator: preload gate: %w", err))
 		}
 	}
 
-	// Freeze is idempotent (intent-tracked), so re-freezing on resume is
-	// safe and re-asserts the desired state.
-	o.freezeServices(ctx, p)
+	// Freeze is idempotent (intent-tracked), so re-freezing on resume re-asserts
+	// desired state. For a frozen service an un-asserted freeze is a leak
+	// (INV-4), so freeze-fanout failure is phase-fatal.
+	if err := o.freezeServices(ctx, p); err != nil {
+		return fail(fmt.Errorf("orchestrator: freeze gate: %w", err))
+	}
 	if fresh {
 		o.recordFreezeEvents(ctx, p)
 	}
@@ -435,13 +443,18 @@ func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
 // each service (the cache-box decomposition primitive). Mu/Sigma come from
 // the service's fitted synthetic-delay distribution. FreezeService persists
 // intent so a re-registering SDK inherits the freeze.
-func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) {
+func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) error {
 	for _, fs := range p.FrozenServices {
-		if _, err := o.controller.FreezeService(ctx, fs.Service, freezeDelayRequest(p, fs)); err != nil {
-			o.logger.Warn("orchestrator: freeze service failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
+		result, err := o.controller.FreezeService(ctx, fs.Service, freezeDelayRequest(p, fs))
+		if err != nil {
+			return fmt.Errorf("freeze %q: %w", fs.Service, err)
+		}
+		if len(result.Failed) > 0 {
+			return fmt.Errorf("freeze %q: %d of %d instances failed to freeze",
+				fs.Service, len(result.Failed), len(result.Targeted))
 		}
 	}
+	return nil
 }
 
 // freezeDelayRequest builds the SDK freeze command for one frozen service: its
@@ -481,37 +494,79 @@ func (o *Orchestrator) thawServices(ctx context.Context, p *model.ExperimentPhas
 	}
 }
 
-// preloadCacheEntries reads the baseline phase's persisted cache files and
-// fans them out to all frozen services' SDK instances before the isolation
-// phase begins. The baseline is the experiment's most recently completed
+// preloadCacheEntries installs each frozen service's baseline recording onto
+// every live SDK instance via the staged, verified §W4 protocol, and returns an
+// error (the phase-abort trigger) unless every instance verify-commits the
+// byte-exact set. The baseline is the experiment's most recently completed
 // phase that persisted its cache and froze nothing.
+//
+// This is a hard gate (INV-4), replacing the old warn-and-continue: a missing
+// baseline, a zero-entry frozen service, a checksum/count mismatch, or any
+// instance failure aborts the isolation phase before freeze and before load —
+// so load never runs all-miss (all-leak) against an unverified replay set.
 func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.ExperimentPhase) error {
 	baseline, err := o.baselinePhase(ctx, p.ExperimentID)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve baseline: %w", err)
 	}
 	if baseline == nil {
-		o.logger.Info("orchestrator: no completed baseline phase; skipping cache preload",
-			"phase_id", p.ID)
-		return nil
+		return fmt.Errorf("no completed baseline recording for experiment %q; cannot preload frozen services", p.ExperimentID)
 	}
 
 	for _, fs := range p.FrozenServices {
 		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, fs.Service)
 		if err != nil {
-			o.logger.Warn("orchestrator: read cache entries failed",
-				"phase_id", p.ID, "baseline_phase_id", baseline.ID,
-				"service", fs.Service, "error", err)
-			continue
+			return fmt.Errorf("read baseline entries for %q: %w", fs.Service, err)
 		}
 		if len(entries) == 0 {
-			o.logger.Info("orchestrator: no cache entries for service",
-				"baseline_phase_id", baseline.ID, "service", fs.Service)
-			continue
+			return fmt.Errorf("baseline recorded zero entries for frozen service %q; nothing to replay", fs.Service)
 		}
-		if _, err := o.controller.PreloadEntries(ctx, fs.Service, entries); err != nil {
-			o.logger.Warn("orchestrator: preload entries failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
+
+		strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+		checksum := cachestore.SetChecksum(entries)
+		results, err := o.controller.PreloadService(ctx, fs.Service, atrocontrol.PreloadSpec{
+			ExperimentID:    p.ExperimentID,
+			PhaseID:         p.ID,
+			SourcePhaseID:   baseline.ID,
+			KeyStrategy:     strat,
+			StrategyVersion: model.KeyStrategyVersion(strat),
+			KeyHeaders:      fs.KeyHeaders,
+			MaxBytes:        atrocontrol.DefaultPreloadMaxBytes,
+			Entries:         entries,
+			Checksum:        checksum,
+		})
+		if err != nil {
+			return fmt.Errorf("preload %q: %w", fs.Service, err)
+		}
+		if err := verifyPreload(fs.Service, len(entries), checksum, results); err != nil {
+			return err
+		}
+		o.logger.Info("orchestrator: preload verified",
+			"phase_id", p.ID, "service", fs.Service,
+			"entries", len(entries), "instances", len(results))
+	}
+	return nil
+}
+
+// verifyPreload is the per-instance completeness gate (INV-4): every live
+// instance must have verify-committed the exact expected set. Any transport
+// failure, rejected commit, wrong count, or checksum mismatch — or no live
+// instances at all — fails the phase.
+func verifyPreload(service string, expectedCount int, expectedChecksum string, results []atrocontrol.InstancePreloadResult) error {
+	if len(results) == 0 {
+		return fmt.Errorf("preload %q: no live instances to install the replay set", service)
+	}
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			return fmt.Errorf("preload %q instance %s: %w", service, r.InstanceID, r.Err)
+		case !r.Committed:
+			return fmt.Errorf("preload %q instance %s: commit rejected (loaded=%d checksum=%s, want %d/%s)",
+				service, r.InstanceID, r.Loaded, r.Checksum, expectedCount, expectedChecksum)
+		case r.Loaded != expectedCount:
+			return fmt.Errorf("preload %q instance %s: loaded %d entries, want %d", service, r.InstanceID, r.Loaded, expectedCount)
+		case r.Checksum != expectedChecksum:
+			return fmt.Errorf("preload %q instance %s: checksum %s, want %s", service, r.InstanceID, r.Checksum, expectedChecksum)
 		}
 	}
 	return nil

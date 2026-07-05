@@ -593,10 +593,25 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	ctx := context.Background()
 	o := newOrch(t, "") // no zeus → driver-less phases auto-complete
 	feRepo := store.NewPhaseFaultEventRepo(testDB)
-	exp, _ := mkExperiment(t, 1) // phase 0 is bare (no frozen services)
+	exp := &model.Experiment{ID: id.New("exp"), Name: "audit-" + id.New("n"), Status: "planned", CreatedAt: time.Now()}
+	if err := testExpRepo.Create(ctx, exp); err != nil {
+		t.Fatalf("create exp: %v", err)
+	}
+	// Phase 0 is a baseline recording (persist_cache) so the frozen phase 1 has
+	// a completed baseline to preload from (MANT-1 gate).
+	base := &model.ExperimentPhase{
+		ID: id.New("phase"), ExperimentID: exp.ID, Name: "baseline", Position: 0, Status: "pending", PersistCache: true,
+	}
+	if err := testExpRepo.CreatePhase(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.cacheStore.Append(exp.ID, base.ID, "frontend",
+		[]atroposdk.CacheBoxWireEntry{{Key: "k1", StatusCode: 200, Body: []byte("v1")}}); err != nil {
+		t.Fatal(err)
+	}
 
-	// Add a second phase that freezes a service, so enterPhase records a
-	// cachebox event that finishPhase must then close.
+	// A second phase that freezes a service, so enterPhase records a cachebox
+	// event that finishPhase must then close.
 	fp := &model.ExperimentPhase{
 		ID: id.New("phase"), ExperimentID: exp.ID, Name: "frozen", Position: 1, Status: "pending",
 		FrozenServices: []model.CacheBoxConfig{{Service: "frontend", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
@@ -604,6 +619,11 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	if err := testExpRepo.CreatePhase(ctx, fp); err != nil {
 		t.Fatal(err)
 	}
+
+	// A cooperative SDK instance for frontend: verify-commits the preload and
+	// accepts the freeze, so the frozen phase clears the MANT-1 gates.
+	sdk := newFakeSDK(t, true)
+	registerSDK(t, "frontend", sdk.server.URL)
 
 	// Attach a cachebox-action rule to fp so recordRuleEvents fires.
 	// A cachebox rule needs no FaultSpec, and ruleKind returns "rule" for it.

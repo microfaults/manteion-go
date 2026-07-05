@@ -72,13 +72,19 @@ func main() {
 	// Create zeus client.
 	zeusClient := zeus.NewClient(zeusURL)
 
-	// Create atropos transport + orchestration controller.
+	// Create atropos transport + orchestration controller. Preload rides a
+	// dedicated long-timeout transport (MANTEION_PRELOAD_TIMEOUT, default 60s)
+	// so chunked tens-of-MiB replay sets are not truncated by the 5s command
+	// client / 2s fanout — see atrocontrol.WithPreloadTransport (MANT-1).
 	txClient := atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: 5 * time.Second}))
+	preloadTimeout := envDurationOr("MANTEION_PRELOAD_TIMEOUT", 60*time.Second)
+	preloadClient := atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: preloadTimeout}))
 	resolver := &atrocontrol.RepoResolver{Repo: sdkRepo}
 	controller := atrocontrol.New(txClient, resolver,
 		atrocontrol.WithDefaultTimeout(2*time.Second),
 		atrocontrol.WithDefaultConcurrency(16),
 		atrocontrol.WithLogger(logger),
+		atrocontrol.WithPreloadTransport(preloadClient),
 	)
 
 	policyRepo := store.NewPolicyRepo(database)
@@ -186,6 +192,17 @@ func main() {
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+// envDurationOr parses the environment variable key as a Go duration (e.g.
+// "60s", "2m"), falling back on an unset or unparseable value.
+func envDurationOr(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return fallback
 }
