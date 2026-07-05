@@ -326,26 +326,98 @@ func (r *ExperimentRepo) GetPhase(ctx context.Context, id string) (*model.Experi
 	return p, nil
 }
 
-// RunningPersistCachePhaseID returns the id of the currently-running phase
-// with persist_cache=true (the active baseline recording phase), or "" when
-// none is running. SDKs receive this via RuleSync.RecordingPhaseID and tag
-// their cache ingests with it. Assumes at most one such phase in flight
-// (phases run sequentially per experiment); if several race, the most recently
-// started wins.
-func (r *ExperimentRepo) RunningPersistCachePhaseID(ctx context.Context) (string, error) {
-	var phaseID sql.NullString
-	err := r.db.QueryRowContext(ctx, `
-		SELECT id FROM experiment_phases
-		WHERE status = 'running' AND persist_cache = true
-		ORDER BY started_at DESC NULLS LAST
-		LIMIT 1`).Scan(&phaseID)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
+// ListRunningPhases returns every phase currently in status 'running' across
+// all experiments (newest-started first), each with its frozen_services — the
+// input to per-service cache-box rule synthesis (MANT-4). Small in practice:
+// at most one running phase per active experiment.
+func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, experiment_id, name, position, status, frozen_services,
+			persist_cache, started_at, completed_at
+		FROM experiment_phases
+		WHERE status = 'running'
+		ORDER BY started_at DESC NULLS LAST`)
 	if err != nil {
-		return "", fmt.Errorf("running persist-cache phase: %w", err)
+		return nil, fmt.Errorf("list running phases: %w", err)
 	}
-	return phaseID.String, nil
+	defer rows.Close()
+	var out []*model.ExperimentPhase
+	for rows.Next() {
+		p, err := scanPhaseRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan running phase: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ActiveCacheBoxPhaseForService resolves the cache-box role a service is
+// currently playing, if any — the context from which the poll path synthesizes
+// the service's compiled cache-box rule (MANT-4, replacing the deleted global
+// RecordingPhaseID signal). Provenance is phase-scoped (INV-5): there is no
+// ambient "most recently started phase" fallback.
+//
+//   - Replay: the service is frozen in a running phase → its freeze mode +
+//     strategy (an isolation phase).
+//   - Record: the service is frozen somewhere in an experiment that has a
+//     running persist_cache (baseline) phase → passthrough into that baseline,
+//     so exactly the services that will be replayed are recorded.
+//
+// Returns nil when the service has no active cache-box role.
+func (r *ExperimentRepo) ActiveCacheBoxPhaseForService(ctx context.Context, service string) (*model.CacheBoxRuleContext, error) {
+	running, err := r.ListRunningPhases(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	baselineByExp := make(map[string]*model.ExperimentPhase)
+	var baselineExpIDs []string
+	for _, p := range running {
+		for i := range p.FrozenServices {
+			if p.FrozenServices[i].Service == service {
+				return cacheBoxRuleContext(p.ExperimentID, p.ID, p.FrozenServices[i]), nil
+			}
+		}
+		if p.PersistCache {
+			if _, ok := baselineByExp[p.ExperimentID]; !ok {
+				baselineByExp[p.ExperimentID] = p
+				baselineExpIDs = append(baselineExpIDs, p.ExperimentID)
+			}
+		}
+	}
+
+	for _, expID := range baselineExpIDs {
+		phases, err := r.ListPhasesForExperiment(ctx, expID)
+		if err != nil {
+			return nil, err
+		}
+		for _, ph := range phases {
+			for i := range ph.FrozenServices {
+				if ph.FrozenServices[i].Service == service {
+					bp := baselineByExp[expID]
+					rc := cacheBoxRuleContext(bp.ExperimentID, bp.ID, ph.FrozenServices[i])
+					rc.Mode = "passthrough" // record on the baseline, regardless of the isolation freeze mode
+					return rc, nil
+				}
+			}
+		}
+	}
+	return nil, nil
+}
+
+// cacheBoxRuleContext builds a resolved rule context from a frozen-service
+// config, defaulting the key strategy and deriving its wire version.
+func cacheBoxRuleContext(experimentID, phaseID string, fs model.CacheBoxConfig) *model.CacheBoxRuleContext {
+	strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+	return &model.CacheBoxRuleContext{
+		ExperimentID:    experimentID,
+		PhaseID:         phaseID,
+		Mode:            fs.Mode,
+		KeyStrategy:     strat,
+		StrategyVersion: model.KeyStrategyVersion(strat),
+		KeyHeaders:      fs.KeyHeaders,
+	}
 }
 
 // ListPhasesForExperiment returns phases ordered by position.

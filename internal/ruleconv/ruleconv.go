@@ -26,6 +26,35 @@ type (
 	CompiledCompositionMember = atroposdk.CompiledCompositionMember
 )
 
+// SynthesizeCacheBoxRule builds the wildcard-egress compiled cache-box rule
+// that carries a service's authoritative CacheBoxContext (§W1) for a running
+// phase. The SDK matches it on any egress request (empty labels) and records
+// (passthrough) or replays (replay/replay_with_delay) tagged with the
+// context's (experiment_id, phase_id).
+//
+// This synthesized rule is the sole recording/replay provenance since the
+// global RecordingPhaseID signal was removed (MANT-4/INV-5): the SDK's
+// ActiveRecordingPhases + CacheDrainTracker key off it appearing in — and, at
+// drain, disappearing from — the polled rule set.
+func SynthesizeCacheBoxRule(rc model.CacheBoxRuleContext) CompiledRule {
+	return CompiledRule{
+		Name:           "cachebox:" + rc.Mode + ":" + rc.PhaseID,
+		InjectionPoint: "egress",
+		Mode:           "inline",
+		CacheBox: &CompiledCacheBox{
+			Mode:        rc.Mode,
+			KeyStrategy: rc.KeyStrategy,
+			Context: &atroposdk.CacheBoxContext{
+				ExperimentID:    rc.ExperimentID,
+				PhaseID:         rc.PhaseID,
+				KeyStrategy:     rc.KeyStrategy,
+				StrategyVersion: rc.StrategyVersion,
+				KeyHeaders:      rc.KeyHeaders,
+			},
+		},
+	}
+}
+
 // FaultSpecResolver looks up a FaultSpec by ID.
 type FaultSpecResolver interface {
 	GetFaultSpec(id string) (*model.FaultSpec, error)

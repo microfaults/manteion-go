@@ -56,10 +56,19 @@ ALTER TABLE phase_service_cache
     ADD COLUMN recorded_entry_count BIGINT NOT NULL DEFAULT 0;
 `
 
+// migration4 adds the canonical_v2 keyer to the cachebox_key_strategy enum
+// (design doc Q3): the new length-prefixed SHA-256 strategy and the default
+// when a frozen-service config leaves key_strategy empty. Appended last so the
+// enum label order still matches model.CacheBoxKeyStrategyValues (enum_parity_test).
+const migration4 = `
+ALTER TYPE cachebox_key_strategy ADD VALUE IF NOT EXISTS 'canonical_v2';
+`
+
 var migrations = []migration{
 	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
 	{2, "phase_fault_events audit trail + fault_event_source enum", migration2},
 	{3, "phase_service_cache: request_count + recorded_entry_count (fidelity coverage)", migration3},
+	{4, "cachebox_key_strategy: add canonical_v2 (default keyer, design doc Q3)", migration4},
 }
 
 // Migrate applies any pending migrations to the database.

@@ -17,10 +17,12 @@ import (
 	"manteion-go/internal/store"
 )
 
-// TestPollRules_RecordingPhaseID verifies the SDK poll response carries
-// recording_phase_id = the running persist_cache (baseline) phase, so SDKs
-// know which phase to ingest recorded cache into — and empty when none runs.
-func TestPollRules_RecordingPhaseID(t *testing.T) {
+// TestPoll_RulesCarryPhaseContext pins MANT-4/INV-5: recording (and replay)
+// provenance rides on each service's synthesized cache-box rule's
+// CacheBoxContext — never a global RecordingPhaseID. Two concurrent experiments
+// recording different services each get their own (experiment_id, phase_id)
+// pair and key strategy; the deleted RecordingPhaseID field is always empty.
+func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	if os.Getenv("MANTEION_TEST_DB") == "" {
 		t.Skip("set MANTEION_TEST_DB=1 to run")
 	}
@@ -45,13 +47,13 @@ func TestPollRules_RecordingPhaseID(t *testing.T) {
 		logger:      discardLogger(),
 	}
 
-	poll := func() atroposdk.RuleSync {
+	poll := func(service string) atroposdk.RuleSync {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/sdk/rules?service=frontend&version=0", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/sdk/rules?service="+service+"&version=0", nil)
 		w := httptest.NewRecorder()
 		s.handlePollRules(w, req)
 		if w.Code != http.StatusOK {
-			t.Fatalf("poll status=%d body=%s", w.Code, w.Body.String())
+			t.Fatalf("poll %s: status=%d body=%s", service, w.Code, w.Body.String())
 		}
 		var sync atroposdk.RuleSync
 		if err := json.Unmarshal(w.Body.Bytes(), &sync); err != nil {
@@ -60,32 +62,101 @@ func TestPollRules_RecordingPhaseID(t *testing.T) {
 		return sync
 	}
 
-	// No running persist_cache phase → empty recording_phase_id.
-	if got := poll().RecordingPhaseID; got != "" {
-		t.Errorf("recording_phase_id=%q with no baseline, want empty", got)
+	// Build an experiment with a baseline that will record `svc` (frozen in the
+	// experiment's isolation phase) using `strat`, then set the baseline running.
+	buildRecording := func(name, svc, strat string) (expID, basePhaseID string) {
+		t.Helper()
+		e := &model.Experiment{ID: id.New("exp"), Name: name + id.New("n"), Status: "planned", CreatedAt: time.Now()}
+		if err := exp.Create(ctx, e); err != nil {
+			t.Fatalf("create exp: %v", err)
+		}
+		base := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: e.ID, Name: "baseline", Position: 0, Status: "pending", PersistCache: true}
+		iso := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: e.ID, Name: "isolation", Position: 1,
+			Status: "pending", FrozenServices: []model.CacheBoxConfig{{Service: svc, Mode: "replay", KeyStrategy: strat, MutationPolicy: "deny"}}}
+		for _, p := range []*model.ExperimentPhase{base, iso} {
+			if err := exp.CreatePhase(ctx, p); err != nil {
+				t.Fatalf("create phase: %v", err)
+			}
+		}
+		if err := exp.UpdatePhaseStatus(ctx, base.ID, "running"); err != nil {
+			t.Fatalf("set baseline running: %v", err)
+		}
+		return e.ID, base.ID
 	}
 
-	// A running persist_cache phase → its id is delivered.
-	e := &model.Experiment{ID: id.New("exp"), Name: "rec-" + id.New("n"), Status: "planned", CreatedAt: time.Now()}
-	if err := exp.Create(ctx, e); err != nil {
-		t.Fatalf("create exp: %v", err)
-	}
-	ph := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: e.ID, Name: "baseline", Position: 0, Status: "pending", PersistCache: true}
-	if err := exp.CreatePhase(ctx, ph); err != nil {
-		t.Fatalf("create phase: %v", err)
-	}
-	if err := exp.UpdatePhaseStatus(ctx, ph.ID, "running"); err != nil {
-		t.Fatalf("set running: %v", err)
-	}
-	if got := poll().RecordingPhaseID; got != ph.ID {
-		t.Errorf("recording_phase_id=%q, want %q", got, ph.ID)
+	expA, baseA := buildRecording("recA-", "svc-a", "exact")
+	expB, baseB := buildRecording("recB-", "svc-b", "canonical_v2")
+
+	cb := func(sync atroposdk.RuleSync) *atroposdk.CompiledCacheBox {
+		t.Helper()
+		var found *atroposdk.CompiledCacheBox
+		for i := range sync.Rules {
+			if sync.Rules[i].CacheBox != nil {
+				if found != nil {
+					t.Fatalf("expected exactly one cache-box rule, got >1")
+				}
+				found = sync.Rules[i].CacheBox
+			}
+		}
+		if found == nil {
+			t.Fatalf("no cache-box rule synthesized")
+		}
+		return found
 	}
 
-	// Once completed, it clears.
-	if err := exp.UpdatePhaseStatus(ctx, ph.ID, "completed"); err != nil {
-		t.Fatalf("set completed: %v", err)
+	// svc-a records into experiment A's baseline with the exact strategy.
+	syncA := poll("svc-a")
+	if syncA.RecordingPhaseID != "" {
+		t.Fatalf("RecordingPhaseID must be empty (deleted); got %q", syncA.RecordingPhaseID)
 	}
-	if got := poll().RecordingPhaseID; got != "" {
-		t.Errorf("recording_phase_id=%q after completion, want empty", got)
+	cbA := cb(syncA)
+	if cbA.Mode != "passthrough" {
+		t.Fatalf("svc-a mode=%q, want passthrough (record)", cbA.Mode)
+	}
+	if cbA.Context == nil || cbA.Context.ExperimentID != expA || cbA.Context.PhaseID != baseA {
+		t.Fatalf("svc-a context = %+v, want (exp=%s, phase=%s)", cbA.Context, expA, baseA)
+	}
+	if cbA.Context.KeyStrategy != "exact" || cbA.Context.StrategyVersion != 1 {
+		t.Fatalf("svc-a strategy = (%s, v%d), want (exact, v1)", cbA.Context.KeyStrategy, cbA.Context.StrategyVersion)
+	}
+
+	// svc-b records into experiment B's baseline — its own pair + strategy.
+	cbB := cb(poll("svc-b"))
+	if cbB.Context.ExperimentID != expB || cbB.Context.PhaseID != baseB {
+		t.Fatalf("svc-b context = %+v, want (exp=%s, phase=%s)", cbB.Context, expB, baseB)
+	}
+	if cbB.Context.KeyStrategy != "canonical_v2" || cbB.Context.StrategyVersion != 2 {
+		t.Fatalf("svc-b strategy = (%s, v%d), want (canonical_v2, v2)", cbB.Context.KeyStrategy, cbB.Context.StrategyVersion)
+	}
+
+	// A service in no experiment's frozen set gets no cache-box rule.
+	if sync := poll("svc-unrelated"); len(sync.Rules) != 0 {
+		t.Fatalf("unrelated service got %d rules, want 0", len(sync.Rules))
+	}
+
+	// When A's baseline completes and its isolation phase runs, svc-a flips to
+	// replay under the isolation phase's pair.
+	phases, err := exp.ListPhasesForExperiment(ctx, expA)
+	if err != nil {
+		t.Fatalf("list phases: %v", err)
+	}
+	var isoA string
+	for _, p := range phases {
+		if p.Name == "isolation" {
+			isoA = p.ID
+		}
+	}
+	if err := exp.UpdatePhaseStatus(ctx, baseA, "completed"); err != nil {
+		t.Fatalf("complete baseline A: %v", err)
+	}
+	if err := exp.UpdatePhaseStatus(ctx, isoA, "running"); err != nil {
+		t.Fatalf("run isolation A: %v", err)
+	}
+	cbReplay := cb(poll("svc-a"))
+	if cbReplay.Mode != "replay" {
+		t.Fatalf("svc-a isolation mode=%q, want replay", cbReplay.Mode)
+	}
+	if cbReplay.Context.PhaseID != isoA {
+		t.Fatalf("svc-a replay phase=%q, want isolation %q", cbReplay.Context.PhaseID, isoA)
 	}
 }

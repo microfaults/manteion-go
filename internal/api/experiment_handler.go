@@ -97,6 +97,18 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// INV-2 (MANT-4d): every phase touching a service must agree on its
+	// cache-box key strategy + headers, so record and replay of that service
+	// derive identical keys. Reject upfront, before any row is written.
+	phasesForCheck := make([]model.ExperimentPhase, len(req.Phases))
+	for i, ph := range req.Phases {
+		phasesForCheck[i] = model.ExperimentPhase{FrozenServices: ph.FrozenServices}
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	exp := &model.Experiment{
 		ID:          req.ID,
 		Name:        req.Name,

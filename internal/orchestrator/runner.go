@@ -102,13 +102,13 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: load experiment: %w", err))
 	}
 
-	// A baseline (persist_cache) phase becoming active changes which phase SDKs
-	// should record cache INTO. Bump the rule version so SDKs re-poll and pick
-	// up the new RecordingPhaseID (the phase is already 'running' here, so the
-	// poll query returns it). Cleared again on finish.
-	if fresh && p.PersistCache {
+	// A cache-box phase becoming active changes the rule set SDKs synthesize on
+	// poll: a baseline (persist_cache) adds record rules, an isolation phase
+	// (frozen_services) adds replay rules. Bump the rule version so SDKs re-poll
+	// and pick them up (the phase is already 'running' here). Cleared on finish.
+	if fresh && (p.PersistCache || len(p.FrozenServices) > 0) {
 		if err := o.rules.BumpVersion(ctx); err != nil {
-			o.logger.Warn("orchestrator: bump version for recording start failed",
+			o.logger.Warn("orchestrator: bump version for cache-box phase start failed",
 				"phase_id", p.ID, "error", err)
 		}
 	}
@@ -208,12 +208,14 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 
 	o.cancelPoller(phaseID)
 
-	// A finished baseline (persist_cache) phase is no longer the recording
-	// phase — bump the rule version so SDKs re-poll and clear RecordingPhaseID
-	// (the phase is now terminal, so the poll query no longer returns it).
-	if p.PersistCache {
+	// A finished cache-box phase drops out of the synthesized rule set — bump
+	// the rule version so SDKs re-poll and stop recording/replaying. For a
+	// recording (persist_cache) phase this rule-set removal is what the SDK's
+	// drain tracker keys off (MANT-2): the phase is terminal here, so the poll
+	// no longer synthesizes its cache-box rule.
+	if p.PersistCache || len(p.FrozenServices) > 0 {
 		if err := o.rules.BumpVersion(ctx); err != nil {
-			o.logger.Warn("orchestrator: bump version for recording stop failed",
+			o.logger.Warn("orchestrator: bump version for cache-box phase stop failed",
 				"phase_id", phaseID, "error", err)
 		}
 	}
@@ -435,20 +437,37 @@ func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
 // intent so a re-registering SDK inherits the freeze.
 func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) {
 	for _, fs := range p.FrozenServices {
-		delay := atroposdk.DelayRequest{}
-		if fs.SyntheticDelay != nil {
-			if fs.SyntheticDelay.FitMu != nil {
-				delay.Mu = *fs.SyntheticDelay.FitMu
-			}
-			if fs.SyntheticDelay.FitSigma != nil {
-				delay.Sigma = *fs.SyntheticDelay.FitSigma
-			}
-		}
-		if _, err := o.controller.FreezeService(ctx, fs.Service, delay); err != nil {
+		if _, err := o.controller.FreezeService(ctx, fs.Service, freezeDelayRequest(p, fs)); err != nil {
 			o.logger.Warn("orchestrator: freeze service failed",
 				"phase_id", p.ID, "service", fs.Service, "error", err)
 		}
 	}
+}
+
+// freezeDelayRequest builds the SDK freeze command for one frozen service: its
+// fitted synthetic-delay distribution plus the authoritative CacheBoxContext
+// (§W1) scoping the freeze to (experiment_id, phase_id) with the service's key
+// strategy. The context is provenance/forward-compat — replay itself is driven
+// by the poll-synthesized replay rule (MANT-4).
+func freezeDelayRequest(p *model.ExperimentPhase, fs model.CacheBoxConfig) atroposdk.DelayRequest {
+	delay := atroposdk.DelayRequest{}
+	if fs.SyntheticDelay != nil {
+		if fs.SyntheticDelay.FitMu != nil {
+			delay.Mu = *fs.SyntheticDelay.FitMu
+		}
+		if fs.SyntheticDelay.FitSigma != nil {
+			delay.Sigma = *fs.SyntheticDelay.FitSigma
+		}
+	}
+	strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+	delay.Context = &atroposdk.CacheBoxContext{
+		ExperimentID:    p.ExperimentID,
+		PhaseID:         p.ID,
+		KeyStrategy:     strat,
+		StrategyVersion: model.KeyStrategyVersion(strat),
+		KeyHeaders:      fs.KeyHeaders,
+	}
+	return delay
 }
 
 // thawServices clears the phase's frozen_services cache-box freeze. Called
