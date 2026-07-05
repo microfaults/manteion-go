@@ -155,7 +155,7 @@ func (r *ExperimentRepo) Delete(ctx context.Context, id string) error {
 func (r *ExperimentRepo) UpdateStatus(ctx context.Context, id, status string) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE experiments SET
-			status       = $2,
+			status       = $2::experiment_status,
 			started_at   = CASE WHEN $2 = 'running'                            AND started_at IS NULL THEN now() ELSE started_at END,
 			completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now()              ELSE completed_at END
 		WHERE id = $1`, id, status)
@@ -163,6 +163,70 @@ func (r *ExperimentRepo) UpdateStatus(ctx context.Context, id, status string) er
 		return fmt.Errorf("update experiment status: %w", err)
 	}
 	return affectedOrNotFound(res)
+}
+
+// TransitionExperiment atomically moves the experiment to `to` only when its
+// current status is one of `from`. Returns whether the transition happened —
+// the orchestrator FSM's compare-and-swap primitive: exactly one of N racing
+// callers wins, and only the winner runs side effects. Timestamps are stamped
+// like UpdateStatus.
+func (r *ExperimentRepo) TransitionExperiment(ctx context.Context, id, to string, from ...string) (bool, error) {
+	guard, args, err := fromStatusGuard(id, to, from)
+	if err != nil {
+		return false, fmt.Errorf("transition experiment: %w", err)
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiments SET
+			status       = $2::experiment_status,
+			started_at   = CASE WHEN $2 = 'running'                            AND started_at IS NULL THEN now() ELSE started_at END,
+			completed_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now()              ELSE completed_at END
+		WHERE id = $1 AND status::text IN `+guard, args...)
+	if err != nil {
+		return false, fmt.Errorf("transition experiment: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("transition experiment: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// TransitionPhase is the phase-level CAS twin of TransitionExperiment.
+func (r *ExperimentRepo) TransitionPhase(ctx context.Context, id, to string, from ...string) (bool, error) {
+	guard, args, err := fromStatusGuard(id, to, from)
+	if err != nil {
+		return false, fmt.Errorf("transition phase: %w", err)
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiment_phases SET
+			status       = $2::phase_status,
+			started_at   = CASE WHEN $2 = 'running'                              AND started_at IS NULL THEN now() ELSE started_at END,
+			completed_at = CASE WHEN $2 IN ('completed','failed','skipped') THEN now()                  ELSE completed_at END
+		WHERE id = $1 AND status::text IN `+guard, args...)
+	if err != nil {
+		return false, fmt.Errorf("transition phase: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("transition phase: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// fromStatusGuard builds the parameterized "($3, $4, ...)" from-set guard and
+// the full args slice (id, to, from...) for the Transition* CAS updates.
+func fromStatusGuard(id, to string, from []string) (string, []any, error) {
+	if len(from) == 0 {
+		return "", nil, fmt.Errorf("empty from-set")
+	}
+	args := make([]any, 0, len(from)+2)
+	args = append(args, id, to)
+	ph := make([]string, len(from))
+	for i, f := range from {
+		ph[i] = fmt.Sprintf("$%d", i+3)
+		args = append(args, f)
+	}
+	return "(" + strings.Join(ph, ", ") + ")", args, nil
 }
 
 // UpdateMetadata edits non-state fields. Empty arguments are no-ops.
@@ -262,6 +326,198 @@ func (r *ExperimentRepo) GetPhase(ctx context.Context, id string) (*model.Experi
 	return p, nil
 }
 
+// RunningExperimentIDs returns the ids of every experiment currently in status
+// 'running' — the set the admission controller checks a starting experiment's
+// service footprint against (MANT-5).
+func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id FROM experiments WHERE status = 'running'`)
+	if err != nil {
+		return nil, fmt.Errorf("list running experiments: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan running experiment: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ListRunningPhases returns every phase currently in status 'running' across
+// all experiments (newest-started first), each with its frozen_services — the
+// input to per-service cache-box rule synthesis (MANT-4). Small in practice:
+// at most one running phase per active experiment.
+func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, experiment_id, name, position, status, frozen_services,
+			persist_cache, started_at, completed_at
+		FROM experiment_phases
+		WHERE status = 'running'
+		ORDER BY started_at DESC NULLS LAST`)
+	if err != nil {
+		return nil, fmt.Errorf("list running phases: %w", err)
+	}
+	defer rows.Close()
+	var out []*model.ExperimentPhase
+	for rows.Next() {
+		p, err := scanPhaseRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan running phase: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ActiveCacheBoxPhaseForService resolves the cache-box role a service is
+// currently playing, if any — the context from which the poll path synthesizes
+// the service's compiled cache-box rule (MANT-4, replacing the deleted global
+// RecordingPhaseID signal). Provenance is phase-scoped (INV-5): there is no
+// ambient "most recently started phase" fallback.
+//
+//   - Replay: the service is frozen in a running phase → its freeze mode +
+//     strategy (an isolation phase).
+//   - Record: the service is frozen somewhere in an experiment that has a
+//     running persist_cache (baseline) phase → passthrough into that baseline,
+//     so exactly the services that will be replayed are recorded.
+//
+// Returns nil when the service has no active cache-box role.
+func (r *ExperimentRepo) ActiveCacheBoxPhaseForService(ctx context.Context, service string) (*model.CacheBoxRuleContext, error) {
+	running, err := r.ListRunningPhases(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	baselineByExp := make(map[string]*model.ExperimentPhase)
+	var baselineExpIDs []string
+	for _, p := range running {
+		for i := range p.FrozenServices {
+			if p.FrozenServices[i].Service == service {
+				return cacheBoxRuleContext(p.ExperimentID, p.ID, p.FrozenServices[i]), nil
+			}
+		}
+		if p.PersistCache {
+			if _, ok := baselineByExp[p.ExperimentID]; !ok {
+				baselineByExp[p.ExperimentID] = p
+				baselineExpIDs = append(baselineExpIDs, p.ExperimentID)
+			}
+		}
+	}
+
+	for _, expID := range baselineExpIDs {
+		phases, err := r.ListPhasesForExperiment(ctx, expID)
+		if err != nil {
+			return nil, err
+		}
+		for _, ph := range phases {
+			for i := range ph.FrozenServices {
+				if ph.FrozenServices[i].Service == service {
+					bp := baselineByExp[expID]
+					rc := cacheBoxRuleContext(bp.ExperimentID, bp.ID, ph.FrozenServices[i])
+					rc.Mode = "passthrough" // record on the baseline, regardless of the isolation freeze mode
+					return rc, nil
+				}
+			}
+		}
+	}
+	return nil, nil
+}
+
+// cacheBoxRuleContext builds a resolved rule context from a frozen-service
+// config, defaulting the key strategy and deriving its wire version.
+func cacheBoxRuleContext(experimentID, phaseID string, fs model.CacheBoxConfig) *model.CacheBoxRuleContext {
+	strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+	return &model.CacheBoxRuleContext{
+		ExperimentID:    experimentID,
+		PhaseID:         phaseID,
+		Mode:            fs.Mode,
+		KeyStrategy:     strat,
+		StrategyVersion: model.KeyStrategyVersion(strat),
+		KeyHeaders:      fs.KeyHeaders,
+	}
+}
+
+// UpsertPhaseDrain persists a recording phase's drain outcome (MANT-2),
+// idempotent on phase_id so the drain gate can write it exactly once.
+func (r *ExperimentRepo) UpsertPhaseDrain(ctx context.Context, phaseID string, result *model.PhaseDrainResult) error {
+	detail, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal drain result: %w", err)
+	}
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO phase_drain (phase_id, status, detail, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (phase_id) DO UPDATE SET status = $2, detail = $3, updated_at = now()`,
+		phaseID, result.Status, detail)
+	if err != nil {
+		return fmt.Errorf("upsert phase_drain: %w", err)
+	}
+	return nil
+}
+
+// GetPhaseDrain returns a phase's persisted drain outcome, or nil when the phase
+// never drained (e.g. an isolation phase, or one that never completed).
+func (r *ExperimentRepo) GetPhaseDrain(ctx context.Context, phaseID string) (*model.PhaseDrainResult, error) {
+	var detail []byte
+	err := r.db.QueryRowContext(ctx,
+		`SELECT detail FROM phase_drain WHERE phase_id = $1`, phaseID).Scan(&detail)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get phase_drain: %w", err)
+	}
+	var out model.PhaseDrainResult
+	if len(detail) > 0 {
+		if err := json.Unmarshal(detail, &out); err != nil {
+			return nil, fmt.Errorf("decode drain detail: %w", err)
+		}
+	}
+	return &out, nil
+}
+
+// UpsertPhaseVerdict persists a phase's fidelity verdict (MANT-6), idempotent
+// on phase_id so the finish-time computation writes it exactly once.
+func (r *ExperimentRepo) UpsertPhaseVerdict(ctx context.Context, phaseID string, v *model.PhaseVerdict) error {
+	detail, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshal verdict: %w", err)
+	}
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO phase_verdict (phase_id, verdict, detail, computed_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (phase_id) DO UPDATE SET verdict = $2, detail = $3, computed_at = now()`,
+		phaseID, v.Verdict, detail)
+	if err != nil {
+		return fmt.Errorf("upsert phase_verdict: %w", err)
+	}
+	return nil
+}
+
+// GetPhaseVerdict returns a phase's stored fidelity verdict, or nil when none
+// was computed (e.g. a baseline/non-frozen phase).
+func (r *ExperimentRepo) GetPhaseVerdict(ctx context.Context, phaseID string) (*model.PhaseVerdict, error) {
+	var detail []byte
+	err := r.db.QueryRowContext(ctx,
+		`SELECT detail FROM phase_verdict WHERE phase_id = $1`, phaseID).Scan(&detail)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get phase_verdict: %w", err)
+	}
+	var out model.PhaseVerdict
+	if len(detail) > 0 {
+		if err := json.Unmarshal(detail, &out); err != nil {
+			return nil, fmt.Errorf("decode verdict detail: %w", err)
+		}
+	}
+	return &out, nil
+}
+
 // ListPhasesForExperiment returns phases ordered by position.
 func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experimentID string) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
@@ -285,6 +541,68 @@ func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experiment
 	return out, rows.Err()
 }
 
+// ListPhasesPaged returns a cross-experiment page of phase list rows (the
+// "runs" list), newest-started first, each with its experiment name, workflow
+// ids, and frozen-service count. workflow_ids is aggregated as JSONB to avoid
+// PG-array scanning.
+func (r *ExperimentRepo) ListPhasesPaged(ctx context.Context, p Page) ([]*model.PhaseListItem, int, error) {
+	if p.Limit <= 0 {
+		p.Limit = 20
+	}
+	if p.Limit > 200 {
+		p.Limit = 200
+	}
+	if p.Offset < 0 {
+		p.Offset = 0
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT p.id, p.experiment_id, e.name, p.name, p.position, p.status,
+			p.started_at, p.completed_at,
+			CASE WHEN jsonb_typeof(p.frozen_services) = 'array'
+				THEN jsonb_array_length(p.frozen_services)
+				ELSE 0
+			END AS frozen_service_count,
+			COALESCE(jsonb_agg(pw.workflow_id ORDER BY pw.workflow_id)
+				FILTER (WHERE pw.workflow_id IS NOT NULL), '[]'::jsonb) AS workflow_ids,
+			COUNT(*) OVER () AS total_count
+		FROM experiment_phases p
+		JOIN experiments e ON e.id = p.experiment_id
+		LEFT JOIN phase_workflows pw ON pw.phase_id = p.id
+		GROUP BY p.id, e.name
+		ORDER BY p.started_at DESC NULLS LAST, p.position
+		LIMIT $1 OFFSET $2`, p.Limit, p.Offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list phases paged: %w", err)
+	}
+	defer rows.Close()
+	var (
+		out   []*model.PhaseListItem
+		total int
+	)
+	for rows.Next() {
+		var (
+			it                     model.PhaseListItem
+			startedAt, completedAt sql.NullTime
+			workflowIDs            []byte
+		)
+		if err := rows.Scan(
+			&it.ID, &it.ExperimentID, &it.ExperimentName, &it.Name, &it.Position, &it.Status,
+			&startedAt, &completedAt, &it.FrozenServiceCount, &workflowIDs, &total,
+		); err != nil {
+			return nil, 0, fmt.Errorf("scan phase list item: %w", err)
+		}
+		it.StartedAt = nullTimeToPtr(startedAt)
+		it.CompletedAt = nullTimeToPtr(completedAt)
+		if len(workflowIDs) > 0 {
+			if err := json.Unmarshal(workflowIDs, &it.WorkflowIDs); err != nil {
+				return nil, 0, fmt.Errorf("decode workflow_ids: %w", err)
+			}
+		}
+		out = append(out, &it)
+	}
+	return out, total, rows.Err()
+}
+
 // DeletePhase removes one phase and cascades to its workflows/rules/results.
 func (r *ExperimentRepo) DeletePhase(ctx context.Context, id string) error {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM experiment_phases WHERE id = $1`, id)
@@ -298,7 +616,7 @@ func (r *ExperimentRepo) DeletePhase(ctx context.Context, id string) error {
 func (r *ExperimentRepo) UpdatePhaseStatus(ctx context.Context, id, status string) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE experiment_phases SET
-			status       = $2,
+			status       = $2::phase_status,
 			started_at   = CASE WHEN $2 = 'running'                              AND started_at IS NULL THEN now() ELSE started_at END,
 			completed_at = CASE WHEN $2 IN ('completed','failed','skipped') THEN now()                  ELSE completed_at END
 		WHERE id = $1`, id, status)
@@ -609,14 +927,17 @@ func (r *ExperimentRepo) UpsertServiceCache(ctx context.Context, res *model.Phas
 	}
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO phase_service_cache (phase_id, service, cache_hit_rate,
-			cache_exact_match, cache_staleness, computed_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			cache_exact_match, cache_staleness, request_count, recorded_entry_count, computed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (phase_id, service) DO UPDATE SET
-			cache_hit_rate    = EXCLUDED.cache_hit_rate,
-			cache_exact_match = EXCLUDED.cache_exact_match,
-			cache_staleness   = EXCLUDED.cache_staleness,
-			computed_at       = EXCLUDED.computed_at`,
-		res.PhaseID, res.Service, res.CacheHitRate, res.CacheExactMatch, res.CacheStaleness, res.ComputedAt,
+			cache_hit_rate       = EXCLUDED.cache_hit_rate,
+			cache_exact_match    = EXCLUDED.cache_exact_match,
+			cache_staleness      = EXCLUDED.cache_staleness,
+			request_count        = EXCLUDED.request_count,
+			recorded_entry_count = EXCLUDED.recorded_entry_count,
+			computed_at          = EXCLUDED.computed_at`,
+		res.PhaseID, res.Service, res.CacheHitRate, res.CacheExactMatch, res.CacheStaleness,
+		res.RequestCount, res.RecordedEntryCount, res.ComputedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert phase_service_cache: %w", err)
@@ -627,7 +948,8 @@ func (r *ExperimentRepo) UpsertServiceCache(ctx context.Context, res *model.Phas
 // ListServiceCacheForPhase returns per-service cache rows for a phase.
 func (r *ExperimentRepo) ListServiceCacheForPhase(ctx context.Context, phaseID string) ([]*model.PhaseServiceCache, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT phase_id, service, cache_hit_rate, cache_exact_match, cache_staleness, computed_at
+		SELECT phase_id, service, cache_hit_rate, cache_exact_match, cache_staleness,
+			request_count, recorded_entry_count, computed_at
 		FROM phase_service_cache WHERE phase_id = $1
 		ORDER BY service`, phaseID)
 	if err != nil {
@@ -638,7 +960,8 @@ func (r *ExperimentRepo) ListServiceCacheForPhase(ctx context.Context, phaseID s
 	for rows.Next() {
 		var res model.PhaseServiceCache
 		if err := rows.Scan(
-			&res.PhaseID, &res.Service, &res.CacheHitRate, &res.CacheExactMatch, &res.CacheStaleness, &res.ComputedAt,
+			&res.PhaseID, &res.Service, &res.CacheHitRate, &res.CacheExactMatch, &res.CacheStaleness,
+			&res.RequestCount, &res.RecordedEntryCount, &res.ComputedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan phase_service_cache: %w", err)
 		}

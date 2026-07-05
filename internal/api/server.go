@@ -31,25 +31,27 @@ type ruleVersioner interface {
 
 // Server holds all dependencies for the manteion API.
 type Server struct {
-	logger       *slog.Logger
-	db           *sql.DB
-	dbPing       dbPinger // same as db; separate field so tests can inject a fake
-	rules        *store.RuleRepo
-	rulever      ruleVersioner // same as rules; separate field so tests can inject a fake
-	faults       *store.FaultRepo
-	faultStore   FaultStore
-	faultConfigs *store.FaultConfigRepo
-	sdk          *store.SDKRepo
-	experiments  *store.ExperimentRepo
-	workflows    *store.WorkflowRepo
-	workloads    *store.WorkloadRepo
-	policies     *store.PolicyRepo
-	traces       *store.TraceRepo
-	zeus         *zeus.Client
-	intent       atrocontrol.IntentReader
-	orch         *orchestrator.Orchestrator
-	cacheStore   *cachestore.Store
-	broker       *EventBroker
+	logger           *slog.Logger
+	db               *sql.DB
+	dbPing           dbPinger // same as db; separate field so tests can inject a fake
+	rules            *store.RuleRepo
+	rulever          ruleVersioner // same as rules; separate field so tests can inject a fake
+	faults           *store.FaultRepo
+	faultStore       FaultStore
+	faultConfigs     *store.FaultConfigRepo
+	sdk              *store.SDKRepo
+	experiments      *store.ExperimentRepo
+	phaseReader      phaseReader // same as experiments; separate field so ingest tests can inject a fake
+	phaseFaultEvents *store.PhaseFaultEventRepo
+	workflows        *store.WorkflowRepo
+	workloads        *store.WorkloadRepo
+	policies         *store.PolicyRepo
+	traces           *store.TraceRepo
+	zeus             *zeus.Client
+	intent           atrocontrol.IntentReader
+	orch             *orchestrator.Orchestrator
+	cacheStore       *cachestore.Store
+	broker           *EventBroker
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -62,6 +64,7 @@ func NewServer(
 	faultConfigs *store.FaultConfigRepo,
 	sdk *store.SDKRepo,
 	experiments *store.ExperimentRepo,
+	phaseFaultEvents *store.PhaseFaultEventRepo,
 	workflows *store.WorkflowRepo,
 	workloads *store.WorkloadRepo,
 	traces *store.TraceRepo,
@@ -72,25 +75,27 @@ func NewServer(
 	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
-		logger:       logger,
-		db:           db,
-		dbPing:       db,
-		rules:        rules,
-		rulever:      rules,
-		faults:       faults,
-		faultStore:   faultStore,
-		faultConfigs: faultConfigs,
-		sdk:          sdk,
-		experiments:  experiments,
-		workflows:    workflows,
-		workloads:    workloads,
-		policies:     policies,
-		traces:       traces,
-		zeus:         zeusClient,
-		intent:       intent,
-		orch:         orch,
-		cacheStore:   cs,
-		broker:       NewEventBroker(),
+		logger:           logger,
+		db:               db,
+		dbPing:           db,
+		rules:            rules,
+		rulever:          rules,
+		faults:           faults,
+		faultStore:       faultStore,
+		faultConfigs:     faultConfigs,
+		sdk:              sdk,
+		experiments:      experiments,
+		phaseReader:      experiments,
+		phaseFaultEvents: phaseFaultEvents,
+		workflows:        workflows,
+		workloads:        workloads,
+		policies:         policies,
+		traces:           traces,
+		zeus:             zeusClient,
+		intent:           intent,
+		orch:             orch,
+		cacheStore:       cs,
+		broker:           NewEventBroker(),
 	}
 }
 
@@ -186,14 +191,29 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	// Experiment CRUD + lifecycle (phase-first model).
 	// /runs and /contributions endpoints were retired; phases are the run
-	// unit. Pause/resume/cancel return with the phase-aware FSM port.
+	// unit. Pause is phase-level state: the experiment row stays 'running'
+	// while its current phase is 'paused' (the experiment_status enum has no
+	// paused label) — /pause, /resume, and /cancel drive the orchestrator FSM.
 	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)
 	mux.HandleFunc("GET /api/v1/experiments", s.handleListExperiments)
 	mux.HandleFunc("GET /api/v1/experiments/{id}", s.handleGetExperiment)
 	mux.HandleFunc("DELETE /api/v1/experiments/{id}", s.handleDeleteExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/start", s.handleStartExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/pause", s.handlePauseExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/resume", s.handleResumeExperiment)
+	mux.HandleFunc("POST /api/v1/experiments/{id}/cancel", s.handleCancelExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/stop", s.handleStopExperiment)
 	mux.HandleFunc("GET /api/v1/experiments/{id}/results", s.handleExperimentResults)
+
+	// Phase-native run-details surface (a "run" = a phase; phaseId is globally
+	// unique so no experiment segment is needed). Live panels (steps/events/
+	// resources) are the v2 follow-on. See docs/specs/2026-06-18-run-details-*.
+	mux.HandleFunc("GET /api/v1/phases", s.handleListPhases)
+	mux.HandleFunc("GET /api/v1/phases/{phaseId}", s.handleGetPhaseDetail)
+	mux.HandleFunc("GET /api/v1/phases/{phaseId}/faults", s.handleGetPhaseFaults)
+	mux.HandleFunc("POST /api/v1/phases/{phaseId}/pause", s.handlePausePhaseFlat)
+	mux.HandleFunc("POST /api/v1/phases/{phaseId}/resume", s.handleResumePhaseFlat)
+	mux.HandleFunc("POST /api/v1/phases/{phaseId}/stop", s.handleStopPhaseFlat)
 
 	// Phase CRUD + lifecycle.
 	mux.HandleFunc("POST /api/v1/experiments/{id}/phases", s.handleCreatePhase)
@@ -222,6 +242,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Cache ingest + serve
 	mux.HandleFunc("POST /api/v1/cache/ingest", s.handleCacheIngest)
 	mux.HandleFunc("GET /api/v1/cache/entries", s.handleCacheEntries)
+	mux.HandleFunc("POST /api/v1/sdk/cachebox/drain", s.handleCacheDrain)
 
 	// Zeus proxy — workflow lifecycle (register, validate, trigger runs, view status).
 	// Manteion owns experiment orchestration; zeus owns workflow execution.

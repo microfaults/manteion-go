@@ -97,6 +97,18 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// INV-2 (MANT-4d): every phase touching a service must agree on its
+	// cache-box key strategy + headers, so record and replay of that service
+	// derive identical keys. Reject upfront, before any row is written.
+	phasesForCheck := make([]model.ExperimentPhase, len(req.Phases))
+	for i, ph := range req.Phases {
+		phasesForCheck[i] = model.ExperimentPhase{FrozenServices: ph.FrozenServices}
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	exp := &model.Experiment{
 		ID:          req.ID,
 		Name:        req.Name,
@@ -219,6 +231,52 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
+// handlePauseExperiment pauses the experiment's running phase(s). The
+// experiment row stays 'running' — pause lives on the phase (phase_status
+// has a 'paused' label; experiment_status deliberately does not), and a
+// paused phase gates the orchestrator's scheduler.
+func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.PauseExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("pause experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+}
+
+func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.ResumeExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("resume experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
+}
+
+func (s *Server) handleCancelExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.orch.CancelExperiment(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("cancel experiment failed", "experiment_id", id, "error", err)
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
 func (s *Server) handleStopExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	finalStatus := r.URL.Query().Get("status")
@@ -338,6 +396,10 @@ type phaseResultsResponse struct {
 	WorkflowResults []*model.PhaseWorkflowResult `json:"workflow_results"`
 	ServiceLatency  []*model.PhaseServiceLatency `json:"service_latency"`
 	ServiceCache    []*model.PhaseServiceCache   `json:"service_cache"`
+	// Verdict is the phase's fidelity verdict (INV-6), nil for baseline/non-frozen
+	// phases. SEAM(D): the latency-decomposition/delta engine consuming these
+	// results MUST refuse to compute over a run whose verdict is INVALID.
+	Verdict *model.PhaseVerdict `json:"verdict,omitempty"`
 }
 
 func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
@@ -359,11 +421,17 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load service cache")
 		return
 	}
+	verdict, err := s.experiments.GetPhaseVerdict(ctx, phaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load phase verdict")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, phaseResultsResponse{
 		WorkflowResults: nilToEmpty(wfRes),
 		ServiceLatency:  nilToEmpty(svcLat),
 		ServiceCache:    nilToEmpty(svcCache),
+		Verdict:         verdict,
 	})
 }
 

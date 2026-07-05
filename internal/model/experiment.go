@@ -175,6 +175,56 @@ func (pr *PhaseRule) Validate() error {
 	return nil
 }
 
+var validFaultEventSources = setOf(FaultEventSourceValues...)
+
+// PhaseFaultEvent is one entry in a phase's fault apply→clear audit trail.
+// EndedAt is nil while the fault is active; the orchestrator stamps it when
+// the phase clears rules / thaws cache-box at finish.
+type PhaseFaultEvent struct {
+	ID        string          `json:"id"`
+	PhaseID   string          `json:"phase_id"`
+	Source    string          `json:"source"` // rule | cachebox | fault_config
+	Service   string          `json:"service"`
+	Kind      string          `json:"kind"` // "cachebox:replay", "inline:latency", …
+	Detail    json.RawMessage `json:"detail,omitempty"`
+	StartedAt time.Time       `json:"started_at"`
+	EndedAt   *time.Time      `json:"ended_at,omitempty"`
+}
+
+func (e *PhaseFaultEvent) Validate() error {
+	if e.ID == "" {
+		return errors.New("phase fault event: id required")
+	}
+	if e.PhaseID == "" {
+		return errors.New("phase fault event: phase_id required")
+	}
+	if !validFaultEventSources[e.Source] {
+		return fmt.Errorf("phase fault event: invalid source %q", e.Source)
+	}
+	if e.Service == "" {
+		return errors.New("phase fault event: service required")
+	}
+	if e.Kind == "" {
+		return errors.New("phase fault event: kind required")
+	}
+	return nil
+}
+
+// PhaseListItem is the cross-experiment list projection for GET /api/v1/phases
+// (a "run" row). Composed by ExperimentRepo.ListPhasesPaged.
+type PhaseListItem struct {
+	ID                 string     `json:"id"`
+	ExperimentID       string     `json:"experiment_id"`
+	ExperimentName     string     `json:"experiment_name"`
+	Name               string     `json:"name"`
+	Position           int        `json:"position"`
+	WorkflowIDs        []string   `json:"workflow_ids"`
+	FrozenServiceCount int        `json:"frozen_service_count"`
+	Status             string     `json:"status"`
+	StartedAt          *time.Time `json:"started_at,omitempty"`
+	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+}
+
 // ---------- Results ----------
 
 // PhaseWorkflowResult is the end-to-end latency and throughput for one
@@ -235,16 +285,23 @@ func (r *PhaseServiceLatency) Validate() error {
 	return nil
 }
 
-// PhaseServiceCache is per-(phase, service) cache-box fidelity stats.
-// Row presence implies the service was frozen in replay mode during this
-// phase. Callers that don't engage cache-box never write to this table.
+// PhaseServiceCache is per-(phase, service) cache-box fidelity stats. A row
+// is written for a service frozen in replay mode (hit_rate/request_count) and
+// for a service that recorded into a baseline phase (recorded_entry_count).
 type PhaseServiceCache struct {
-	PhaseID         string    `json:"phase_id"`
-	Service         string    `json:"service"`
-	CacheHitRate    float64   `json:"cache_hit_rate"`
-	CacheExactMatch float64   `json:"cache_exact_match"`
-	CacheStaleness  float64   `json:"cache_staleness"`
-	ComputedAt      time.Time `json:"computed_at"`
+	PhaseID         string  `json:"phase_id"`
+	Service         string  `json:"service"`
+	CacheHitRate    float64 `json:"cache_hit_rate"`
+	CacheExactMatch float64 `json:"cache_exact_match"`
+	CacheStaleness  float64 `json:"cache_staleness"`
+	// RequestCount is hits+misses observed against the frozen (replay) service
+	// — disambiguates "0 requests served" from "all misses" (both hit_rate 0).
+	RequestCount int64 `json:"request_count"`
+	// RecordedEntryCount is the recording coverage: distinct entries captured
+	// for this service on a baseline phase, or available to replay on an
+	// isolation phase. Together with hit_rate it verifies recording fidelity.
+	RecordedEntryCount int64     `json:"recorded_entry_count"`
+	ComputedAt         time.Time `json:"computed_at"`
 }
 
 func (r *PhaseServiceCache) Validate() error {

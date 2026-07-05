@@ -77,6 +77,7 @@ manteion-go (Controller)
 - **Intent tracker** — `atrocontrol.IntentTracker` is an in-memory map so `POST /api/v1/sdk/register` can piggyback current rules/freeze config in the response without a DB round-trip.
 - **Fanout concurrency** — `atrocontrol.fanout` uses a semaphore (default 16) with per-target timeouts (default 2 s); failures are collected, not fatal.
 - **Fault composition max depth = 3** (atoms → groups → top-level) enforced both in `model.ValidateComposition` at write time and in `ruleconv.resolveComposition` at read time.
+- **Phase-level pause** — `experiment_status` has no `paused` label (deliberate); pausing an experiment pauses its running phase(s) while the experiment row stays `running`, and the orchestrator's scheduler (`advanceExperiment`) refuses to start new phases while any phase is `paused`. The orchestrator FSM (`internal/orchestrator`) is phase-aware: CAS transitions (`store.TransitionPhase`/`TransitionExperiment`), one terminal path (`finishPhase`) that tears down rules/freezes/attacks and harvests exactly once, a per-phase zeus poller, and crash recovery (`Recover`) that reconciles persisted `zeus_attack_id` handles.
 
 ### HTTP API surface
 
@@ -87,6 +88,8 @@ manteion-go (Controller)
 | Fault specs | `POST/GET /api/v1/faults/specs`, `GET/DELETE /api/v1/faults/specs/{id}` |
 | Fault compositions | `POST/GET /api/v1/faults/compositions`, `GET/DELETE /api/v1/faults/compositions/{id}` |
 | SDK | `POST /api/v1/sdk/register`, `DELETE /api/v1/sdk/register/{id}`, `GET /api/v1/sdk/instances`, `GET /api/v1/sdk/rules`, `GET /api/v1/sdk/init` |
+| Experiments | `POST/GET /api/v1/experiments`, `GET/DELETE ./{id}`, `POST ./{id}/start`, `POST ./{id}/pause`, `POST ./{id}/resume`, `POST ./{id}/cancel`, `POST ./{id}/stop?status=`, `GET ./{id}/results`; phases: `POST ./{id}/phases`, `GET/DELETE ./{id}/phases/{phaseId}`, `POST ./{id}/phases/{phaseId}/start`, `POST ./{id}/phases/{phaseId}/stop?status=`, `GET ./{id}/phases/{phaseId}/results` |
+| Phases (run-details) | `GET /api/v1/phases`, `GET ./{phaseId}`, `GET ./{phaseId}/faults`, `POST ./{phaseId}/pause\|resume\|stop`. A "run" = a phase; live panels (steps/events/resources) are the v2 follow-on. |
 | Zeus proxy | `POST/GET /api/v1/zeus/workflows`, `GET/DELETE ./{id}`, `POST ./{id}/validate`, `POST/GET ./{id}/runs`; `GET /api/v1/zeus/runs`, `GET/DELETE ./{run_id}`, `GET ./{run_id}/events`, `GET ./{run_id}/stats`; `POST/GET /api/v1/zeus/datasets`, `GET/DELETE ./{id}`, `POST ./{id}/upload`, `GET ./{id}/sample` → Archer. Attacks NOT proxied (orchestrator-managed). |
 
 ### Environment variables

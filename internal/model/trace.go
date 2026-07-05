@@ -51,7 +51,8 @@ type CacheBoxConfig struct {
 	Service          string                `json:"service"`
 	Mode             string                `json:"mode"`                   // "passthrough", "replay", "replay_with_delay"
 	WorkflowScope    string                `json:"workflow_scope"`         // meta-trace-id pattern, "" = all traffic
-	KeyStrategy      string                `json:"key_strategy"`           // "exact", "exact_with_host", "exact_with_body" — matches SDK cachebox.KeyStrategy
+	KeyStrategy      string                `json:"key_strategy"`           // "exact", "exact_with_host", "exact_with_body", "canonical_v2" (default when empty) — matches SDK cachebox.KeyStrategy
+	KeyHeaders       []string              `json:"key_headers,omitempty"`  // per-rule additions to the default header allowlist (lowercase); travels on CacheBoxContext (§W1)
 	MutationPolicy   string                `json:"mutation_policy"`        // "deny" (default), "allow". Metadata only — not enforced by SDK. Records operator intent for experiment reproducibility.
 	SafeMethods      []string              `json:"safe_methods,omitempty"` // Metadata only — not enforced by SDK.
 	SyntheticDelay   *SyntheticDelayConfig `json:"synthetic_delay,omitempty"`
@@ -74,7 +75,9 @@ func (c *CacheBoxConfig) Validate() error {
 	if !validCacheBoxModes[c.Mode] {
 		return fmt.Errorf("cachebox config: invalid mode %q", c.Mode)
 	}
-	if !validKeyStrategies[c.KeyStrategy] {
+	// Empty key_strategy is valid — it resolves to the default (canonical_v2)
+	// at rule-synthesis time (see ResolveKeyStrategy).
+	if c.KeyStrategy != "" && !validKeyStrategies[c.KeyStrategy] {
 		return fmt.Errorf("cachebox config: invalid key_strategy %q", c.KeyStrategy)
 	}
 	if !validMutationPolicies[c.MutationPolicy] {
