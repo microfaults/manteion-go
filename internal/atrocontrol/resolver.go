@@ -14,8 +14,16 @@ type InstanceResolver interface {
 
 type InstanceFilter func(*model.SDKInstance) bool
 
-func FilterAliveOrSuspect(i *model.SDKInstance) bool {
-	return i.Status == "" || i.Status == "alive" || i.Status == "suspect"
+// FilterLive keeps every instance that may still be serving traffic. The
+// computed liveness vocabulary is alive|stale|dead (store/sdk_repo.go):
+// "stale" is a slow-polling but LIVE pod -- it must be frozen, receive
+// rule pushes, and it still owes drain records; excluding it leaks live
+// calls during isolation and shrinks the drain gate's expected set
+// (false-clean). Only "dead" (beyond 5x poll interval) is excluded.
+// The previous filter matched "suspect", a status nothing ever computes,
+// so stale instances silently dropped out of every fanout.
+func FilterLive(i *model.SDKInstance) bool {
+	return i.Status == "" || i.Status == "alive" || i.Status == "stale"
 }
 
 func FilterAll(_ *model.SDKInstance) bool { return true }

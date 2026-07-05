@@ -36,7 +36,7 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 		defaults: controllerOpts{
 			timeout:     2 * time.Second,
 			concurrency: 16,
-			filter:      FilterAliveOrSuspect,
+			filter:      FilterLive,
 		},
 	}
 	for _, o := range opts {
