@@ -326,6 +326,26 @@ func (r *ExperimentRepo) GetPhase(ctx context.Context, id string) (*model.Experi
 	return p, nil
 }
 
+// RunningExperimentIDs returns the ids of every experiment currently in status
+// 'running' — the set the admission controller checks a starting experiment's
+// service footprint against (MANT-5).
+func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id FROM experiments WHERE status = 'running'`)
+	if err != nil {
+		return nil, fmt.Errorf("list running experiments: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan running experiment: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // ListRunningPhases returns every phase currently in status 'running' across
 // all experiments (newest-started first), each with its frozen_services — the
 // input to per-service cache-box rule synthesis (MANT-4). Small in practice:

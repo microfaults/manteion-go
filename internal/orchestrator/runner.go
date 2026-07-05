@@ -564,6 +564,9 @@ func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.Experim
 		}
 
 		strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+		if err := verifyRecordedStrategy(fs.Service, entries, strat); err != nil {
+			return err
+		}
 		checksum := cachestore.SetChecksum(entries)
 		results, err := o.controller.PreloadService(ctx, fs.Service, atrocontrol.PreloadSpec{
 			ExperimentID:    p.ExperimentID,
@@ -585,6 +588,22 @@ func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.Experim
 		o.logger.Info("orchestrator: preload verified",
 			"phase_id", p.ID, "service", fs.Service,
 			"entries", len(entries), "instances", len(results))
+	}
+	return nil
+}
+
+// verifyRecordedStrategy is the preload strategy preflight (MANT-5/INV-2): the
+// key strategy the entries were recorded under must equal the strategy the
+// freeze context will replay with, or every key would derive differently and
+// the isolation run would be 100% miss. An entry with an empty key_strategy
+// (recorded by a legacy SDK) is not checked. This converts a would-be silent
+// all-miss run into an explicit preflight failure.
+func verifyRecordedStrategy(service string, entries []atroposdk.CacheBoxWireEntry, expected string) error {
+	for i := range entries {
+		if s := entries[i].KeyStrategy; s != "" && s != expected {
+			return fmt.Errorf("preload %q: key_strategy_mismatch: recorded under %q but the freeze context uses %q "+
+				"(record and replay must key identically)", service, s, expected)
+		}
 	}
 	return nil
 }
