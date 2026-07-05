@@ -84,25 +84,8 @@ func TestExperimentStart_RejectsOverlappingServices(t *testing.T) {
 	}
 }
 
-// TestExperimentStart_OverrideAllowsOverlap pins the MANTEION_ALLOW_CONCURRENT_OVERLAP
-// escape hatch: with it set, an overlapping experiment is admitted (claimed
-// running) despite the shared service.
-func TestExperimentStart_OverrideAllowsOverlap(t *testing.T) {
-	ctx := context.Background()
-	o := newOrch(t, "")
-	o.WithAllowConcurrentOverlap(true)
-	shared := "shared-" + id.New("s")
-
-	exp1 := mkExp(t)
-	frozenPhasePending(t, exp1.ID, shared, "exact", 0)
-	if _, err := testExpRepo.TransitionExperiment(ctx, exp1.ID, "running", "planned"); err != nil {
-		t.Fatalf("run exp1: %v", err)
-	}
-
-	exp2 := mkExp(t)
-	frozenPhasePending(t, exp2.ID, shared, "exact", 0)
-
-	if err := o.StartExperiment(ctx, exp2.ID); err != nil {
-		t.Fatalf("with override, StartExperiment err = %v, want nil (admitted)", err)
-	}
-}
+// (The former MANTEION_ALLOW_CONCURRENT_OVERLAP escape hatch is deleted:
+// the SDK is single-tenant per instance -- one replay set, one preload
+// staging slot -- so shared-service concurrency silently serves one
+// experiment the other's data. Overlap admission is unconditional; see
+// TestExperimentStart_RejectsOverlappingServices.)

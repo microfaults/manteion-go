@@ -99,9 +99,6 @@ func main() {
 	// isolation phases start from a degraded recording.
 	orch.WithDrainTimeout(envDurationOr("MANTEION_DRAIN_TIMEOUT", 30*time.Second))
 	orch.WithAllowDegradedBaseline(envOr("MANTEION_ALLOW_DEGRADED_BASELINE", "false") == "true")
-	// MANTEION_ALLOW_CONCURRENT_OVERLAP lets experiments with overlapping service
-	// sets run concurrently (admission control off).
-	orch.WithAllowConcurrentOverlap(envOr("MANTEION_ALLOW_CONCURRENT_OVERLAP", "false") == "true")
 	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)
 
 	// Restore in-flight runs from the DB. Must run before the API server

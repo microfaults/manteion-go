@@ -61,10 +61,6 @@ type Orchestrator struct {
 	drainPollInterval     time.Duration
 	allowDegradedBaseline bool
 
-	// allowConcurrentOverlap lets an experiment start even when its service set
-	// intersects a running experiment's (MANTEION_ALLOW_CONCURRENT_OVERLAP).
-	allowConcurrentOverlap bool
-
 	mu       sync.Mutex
 	running  map[string]context.CancelFunc // phase ID → poller cancel
 	expLocks map[string]*sync.Mutex        // experiment ID → scheduler serializer
@@ -117,10 +113,6 @@ func (o *Orchestrator) WithDrainPollInterval(d time.Duration) { o.drainPollInter
 // recording (MANTEION_ALLOW_DEGRADED_BASELINE).
 func (o *Orchestrator) WithAllowDegradedBaseline(v bool) { o.allowDegradedBaseline = v }
 
-// WithAllowConcurrentOverlap lets an experiment start even when its service set
-// overlaps a running experiment's (MANTEION_ALLOW_CONCURRENT_OVERLAP).
-func (o *Orchestrator) WithAllowConcurrentOverlap(v bool) { o.allowConcurrentOverlap = v }
-
 // WithMaxPollDuration overrides the default Zeus poll timeout.
 func (o *Orchestrator) WithMaxPollDuration(d time.Duration) {
 	o.maxPollDuration = d
@@ -160,11 +152,13 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 	// Admission control (MANT-5): refuse a service footprint that overlaps a
 	// running experiment, so two experiments never fight over a service
 	// (INV-5). Checked before the claim so a rejected start leaves the
-	// experiment planned.
-	if !o.allowConcurrentOverlap {
-		if err := o.checkServiceOverlap(ctx, experimentID); err != nil {
-			return err
-		}
+	// experiment planned. Deliberately NOT overridable: the SDK holds one
+	// replay set, one preload staging slot, and one freeze delay source per
+	// instance, so shared-service concurrency doesn't degrade -- it silently
+	// serves one experiment the other's data. Disjoint-footprint experiments
+	// already pass this check without any flag.
+	if err := o.checkServiceOverlap(ctx, experimentID); err != nil {
+		return err
 	}
 
 	// Atomically claim planned → running so two concurrent starts can't both

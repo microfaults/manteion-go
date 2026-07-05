@@ -28,9 +28,10 @@ func (o *Orchestrator) experimentServiceSet(ctx context.Context, experimentID st
 // checkServiceOverlap refuses to start an experiment whose service footprint
 // intersects a running experiment's (INV-5 admission control, MANT-5): two
 // experiments sharing a service are rule-conflict irreconcilable — one freezes
-// it, the other wants it live — no matter how keys are scoped. The error names
-// both experiments and the shared services; MANTEION_ALLOW_CONCURRENT_OVERLAP
-// overrides.
+// it, the other wants it live — no matter how keys are scoped, and the SDK is
+// single-tenant per instance (one replay set, one preload staging slot), so
+// overlap corrupts silently rather than degrading. Not overridable. The error
+// names both experiments and the shared services.
 func (o *Orchestrator) checkServiceOverlap(ctx context.Context, experimentID string) error {
 	candidate := o.experimentServiceSet(ctx, experimentID)
 	if len(candidate) == 0 {
@@ -53,7 +54,7 @@ func (o *Orchestrator) checkServiceOverlap(ctx context.Context, experimentID str
 		if len(shared) > 0 {
 			sort.Strings(shared)
 			return fmt.Errorf("experiment %q cannot start: services %v overlap running experiment %q; "+
-				"set MANTEION_ALLOW_CONCURRENT_OVERLAP=true to override", experimentID, shared, rid)
+				"wait for it to finish or stop it", experimentID, shared, rid)
 		}
 	}
 	return nil
