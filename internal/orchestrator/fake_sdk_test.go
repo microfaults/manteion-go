@@ -24,6 +24,9 @@ type fakeSDK struct {
 	server    *httptest.Server
 	commitOK  bool
 	freezeHit atomic.Bool
+	// fidelity, when set, is served at GET /cachebox/fidelity; nil ⇒ 503 (used
+	// to simulate a missing-telemetry instance).
+	fidelity *atroposdk.FidelitySnapshot
 }
 
 func newFakeSDK(t *testing.T, commitOK bool) *fakeSDK {
@@ -57,6 +60,13 @@ func newFakeSDK(t *testing.T, commitOK bool) *fakeSDK {
 	})
 	mux.HandleFunc("DELETE /admin/cachebox", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /cachebox/fidelity", func(w http.ResponseWriter, _ *http.Request) {
+		if f.fidelity == nil {
+			http.Error(w, "no snapshot", http.StatusServiceUnavailable)
+			return
+		}
+		writeTestJSON(w, http.StatusOK, *f.fidelity)
 	})
 
 	f.server = httptest.NewServer(mux)

@@ -396,6 +396,10 @@ type phaseResultsResponse struct {
 	WorkflowResults []*model.PhaseWorkflowResult `json:"workflow_results"`
 	ServiceLatency  []*model.PhaseServiceLatency `json:"service_latency"`
 	ServiceCache    []*model.PhaseServiceCache   `json:"service_cache"`
+	// Verdict is the phase's fidelity verdict (INV-6), nil for baseline/non-frozen
+	// phases. SEAM(D): the latency-decomposition/delta engine consuming these
+	// results MUST refuse to compute over a run whose verdict is INVALID.
+	Verdict *model.PhaseVerdict `json:"verdict,omitempty"`
 }
 
 func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
@@ -417,11 +421,17 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load service cache")
 		return
 	}
+	verdict, err := s.experiments.GetPhaseVerdict(ctx, phaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load phase verdict")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, phaseResultsResponse{
 		WorkflowResults: nilToEmpty(wfRes),
 		ServiceLatency:  nilToEmpty(svcLat),
 		ServiceCache:    nilToEmpty(svcCache),
+		Verdict:         verdict,
 	})
 }
 

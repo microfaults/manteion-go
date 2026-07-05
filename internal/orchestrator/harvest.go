@@ -18,7 +18,7 @@ import (
 // SDK instances into phase_service_cache. Non-fatal throughout — missing or
 // not-yet-ready results are logged and skipped so the phase still completes.
 // Called exactly once per completed phase, by the finishPhase CAS winner.
-func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow) {
+func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow, staleness map[string]float64) {
 	if o.zeusClient != nil {
 		for _, pw := range pws {
 			if pw.ZeusAttackID == "" {
@@ -31,7 +31,7 @@ func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhas
 			}
 		}
 	}
-	o.harvestCacheStats(ctx, p)
+	o.harvestCacheStats(ctx, p, staleness)
 }
 
 // harvestAttack fetches the final metrics for one (phase, workflow) attack
@@ -129,10 +129,10 @@ func (o *Orchestrator) harvestAttack(ctx context.Context, p *model.ExperimentPha
 //     service that ingested into this phase, recorded_entry_count = number of
 //     entries captured (hit_rate/request_count = 0, no replay happened).
 //
-// cache_exact_match = hit_rate and cache_staleness = 0.0 (the SDK exposes no
-// fuzzier-match or staleness counter yet — a documented follow-on). Best-effort
-// throughout: an unreachable service or store error is logged, not fatal.
-func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.ExperimentPhase) {
+// cache_exact_match = hit_rate; cache_staleness = the mean replay age (ms) from
+// the W6 fidelity snapshots (MANT-6), or 0 when telemetry was missing.
+// Best-effort throughout: an unreachable service or store error is logged, not fatal.
+func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.ExperimentPhase, staleness map[string]float64) {
 	// Pass 1 — isolation replay stats.
 	if len(p.FrozenServices) > 0 {
 		baselineCoverage := o.baselineCoverage(ctx, p.ExperimentID)
@@ -168,7 +168,7 @@ func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.Experimen
 				Service:            fs.Service,
 				CacheHitRate:       hitRate,
 				CacheExactMatch:    hitRate,
-				CacheStaleness:     0.0,
+				CacheStaleness:     staleness[fs.Service], // real mean replay age (ms) from W6 snapshots (MANT-6); 0 if telemetry missing
 				RequestCount:       total,
 				RecordedEntryCount: baselineCoverage[fs.Service],
 			}

@@ -87,6 +87,19 @@ CREATE TABLE phase_drain (
 );
 `
 
+// migration7 records a phase's first-class fidelity verdict (design doc Q6 /
+// INV-6): VALID | VALID_WITH_WARNINGS | INVALID, with the per-instance fidelity
+// snapshots and reasons in detail. Read at the results/decomposition boundary —
+// the delta engine (SEAM(D)) must refuse to compute over an INVALID run.
+const migration7 = `
+CREATE TABLE phase_verdict (
+    phase_id    TEXT PRIMARY KEY REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    verdict     TEXT NOT NULL,
+    detail      JSONB NOT NULL DEFAULT '{}',
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`
+
 var migrations = []migration{
 	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
 	{2, "phase_fault_events audit trail + fault_event_source enum", migration2},
@@ -94,6 +107,7 @@ var migrations = []migration{
 	{4, "cachebox_key_strategy: add canonical_v2 (default keyer, design doc Q3)", migration4},
 	{5, "phase_status: add draining (drain barrier, design doc Q2)", migration5},
 	{6, "phase_drain: per-phase drain outcome (clean|degraded + detail)", migration6},
+	{7, "phase_verdict: per-phase fidelity verdict (VALID|WARN|INVALID, design doc Q6)", migration7},
 }
 
 // Migrate applies any pending migrations to the database.

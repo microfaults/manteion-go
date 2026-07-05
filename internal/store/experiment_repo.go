@@ -479,6 +479,45 @@ func (r *ExperimentRepo) GetPhaseDrain(ctx context.Context, phaseID string) (*mo
 	return &out, nil
 }
 
+// UpsertPhaseVerdict persists a phase's fidelity verdict (MANT-6), idempotent
+// on phase_id so the finish-time computation writes it exactly once.
+func (r *ExperimentRepo) UpsertPhaseVerdict(ctx context.Context, phaseID string, v *model.PhaseVerdict) error {
+	detail, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshal verdict: %w", err)
+	}
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO phase_verdict (phase_id, verdict, detail, computed_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (phase_id) DO UPDATE SET verdict = $2, detail = $3, computed_at = now()`,
+		phaseID, v.Verdict, detail)
+	if err != nil {
+		return fmt.Errorf("upsert phase_verdict: %w", err)
+	}
+	return nil
+}
+
+// GetPhaseVerdict returns a phase's stored fidelity verdict, or nil when none
+// was computed (e.g. a baseline/non-frozen phase).
+func (r *ExperimentRepo) GetPhaseVerdict(ctx context.Context, phaseID string) (*model.PhaseVerdict, error) {
+	var detail []byte
+	err := r.db.QueryRowContext(ctx,
+		`SELECT detail FROM phase_verdict WHERE phase_id = $1`, phaseID).Scan(&detail)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get phase_verdict: %w", err)
+	}
+	var out model.PhaseVerdict
+	if len(detail) > 0 {
+		if err := json.Unmarshal(detail, &out); err != nil {
+			return nil, fmt.Errorf("decode verdict detail: %w", err)
+		}
+	}
+	return &out, nil
+}
+
 // ListPhasesForExperiment returns phases ordered by position.
 func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experimentID string) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `

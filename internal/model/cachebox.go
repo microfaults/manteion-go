@@ -1,10 +1,32 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 )
+
+// Phase verdict values (design doc Q6 / INV-6).
+const (
+	VerdictValid            = "VALID"
+	VerdictValidWithWarning = "VALID_WITH_WARNINGS"
+	VerdictInvalid          = "INVALID"
+)
+
+// PhaseVerdict is the first-class fidelity verdict for an isolation phase
+// (INV-6): whether the freeze held. INVALID reasons are machine-readable
+// (fidelity_violation:replay_miss, preload_incomplete, degraded_baseline,
+// telemetry_missing); the SEAM(D) delta engine must refuse to compute over an
+// INVALID run. Snapshots is the raw per-instance W6 fidelity JSON.
+type PhaseVerdict struct {
+	Verdict         string          `json:"verdict"`
+	Reasons         []string        `json:"reasons,omitempty"`
+	CollisionRate   float64         `json:"collision_rate"`
+	ReplayAgeMaxMs  int64           `json:"replay_age_max_ms"`
+	ReplayAgeMeanMs int64           `json:"replay_age_mean_ms"`
+	Snapshots       json.RawMessage `json:"snapshots,omitempty"`
+}
 
 // DefaultKeyStrategy is the cache-box keyer used when a frozen-service config
 // leaves key_strategy empty. canonical_v2 is the length-prefixed SHA-256 keyer
