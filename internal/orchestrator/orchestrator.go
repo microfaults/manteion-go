@@ -53,6 +53,14 @@ type Orchestrator struct {
 	pollInterval    time.Duration
 	autoComplete    bool // auto-complete driver-less phases (off in FSM unit tests)
 
+	// Drain barrier (MANT-2). drainTimeout bounds the wait for every expected
+	// SDK to flush + drain-report; drainPollInterval is how often the gate
+	// re-checks. allowDegradedBaseline lets an isolation phase start from a
+	// degraded recording (MANTEION_ALLOW_DEGRADED_BASELINE).
+	drainTimeout          time.Duration
+	drainPollInterval     time.Duration
+	allowDegradedBaseline bool
+
 	mu       sync.Mutex
 	running  map[string]context.CancelFunc // phase ID → poller cancel
 	expLocks map[string]*sync.Mutex        // experiment ID → scheduler serializer
@@ -73,24 +81,37 @@ func New(
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
-		experiments:     experiments,
-		rules:           rules,
-		faults:          faults,
-		workloads:       workloads,
-		workflows:       workflows,
-		controller:      controller,
-		prom:            prom,
-		zeusClient:      zeusClient,
-		cacheStore:      cs,
-		faultEvents:     faultEvents,
-		logger:          logger,
-		maxPollDuration: defaultMaxPollDuration,
-		pollInterval:    defaultZeusPollInterval,
-		autoComplete:    true,
-		running:         make(map[string]context.CancelFunc),
-		expLocks:        make(map[string]*sync.Mutex),
+		experiments:       experiments,
+		rules:             rules,
+		faults:            faults,
+		workloads:         workloads,
+		workflows:         workflows,
+		controller:        controller,
+		prom:              prom,
+		zeusClient:        zeusClient,
+		cacheStore:        cs,
+		faultEvents:       faultEvents,
+		logger:            logger,
+		maxPollDuration:   defaultMaxPollDuration,
+		pollInterval:      defaultZeusPollInterval,
+		autoComplete:      true,
+		drainTimeout:      30 * time.Second,
+		drainPollInterval: 200 * time.Millisecond,
+		running:           make(map[string]context.CancelFunc),
+		expLocks:          make(map[string]*sync.Mutex),
 	}
 }
+
+// WithDrainTimeout overrides the recording-phase drain barrier's bound
+// (MANTEION_DRAIN_TIMEOUT; must be ≥ 3× the SDK poll interval + flush time).
+func (o *Orchestrator) WithDrainTimeout(d time.Duration) { o.drainTimeout = d }
+
+// WithDrainPollInterval overrides how often the drain gate re-checks (test seam).
+func (o *Orchestrator) WithDrainPollInterval(d time.Duration) { o.drainPollInterval = d }
+
+// WithAllowDegradedBaseline lets isolation phases start from a degraded
+// recording (MANTEION_ALLOW_DEGRADED_BASELINE).
+func (o *Orchestrator) WithAllowDegradedBaseline(v bool) { o.allowDegradedBaseline = v }
 
 // WithMaxPollDuration overrides the default Zeus poll timeout.
 func (o *Orchestrator) WithMaxPollDuration(d time.Duration) {
@@ -273,9 +294,10 @@ func (o *Orchestrator) terminateExperiment(ctx context.Context, experimentID, fi
 	}
 	for _, p := range phases {
 		switch p.Status {
-		case "running", "paused":
-			// finishPhase tears down the poller, rules, freezes, and attacks.
-			o.finishPhase(ctx, p.ID, "skipped", "running", "paused")
+		case "running", "paused", "draining":
+			// finishPhase tears down the poller, rules, freezes, and attacks. A
+			// draining phase is skipped straight from draining (no re-drain).
+			o.finishPhase(ctx, p.ID, "skipped", "running", "paused", "draining")
 		case "pending":
 			if _, err := o.experiments.TransitionPhase(ctx, p.ID, "skipped", "pending"); err != nil {
 				o.logger.Warn("orchestrator: terminate: skip pending phase failed",
@@ -321,9 +343,10 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 	anyFailed := false
 	for _, p := range phases {
 		switch p.Status {
-		case "running", "paused":
-			// A phase in flight (or paused by the operator) blocks the
-			// scheduler — sequential execution, and the pause gate.
+		case "running", "paused", "draining":
+			// A phase in flight (running), paused by the operator, or draining
+			// (completing through the drain barrier) blocks the scheduler —
+			// sequential execution, the pause gate, and the drain gate.
 			return
 		case "failed":
 			anyFailed = true

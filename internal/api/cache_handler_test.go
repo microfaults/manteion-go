@@ -121,6 +121,27 @@ func TestIngest_RejectsInactivePair(t *testing.T) {
 	}
 }
 
+// TestPushEndpoint_AcceptedDuringDraining pins MANT-2 (W2): the push endpoint
+// keeps accepting recorded batches while the phase is draining, so SDKs can
+// flush their tail — this is what removes the mark-completed-then-409 loss window.
+func TestPushEndpoint_AcceptedDuringDraining(t *testing.T) {
+	reader := stubPhaseReader{phases: map[string]*model.ExperimentPhase{
+		"phase-draining": {ID: "phase-draining", ExperimentID: "exp-1", Status: "draining", PersistCache: true},
+	}}
+	s := &Server{phaseReader: reader, cacheStore: cachestore.New(t.TempDir()), logger: discardLogger()}
+
+	w := postIngest(t, s, ingestEnvelope{
+		ExperimentID: "exp-1", PhaseID: "phase-draining", Service: "frontend", Instance: "i1", BatchSeq: 1,
+		Entries: []atroposdk.CacheBoxWireEntry{{Key: "k1"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("push during draining: status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if got := s.cacheStore.ReceivedCount("exp-1", "phase-draining", "frontend", "i1"); got != 1 {
+		t.Fatalf("received = %d, want 1 (draining push must persist)", got)
+	}
+}
+
 func assertErrorBody(t *testing.T, w *httptest.ResponseRecorder, want string) {
 	t.Helper()
 	var e struct {

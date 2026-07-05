@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 )
@@ -83,4 +84,25 @@ func (c *Client) PreloadCommit(ctx context.Context, addr string, req atroposdk.P
 func (c *Client) PreloadAbort(ctx context.Context, addr string, req atroposdk.PreloadAbortRequest) error {
 	_, err := c.doExpectStatus(ctx, http.MethodPost, addr+"/cachebox/preload/abort", req, http.StatusOK)
 	return err
+}
+
+// GetCacheBoxFidelity pulls the SDK's W6 fidelity snapshot for (exp, phase) —
+// the authoritative per-instance counters manteion reads at the drain-timeout
+// fallback (MANT-2) and at verdict time (MANT-6).
+func (c *Client) GetCacheBoxFidelity(ctx context.Context, addr, experimentID, phaseID string) (atroposdk.FidelitySnapshot, error) {
+	u := addr + "/cachebox/fidelity?experiment_id=" + url.QueryEscape(experimentID) + "&phase_id=" + url.QueryEscape(phaseID)
+	resp, err := c.do(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return atroposdk.FidelitySnapshot{}, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return atroposdk.FidelitySnapshot{}, &HTTPError{Method: http.MethodGet, URL: u, Status: resp.StatusCode, Body: string(data)}
+	}
+	var snap atroposdk.FidelitySnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return atroposdk.FidelitySnapshot{}, &TransportError{Method: http.MethodGet, URL: u, Err: err}
+	}
+	return snap, nil
 }

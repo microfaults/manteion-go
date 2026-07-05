@@ -39,11 +39,12 @@ import (
 type Store struct {
 	root string
 
-	mu         sync.Mutex
-	dedup      map[string]map[string]struct{} // pair -> "instance\x00batch_seq" -> seen
-	received   map[string]map[string]int64    // pair -> "service\x00instance"   -> entries persisted
-	seenKeys   map[string]map[string]entrySig // pair -> cache key -> last-seen signature (collision detection)
-	collisions map[string]*collisionCounts    // pair -> divergent/identical tallies
+	mu           sync.Mutex
+	dedup        map[string]map[string]struct{}              // pair -> "instance\x00batch_seq" -> seen
+	received     map[string]map[string]int64                 // pair -> "service\x00instance"   -> entries persisted
+	seenKeys     map[string]map[string]entrySig              // pair -> cache key -> last-seen signature (collision detection)
+	collisions   map[string]*collisionCounts                 // pair -> divergent/identical tallies
+	drainReports map[string]map[string]atroposdk.DrainReport // pair -> instance_id -> latest W3 drain report
 }
 
 // entrySig is the (status, body digest) fingerprint a recorded entry must keep
@@ -68,11 +69,12 @@ type IngestResult struct {
 // any experiment/phase sub-directories are created lazily on first write.
 func New(root string) *Store {
 	return &Store{
-		root:       root,
-		dedup:      map[string]map[string]struct{}{},
-		received:   map[string]map[string]int64{},
-		seenKeys:   map[string]map[string]entrySig{},
-		collisions: map[string]*collisionCounts{},
+		root:         root,
+		dedup:        map[string]map[string]struct{}{},
+		received:     map[string]map[string]int64{},
+		seenKeys:     map[string]map[string]entrySig{},
+		collisions:   map[string]*collisionCounts{},
+		drainReports: map[string]map[string]atroposdk.DrainReport{},
 	}
 }
 

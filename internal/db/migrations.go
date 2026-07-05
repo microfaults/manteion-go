@@ -64,11 +64,36 @@ const migration4 = `
 ALTER TYPE cachebox_key_strategy ADD VALUE IF NOT EXISTS 'canonical_v2';
 `
 
+// migration5 adds the 'draining' phase state (design doc Q2, MANT-2): a
+// recording phase transitions running → draining → completed, holding at
+// draining while manteion waits for every SDK to flush + drain-report. Appended
+// last so the enum label order still matches model.PhaseStatusValues. Kept in
+// its own migration because ALTER TYPE ... ADD VALUE cannot be used in the same
+// transaction that adds it.
+const migration5 = `
+ALTER TYPE phase_status ADD VALUE IF NOT EXISTS 'draining';
+`
+
+// migration6 records the per-phase drain outcome (design doc Q2): status is
+// clean|degraded and detail carries missing_instances + shortfall. Read by the
+// scheduler (refuse to start an isolation phase from a degraded baseline) and
+// the phase verdict (MANT-6). A separate table keeps the phases SELECTs stable.
+const migration6 = `
+CREATE TABLE phase_drain (
+    phase_id   TEXT PRIMARY KEY REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL,
+    detail     JSONB NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`
+
 var migrations = []migration{
 	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
 	{2, "phase_fault_events audit trail + fault_event_source enum", migration2},
 	{3, "phase_service_cache: request_count + recorded_entry_count (fidelity coverage)", migration3},
 	{4, "cachebox_key_strategy: add canonical_v2 (default keyer, design doc Q3)", migration4},
+	{5, "phase_status: add draining (drain barrier, design doc Q2)", migration5},
+	{6, "phase_drain: per-phase drain outcome (clean|degraded + detail)", migration6},
 }
 
 // Migrate applies any pending migrations to the database.

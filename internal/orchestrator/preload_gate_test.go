@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func mkRunningIsolation(t *testing.T, expID, service string, pos int) *model.Exp
 	t.Helper()
 	ctx := context.Background()
 	p := &model.ExperimentPhase{
-		ID: id.New("phase"), ExperimentID: expID, Name: "isolation", Position: pos, Status: "pending",
+		ID: id.New("phase"), ExperimentID: expID, Name: fmt.Sprintf("isolation-%d", pos), Position: pos, Status: "pending",
 		FrozenServices: []model.CacheBoxConfig{{Service: service, Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
 	}
 	if err := testExpRepo.CreatePhase(ctx, p); err != nil {

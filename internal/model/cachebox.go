@@ -30,6 +30,19 @@ func KeyStrategyVersion(s string) int {
 	return 1
 }
 
+// PhaseDrainResult is the persisted outcome of a recording phase's drain gate
+// (design doc Q2 / INV-3): clean when every expected instance flushed and its
+// recorded count matched manteion's received count, degraded otherwise — with
+// the culprit instances and the total entry shortfall.
+type PhaseDrainResult struct {
+	Status           string   `json:"status"` // "clean" | "degraded"
+	MissingInstances []string `json:"missing_instances,omitempty"`
+	ShortfallEntries int64    `json:"shortfall_entries,omitempty"`
+}
+
+// Degraded reports whether the drain outcome is degraded (nil ⇒ not degraded).
+func (d *PhaseDrainResult) Degraded() bool { return d != nil && d.Status == "degraded" }
+
 // CacheBoxRuleContext is the resolved authoritative context (§W1) for one
 // service's active cache-box role in a running phase — the input from which
 // the poll path synthesizes a compiled cache-box rule (MANT-4). Mode is

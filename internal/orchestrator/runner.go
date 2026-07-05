@@ -73,7 +73,7 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 // completed/failed/skipped (default completed). Idempotent — a no-op if the
 // phase already reached a terminal state.
 func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus string) error {
-	from := []string{"running", "paused"}
+	from := []string{"running", "paused", "draining"}
 	switch finalStatus {
 	case "":
 		finalStatus = "completed"
@@ -204,6 +204,25 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 		return false
 	}
 
+	// A recording (persist_cache) phase completes through the drain barrier
+	// (INV-3): running → draining (drain gate) → completed. The CAS winner of
+	// running→draining owns the drain AND the completion; losers no-op — the
+	// winner-only discipline holds across BOTH hops. A failed/cancelled/skipped
+	// recording phase skips the barrier (it never drains).
+	if status == "completed" && p.PersistCache {
+		won, err := o.experiments.TransitionPhase(ctx, phaseID, "draining", from...)
+		if err != nil {
+			o.logger.Error("orchestrator: finish phase: transition to draining failed",
+				"phase_id", phaseID, "error", err)
+			return false
+		}
+		if !won {
+			return false // lost the race / not in an allowed source state
+		}
+		o.runDrainBarrier(ctx, p, pws)
+		from = []string{"draining"} // now complete from draining
+	}
+
 	transitioned, err := o.experiments.TransitionPhase(ctx, phaseID, status, from...)
 	if err != nil {
 		o.logger.Error("orchestrator: finish phase: transition failed",
@@ -242,17 +261,7 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 		}
 	}
 
-	if o.zeusClient != nil {
-		for _, pw := range pws {
-			if pw.ZeusAttackID == "" {
-				continue
-			}
-			if err := o.zeusClient.StopAttack(ctx, pw.ZeusAttackID); err != nil {
-				o.logger.Warn("orchestrator: zeus attack stop failed",
-					"phase_id", phaseID, "attack_id", pw.ZeusAttackID, "error", err)
-			}
-		}
-	}
+	o.stopZeusAttacks(ctx, pws)
 
 	if status == "completed" {
 		o.harvestPhase(ctx, p, pws) // exactly once — only the transition winner reaches here
@@ -483,6 +492,25 @@ func freezeDelayRequest(p *model.ExperimentPhase, fs model.CacheBoxConfig) atrop
 	return delay
 }
 
+// stopZeusAttacks stops each of the phase's running zeus attacks. Best-effort:
+// a stop error (e.g. an already-finished attack) is logged, not fatal. Safe to
+// call more than once (the drain barrier stops attacks before the gate; the
+// terminal teardown calls it again).
+func (o *Orchestrator) stopZeusAttacks(ctx context.Context, pws []model.PhaseWorkflow) {
+	if o.zeusClient == nil {
+		return
+	}
+	for _, pw := range pws {
+		if pw.ZeusAttackID == "" {
+			continue
+		}
+		if err := o.zeusClient.StopAttack(ctx, pw.ZeusAttackID); err != nil {
+			o.logger.Warn("orchestrator: zeus attack stop failed",
+				"attack_id", pw.ZeusAttackID, "error", err)
+		}
+	}
+}
+
 // thawServices clears the phase's frozen_services cache-box freeze. Called
 // at the phase's terminal cleanup, symmetric to freezeServices.
 func (o *Orchestrator) thawServices(ctx context.Context, p *model.ExperimentPhase) {
@@ -511,6 +539,19 @@ func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.Experim
 	}
 	if baseline == nil {
 		return fmt.Errorf("no completed baseline recording for experiment %q; cannot preload frozen services", p.ExperimentID)
+	}
+
+	// Refuse to build a replay set from a degraded recording (INV-3): its
+	// coverage is unverified, so any isolation run over it is suspect. The
+	// operator can override with MANTEION_ALLOW_DEGRADED_BASELINE.
+	drain, err := o.experiments.GetPhaseDrain(ctx, baseline.ID)
+	if err != nil {
+		return fmt.Errorf("read baseline drain result: %w", err)
+	}
+	if drain.Degraded() && !o.allowDegradedBaseline {
+		return fmt.Errorf("baseline recording %q is degraded (%d missing instances, %d entry shortfall); "+
+			"refusing to preload — set MANTEION_ALLOW_DEGRADED_BASELINE=true to override",
+			baseline.ID, len(drain.MissingInstances), drain.ShortfallEntries)
 	}
 
 	for _, fs := range p.FrozenServices {

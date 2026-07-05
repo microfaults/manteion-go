@@ -94,6 +94,11 @@ func main() {
 	cs := cachestore.New(cacheDir)
 	phaseFaultEventRepo := store.NewPhaseFaultEventRepo(database)
 	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, logger)
+	// Drain barrier (MANT-2): MANTEION_DRAIN_TIMEOUT must be ≥ 3× the SDK poll
+	// interval + flush time (default 30s); MANTEION_ALLOW_DEGRADED_BASELINE lets
+	// isolation phases start from a degraded recording.
+	orch.WithDrainTimeout(envDurationOr("MANTEION_DRAIN_TIMEOUT", 30*time.Second))
+	orch.WithAllowDegradedBaseline(envOr("MANTEION_ALLOW_DEGRADED_BASELINE", "false") == "true")
 	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)
 
 	// Restore in-flight runs from the DB. Must run before the API server

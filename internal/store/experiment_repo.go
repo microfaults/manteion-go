@@ -420,6 +420,45 @@ func cacheBoxRuleContext(experimentID, phaseID string, fs model.CacheBoxConfig) 
 	}
 }
 
+// UpsertPhaseDrain persists a recording phase's drain outcome (MANT-2),
+// idempotent on phase_id so the drain gate can write it exactly once.
+func (r *ExperimentRepo) UpsertPhaseDrain(ctx context.Context, phaseID string, result *model.PhaseDrainResult) error {
+	detail, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal drain result: %w", err)
+	}
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO phase_drain (phase_id, status, detail, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (phase_id) DO UPDATE SET status = $2, detail = $3, updated_at = now()`,
+		phaseID, result.Status, detail)
+	if err != nil {
+		return fmt.Errorf("upsert phase_drain: %w", err)
+	}
+	return nil
+}
+
+// GetPhaseDrain returns a phase's persisted drain outcome, or nil when the phase
+// never drained (e.g. an isolation phase, or one that never completed).
+func (r *ExperimentRepo) GetPhaseDrain(ctx context.Context, phaseID string) (*model.PhaseDrainResult, error) {
+	var detail []byte
+	err := r.db.QueryRowContext(ctx,
+		`SELECT detail FROM phase_drain WHERE phase_id = $1`, phaseID).Scan(&detail)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get phase_drain: %w", err)
+	}
+	var out model.PhaseDrainResult
+	if len(detail) > 0 {
+		if err := json.Unmarshal(detail, &out); err != nil {
+			return nil, fmt.Errorf("decode drain detail: %w", err)
+		}
+	}
+	return &out, nil
+}
+
 // ListPhasesForExperiment returns phases ordered by position.
 func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experimentID string) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `

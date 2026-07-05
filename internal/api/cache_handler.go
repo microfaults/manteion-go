@@ -45,13 +45,12 @@ type ingestResult struct {
 	Duplicate bool `json:"duplicate"`
 }
 
-// isActiveRecordingPair reports whether the phase is still an open recording
-// target — it persists cache and is in a state that accepts pushes.
-//
-// MANT-2 adds "draining" here (W2: the push endpoint accepts recording|draining)
-// once the drain barrier lands; until then "running" is the only recording state.
+// isActiveRecordingPair reports whether the phase still accepts recorded pushes:
+// it persists cache and is either actively recording (running) or draining. The
+// drain state keeps the push endpoint open while SDKs flush their remaining
+// batches (W2), which is what removes the mark-completed-then-409 loss window.
 func isActiveRecordingPair(p *model.ExperimentPhase) bool {
-	return p.PersistCache && p.Status == "running"
+	return p.PersistCache && (p.Status == "running" || p.Status == "draining")
 }
 
 // handleCacheIngest receives cache-box entries from SDK instances and persists
@@ -111,6 +110,25 @@ func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ingestResult{Accepted: res.Accepted, Duplicate: res.Duplicate})
+}
+
+// handleCacheDrain receives an SDK's W3 drain report at recording-phase end,
+// accounting for every buffered record it flushed (or dropped). Idempotent on
+// (experiment_id, phase_id, instance_id) — a retried report overwrites. The
+// orchestrator's drain gate (MANT-2) reads these to decide clean vs degraded.
+func (s *Server) handleCacheDrain(w http.ResponseWriter, r *http.Request) {
+	var rep atroposdk.DrainReport
+	defer r.Body.Close()
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxIngestBody)).Decode(&rep); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if rep.ExperimentID == "" || rep.PhaseID == "" || rep.InstanceID == "" {
+		writeError(w, http.StatusBadRequest, "experiment_id, phase_id, instance_id required")
+		return
+	}
+	s.cacheStore.RecordDrainReport(rep)
+	writeJSON(w, http.StatusOK, atroposdk.DrainReportResponse{Accepted: true})
 }
 
 // handleCacheEntries serves stored cache entries for a service, used by SDK

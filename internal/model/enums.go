@@ -33,7 +33,7 @@ var EnumValues = map[string][]string{
 
 var (
 	ExperimentStatusValues    = []string{"planned", "running", "completed", "failed", "cancelled"}
-	PhaseStatusValues         = []string{"pending", "running", "paused", "completed", "failed", "skipped"}
+	PhaseStatusValues         = []string{"pending", "running", "paused", "completed", "failed", "skipped", "draining"}
 	FaultCategoryValues       = []string{"inline", "network", "resource"}
 	FaultHostValues           = []string{"proxy", "inline", "process"}
 	NetworkDirectionValues    = []string{"upstream", "downstream"}

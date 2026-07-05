@@ -110,6 +110,10 @@ func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB), logger)
 	o.WithPollInterval(50 * time.Millisecond)
 	o.WithMaxPollDuration(15 * time.Second)
+	// Keep the drain barrier fast so tests never wait the 30s production bound;
+	// tests that exercise the gate directly override these.
+	o.WithDrainTimeout(500 * time.Millisecond)
+	o.WithDrainPollInterval(20 * time.Millisecond)
 	return o
 }
 
@@ -621,9 +625,13 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	}
 
 	// A cooperative SDK instance for frontend: verify-commits the preload and
-	// accepts the freeze, so the frozen phase clears the MANT-1 gates.
+	// accepts the freeze, so the frozen phase clears the MANT-1 gates. The
+	// baseline's drain will degrade (this registered instance sends no drain
+	// report in-test), so allow a degraded baseline — this test asserts audit
+	// events, not drain fidelity.
 	sdk := newFakeSDK(t, true)
 	registerSDK(t, "frontend", sdk.server.URL)
+	o.WithAllowDegradedBaseline(true)
 
 	// Attach a cachebox-action rule to fp so recordRuleEvents fires.
 	// A cachebox rule needs no FaultSpec, and ruleKind returns "rule" for it.

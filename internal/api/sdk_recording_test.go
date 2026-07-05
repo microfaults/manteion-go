@@ -84,8 +84,13 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 		return e.ID, base.ID
 	}
 
-	expA, baseA := buildRecording("recA-", "svc-a", "exact")
-	expB, baseB := buildRecording("recB-", "svc-b", "canonical_v2")
+	// Per-run-unique service names so a prior run's leftover running phase (this
+	// test transitions isoA → running below and does not truncate) can never
+	// match this run's ListRunningPhases-driven synthesis.
+	suffix := id.New("s")
+	svcA, svcB, svcUnrelated := "svca-"+suffix, "svcb-"+suffix, "svcx-"+suffix
+	expA, baseA := buildRecording("recA-", svcA, "exact")
+	expB, baseB := buildRecording("recB-", svcB, "canonical_v2")
 
 	cb := func(sync atroposdk.RuleSync) *atroposdk.CompiledCacheBox {
 		t.Helper()
@@ -105,7 +110,7 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	}
 
 	// svc-a records into experiment A's baseline with the exact strategy.
-	syncA := poll("svc-a")
+	syncA := poll(svcA)
 	if syncA.RecordingPhaseID != "" {
 		t.Fatalf("RecordingPhaseID must be empty (deleted); got %q", syncA.RecordingPhaseID)
 	}
@@ -121,7 +126,7 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	}
 
 	// svc-b records into experiment B's baseline — its own pair + strategy.
-	cbB := cb(poll("svc-b"))
+	cbB := cb(poll(svcB))
 	if cbB.Context.ExperimentID != expB || cbB.Context.PhaseID != baseB {
 		t.Fatalf("svc-b context = %+v, want (exp=%s, phase=%s)", cbB.Context, expB, baseB)
 	}
@@ -130,7 +135,7 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	}
 
 	// A service in no experiment's frozen set gets no cache-box rule.
-	if sync := poll("svc-unrelated"); len(sync.Rules) != 0 {
+	if sync := poll(svcUnrelated); len(sync.Rules) != 0 {
 		t.Fatalf("unrelated service got %d rules, want 0", len(sync.Rules))
 	}
 
@@ -152,7 +157,7 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	if err := exp.UpdatePhaseStatus(ctx, isoA, "running"); err != nil {
 		t.Fatalf("run isolation A: %v", err)
 	}
-	cbReplay := cb(poll("svc-a"))
+	cbReplay := cb(poll(svcA))
 	if cbReplay.Mode != "replay" {
 		t.Fatalf("svc-a isolation mode=%q, want replay", cbReplay.Mode)
 	}
