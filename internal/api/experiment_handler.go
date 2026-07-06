@@ -400,6 +400,10 @@ type phaseResultsResponse struct {
 	// phases. SEAM(D): the latency-decomposition/delta engine consuming these
 	// results MUST refuse to compute over a run whose verdict is INVALID.
 	Verdict *model.PhaseVerdict `json:"verdict,omitempty"`
+	// Drain is the recording-phase drain outcome (clean|degraded), nil for a
+	// non-recording phase. A baseline records but has no verdict, so this is
+	// the operator's completeness signal for the reference dataset.
+	Drain *model.PhaseDrainResult `json:"drain,omitempty"`
 }
 
 func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
@@ -426,12 +430,18 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load phase verdict")
 		return
 	}
+	drain, err := s.experiments.GetPhaseDrain(ctx, phaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load phase drain")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, phaseResultsResponse{
 		WorkflowResults: nilToEmpty(wfRes),
 		ServiceLatency:  nilToEmpty(svcLat),
 		ServiceCache:    nilToEmpty(svcCache),
 		Verdict:         verdict,
+		Drain:           drain,
 	})
 }
 
