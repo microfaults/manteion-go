@@ -46,9 +46,69 @@ CREATE TABLE phase_fault_events (
 CREATE INDEX idx_phase_fault_events_phase ON phase_fault_events(phase_id, started_at);
 `
 
+// migration3 adds cachebox-fidelity coverage columns to phase_service_cache:
+// request_count disambiguates "0 requests served" from "all misses"; and
+// recorded_entry_count is the recording coverage (entries captured on a
+// baseline phase / available to replay on an isolation phase).
+const migration3 = `
+ALTER TABLE phase_service_cache
+    ADD COLUMN request_count        BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN recorded_entry_count BIGINT NOT NULL DEFAULT 0;
+`
+
+// migration4 adds the canonical_v2 keyer to the cachebox_key_strategy enum
+// (design doc Q3): the new length-prefixed SHA-256 strategy and the default
+// when a frozen-service config leaves key_strategy empty. Appended last so the
+// enum label order still matches model.CacheBoxKeyStrategyValues (enum_parity_test).
+const migration4 = `
+ALTER TYPE cachebox_key_strategy ADD VALUE IF NOT EXISTS 'canonical_v2';
+`
+
+// migration5 adds the 'draining' phase state (design doc Q2, MANT-2): a
+// recording phase transitions running → draining → completed, holding at
+// draining while manteion waits for every SDK to flush + drain-report. Appended
+// last so the enum label order still matches model.PhaseStatusValues. Kept in
+// its own migration because ALTER TYPE ... ADD VALUE cannot be used in the same
+// transaction that adds it.
+const migration5 = `
+ALTER TYPE phase_status ADD VALUE IF NOT EXISTS 'draining';
+`
+
+// migration6 records the per-phase drain outcome (design doc Q2): status is
+// clean|degraded and detail carries missing_instances + shortfall. Read by the
+// scheduler (refuse to start an isolation phase from a degraded baseline) and
+// the phase verdict (MANT-6). A separate table keeps the phases SELECTs stable.
+const migration6 = `
+CREATE TABLE phase_drain (
+    phase_id   TEXT PRIMARY KEY REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL,
+    detail     JSONB NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`
+
+// migration7 records a phase's first-class fidelity verdict (design doc Q6 /
+// INV-6): VALID | VALID_WITH_WARNINGS | INVALID, with the per-instance fidelity
+// snapshots and reasons in detail. Read at the results/decomposition boundary —
+// the delta engine (SEAM(D)) must refuse to compute over an INVALID run.
+const migration7 = `
+CREATE TABLE phase_verdict (
+    phase_id    TEXT PRIMARY KEY REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    verdict     TEXT NOT NULL,
+    detail      JSONB NOT NULL DEFAULT '{}',
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`
+
 var migrations = []migration{
 	{1, "consolidated schema v2 (epoch 2 — prior history in git)", schemaV2},
 	{2, "phase_fault_events audit trail + fault_event_source enum", migration2},
+	{3, "phase_service_cache: request_count + recorded_entry_count (fidelity coverage)", migration3},
+	{4, "cachebox_key_strategy: add canonical_v2 (default keyer, design doc Q3)", migration4},
+	{5, "phase_status: add draining (drain barrier, design doc Q2)", migration5},
+	{6, "phase_drain: per-phase drain outcome (clean|degraded + detail)", migration6},
+	{7, "phase_verdict: per-phase fidelity verdict (VALID|WARN|INVALID, design doc Q6)", migration7},
+	{8, "phase_workflows: zeus_run_id (k6 workflow-run handle, additive to zeus_attack_id)", migration8},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -548,4 +608,15 @@ CREATE TABLE trace_anchors (
     collected_at  TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX idx_trace_anchors_phase ON trace_anchors(phase_id);
+`
+
+// migration8 adds zeus_run_id to phase_workflows. A phase workflow now drives
+// load two independent ways: a k6 workflow RUN that executes the DSL v2 DAG
+// (zeus_run_id, the primary path) and — additively — a flat vegeta ATTACK
+// against target_url (zeus_attack_id). Both handles are opaque zeus-minted
+// TEXT; the poller watches both to terminal before completing the phase.
+const migration8 = `
+ALTER TABLE phase_workflows ADD COLUMN zeus_run_id TEXT;
+CREATE INDEX idx_phase_workflows_zeus_run ON phase_workflows(zeus_run_id)
+    WHERE zeus_run_id IS NOT NULL;
 `

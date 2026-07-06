@@ -18,7 +18,7 @@ import (
 // SDK instances into phase_service_cache. Non-fatal throughout — missing or
 // not-yet-ready results are logged and skipped so the phase still completes.
 // Called exactly once per completed phase, by the finishPhase CAS winner.
-func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow) {
+func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow, staleness map[string]float64) {
 	if o.zeusClient != nil {
 		for _, pw := range pws {
 			if pw.ZeusAttackID == "" {
@@ -31,7 +31,7 @@ func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhas
 			}
 		}
 	}
-	o.harvestCacheStats(ctx, p)
+	o.harvestCacheStats(ctx, p, staleness)
 }
 
 // harvestAttack fetches the final metrics for one (phase, workflow) attack
@@ -118,56 +118,114 @@ func (o *Orchestrator) harvestAttack(ctx context.Context, p *model.ExperimentPha
 	return nil
 }
 
-// harvestCacheStats snapshots cache-box counters from every frozen service's
-// live SDK instances and upserts one phase_service_cache row per service.
+// harvestCacheStats writes phase_service_cache fidelity rows. Two independent
+// passes (mutually exclusive in the normal baseline/isolation split):
 //
-// Metric mapping (the SDK exposes store hit/miss counters only):
-//   - cache_hit_rate    = Σhits / (Σhits + Σmisses)
-//   - cache_exact_match = same ratio — every hit is an exact key match under
-//     the exact* key strategies, so the two coincide until fuzzier matching
-//     exists.
-//   - cache_staleness   = 0.0 — no staleness counter in the SDK yet.
+//   - Isolation (frozen services): snapshot live cache-box counters →
+//     cache_hit_rate = Σhits/(Σhits+Σmisses), request_count = Σ(hits+misses)
+//     (disambiguates "0 requests" from "all misses"), and recorded_entry_count
+//     = the baseline coverage that was available to replay for this service.
+//   - Baseline (persist_cache, no frozen): recording coverage — for each
+//     service that ingested into this phase, recorded_entry_count = number of
+//     entries captured (hit_rate/request_count = 0, no replay happened).
 //
-// Row presence still carries the signal "this service was frozen in replay
-// during this phase". Best-effort: a service with no reachable instances is
-// skipped, not failed.
-func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.ExperimentPhase) {
-	for _, fs := range p.FrozenServices {
-		st, err := o.controller.StatusByService(ctx, fs.Service)
-		if err != nil {
-			o.logger.Warn("orchestrator: cache stats: status by service failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
-			continue
-		}
-		var hits, misses int64
-		seen := false
-		for _, inst := range st.Instances {
-			if inst.CacheBox == nil {
+// cache_exact_match = hit_rate; cache_staleness = the mean replay age (ms) from
+// the W6 fidelity snapshots (MANT-6), or 0 when telemetry was missing.
+// Best-effort throughout: an unreachable service or store error is logged, not fatal.
+func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.ExperimentPhase, staleness map[string]float64) {
+	// Pass 1 — isolation replay stats.
+	if len(p.FrozenServices) > 0 {
+		baselineCoverage := o.baselineCoverage(ctx, p.ExperimentID)
+		for _, fs := range p.FrozenServices {
+			st, err := o.controller.StatusByService(ctx, fs.Service)
+			if err != nil {
+				o.logger.Warn("orchestrator: cache stats: status by service failed",
+					"phase_id", p.ID, "service", fs.Service, "error", err)
 				continue
 			}
-			hits += inst.CacheBox.Store.Hits
-			misses += inst.CacheBox.Store.Misses
-			seen = true
-		}
-		if !seen {
-			o.logger.Info("orchestrator: cache stats: no cache-box stats reachable",
-				"phase_id", p.ID, "service", fs.Service)
-			continue
-		}
-		hitRate := 0.0
-		if total := hits + misses; total > 0 {
-			hitRate = float64(hits) / float64(total)
-		}
-		res := &model.PhaseServiceCache{
-			PhaseID:         p.ID,
-			Service:         fs.Service,
-			CacheHitRate:    hitRate,
-			CacheExactMatch: hitRate,
-			CacheStaleness:  0.0,
-		}
-		if err := o.experiments.UpsertServiceCache(ctx, res); err != nil {
-			o.logger.Warn("orchestrator: upsert service cache failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
+			var hits, misses int64
+			seen := false
+			for _, inst := range st.Instances {
+				if inst.CacheBox == nil {
+					continue
+				}
+				hits += inst.CacheBox.Store.Hits
+				misses += inst.CacheBox.Store.Misses
+				seen = true
+			}
+			if !seen {
+				o.logger.Info("orchestrator: cache stats: no cache-box stats reachable",
+					"phase_id", p.ID, "service", fs.Service)
+				continue
+			}
+			total := hits + misses
+			hitRate := 0.0
+			if total > 0 {
+				hitRate = float64(hits) / float64(total)
+			}
+			res := &model.PhaseServiceCache{
+				PhaseID:            p.ID,
+				Service:            fs.Service,
+				CacheHitRate:       hitRate,
+				CacheExactMatch:    hitRate,
+				CacheStaleness:     staleness[fs.Service], // real mean replay age (ms) from W6 snapshots (MANT-6); 0 if telemetry missing
+				RequestCount:       total,
+				RecordedEntryCount: baselineCoverage[fs.Service],
+			}
+			if err := o.experiments.UpsertServiceCache(ctx, res); err != nil {
+				o.logger.Warn("orchestrator: upsert service cache failed",
+					"phase_id", p.ID, "service", fs.Service, "error", err)
+			}
 		}
 	}
+
+	// Pass 2 — baseline recording coverage.
+	if p.PersistCache && len(p.FrozenServices) == 0 {
+		services, err := o.cacheStore.Services(p.ExperimentID, p.ID)
+		if err != nil {
+			o.logger.Warn("orchestrator: cache stats: list recorded services failed",
+				"phase_id", p.ID, "error", err)
+			return
+		}
+		for _, svc := range services {
+			entries, err := o.cacheStore.Read(p.ExperimentID, p.ID, svc)
+			if err != nil {
+				o.logger.Warn("orchestrator: cache stats: read recorded entries failed",
+					"phase_id", p.ID, "service", svc, "error", err)
+				continue
+			}
+			res := &model.PhaseServiceCache{
+				PhaseID:            p.ID,
+				Service:            svc,
+				RecordedEntryCount: int64(len(entries)),
+			}
+			if err := o.experiments.UpsertServiceCache(ctx, res); err != nil {
+				o.logger.Warn("orchestrator: upsert recording coverage failed",
+					"phase_id", p.ID, "service", svc, "error", err)
+			}
+		}
+	}
+}
+
+// baselineCoverage returns, per service, the count of entries recorded by the
+// experiment's baseline phase — the coverage available to replay. Empty when
+// there is no completed baseline.
+func (o *Orchestrator) baselineCoverage(ctx context.Context, experimentID string) map[string]int64 {
+	out := map[string]int64{}
+	baseline, err := o.baselinePhase(ctx, experimentID)
+	if err != nil || baseline == nil {
+		return out
+	}
+	services, err := o.cacheStore.Services(baseline.ExperimentID, baseline.ID)
+	if err != nil {
+		return out
+	}
+	for _, svc := range services {
+		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, svc)
+		if err != nil {
+			continue
+		}
+		out[svc] = int64(len(entries))
+	}
+	return out
 }

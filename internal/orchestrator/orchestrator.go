@@ -53,6 +53,14 @@ type Orchestrator struct {
 	pollInterval    time.Duration
 	autoComplete    bool // auto-complete driver-less phases (off in FSM unit tests)
 
+	// Drain barrier (MANT-2). drainTimeout bounds the wait for every expected
+	// SDK to flush + drain-report; drainPollInterval is how often the gate
+	// re-checks. allowDegradedBaseline lets an isolation phase start from a
+	// degraded recording (MANTEION_ALLOW_DEGRADED_BASELINE).
+	drainTimeout          time.Duration
+	drainPollInterval     time.Duration
+	allowDegradedBaseline bool
+
 	mu       sync.Mutex
 	running  map[string]context.CancelFunc // phase ID → poller cancel
 	expLocks map[string]*sync.Mutex        // experiment ID → scheduler serializer
@@ -73,24 +81,37 @@ func New(
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
-		experiments:     experiments,
-		rules:           rules,
-		faults:          faults,
-		workloads:       workloads,
-		workflows:       workflows,
-		controller:      controller,
-		prom:            prom,
-		zeusClient:      zeusClient,
-		cacheStore:      cs,
-		faultEvents:     faultEvents,
-		logger:          logger,
-		maxPollDuration: defaultMaxPollDuration,
-		pollInterval:    defaultZeusPollInterval,
-		autoComplete:    true,
-		running:         make(map[string]context.CancelFunc),
-		expLocks:        make(map[string]*sync.Mutex),
+		experiments:       experiments,
+		rules:             rules,
+		faults:            faults,
+		workloads:         workloads,
+		workflows:         workflows,
+		controller:        controller,
+		prom:              prom,
+		zeusClient:        zeusClient,
+		cacheStore:        cs,
+		faultEvents:       faultEvents,
+		logger:            logger,
+		maxPollDuration:   defaultMaxPollDuration,
+		pollInterval:      defaultZeusPollInterval,
+		autoComplete:      true,
+		drainTimeout:      30 * time.Second,
+		drainPollInterval: 200 * time.Millisecond,
+		running:           make(map[string]context.CancelFunc),
+		expLocks:          make(map[string]*sync.Mutex),
 	}
 }
+
+// WithDrainTimeout overrides the recording-phase drain barrier's bound
+// (MANTEION_DRAIN_TIMEOUT; must be ≥ 3× the SDK poll interval + flush time).
+func (o *Orchestrator) WithDrainTimeout(d time.Duration) { o.drainTimeout = d }
+
+// WithDrainPollInterval overrides how often the drain gate re-checks (test seam).
+func (o *Orchestrator) WithDrainPollInterval(d time.Duration) { o.drainPollInterval = d }
+
+// WithAllowDegradedBaseline lets isolation phases start from a degraded
+// recording (MANTEION_ALLOW_DEGRADED_BASELINE).
+func (o *Orchestrator) WithAllowDegradedBaseline(v bool) { o.allowDegradedBaseline = v }
 
 // WithMaxPollDuration overrides the default Zeus poll timeout.
 func (o *Orchestrator) WithMaxPollDuration(d time.Duration) {
@@ -126,6 +147,18 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 	}
 	if len(phases) == 0 {
 		return errors.New("orchestrator: experiment has no phases")
+	}
+
+	// Admission control (MANT-5): refuse a service footprint that overlaps a
+	// running experiment, so two experiments never fight over a service
+	// (INV-5). Checked before the claim so a rejected start leaves the
+	// experiment planned. Deliberately NOT overridable: the SDK holds one
+	// replay set, one preload staging slot, and one freeze delay source per
+	// instance, so shared-service concurrency doesn't degrade -- it silently
+	// serves one experiment the other's data. Disjoint-footprint experiments
+	// already pass this check without any flag.
+	if err := o.checkServiceOverlap(ctx, experimentID); err != nil {
+		return err
 	}
 
 	// Atomically claim planned → running so two concurrent starts can't both
@@ -273,9 +306,10 @@ func (o *Orchestrator) terminateExperiment(ctx context.Context, experimentID, fi
 	}
 	for _, p := range phases {
 		switch p.Status {
-		case "running", "paused":
-			// finishPhase tears down the poller, rules, freezes, and attacks.
-			o.finishPhase(ctx, p.ID, "skipped", "running", "paused")
+		case "running", "paused", "draining":
+			// finishPhase tears down the poller, rules, freezes, and attacks. A
+			// draining phase is skipped straight from draining (no re-drain).
+			o.finishPhase(ctx, p.ID, "skipped", "running", "paused", "draining")
 		case "pending":
 			if _, err := o.experiments.TransitionPhase(ctx, p.ID, "skipped", "pending"); err != nil {
 				o.logger.Warn("orchestrator: terminate: skip pending phase failed",
@@ -321,9 +355,10 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 	anyFailed := false
 	for _, p := range phases {
 		switch p.Status {
-		case "running", "paused":
-			// A phase in flight (or paused by the operator) blocks the
-			// scheduler — sequential execution, and the pause gate.
+		case "running", "paused", "draining":
+			// A phase in flight (running), paused by the operator, or draining
+			// (completing through the drain barrier) blocks the scheduler —
+			// sequential execution, the pause gate, and the drain gate.
 			return
 		case "failed":
 			anyFailed = true
@@ -445,20 +480,26 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 		return
 	}
 
-	var attackIDs []string
+	// Both load-driver kinds must be reconciled: a phase whose only driver is
+	// a workflow run (no additive attack) must not be seen as driver-less and
+	// wrongly auto-completed while its run is still generating traffic.
 	var maxDur time.Duration
+	drivers := 0
 	for _, pw := range pws {
 		if pw.ZeusAttackID != "" {
-			attackIDs = append(attackIDs, pw.ZeusAttackID)
+			drivers++
+		}
+		if pw.ZeusRunID != "" {
+			drivers++
 		}
 		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
 			maxDur = d
 		}
 	}
 
-	if len(attackIDs) == 0 {
+	if drivers == 0 {
 		if o.autoComplete {
-			o.logger.Info("orchestrator: recover: phase has no attacks; auto-completing",
+			o.logger.Info("orchestrator: recover: phase has no load drivers; auto-completing",
 				"phase_id", phaseID)
 			go o.finishPhase(context.Background(), phaseID, "completed", "running")
 		}
@@ -467,26 +508,29 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 
 	if o.zeusClient != nil {
 		lost := 0
-		for _, id := range attackIDs {
-			if !o.reconcileOneAttack(ctx, phaseID, id) {
+		for _, pw := range pws {
+			if pw.ZeusAttackID != "" && !o.reconcileOneAttack(ctx, phaseID, pw.ZeusAttackID) {
+				lost++
+			}
+			if pw.ZeusRunID != "" && !o.reconcileOneRun(ctx, phaseID, pw.ZeusRunID) {
 				lost++
 			}
 		}
-		if lost == len(attackIDs) {
-			o.logger.Warn("orchestrator: recover: all zeus attacks lost; marking phase failed",
+		if lost == drivers {
+			o.logger.Warn("orchestrator: recover: all zeus load drivers lost; marking phase failed",
 				"phase_id", phaseID)
 			o.finishPhase(ctx, phaseID, "failed", "running")
 			return
 		}
 		if lost > 0 {
-			o.logger.Warn("orchestrator: recover: some zeus attacks lost; continuing with survivors",
-				"phase_id", phaseID, "lost", lost, "total", len(attackIDs))
+			o.logger.Warn("orchestrator: recover: some zeus load drivers lost; continuing with survivors",
+				"phase_id", phaseID, "lost", lost, "total", drivers)
 		}
 	}
 
 	o.spawnPoller(phaseID, maxDur)
 	o.logger.Info("orchestrator: recover: running phase restored",
-		"phase_id", phaseID, "attacks", len(attackIDs))
+		"phase_id", phaseID, "drivers", drivers)
 }
 
 const reconcileRetries = 3
@@ -511,5 +555,25 @@ func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID
 	}
 	o.logger.Warn("orchestrator: recover: zeus attack not found after retries",
 		"phase_id", phaseID, "attack_id", attackID, "error", lastErr)
+	return false
+}
+
+// reconcileOneRun calls Zeus.GetRun with retries. Reports whether zeus still
+// knows the run (the k6 subprocess survives a manteion restart because it
+// runs inside zeus; it is lost only if zeus itself restarted).
+func (o *Orchestrator) reconcileOneRun(ctx context.Context, phaseID, runID string) bool {
+	var lastErr error
+	for attempt := 0; attempt < reconcileRetries; attempt++ {
+		if _, err := o.zeusClient.GetRun(ctx, runID); err == nil {
+			return true
+		} else {
+			lastErr = err
+		}
+		if attempt < reconcileRetries-1 {
+			time.Sleep(reconcileBackoff[attempt])
+		}
+	}
+	o.logger.Warn("orchestrator: recover: zeus run not found after retries",
+		"phase_id", phaseID, "run_id", runID, "error", lastErr)
 	return false
 }

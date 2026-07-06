@@ -29,6 +29,8 @@ import (
 	"testing"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/cachestore"
@@ -108,6 +110,10 @@ func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB), logger)
 	o.WithPollInterval(50 * time.Millisecond)
 	o.WithMaxPollDuration(15 * time.Second)
+	// Keep the drain barrier fast so tests never wait the 30s production bound;
+	// tests that exercise the gate directly override these.
+	o.WithDrainTimeout(500 * time.Millisecond)
+	o.WithDrainPollInterval(20 * time.Millisecond)
 	return o
 }
 
@@ -206,14 +212,47 @@ type fakeAttack struct {
 type fakeZeus struct {
 	mu      sync.Mutex
 	attacks map[string]*fakeAttack
+	runs    map[string]string // run id -> status
 	srv     *httptest.Server
 }
 
 func newFakeZeus(t *testing.T) *fakeZeus {
 	t.Helper()
-	f := &fakeZeus{attacks: make(map[string]*fakeAttack)}
+	f := &fakeZeus{attacks: make(map[string]*fakeAttack), runs: make(map[string]string)}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/workflows/{id}/runs", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			RunID string `json:"run_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.RunID == "" {
+			req.RunID = id.New("run")
+		}
+		f.mu.Lock()
+		f.runs[req.RunID] = "running"
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"run_id": req.RunID, "status": "running"})
+	})
+	mux.HandleFunc("GET /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		st, ok := f.runs[r.PathValue("run_id")]
+		f.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": r.PathValue("run_id"), "status": st})
+	})
+	mux.HandleFunc("DELETE /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		if _, ok := f.runs[r.PathValue("run_id")]; ok {
+			f.runs[r.PathValue("run_id")] = "stopped"
+		}
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("POST /api/v1/attacks", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ID string `json:"id"`
@@ -287,6 +326,22 @@ func (f *fakeZeus) attackCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.attacks)
+}
+
+func (f *fakeZeus) runCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.runs)
+}
+
+// completeAllRuns marks every started workflow run completed so the poller
+// observes natural completion.
+func (f *fakeZeus) completeAllRuns() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := range f.runs {
+		f.runs[id] = "completed"
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -486,6 +541,8 @@ func TestAttackDrivenPhase_HarvestsResults(t *testing.T) {
 		t.Fatalf("fake zeus has %d attacks, want 1", fz.attackCount())
 	}
 
+	// This workflow has a target_url, so it drives BOTH an additive attack and
+	// a workflow run; the phase completes only when both are terminal.
 	fz.completeAll(zeus.AttackResultInfo{
 		Service:       "frontend",
 		TotalRequests: 100,
@@ -496,6 +553,7 @@ func TestAttackDrivenPhase_HarvestsResults(t *testing.T) {
 		LatencyP99Us:  3000,
 		ThroughputRPS: 100,
 	})
+	fz.completeAllRuns()
 
 	waitFor(t, "experiment completed", 10*time.Second, func() bool {
 		return getExp(t, exp.ID).Status == "completed"
@@ -591,10 +649,25 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	ctx := context.Background()
 	o := newOrch(t, "") // no zeus → driver-less phases auto-complete
 	feRepo := store.NewPhaseFaultEventRepo(testDB)
-	exp, _ := mkExperiment(t, 1) // phase 0 is bare (no frozen services)
+	exp := &model.Experiment{ID: id.New("exp"), Name: "audit-" + id.New("n"), Status: "planned", CreatedAt: time.Now()}
+	if err := testExpRepo.Create(ctx, exp); err != nil {
+		t.Fatalf("create exp: %v", err)
+	}
+	// Phase 0 is a baseline recording (persist_cache) so the frozen phase 1 has
+	// a completed baseline to preload from (MANT-1 gate).
+	base := &model.ExperimentPhase{
+		ID: id.New("phase"), ExperimentID: exp.ID, Name: "baseline", Position: 0, Status: "pending", PersistCache: true,
+	}
+	if err := testExpRepo.CreatePhase(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.cacheStore.Append(exp.ID, base.ID, "frontend",
+		[]atroposdk.CacheBoxWireEntry{{Key: "k1", StatusCode: 200, Body: []byte("v1")}}); err != nil {
+		t.Fatal(err)
+	}
 
-	// Add a second phase that freezes a service, so enterPhase records a
-	// cachebox event that finishPhase must then close.
+	// A second phase that freezes a service, so enterPhase records a cachebox
+	// event that finishPhase must then close.
 	fp := &model.ExperimentPhase{
 		ID: id.New("phase"), ExperimentID: exp.ID, Name: "frozen", Position: 1, Status: "pending",
 		FrozenServices: []model.CacheBoxConfig{{Service: "frontend", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}},
@@ -602,6 +675,15 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	if err := testExpRepo.CreatePhase(ctx, fp); err != nil {
 		t.Fatal(err)
 	}
+
+	// A cooperative SDK instance for frontend: verify-commits the preload and
+	// accepts the freeze, so the frozen phase clears the MANT-1 gates. The
+	// baseline's drain will degrade (this registered instance sends no drain
+	// report in-test), so allow a degraded baseline — this test asserts audit
+	// events, not drain fidelity.
+	sdk := newFakeSDK(t, true)
+	registerSDK(t, "frontend", sdk.server.URL)
+	o.WithAllowDegradedBaseline(true)
 
 	// Attach a cachebox-action rule to fp so recordRuleEvents fires.
 	// A cachebox rule needs no FaultSpec, and ruleKind returns "rule" for it.
@@ -662,4 +744,123 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	if !hasRule {
 		t.Error("no rule event recorded for attached rule")
 	}
+}
+
+// TestBaselineRecordingCoverage verifies the baseline (persist_cache, no
+// frozen) phase harvests recording coverage: recorded_entry_count per service
+// equals the number of entries the SDK ingested into that phase's cache store.
+func TestBaselineRecordingCoverage(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "") // no zeus → the driver-less baseline phase auto-completes
+	exp := &model.Experiment{ID: id.New("exp"), Name: "cov-" + id.New("n"), Status: "planned", CreatedAt: time.Now()}
+	if err := testExpRepo.Create(ctx, exp); err != nil {
+		t.Fatalf("create exp: %v", err)
+	}
+	bp := &model.ExperimentPhase{
+		ID: id.New("phase"), ExperimentID: exp.ID, Name: "baseline", Position: 0, Status: "pending",
+		PersistCache: true,
+	}
+	if err := testExpRepo.CreatePhase(ctx, bp); err != nil {
+		t.Fatalf("create phase: %v", err)
+	}
+
+	// Simulate SDK cache ingest during the baseline: write recorded entries.
+	front := []atroposdk.CacheBoxWireEntry{{Key: "k1"}, {Key: "k2"}, {Key: "k3"}}
+	cat := []atroposdk.CacheBoxWireEntry{{Key: "k1"}}
+	if err := o.cacheStore.Append(bp.ExperimentID, bp.ID, "frontend", front); err != nil {
+		t.Fatalf("write frontend cache: %v", err)
+	}
+	if err := o.cacheStore.Append(bp.ExperimentID, bp.ID, "productcatalogservice", cat); err != nil {
+		t.Fatalf("write catalog cache: %v", err)
+	}
+
+	if err := o.StartExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor(t, "experiment completed", 5*time.Second, func() bool {
+		return getExp(t, exp.ID).Status == "completed"
+	})
+
+	rows, err := testExpRepo.ListServiceCacheForPhase(ctx, bp.ID)
+	if err != nil {
+		t.Fatalf("list service cache: %v", err)
+	}
+	got := map[string]int64{}
+	for _, r := range rows {
+		got[r.Service] = r.RecordedEntryCount
+	}
+	if got["frontend"] != 3 {
+		t.Errorf("frontend recorded_entry_count=%d, want 3", got["frontend"])
+	}
+	if got["productcatalogservice"] != 1 {
+		t.Errorf("productcatalogservice recorded_entry_count=%d, want 1", got["productcatalogservice"])
+	}
+}
+
+// TestRunDrivenPhase_CompletesOnRunAndAttack pins the workflow-run driver
+// path: a phase workflow with NO target_url is driven purely by a k6 run;
+// the poller waits for the run (not an attack) to complete. It also asserts
+// the additive model -- a workflow with target_url starts BOTH a run and an
+// attack, and the phase completes only when both are terminal.
+func TestRunDrivenPhase_CompletesOnRunAndAttack(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+
+	// Phase 0: run-only (no target_url → no attack). Phase 1: run + attack.
+	exp, phases := mkExperiment(t, 2)
+	attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 5, DurationSec: 1})
+	attachAttackWorkflow(t, phases[1].ID, model.PhaseWorkflow{
+		VUs: 5, RateRPS: 10, DurationSec: 1,
+		TargetURL: "http://frontend:8080/", TargetMethod: "GET",
+	})
+
+	if err := o.StartExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("start experiment: %v", err)
+	}
+
+	// Phase 0 stamps a run id and no attack.
+	var runID string
+	waitFor(t, "zeus_run_id persisted (run-only phase)", 5*time.Second, func() bool {
+		pws, err := testExpRepo.ListPhaseWorkflows(ctx, phases[0].ID)
+		if err != nil || len(pws) != 1 {
+			return false
+		}
+		runID = pws[0].ZeusRunID
+		return runID != "" && pws[0].ZeusAttackID == ""
+	})
+	if fz.attackCount() != 0 {
+		t.Fatalf("run-only phase must not start an attack; got %d attacks", fz.attackCount())
+	}
+
+	// The run keeps the phase running until it completes.
+	if got := getPhase(t, phases[0].ID); got.Status != "running" {
+		t.Fatalf("phase 0 status %q, want running (run still in flight)", got.Status)
+	}
+	fz.completeAllRuns()
+	waitFor(t, "phase 0 completes on run completion", 5*time.Second, func() bool {
+		return getPhase(t, phases[0].ID).Status == "completed"
+	})
+
+	// Phase 1 starts both a run and an attack (additive).
+	waitFor(t, "phase 1 starts run + attack", 5*time.Second, func() bool {
+		pws, err := testExpRepo.ListPhaseWorkflows(ctx, phases[1].ID)
+		if err != nil || len(pws) != 1 {
+			return false
+		}
+		return pws[0].ZeusRunID != "" && pws[0].ZeusAttackID != ""
+	})
+
+	// Completing only the attack must NOT finish the phase -- the run is still
+	// in flight (the additive driver can't end the phase alone).
+	fz.completeAll(zeus.AttackResultInfo{TotalRequests: 100, SuccessRate: 1.0})
+	time.Sleep(2 * o.pollInterval)
+	if got := getPhase(t, phases[1].ID); got.Status != "running" {
+		t.Fatalf("phase 1 status %q, want running (run still in flight after attack done)", got.Status)
+	}
+	// Completing the run too finishes the phase.
+	fz.completeAllRuns()
+	waitFor(t, "phase 1 completes when both drivers done", 5*time.Second, func() bool {
+		return getPhase(t, phases[1].ID).Status == "completed"
+	})
 }

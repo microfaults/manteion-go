@@ -107,6 +107,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.ActiveFaults = faults
 	resp.FreezeCfg = freeze
+	// A freshly-registered SDK converges before its first poll: hand it the
+	// service's active cache-box rule (record/replay) alongside the intent
+	// rules so recording/replay starts immediately (INV-5).
+	if cbctx, err := s.experiments.ActiveCacheBoxPhaseForService(r.Context(), inst.Service); err != nil {
+		s.logger.Warn("register: resolve cache-box context failed", "service", inst.Service, "error", err)
+	} else if cbctx != nil {
+		resp.Rules = append(resp.Rules, ruleconv.SynthesizeCacheBoxRule(*cbctx))
+	}
 	writeJSON(w, http.StatusCreated, resp)
 }
 
@@ -246,6 +254,26 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("compile rules failed", "service", service, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to compile rules")
 		return
+	}
+
+	// Synthesize the service's active cache-box rule (record on a baseline,
+	// replay on an isolation freeze) and append it to the desired rule set.
+	// Recording/replay provenance rides on this rule's CacheBoxContext (INV-5),
+	// replacing the removed global RecordingPhaseID signal. Best-effort: an
+	// error leaves the set unchanged (SDK won't record), never fails the poll.
+	if cbctx, err := s.experiments.ActiveCacheBoxPhaseForService(ctx, service); err != nil {
+		s.logger.Warn("poll: resolve cache-box context failed", "service", service, "error", err)
+	} else if cbctx != nil {
+		compiled = append(compiled, ruleconv.SynthesizeCacheBoxRule(*cbctx))
+	}
+
+	// The poll is the reconciler, so rules must never serialize as null:
+	// [] is the authoritative "no rules" the SDK clears on (its Apply
+	// treats nil as "no change" but honors an explicit empty list). This
+	// is also what delivers the drain trigger for a baseline-recorded
+	// service, whose set is empty once its recording rule drops out.
+	if compiled == nil {
+		compiled = []atroposdk.CompiledRule{}
 	}
 
 	writeJSON(w, http.StatusOK, atroposdk.RuleSync{

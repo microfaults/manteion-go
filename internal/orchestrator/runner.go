@@ -8,6 +8,8 @@ import (
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
+	"manteion-go/internal/atrocontrol"
+	"manteion-go/internal/cachestore"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/zeus"
@@ -63,6 +65,11 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 
 	o.cancelPoller(phaseID)
 	o.stopPhaseAttacks(ctx, phaseID)
+	// k6 runs aren't resumable; pause kills them and resume re-launches
+	// (StartPhase fresh=false re-runs startPhaseRuns), matching attacks.
+	if pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID); err == nil {
+		o.stopPhaseRuns(ctx, pws)
+	}
 	o.logger.Info("orchestrator: phase paused", "phase_id", phaseID)
 	return nil
 }
@@ -71,7 +78,7 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 // completed/failed/skipped (default completed). Idempotent — a no-op if the
 // phase already reached a terminal state.
 func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus string) error {
-	from := []string{"running", "paused"}
+	from := []string{"running", "paused", "draining"}
 	switch finalStatus {
 	case "":
 		finalStatus = "completed"
@@ -102,18 +109,35 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: load experiment: %w", err))
 	}
 
-	// Cache preload only on a fresh start: a resume continues with whatever
-	// the cache boxes already hold.
-	if fresh && len(p.FrozenServices) > 0 {
-		if err := o.preloadCacheEntries(ctx, p); err != nil {
-			o.logger.Warn("orchestrator: cache preload failed",
+	// A cache-box phase becoming active changes the rule set SDKs synthesize on
+	// poll: a baseline (persist_cache) adds record rules, an isolation phase
+	// (frozen_services) adds replay rules. Bump the rule version so SDKs re-poll
+	// and pick them up (the phase is already 'running' here). Cleared on finish.
+	if fresh && (p.PersistCache || len(p.FrozenServices) > 0) {
+		if err := o.rules.BumpVersion(ctx); err != nil {
+			o.logger.Warn("orchestrator: bump version for cache-box phase start failed",
 				"phase_id", p.ID, "error", err)
 		}
 	}
 
-	// Freeze is idempotent (intent-tracked), so re-freezing on resume is
-	// safe and re-asserts the desired state.
-	o.freezeServices(ctx, p)
+	// Cache preload is a HARD GATE on a fresh start of a frozen phase (INV-4):
+	// load may only begin against a replay set that every live instance has
+	// verify-committed (byte-exact count + checksum). A missing baseline, a
+	// zero-entry frozen service, or any instance failing/mismatching aborts the
+	// phase here — before freeze and before any load. A resume continues with
+	// whatever the boxes already hold.
+	if fresh && len(p.FrozenServices) > 0 {
+		if err := o.preloadCacheEntries(ctx, p); err != nil {
+			return fail(fmt.Errorf("orchestrator: preload gate: %w", err))
+		}
+	}
+
+	// Freeze is idempotent (intent-tracked), so re-freezing on resume re-asserts
+	// desired state. For a frozen service an un-asserted freeze is a leak
+	// (INV-4), so freeze-fanout failure is phase-fatal.
+	if err := o.freezeServices(ctx, p); err != nil {
+		return fail(fmt.Errorf("orchestrator: freeze gate: %w", err))
+	}
 	if fresh {
 		o.recordFreezeEvents(ctx, p)
 	}
@@ -129,31 +153,52 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: materialize workflows: %w", err))
 	}
 
-	started, configured, maxDur, err := o.startPhaseAttacks(ctx, exp, p)
+	// A phase workflow drives load two ways, both scoped to (experiment, phase):
+	// the k6 workflow RUN executes the DSL v2 DAG (the primary, workflow-shaped
+	// driver), and a flat vegeta ATTACK against target_url runs additively for
+	// targeted precision load. Start runs first so the DAG is generating traffic
+	// before the additive attacks pile on.
+	runsStarted, runsConfigured, runsMaxDur, err := o.startPhaseRuns(ctx, exp, p)
 	if err != nil {
 		return fail(err)
 	}
+
+	atkStarted, atkConfigured, atkMaxDur, err := o.startPhaseAttacks(ctx, exp, p)
+	if err != nil {
+		return fail(err)
+	}
+
+	// Fail only if drivers were configured but NONE of either kind started --
+	// a workflow may be run-only, attack-only, or both, and losing one kind
+	// while the other runs is a warning, not a phase failure.
+	configured := runsConfigured + atkConfigured
+	started := runsStarted + atkStarted
 	if configured > 0 && started == 0 {
-		return fail(fmt.Errorf("orchestrator: no attack could be started (%d configured)", configured))
+		return fail(fmt.Errorf("orchestrator: no load driver could be started (%d configured)", configured))
+	}
+
+	maxDur := runsMaxDur
+	if atkMaxDur > maxDur {
+		maxDur = atkMaxDur
 	}
 
 	if started > 0 {
 		o.spawnPoller(p.ID, maxDur)
 		o.logger.Info("orchestrator: phase started",
-			"phase_id", p.ID, "attacks", started, "fresh", fresh)
+			"phase_id", p.ID, "runs", runsStarted, "attacks", atkStarted, "fresh", fresh)
 		return nil
 	}
 
-	// No attacks → no driver takes this phase to a terminal state.
+	// No run and no attack → no driver takes this phase to a terminal state.
 	// Auto-complete (a driver-less phase is valid — e.g. rules-only against
 	// externally generated load). Only from 'running', so a concurrent
 	// pause/stop wins the race.
 	if o.autoComplete {
-		o.logger.Info("orchestrator: phase has no attack driver; auto-completing",
+		o.logger.Info("orchestrator: phase has no load driver; auto-completing",
 			"phase_id", p.ID)
 		go o.finishPhase(context.Background(), p.ID, "completed", "running")
 	} else {
-		o.logger.Info("orchestrator: phase started without attack driver",
+		o.logger.Info("orchestrator: phase started without load driver",
 			"phase_id", p.ID)
 	}
 	return nil
@@ -185,6 +230,25 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 		return false
 	}
 
+	// A recording (persist_cache) phase completes through the drain barrier
+	// (INV-3): running → draining (drain gate) → completed. The CAS winner of
+	// running→draining owns the drain AND the completion; losers no-op — the
+	// winner-only discipline holds across BOTH hops. A failed/cancelled/skipped
+	// recording phase skips the barrier (it never drains).
+	if status == "completed" && p.PersistCache {
+		won, err := o.experiments.TransitionPhase(ctx, phaseID, "draining", from...)
+		if err != nil {
+			o.logger.Error("orchestrator: finish phase: transition to draining failed",
+				"phase_id", phaseID, "error", err)
+			return false
+		}
+		if !won {
+			return false // lost the race / not in an allowed source state
+		}
+		o.runDrainBarrier(ctx, p, pws)
+		from = []string{"draining"} // now complete from draining
+	}
+
 	transitioned, err := o.experiments.TransitionPhase(ctx, phaseID, status, from...)
 	if err != nil {
 		o.logger.Error("orchestrator: finish phase: transition failed",
@@ -197,12 +261,33 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 
 	o.cancelPoller(phaseID)
 
+	// A finished cache-box phase drops out of the synthesized rule set — bump
+	// the rule version so SDKs re-poll and stop recording/replaying. For a
+	// recording (persist_cache) phase this rule-set removal is what the SDK's
+	// drain tracker keys off (MANT-2): the phase is terminal here, so the poll
+	// no longer synthesizes its cache-box rule.
+	if p.PersistCache || len(p.FrozenServices) > 0 {
+		if err := o.rules.BumpVersion(ctx); err != nil {
+			o.logger.Warn("orchestrator: bump version for cache-box phase stop failed",
+				"phase_id", phaseID, "error", err)
+		}
+	}
+
 	for _, svc := range o.phaseServices(ctx, p) {
 		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
 			o.logger.Warn("orchestrator: clear rules failed on finish",
 				"phase_id", phaseID, "service", svc, "error", err)
 		}
 	}
+
+	// Fidelity verdict BEFORE thaw (INV-6): pull each frozen instance's W6
+	// snapshot while its counters are intact, compute + persist the verdict, and
+	// carry the real per-service replay age into harvest's staleness metric.
+	var staleness map[string]float64
+	if status == "completed" && len(p.FrozenServices) > 0 {
+		staleness = o.collectFidelityVerdict(ctx, p)
+	}
+
 	o.thawServices(ctx, p)
 
 	if o.faultEvents != nil {
@@ -211,20 +296,11 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 		}
 	}
 
-	if o.zeusClient != nil {
-		for _, pw := range pws {
-			if pw.ZeusAttackID == "" {
-				continue
-			}
-			if err := o.zeusClient.StopAttack(ctx, pw.ZeusAttackID); err != nil {
-				o.logger.Warn("orchestrator: zeus attack stop failed",
-					"phase_id", phaseID, "attack_id", pw.ZeusAttackID, "error", err)
-			}
-		}
-	}
+	o.stopZeusAttacks(ctx, pws)
+	o.stopPhaseRuns(ctx, pws)
 
 	if status == "completed" {
-		o.harvestPhase(ctx, p, pws) // exactly once — only the transition winner reaches here
+		o.harvestPhase(ctx, p, pws, staleness) // exactly once — only the transition winner reaches here
 	}
 
 	if _, err := o.experiments.RecomputeExperimentResults(ctx, p.ExperimentID); err != nil {
@@ -301,11 +377,36 @@ func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID st
 			o.logger.Warn("orchestrator: stale zeus workflow delete failed; proceeding",
 				"workflow_id", wf.ID, "error", err)
 		}
-		if err := o.zeusClient.RegisterWorkflow(ctx, wf.DSL); err != nil {
+		// Stamp manteion's workflow id into the DSL doc so zeus stores it under
+		// the SAME id manteion deletes and runs by. Zeus mints its own id when
+		// the doc omits one, which would make DeleteWorkflow(wf.ID) and
+		// StartRun(wf.ID) miss. The DSL is otherwise opaque to manteion.
+		doc, err := withDocID(wf.DSL, wf.ID)
+		if err != nil {
+			return fmt.Errorf("stamp workflow id %q: %w", wf.ID, err)
+		}
+		if err := o.zeusClient.RegisterWorkflow(ctx, doc); err != nil {
 			return fmt.Errorf("register workflow %q in zeus: %w", wf.ID, err)
 		}
 	}
 	return nil
+}
+
+// withDocID sets the top-level "id" field of a JSON DSL document to id,
+// preserving every other field. This is the one place manteion reaches into
+// the otherwise-opaque DSL: zeus keys its workflow store on the doc id, and
+// manteion must control that key to address the workflow it materialized.
+func withDocID(doc json.RawMessage, id string) (json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &m); err != nil {
+		return nil, err
+	}
+	idJSON, err := json.Marshal(id)
+	if err != nil {
+		return nil, err
+	}
+	m["id"] = idJSON
+	return json.Marshal(m)
 }
 
 // startPhaseAttacks launches one zeus attack per phase_workflows row that
@@ -358,7 +459,6 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 			DurationS:     pw.DurationSec,
 			MetaTraceID:   p.ID,
 			ExperimentID:  exp.ID,
-			RunRef:        p.ID,
 			WorkflowLabel: pw.WorkflowID,
 		})
 		if err != nil {
@@ -381,6 +481,84 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 		}
 	}
 	return started, configured, maxDur, nil
+}
+
+// startPhaseRuns launches one k6 workflow run per phase_workflows row,
+// executing the workflow's DSL v2 DAG. The run is scoped to the phase:
+// experiment_id + meta_trace_id=phase_id tag the traffic so records and
+// traces slice by phase. The run id is persisted BEFORE StartRun so crash
+// recovery can find the handle even if the response is lost; zeus echoes the
+// id back (manteion mints it). Returns (started, configured, max duration).
+//
+// The workflow is already validated-and-registered in zeus by
+// materializePhaseWorkflows, so a StartRun failure here is a live-fleet
+// problem (zeus down, run rejected), logged per-row rather than fatal — the
+// phase can still be driven by additive attacks, and a fully driver-less
+// phase is handled by the caller.
+func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (started, configured int, maxDur time.Duration, err error) {
+	if o.zeusClient == nil {
+		return 0, 0, 0, nil
+	}
+	pws, err := o.experiments.ListPhaseWorkflows(ctx, p.ID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("orchestrator: list phase workflows: %w", err)
+	}
+
+	for _, pw := range pws {
+		configured++
+		runID := id.New("run")
+
+		// Unlike attacks, the run id is stamped only AFTER a successful start:
+		// a failed StartRun (zeus down, DSL rejected) must leave no handle, or
+		// the poller would wait forever on a run that never existed. The
+		// crash-recovery window this trades away (a manteion death between
+		// StartRun returning and the stamp) is negligible -- an orphaned run
+		// self-terminates after its DurationS.
+		zeusRunID, err := o.zeusClient.StartRun(ctx, pw.WorkflowID, zeus.RunRequest{
+			RunID:         runID,
+			ExperimentID:  exp.ID,
+			VUs:           pw.VUs,
+			DurationS:     pw.DurationSec,
+			MetaTraceID:   p.ID,
+			WorkflowLabel: pw.WorkflowID,
+		})
+		if err != nil {
+			o.logger.Error("orchestrator: start run failed",
+				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
+			continue
+		}
+		if zeusRunID == "" {
+			zeusRunID = runID
+		}
+		if err := o.experiments.UpdatePhaseWorkflowZeusRun(ctx, p.ID, pw.WorkflowID, zeusRunID); err != nil {
+			o.logger.Error("orchestrator: persist run id failed",
+				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "run_id", zeusRunID, "error", err)
+			// The run is live in zeus but unrecorded here; still counts as a
+			// started driver so the phase isn't mistaken for driver-less.
+		}
+
+		started++
+		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
+			maxDur = d
+		}
+	}
+	return started, configured, maxDur, nil
+}
+
+// stopPhaseRuns best-effort stops every workflow run recorded on the phase.
+func (o *Orchestrator) stopPhaseRuns(ctx context.Context, pws []model.PhaseWorkflow) {
+	if o.zeusClient == nil {
+		return
+	}
+	for _, pw := range pws {
+		if pw.ZeusRunID == "" {
+			continue
+		}
+		if err := o.zeusClient.StopRun(ctx, pw.ZeusRunID); err != nil {
+			o.logger.Warn("orchestrator: stop zeus run failed",
+				"attack_id", pw.ZeusRunID, "error", err)
+		}
+	}
 }
 
 // stopPhaseAttacks best-effort stops every attack recorded on the phase.
@@ -413,20 +591,61 @@ func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
 // each service (the cache-box decomposition primitive). Mu/Sigma come from
 // the service's fitted synthetic-delay distribution. FreezeService persists
 // intent so a re-registering SDK inherits the freeze.
-func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) {
+func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) error {
 	for _, fs := range p.FrozenServices {
-		delay := atroposdk.DelayRequest{}
-		if fs.SyntheticDelay != nil {
-			if fs.SyntheticDelay.FitMu != nil {
-				delay.Mu = *fs.SyntheticDelay.FitMu
-			}
-			if fs.SyntheticDelay.FitSigma != nil {
-				delay.Sigma = *fs.SyntheticDelay.FitSigma
-			}
+		result, err := o.controller.FreezeService(ctx, fs.Service, freezeDelayRequest(p, fs))
+		if err != nil {
+			return fmt.Errorf("freeze %q: %w", fs.Service, err)
 		}
-		if _, err := o.controller.FreezeService(ctx, fs.Service, delay); err != nil {
-			o.logger.Warn("orchestrator: freeze service failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
+		if len(result.Failed) > 0 {
+			return fmt.Errorf("freeze %q: %d of %d instances failed to freeze",
+				fs.Service, len(result.Failed), len(result.Targeted))
+		}
+	}
+	return nil
+}
+
+// freezeDelayRequest builds the SDK freeze command for one frozen service: its
+// fitted synthetic-delay distribution plus the authoritative CacheBoxContext
+// (§W1) scoping the freeze to (experiment_id, phase_id) with the service's key
+// strategy. The context is provenance/forward-compat — replay itself is driven
+// by the poll-synthesized replay rule (MANT-4).
+func freezeDelayRequest(p *model.ExperimentPhase, fs model.CacheBoxConfig) atroposdk.DelayRequest {
+	delay := atroposdk.DelayRequest{}
+	if fs.SyntheticDelay != nil {
+		if fs.SyntheticDelay.FitMu != nil {
+			delay.Mu = *fs.SyntheticDelay.FitMu
+		}
+		if fs.SyntheticDelay.FitSigma != nil {
+			delay.Sigma = *fs.SyntheticDelay.FitSigma
+		}
+	}
+	strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+	delay.Context = &atroposdk.CacheBoxContext{
+		ExperimentID:    p.ExperimentID,
+		PhaseID:         p.ID,
+		KeyStrategy:     strat,
+		StrategyVersion: model.KeyStrategyVersion(strat),
+		KeyHeaders:      fs.KeyHeaders,
+	}
+	return delay
+}
+
+// stopZeusAttacks stops each of the phase's running zeus attacks. Best-effort:
+// a stop error (e.g. an already-finished attack) is logged, not fatal. Safe to
+// call more than once (the drain barrier stops attacks before the gate; the
+// terminal teardown calls it again).
+func (o *Orchestrator) stopZeusAttacks(ctx context.Context, pws []model.PhaseWorkflow) {
+	if o.zeusClient == nil {
+		return
+	}
+	for _, pw := range pws {
+		if pw.ZeusAttackID == "" {
+			continue
+		}
+		if err := o.zeusClient.StopAttack(ctx, pw.ZeusAttackID); err != nil {
+			o.logger.Warn("orchestrator: zeus attack stop failed",
+				"attack_id", pw.ZeusAttackID, "error", err)
 		}
 	}
 }
@@ -442,37 +661,111 @@ func (o *Orchestrator) thawServices(ctx context.Context, p *model.ExperimentPhas
 	}
 }
 
-// preloadCacheEntries reads the baseline phase's persisted cache files and
-// fans them out to all frozen services' SDK instances before the isolation
-// phase begins. The baseline is the experiment's most recently completed
+// preloadCacheEntries installs each frozen service's baseline recording onto
+// every live SDK instance via the staged, verified §W4 protocol, and returns an
+// error (the phase-abort trigger) unless every instance verify-commits the
+// byte-exact set. The baseline is the experiment's most recently completed
 // phase that persisted its cache and froze nothing.
+//
+// This is a hard gate (INV-4), replacing the old warn-and-continue: a missing
+// baseline, a zero-entry frozen service, a checksum/count mismatch, or any
+// instance failure aborts the isolation phase before freeze and before load —
+// so load never runs all-miss (all-leak) against an unverified replay set.
 func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.ExperimentPhase) error {
 	baseline, err := o.baselinePhase(ctx, p.ExperimentID)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve baseline: %w", err)
 	}
 	if baseline == nil {
-		o.logger.Info("orchestrator: no completed baseline phase; skipping cache preload",
-			"phase_id", p.ID)
-		return nil
+		return fmt.Errorf("no completed baseline recording for experiment %q; cannot preload frozen services", p.ExperimentID)
+	}
+
+	// Refuse to build a replay set from a degraded recording (INV-3): its
+	// coverage is unverified, so any isolation run over it is suspect. The
+	// operator can override with MANTEION_ALLOW_DEGRADED_BASELINE.
+	drain, err := o.experiments.GetPhaseDrain(ctx, baseline.ID)
+	if err != nil {
+		return fmt.Errorf("read baseline drain result: %w", err)
+	}
+	if drain.Degraded() && !o.allowDegradedBaseline {
+		return fmt.Errorf("baseline recording %q is degraded (%d missing instances, %d entry shortfall); "+
+			"refusing to preload — set MANTEION_ALLOW_DEGRADED_BASELINE=true to override",
+			baseline.ID, len(drain.MissingInstances), drain.ShortfallEntries)
 	}
 
 	for _, fs := range p.FrozenServices {
-		entries, err := o.cacheStore.Read(baseline.ID, fs.Service)
+		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, fs.Service)
 		if err != nil {
-			o.logger.Warn("orchestrator: read cache entries failed",
-				"phase_id", p.ID, "baseline_phase_id", baseline.ID,
-				"service", fs.Service, "error", err)
-			continue
+			return fmt.Errorf("read baseline entries for %q: %w", fs.Service, err)
 		}
 		if len(entries) == 0 {
-			o.logger.Info("orchestrator: no cache entries for service",
-				"baseline_phase_id", baseline.ID, "service", fs.Service)
-			continue
+			return fmt.Errorf("baseline recorded zero entries for frozen service %q; nothing to replay", fs.Service)
 		}
-		if _, err := o.controller.PreloadEntries(ctx, fs.Service, entries); err != nil {
-			o.logger.Warn("orchestrator: preload entries failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
+
+		strat := model.ResolveKeyStrategy(fs.KeyStrategy)
+		if err := verifyRecordedStrategy(fs.Service, entries, strat); err != nil {
+			return err
+		}
+		checksum := cachestore.SetChecksum(entries)
+		results, err := o.controller.PreloadService(ctx, fs.Service, atrocontrol.PreloadSpec{
+			ExperimentID:    p.ExperimentID,
+			PhaseID:         p.ID,
+			SourcePhaseID:   baseline.ID,
+			KeyStrategy:     strat,
+			StrategyVersion: model.KeyStrategyVersion(strat),
+			KeyHeaders:      fs.KeyHeaders,
+			MaxBytes:        atrocontrol.DefaultPreloadMaxBytes,
+			Entries:         entries,
+			Checksum:        checksum,
+		})
+		if err != nil {
+			return fmt.Errorf("preload %q: %w", fs.Service, err)
+		}
+		if err := verifyPreload(fs.Service, len(entries), checksum, results); err != nil {
+			return err
+		}
+		o.logger.Info("orchestrator: preload verified",
+			"phase_id", p.ID, "service", fs.Service,
+			"entries", len(entries), "instances", len(results))
+	}
+	return nil
+}
+
+// verifyRecordedStrategy is the preload strategy preflight (MANT-5/INV-2): the
+// key strategy the entries were recorded under must equal the strategy the
+// freeze context will replay with, or every key would derive differently and
+// the isolation run would be 100% miss. An entry with an empty key_strategy
+// (recorded by a legacy SDK) is not checked. This converts a would-be silent
+// all-miss run into an explicit preflight failure.
+func verifyRecordedStrategy(service string, entries []atroposdk.CacheBoxWireEntry, expected string) error {
+	for i := range entries {
+		if s := entries[i].KeyStrategy; s != "" && s != expected {
+			return fmt.Errorf("preload %q: key_strategy_mismatch: recorded under %q but the freeze context uses %q "+
+				"(record and replay must key identically)", service, s, expected)
+		}
+	}
+	return nil
+}
+
+// verifyPreload is the per-instance completeness gate (INV-4): every live
+// instance must have verify-committed the exact expected set. Any transport
+// failure, rejected commit, wrong count, or checksum mismatch — or no live
+// instances at all — fails the phase.
+func verifyPreload(service string, expectedCount int, expectedChecksum string, results []atrocontrol.InstancePreloadResult) error {
+	if len(results) == 0 {
+		return fmt.Errorf("preload %q: no live instances to install the replay set", service)
+	}
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			return fmt.Errorf("preload %q instance %s: %w", service, r.InstanceID, r.Err)
+		case !r.Committed:
+			return fmt.Errorf("preload %q instance %s: commit rejected (loaded=%d checksum=%s, want %d/%s)",
+				service, r.InstanceID, r.Loaded, r.Checksum, expectedCount, expectedChecksum)
+		case r.Loaded != expectedCount:
+			return fmt.Errorf("preload %q instance %s: loaded %d entries, want %d", service, r.InstanceID, r.Loaded, expectedCount)
+		case r.Checksum != expectedChecksum:
+			return fmt.Errorf("preload %q instance %s: checksum %s, want %s", service, r.InstanceID, r.Checksum, expectedChecksum)
 		}
 	}
 	return nil

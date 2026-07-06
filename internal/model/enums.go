@@ -33,7 +33,7 @@ var EnumValues = map[string][]string{
 
 var (
 	ExperimentStatusValues    = []string{"planned", "running", "completed", "failed", "cancelled"}
-	PhaseStatusValues         = []string{"pending", "running", "paused", "completed", "failed", "skipped"}
+	PhaseStatusValues         = []string{"pending", "running", "paused", "completed", "failed", "skipped", "draining"}
 	FaultCategoryValues       = []string{"inline", "network", "resource"}
 	FaultHostValues           = []string{"proxy", "inline", "process"}
 	NetworkDirectionValues    = []string{"upstream", "downstream"}
@@ -42,7 +42,7 @@ var (
 	RuleActionTypeValues      = []string{"fault_spec", "fault_composition", "cachebox"}
 	StartPolicyValues         = []string{"deduplicate_by_rule", "always_start"}
 	CacheBoxModeValues        = []string{"passthrough", "replay", "replay_with_delay"}
-	CacheBoxKeyStrategyValues = []string{"exact", "exact_with_host", "exact_with_body"}
+	CacheBoxKeyStrategyValues = []string{"exact", "exact_with_host", "exact_with_body", "canonical_v2"}
 	ExecutionModeValues       = []string{"parallel", "sequential"}
 	TraceBackendValues        = []string{"jaeger", "prometheus", "tempo"}
 	FaultConfigStatusValues   = []string{"ready", "active", "completed", "cancelled"}

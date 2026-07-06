@@ -173,6 +173,11 @@ type AttackDedupBypass struct {
 // Wire-format breaking change vs. prior versions of this client:
 //   - Duration (Go duration string) → DurationS (integer seconds)
 //   - DedupBypass (string)          → DedupBypass (*AttackDedupBypass)
+//   - RunRef removed — it duplicated MetaTraceID (both carried the phase id)
+//     and nothing consumed it: the atropos SDK tags cache entries by the
+//     workflow_label baggage, manteion attributes results by attack id, and
+//     zeus does not execute runs in the single-URL model. meta_trace_id +
+//     experiment_id + workflow_label carry all correlation.
 //
 // The optional Timeout/MaxConnections/MaxBody/Redirects fields are vegeta
 // tuning knobs on zeus; omit (zero) to use vegeta defaults.
@@ -190,7 +195,6 @@ type AttackRequest struct {
 	DedupBypass   *AttackDedupBypass `json:"dedup_bypass,omitempty"`
 	MetaTraceID   string             `json:"meta_trace_id,omitempty"`
 	ExperimentID  string             `json:"experiment_id,omitempty"`
-	RunRef        string             `json:"run_ref,omitempty"`
 	WorkflowLabel string             `json:"workflow_label,omitempty"`
 }
 
@@ -305,4 +309,101 @@ func (c *Client) GetAttackResult(ctx context.Context, attackID string) (*AttackR
 		return nil, fmt.Errorf("zeus: decode attack result: %w", err)
 	}
 	return &result, nil
+}
+
+// --- Workflow runs (k6 DAG execution) ---
+//
+// A run executes a workflow's DSL v2 document via zeus's k6 launcher. It is
+// the primary, workflow-shaped load driver for a phase; flat attacks (above)
+// run additively alongside it. The run is scoped to (experiment_id, phase_id):
+// experiment_id tags it for cross-service correlation and meta_trace_id
+// carries the phase id, so recorded traffic and traces slice by phase.
+
+// RunRequest is the POST body for /api/v1/workflows/{id}/runs.
+type RunRequest struct {
+	RunID         string            `json:"run_id,omitempty"`
+	ExperimentID  string            `json:"experiment_id,omitempty"`
+	DatasetID     string            `json:"dataset_id,omitempty"`
+	VUs           int               `json:"vus,omitempty"`
+	DurationS     int               `json:"duration_s,omitempty"`
+	Persona       string            `json:"persona,omitempty"`
+	MetaTraceID   string            `json:"meta_trace_id,omitempty"`
+	WorkflowLabel string            `json:"workflow_label,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+}
+
+// RunResponse is the 202 envelope from POST /api/v1/workflows/{id}/runs.
+type RunResponse struct {
+	RunID  string `json:"run_id"`
+	Status string `json:"status"`
+}
+
+// StartRun starts a workflow run in zeus and returns the run id. workflowID
+// is the zeus-side workflow id (== manteion's workflow id — manteion
+// materializes with its own id). A 422 (dataset schema rejection) surfaces as
+// an error; the caller decides whether to fail the phase.
+func (c *Client) StartRun(ctx context.Context, workflowID string, req RunRequest) (string, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("zeus: marshal run request: %w", err)
+	}
+	resp, err := c.Do(ctx, http.MethodPost, "/workflows/"+workflowID+"/runs", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return "", fmt.Errorf("zeus: start run for workflow %q: status %d: %s", workflowID, resp.StatusCode, raw)
+	}
+	var rr RunResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return "", fmt.Errorf("zeus: decode run response: %w", err)
+	}
+	return rr.RunID, nil
+}
+
+// StopRun sends DELETE /api/v1/runs/{id}. A 409 (already terminal) is
+// tolerated — stopping a finished run is a no-op, which is what teardown
+// wants.
+func (c *Client) StopRun(ctx context.Context, runID string) error {
+	resp, err := c.Do(ctx, http.MethodDelete, "/runs/"+runID, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK, http.StatusConflict, http.StatusNotFound:
+		return nil
+	default:
+		return fmt.Errorf("zeus: stop run %q: status %d", runID, resp.StatusCode)
+	}
+}
+
+// RunInfo is the subset of GET /api/v1/runs/{id} the orchestrator polls.
+type RunInfo struct {
+	ID     string `json:"id"`
+	Status string `json:"status"` // starting, validating, running, completing, completed, stopped, failed, rejected
+}
+
+// GetRun fetches a run's current status.
+func (c *Client) GetRun(ctx context.Context, runID string) (*RunInfo, error) {
+	resp, err := c.Do(ctx, http.MethodGet, "/runs/"+runID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("zeus: run %q not found", runID)
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("zeus: get run %q: status %d: %s", runID, resp.StatusCode, raw)
+	}
+	var info RunInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("zeus: decode run info: %w", err)
+	}
+	return &info, nil
 }

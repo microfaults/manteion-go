@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/model"
 )
@@ -17,11 +19,12 @@ type logger interface {
 }
 
 type Controller struct {
-	tx       *atropos.Client
-	resolver InstanceResolver
-	intent   *IntentTracker
-	logger   logger
-	defaults controllerOpts
+	tx        *atropos.Client
+	preloadTx *atropos.Client // dedicated long-timeout transport for staged preload (MANT-1)
+	resolver  InstanceResolver
+	intent    *IntentTracker
+	logger    logger
+	defaults  controllerOpts
 }
 
 func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption) *Controller {
@@ -33,7 +36,7 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 		defaults: controllerOpts{
 			timeout:     2 * time.Second,
 			concurrency: 16,
-			filter:      FilterAliveOrSuspect,
+			filter:      FilterLive,
 		},
 	}
 	for _, o := range opts {
@@ -41,6 +44,10 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 	}
 	if c.defaults.logger != nil {
 		c.logger = c.defaults.logger
+	}
+	c.preloadTx = c.defaults.preloadTx
+	if c.preloadTx == nil {
+		c.preloadTx = tx // fall back to the command transport if no dedicated one is set
 	}
 	return c
 }
@@ -75,6 +82,32 @@ func (c *Controller) resolveTargets(ctx context.Context, service string, filter 
 		return nil, fmt.Errorf("no instances found for service %q", service)
 	}
 	return targets, nil
+}
+
+// InstancesForService returns the live (alive/suspect) registered instances of
+// a service — the registry half of the drain gate's expected set (MANT-2).
+// Unlike resolveTargets it does not error on an empty fleet.
+func (c *Controller) InstancesForService(ctx context.Context, service string) ([]*model.SDKInstance, error) {
+	instances, err := c.resolver.ForService(ctx, service)
+	if err != nil {
+		return nil, fmt.Errorf("resolve service %q: %w", service, err)
+	}
+	var live []*model.SDKInstance
+	for _, inst := range instances {
+		if c.defaults.filter == nil || c.defaults.filter(inst) {
+			live = append(live, inst)
+		}
+	}
+	return live, nil
+}
+
+// FetchFidelity pulls one instance's W6 fidelity snapshot for (exp, phase) — the
+// drain-timeout fallback (MANT-2) and verdict collection (MANT-6). Uses the
+// command transport with a per-call timeout.
+func (c *Controller) FetchFidelity(ctx context.Context, addr, experimentID, phaseID string, timeout time.Duration) (atroposdk.FidelitySnapshot, error) {
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.tx.GetCacheBoxFidelity(opCtx, addr, experimentID, phaseID)
 }
 
 func (c *Controller) resolveInstance(ctx context.Context, instanceID string) (*model.SDKInstance, error) {

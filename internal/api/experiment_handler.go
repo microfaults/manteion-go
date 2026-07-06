@@ -97,6 +97,18 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// INV-2 (MANT-4d): every phase touching a service must agree on its
+	// cache-box key strategy + headers, so record and replay of that service
+	// derive identical keys. Reject upfront, before any row is written.
+	phasesForCheck := make([]model.ExperimentPhase, len(req.Phases))
+	for i, ph := range req.Phases {
+		phasesForCheck[i] = model.ExperimentPhase{FrozenServices: ph.FrozenServices}
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	exp := &model.Experiment{
 		ID:          req.ID,
 		Name:        req.Name,
@@ -384,6 +396,14 @@ type phaseResultsResponse struct {
 	WorkflowResults []*model.PhaseWorkflowResult `json:"workflow_results"`
 	ServiceLatency  []*model.PhaseServiceLatency `json:"service_latency"`
 	ServiceCache    []*model.PhaseServiceCache   `json:"service_cache"`
+	// Verdict is the phase's fidelity verdict (INV-6), nil for baseline/non-frozen
+	// phases. SEAM(D): the latency-decomposition/delta engine consuming these
+	// results MUST refuse to compute over a run whose verdict is INVALID.
+	Verdict *model.PhaseVerdict `json:"verdict,omitempty"`
+	// Drain is the recording-phase drain outcome (clean|degraded), nil for a
+	// non-recording phase. A baseline records but has no verdict, so this is
+	// the operator's completeness signal for the reference dataset.
+	Drain *model.PhaseDrainResult `json:"drain,omitempty"`
 }
 
 func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
@@ -405,11 +425,23 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load service cache")
 		return
 	}
+	verdict, err := s.experiments.GetPhaseVerdict(ctx, phaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load phase verdict")
+		return
+	}
+	drain, err := s.experiments.GetPhaseDrain(ctx, phaseID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load phase drain")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, phaseResultsResponse{
 		WorkflowResults: nilToEmpty(wfRes),
 		ServiceLatency:  nilToEmpty(svcLat),
 		ServiceCache:    nilToEmpty(svcCache),
+		Verdict:         verdict,
+		Drain:           drain,
 	})
 }
 

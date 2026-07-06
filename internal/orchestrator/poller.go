@@ -50,14 +50,14 @@ func (o *Orchestrator) pollPhaseAttacks(ctx context.Context, phaseID string, pha
 					"phase_id", phaseID, "error", err)
 				continue
 			}
-			done, failed := o.checkAttackStatuses(ctx, phaseID, pws)
+			done, failed := o.checkLoadStatuses(ctx, phaseID, pws)
 			if failed {
-				o.logger.Warn("orchestrator: zeus attack failed unexpectedly", "phase_id", phaseID)
+				o.logger.Warn("orchestrator: zeus load driver failed unexpectedly", "phase_id", phaseID)
 				o.finishPhase(context.Background(), phaseID, "failed", "running")
 				return
 			}
 			if done {
-				o.logger.Info("orchestrator: zeus attacks completed naturally", "phase_id", phaseID)
+				o.logger.Info("orchestrator: zeus load drivers completed naturally", "phase_id", phaseID)
 				o.finishPhase(context.Background(), phaseID, "completed", "running")
 				return
 			}
@@ -65,45 +65,65 @@ func (o *Orchestrator) pollPhaseAttacks(ctx context.Context, phaseID string, pha
 	}
 }
 
-// checkAttackStatuses polls every attack recorded on the phase's workflow
-// rows. Returns (allDone, anyFailed). "completed" and "stopped" count as
-// done ("stopped" is externally managed — we don't interfere);
-// "pending"/"running" are in flight; anything unrecognized is a failure for
-// defense-in-depth. Transient GetAttack errors leave the attack uncounted so
-// the next tick retries.
-func (o *Orchestrator) checkAttackStatuses(ctx context.Context, phaseID string, pws []model.PhaseWorkflow) (allDone bool, anyFailed bool) {
+// checkLoadStatuses polls every load driver recorded on the phase's workflow
+// rows -- both the k6 workflow RUNS and the additive vegeta ATTACKS -- and
+// returns (allDone, anyFailed). The phase completes only when EVERY driver of
+// both kinds is terminal, so an additive attack cannot end the phase while its
+// workflow run is still generating traffic (or vice versa). A "stopped" driver
+// counts as done (externally managed); a "failed"/"rejected"/unrecognized
+// driver fails the phase; transient GetRun/GetAttack errors leave that driver
+// uncounted so the next tick retries. A phase with no drivers at all returns
+// not-done (the auto-complete path in enterPhase handles the driver-less case
+// before the poller is ever spawned).
+func (o *Orchestrator) checkLoadStatuses(ctx context.Context, phaseID string, pws []model.PhaseWorkflow) (allDone bool, anyFailed bool) {
 	if o.zeusClient == nil {
 		return false, false
 	}
-	var attackIDs []string
+
+	total, completed := 0, 0
 	for _, pw := range pws {
+		if pw.ZeusRunID != "" {
+			total++
+			info, err := o.zeusClient.GetRun(ctx, pw.ZeusRunID)
+			if err != nil {
+				o.logger.Warn("orchestrator: get run status failed",
+					"phase_id", phaseID, "run_id", pw.ZeusRunID, "error", err)
+				continue // uncounted; retried next tick
+			}
+			switch info.Status {
+			case "completed", "stopped":
+				completed++
+			case "starting", "validating", "running", "completing":
+				// in flight
+			default: // failed, rejected, or unknown
+				o.logger.Error("orchestrator: zeus run in failure state",
+					"phase_id", phaseID, "run_id", pw.ZeusRunID, "status", info.Status)
+				anyFailed = true
+			}
+		}
 		if pw.ZeusAttackID != "" {
-			attackIDs = append(attackIDs, pw.ZeusAttackID)
-		}
-	}
-	if len(attackIDs) == 0 {
-		return false, false
-	}
-
-	completed := 0
-	for _, id := range attackIDs {
-		info, err := o.zeusClient.GetAttack(ctx, id)
-		if err != nil {
-			o.logger.Warn("orchestrator: get attack status failed",
-				"phase_id", phaseID, "attack_id", id, "error", err)
-			continue
-		}
-		switch info.Status {
-		case "completed", "stopped":
-			completed++
-		case "pending", "running":
-			// Still in progress — not counted.
-		default:
-			o.logger.Error("orchestrator: unexpected zeus attack status",
-				"phase_id", phaseID, "attack_id", id, "status", info.Status)
-			anyFailed = true
+			total++
+			info, err := o.zeusClient.GetAttack(ctx, pw.ZeusAttackID)
+			if err != nil {
+				o.logger.Warn("orchestrator: get attack status failed",
+					"phase_id", phaseID, "attack_id", pw.ZeusAttackID, "error", err)
+				continue
+			}
+			switch info.Status {
+			case "completed", "stopped":
+				completed++
+			case "pending", "running":
+				// in flight
+			default:
+				o.logger.Error("orchestrator: unexpected zeus attack status",
+					"phase_id", phaseID, "attack_id", pw.ZeusAttackID, "status", info.Status)
+				anyFailed = true
+			}
 		}
 	}
 
-	return completed == len(attackIDs), anyFailed
+	if total == 0 {
+		return false, anyFailed
+	}
+	return completed == total, anyFailed
 }

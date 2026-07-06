@@ -41,6 +41,7 @@ type Server struct {
 	faultConfigs     *store.FaultConfigRepo
 	sdk              *store.SDKRepo
 	experiments      *store.ExperimentRepo
+	phaseReader      phaseReader // same as experiments; separate field so ingest tests can inject a fake
 	phaseFaultEvents *store.PhaseFaultEventRepo
 	workflows        *store.WorkflowRepo
 	workloads        *store.WorkloadRepo
@@ -84,6 +85,7 @@ func NewServer(
 		faultConfigs:     faultConfigs,
 		sdk:              sdk,
 		experiments:      experiments,
+		phaseReader:      experiments,
 		phaseFaultEvents: phaseFaultEvents,
 		workflows:        workflows,
 		workloads:        workloads,
@@ -240,6 +242,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Cache ingest + serve
 	mux.HandleFunc("POST /api/v1/cache/ingest", s.handleCacheIngest)
 	mux.HandleFunc("GET /api/v1/cache/entries", s.handleCacheEntries)
+	mux.HandleFunc("POST /api/v1/sdk/cachebox/drain", s.handleCacheDrain)
 
 	// Zeus proxy — workflow lifecycle (register, validate, trigger runs, view status).
 	// Manteion owns experiment orchestration; zeus owns workflow execution.

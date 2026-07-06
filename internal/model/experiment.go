@@ -132,7 +132,11 @@ type PhaseWorkflow struct {
 	DurationSec  int     `json:"duration_sec"`
 	TargetURL    string  `json:"target_url,omitempty"`
 	TargetMethod string  `json:"target_method,omitempty"`
-	ZeusAttackID string  `json:"zeus_attack_id,omitempty"`
+	// ZeusAttackID is the flat vegeta attack handle (additive load against
+	// TargetURL); ZeusRunID is the k6 workflow-run handle (the DSL DAG). A
+	// phase workflow drives both independently -- the poller waits for both.
+	ZeusAttackID string `json:"zeus_attack_id,omitempty"`
+	ZeusRunID    string `json:"zeus_run_id,omitempty"`
 }
 
 func (pw *PhaseWorkflow) Validate() error {
@@ -285,16 +289,23 @@ func (r *PhaseServiceLatency) Validate() error {
 	return nil
 }
 
-// PhaseServiceCache is per-(phase, service) cache-box fidelity stats.
-// Row presence implies the service was frozen in replay mode during this
-// phase. Callers that don't engage cache-box never write to this table.
+// PhaseServiceCache is per-(phase, service) cache-box fidelity stats. A row
+// is written for a service frozen in replay mode (hit_rate/request_count) and
+// for a service that recorded into a baseline phase (recorded_entry_count).
 type PhaseServiceCache struct {
-	PhaseID         string    `json:"phase_id"`
-	Service         string    `json:"service"`
-	CacheHitRate    float64   `json:"cache_hit_rate"`
-	CacheExactMatch float64   `json:"cache_exact_match"`
-	CacheStaleness  float64   `json:"cache_staleness"`
-	ComputedAt      time.Time `json:"computed_at"`
+	PhaseID         string  `json:"phase_id"`
+	Service         string  `json:"service"`
+	CacheHitRate    float64 `json:"cache_hit_rate"`
+	CacheExactMatch float64 `json:"cache_exact_match"`
+	CacheStaleness  float64 `json:"cache_staleness"`
+	// RequestCount is hits+misses observed against the frozen (replay) service
+	// — disambiguates "0 requests served" from "all misses" (both hit_rate 0).
+	RequestCount int64 `json:"request_count"`
+	// RecordedEntryCount is the recording coverage: distinct entries captured
+	// for this service on a baseline phase, or available to replay on an
+	// isolation phase. Together with hit_rate it verifies recording fidelity.
+	RecordedEntryCount int64     `json:"recorded_entry_count"`
+	ComputedAt         time.Time `json:"computed_at"`
 }
 
 func (r *PhaseServiceCache) Validate() error {
