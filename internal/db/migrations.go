@@ -108,6 +108,7 @@ var migrations = []migration{
 	{5, "phase_status: add draining (drain barrier, design doc Q2)", migration5},
 	{6, "phase_drain: per-phase drain outcome (clean|degraded + detail)", migration6},
 	{7, "phase_verdict: per-phase fidelity verdict (VALID|WARN|INVALID, design doc Q6)", migration7},
+	{8, "phase_workflows: zeus_run_id (k6 workflow-run handle, additive to zeus_attack_id)", migration8},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -607,4 +608,15 @@ CREATE TABLE trace_anchors (
     collected_at  TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX idx_trace_anchors_phase ON trace_anchors(phase_id);
+`
+
+// migration8 adds zeus_run_id to phase_workflows. A phase workflow now drives
+// load two independent ways: a k6 workflow RUN that executes the DSL v2 DAG
+// (zeus_run_id, the primary path) and — additively — a flat vegeta ATTACK
+// against target_url (zeus_attack_id). Both handles are opaque zeus-minted
+// TEXT; the poller watches both to terminal before completing the phase.
+const migration8 = `
+ALTER TABLE phase_workflows ADD COLUMN zeus_run_id TEXT;
+CREATE INDEX idx_phase_workflows_zeus_run ON phase_workflows(zeus_run_id)
+    WHERE zeus_run_id IS NOT NULL;
 `

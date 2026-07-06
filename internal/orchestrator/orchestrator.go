@@ -480,20 +480,26 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 		return
 	}
 
-	var attackIDs []string
+	// Both load-driver kinds must be reconciled: a phase whose only driver is
+	// a workflow run (no additive attack) must not be seen as driver-less and
+	// wrongly auto-completed while its run is still generating traffic.
 	var maxDur time.Duration
+	drivers := 0
 	for _, pw := range pws {
 		if pw.ZeusAttackID != "" {
-			attackIDs = append(attackIDs, pw.ZeusAttackID)
+			drivers++
+		}
+		if pw.ZeusRunID != "" {
+			drivers++
 		}
 		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
 			maxDur = d
 		}
 	}
 
-	if len(attackIDs) == 0 {
+	if drivers == 0 {
 		if o.autoComplete {
-			o.logger.Info("orchestrator: recover: phase has no attacks; auto-completing",
+			o.logger.Info("orchestrator: recover: phase has no load drivers; auto-completing",
 				"phase_id", phaseID)
 			go o.finishPhase(context.Background(), phaseID, "completed", "running")
 		}
@@ -502,26 +508,29 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 
 	if o.zeusClient != nil {
 		lost := 0
-		for _, id := range attackIDs {
-			if !o.reconcileOneAttack(ctx, phaseID, id) {
+		for _, pw := range pws {
+			if pw.ZeusAttackID != "" && !o.reconcileOneAttack(ctx, phaseID, pw.ZeusAttackID) {
+				lost++
+			}
+			if pw.ZeusRunID != "" && !o.reconcileOneRun(ctx, phaseID, pw.ZeusRunID) {
 				lost++
 			}
 		}
-		if lost == len(attackIDs) {
-			o.logger.Warn("orchestrator: recover: all zeus attacks lost; marking phase failed",
+		if lost == drivers {
+			o.logger.Warn("orchestrator: recover: all zeus load drivers lost; marking phase failed",
 				"phase_id", phaseID)
 			o.finishPhase(ctx, phaseID, "failed", "running")
 			return
 		}
 		if lost > 0 {
-			o.logger.Warn("orchestrator: recover: some zeus attacks lost; continuing with survivors",
-				"phase_id", phaseID, "lost", lost, "total", len(attackIDs))
+			o.logger.Warn("orchestrator: recover: some zeus load drivers lost; continuing with survivors",
+				"phase_id", phaseID, "lost", lost, "total", drivers)
 		}
 	}
 
 	o.spawnPoller(phaseID, maxDur)
 	o.logger.Info("orchestrator: recover: running phase restored",
-		"phase_id", phaseID, "attacks", len(attackIDs))
+		"phase_id", phaseID, "drivers", drivers)
 }
 
 const reconcileRetries = 3
@@ -546,5 +555,25 @@ func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID
 	}
 	o.logger.Warn("orchestrator: recover: zeus attack not found after retries",
 		"phase_id", phaseID, "attack_id", attackID, "error", lastErr)
+	return false
+}
+
+// reconcileOneRun calls Zeus.GetRun with retries. Reports whether zeus still
+// knows the run (the k6 subprocess survives a manteion restart because it
+// runs inside zeus; it is lost only if zeus itself restarted).
+func (o *Orchestrator) reconcileOneRun(ctx context.Context, phaseID, runID string) bool {
+	var lastErr error
+	for attempt := 0; attempt < reconcileRetries; attempt++ {
+		if _, err := o.zeusClient.GetRun(ctx, runID); err == nil {
+			return true
+		} else {
+			lastErr = err
+		}
+		if attempt < reconcileRetries-1 {
+			time.Sleep(reconcileBackoff[attempt])
+		}
+	}
+	o.logger.Warn("orchestrator: recover: zeus run not found after retries",
+		"phase_id", phaseID, "run_id", runID, "error", lastErr)
 	return false
 }

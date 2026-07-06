@@ -23,6 +23,7 @@ type drainTarget struct {
 func (o *Orchestrator) runDrainBarrier(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow) {
 	o.cancelPoller(p.ID)
 	o.stopZeusAttacks(ctx, pws)
+	o.stopPhaseRuns(ctx, pws)
 	if err := o.rules.BumpVersion(ctx); err != nil {
 		o.logger.Warn("orchestrator: drain: bump version failed", "phase_id", p.ID, "error", err)
 	}

@@ -65,6 +65,11 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 
 	o.cancelPoller(phaseID)
 	o.stopPhaseAttacks(ctx, phaseID)
+	// k6 runs aren't resumable; pause kills them and resume re-launches
+	// (StartPhase fresh=false re-runs startPhaseRuns), matching attacks.
+	if pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID); err == nil {
+		o.stopPhaseRuns(ctx, pws)
+	}
 	o.logger.Info("orchestrator: phase paused", "phase_id", phaseID)
 	return nil
 }
@@ -148,31 +153,52 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: materialize workflows: %w", err))
 	}
 
-	started, configured, maxDur, err := o.startPhaseAttacks(ctx, exp, p)
+	// A phase workflow drives load two ways, both scoped to (experiment, phase):
+	// the k6 workflow RUN executes the DSL v2 DAG (the primary, workflow-shaped
+	// driver), and a flat vegeta ATTACK against target_url runs additively for
+	// targeted precision load. Start runs first so the DAG is generating traffic
+	// before the additive attacks pile on.
+	runsStarted, runsConfigured, runsMaxDur, err := o.startPhaseRuns(ctx, exp, p)
 	if err != nil {
 		return fail(err)
 	}
+
+	atkStarted, atkConfigured, atkMaxDur, err := o.startPhaseAttacks(ctx, exp, p)
+	if err != nil {
+		return fail(err)
+	}
+
+	// Fail only if drivers were configured but NONE of either kind started --
+	// a workflow may be run-only, attack-only, or both, and losing one kind
+	// while the other runs is a warning, not a phase failure.
+	configured := runsConfigured + atkConfigured
+	started := runsStarted + atkStarted
 	if configured > 0 && started == 0 {
-		return fail(fmt.Errorf("orchestrator: no attack could be started (%d configured)", configured))
+		return fail(fmt.Errorf("orchestrator: no load driver could be started (%d configured)", configured))
+	}
+
+	maxDur := runsMaxDur
+	if atkMaxDur > maxDur {
+		maxDur = atkMaxDur
 	}
 
 	if started > 0 {
 		o.spawnPoller(p.ID, maxDur)
 		o.logger.Info("orchestrator: phase started",
-			"phase_id", p.ID, "attacks", started, "fresh", fresh)
+			"phase_id", p.ID, "runs", runsStarted, "attacks", atkStarted, "fresh", fresh)
 		return nil
 	}
 
-	// No attacks → no driver takes this phase to a terminal state.
+	// No run and no attack → no driver takes this phase to a terminal state.
 	// Auto-complete (a driver-less phase is valid — e.g. rules-only against
 	// externally generated load). Only from 'running', so a concurrent
 	// pause/stop wins the race.
 	if o.autoComplete {
-		o.logger.Info("orchestrator: phase has no attack driver; auto-completing",
+		o.logger.Info("orchestrator: phase has no load driver; auto-completing",
 			"phase_id", p.ID)
 		go o.finishPhase(context.Background(), p.ID, "completed", "running")
 	} else {
-		o.logger.Info("orchestrator: phase started without attack driver",
+		o.logger.Info("orchestrator: phase started without load driver",
 			"phase_id", p.ID)
 	}
 	return nil
@@ -271,6 +297,7 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 	}
 
 	o.stopZeusAttacks(ctx, pws)
+	o.stopPhaseRuns(ctx, pws)
 
 	if status == "completed" {
 		o.harvestPhase(ctx, p, pws, staleness) // exactly once — only the transition winner reaches here
@@ -429,6 +456,84 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 		}
 	}
 	return started, configured, maxDur, nil
+}
+
+// startPhaseRuns launches one k6 workflow run per phase_workflows row,
+// executing the workflow's DSL v2 DAG. The run is scoped to the phase:
+// experiment_id + meta_trace_id=phase_id tag the traffic so records and
+// traces slice by phase. The run id is persisted BEFORE StartRun so crash
+// recovery can find the handle even if the response is lost; zeus echoes the
+// id back (manteion mints it). Returns (started, configured, max duration).
+//
+// The workflow is already validated-and-registered in zeus by
+// materializePhaseWorkflows, so a StartRun failure here is a live-fleet
+// problem (zeus down, run rejected), logged per-row rather than fatal — the
+// phase can still be driven by additive attacks, and a fully driver-less
+// phase is handled by the caller.
+func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (started, configured int, maxDur time.Duration, err error) {
+	if o.zeusClient == nil {
+		return 0, 0, 0, nil
+	}
+	pws, err := o.experiments.ListPhaseWorkflows(ctx, p.ID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("orchestrator: list phase workflows: %w", err)
+	}
+
+	for _, pw := range pws {
+		configured++
+		runID := id.New("run")
+
+		// Unlike attacks, the run id is stamped only AFTER a successful start:
+		// a failed StartRun (zeus down, DSL rejected) must leave no handle, or
+		// the poller would wait forever on a run that never existed. The
+		// crash-recovery window this trades away (a manteion death between
+		// StartRun returning and the stamp) is negligible -- an orphaned run
+		// self-terminates after its DurationS.
+		zeusRunID, err := o.zeusClient.StartRun(ctx, pw.WorkflowID, zeus.RunRequest{
+			RunID:         runID,
+			ExperimentID:  exp.ID,
+			VUs:           pw.VUs,
+			DurationS:     pw.DurationSec,
+			MetaTraceID:   p.ID,
+			WorkflowLabel: pw.WorkflowID,
+		})
+		if err != nil {
+			o.logger.Error("orchestrator: start run failed",
+				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
+			continue
+		}
+		if zeusRunID == "" {
+			zeusRunID = runID
+		}
+		if err := o.experiments.UpdatePhaseWorkflowZeusRun(ctx, p.ID, pw.WorkflowID, zeusRunID); err != nil {
+			o.logger.Error("orchestrator: persist run id failed",
+				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "run_id", zeusRunID, "error", err)
+			// The run is live in zeus but unrecorded here; still counts as a
+			// started driver so the phase isn't mistaken for driver-less.
+		}
+
+		started++
+		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
+			maxDur = d
+		}
+	}
+	return started, configured, maxDur, nil
+}
+
+// stopPhaseRuns best-effort stops every workflow run recorded on the phase.
+func (o *Orchestrator) stopPhaseRuns(ctx context.Context, pws []model.PhaseWorkflow) {
+	if o.zeusClient == nil {
+		return
+	}
+	for _, pw := range pws {
+		if pw.ZeusRunID == "" {
+			continue
+		}
+		if err := o.zeusClient.StopRun(ctx, pw.ZeusRunID); err != nil {
+			o.logger.Warn("orchestrator: stop zeus run failed",
+				"attack_id", pw.ZeusRunID, "error", err)
+		}
+	}
 }
 
 // stopPhaseAttacks best-effort stops every attack recorded on the phase.

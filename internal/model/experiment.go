@@ -132,7 +132,11 @@ type PhaseWorkflow struct {
 	DurationSec  int     `json:"duration_sec"`
 	TargetURL    string  `json:"target_url,omitempty"`
 	TargetMethod string  `json:"target_method,omitempty"`
-	ZeusAttackID string  `json:"zeus_attack_id,omitempty"`
+	// ZeusAttackID is the flat vegeta attack handle (additive load against
+	// TargetURL); ZeusRunID is the k6 workflow-run handle (the DSL DAG). A
+	// phase workflow drives both independently -- the poller waits for both.
+	ZeusAttackID string `json:"zeus_attack_id,omitempty"`
+	ZeusRunID    string `json:"zeus_run_id,omitempty"`
 }
 
 func (pw *PhaseWorkflow) Validate() error {

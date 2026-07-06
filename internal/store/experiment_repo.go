@@ -688,11 +688,11 @@ func (r *ExperimentRepo) AttachPhaseWorkflows(ctx context.Context, phaseID strin
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO phase_workflows (phase_id, workflow_id, vus, rate_rps,
-				duration_sec, target_url, target_method, zeus_attack_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				duration_sec, target_url, target_method, zeus_attack_id, zeus_run_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			pw.PhaseID, pw.WorkflowID, pw.VUs, nullFloat(pw.RateRPS),
 			pw.DurationSec, nullString(pw.TargetURL), nullString(pw.TargetMethod),
-			nullString(pw.ZeusAttackID),
+			nullString(pw.ZeusAttackID), nullString(pw.ZeusRunID),
 		); err != nil {
 			return fmt.Errorf("insert phase_workflow: %w", err)
 		}
@@ -704,7 +704,7 @@ func (r *ExperimentRepo) AttachPhaseWorkflows(ctx context.Context, phaseID strin
 func (r *ExperimentRepo) ListPhaseWorkflows(ctx context.Context, phaseID string) ([]model.PhaseWorkflow, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT phase_id, workflow_id, vus, rate_rps, duration_sec,
-			target_url, target_method, zeus_attack_id
+			target_url, target_method, zeus_attack_id, zeus_run_id
 		FROM phase_workflows WHERE phase_id = $1
 		ORDER BY workflow_id`, phaseID)
 	if err != nil {
@@ -714,13 +714,13 @@ func (r *ExperimentRepo) ListPhaseWorkflows(ctx context.Context, phaseID string)
 	var out []model.PhaseWorkflow
 	for rows.Next() {
 		var (
-			pw                              model.PhaseWorkflow
-			rateRPS                         sql.NullFloat64
-			targetURL, targetMethod, zeusID sql.NullString
+			pw                                     model.PhaseWorkflow
+			rateRPS                                sql.NullFloat64
+			targetURL, targetMethod, zeusID, runID sql.NullString
 		)
 		if err := rows.Scan(
 			&pw.PhaseID, &pw.WorkflowID, &pw.VUs, &rateRPS, &pw.DurationSec,
-			&targetURL, &targetMethod, &zeusID,
+			&targetURL, &targetMethod, &zeusID, &runID,
 		); err != nil {
 			return nil, fmt.Errorf("scan phase_workflow: %w", err)
 		}
@@ -730,6 +730,7 @@ func (r *ExperimentRepo) ListPhaseWorkflows(ctx context.Context, phaseID string)
 		pw.TargetURL = fromNullString(targetURL)
 		pw.TargetMethod = fromNullString(targetMethod)
 		pw.ZeusAttackID = fromNullString(zeusID)
+		pw.ZeusRunID = fromNullString(runID)
 		out = append(out, pw)
 	}
 	return out, rows.Err()
@@ -744,6 +745,19 @@ func (r *ExperimentRepo) UpdatePhaseWorkflowZeusAttack(ctx context.Context, phas
 		phaseID, workflowID, zeusAttackID)
 	if err != nil {
 		return fmt.Errorf("update phase_workflow zeus_attack_id: %w", err)
+	}
+	return affectedOrNotFound(res)
+}
+
+// UpdatePhaseWorkflowZeusRun stamps the zeus_run_id on a single
+// phase_workflows row once the orchestrator has started the workflow run.
+func (r *ExperimentRepo) UpdatePhaseWorkflowZeusRun(ctx context.Context, phaseID, workflowID, zeusRunID string) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE phase_workflows SET zeus_run_id = $3
+		WHERE phase_id = $1 AND workflow_id = $2`,
+		phaseID, workflowID, zeusRunID)
+	if err != nil {
+		return fmt.Errorf("update phase_workflow zeus_run_id: %w", err)
 	}
 	return affectedOrNotFound(res)
 }
