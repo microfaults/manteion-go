@@ -377,11 +377,36 @@ func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID st
 			o.logger.Warn("orchestrator: stale zeus workflow delete failed; proceeding",
 				"workflow_id", wf.ID, "error", err)
 		}
-		if err := o.zeusClient.RegisterWorkflow(ctx, wf.DSL); err != nil {
+		// Stamp manteion's workflow id into the DSL doc so zeus stores it under
+		// the SAME id manteion deletes and runs by. Zeus mints its own id when
+		// the doc omits one, which would make DeleteWorkflow(wf.ID) and
+		// StartRun(wf.ID) miss. The DSL is otherwise opaque to manteion.
+		doc, err := withDocID(wf.DSL, wf.ID)
+		if err != nil {
+			return fmt.Errorf("stamp workflow id %q: %w", wf.ID, err)
+		}
+		if err := o.zeusClient.RegisterWorkflow(ctx, doc); err != nil {
 			return fmt.Errorf("register workflow %q in zeus: %w", wf.ID, err)
 		}
 	}
 	return nil
+}
+
+// withDocID sets the top-level "id" field of a JSON DSL document to id,
+// preserving every other field. This is the one place manteion reaches into
+// the otherwise-opaque DSL: zeus keys its workflow store on the doc id, and
+// manteion must control that key to address the workflow it materialized.
+func withDocID(doc json.RawMessage, id string) (json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &m); err != nil {
+		return nil, err
+	}
+	idJSON, err := json.Marshal(id)
+	if err != nil {
+		return nil, err
+	}
+	m["id"] = idJSON
+	return json.Marshal(m)
 }
 
 // startPhaseAttacks launches one zeus attack per phase_workflows row that
