@@ -125,3 +125,50 @@ func ingestSig(t *testing.T, o *Orchestrator, exp, phase, instance string, batch
 		t.Fatalf("ingest: %v", err)
 	}
 }
+
+// TestFinishPhase_VerdictToleratesPreCommitNotCommitted pins the setup-window
+// rule: not_committed misses with a COMMITTED preload are provably pre-commit
+// (the SDK's ownership gate passes once the pair's set installs, after which
+// real misses classify as key_absent), so ambient traffic 503'd during phase
+// setup must not invalidate the phase. key_absent still does.
+func TestFinishPhase_VerdictToleratesPreCommitNotCommitted(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 0)
+
+	snap := cleanSnapshot()
+	snap.ReplayMisses = 3
+	snap.MissReasons = atroposdk.FidelityMissReasons{NotCommitted: 3}
+	finishIsolationVerdict(t, o, exp.ID, iso.ID, snap)
+
+	v, err := testExpRepo.GetPhaseVerdict(ctx, iso.ID)
+	if err != nil || v == nil {
+		t.Fatalf("get verdict: %v", err)
+	}
+	if v.Verdict != "VALID" {
+		t.Fatalf("verdict = %q reasons %v, want VALID (pre-commit not_committed is setup noise)", v.Verdict, v.Reasons)
+	}
+}
+
+// TestFinishPhase_VerdictInvalidOnKeyAbsent pins that classified coverage
+// misses under load stay INVALID even when the preload committed.
+func TestFinishPhase_VerdictInvalidOnKeyAbsent(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 0)
+
+	snap := cleanSnapshot()
+	snap.ReplayMisses = 2
+	snap.MissReasons = atroposdk.FidelityMissReasons{NotCommitted: 1, KeyAbsent: 1}
+	finishIsolationVerdict(t, o, exp.ID, iso.ID, snap)
+
+	v, err := testExpRepo.GetPhaseVerdict(ctx, iso.ID)
+	if err != nil || v == nil {
+		t.Fatalf("get verdict: %v", err)
+	}
+	if v.Verdict != "INVALID" || !contains(v.Reasons, "fidelity_violation:replay_miss") {
+		t.Fatalf("verdict = %q reasons %v, want INVALID + replay_miss", v.Verdict, v.Reasons)
+	}
+}

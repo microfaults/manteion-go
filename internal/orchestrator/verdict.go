@@ -47,7 +47,22 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 				continue
 			}
 			snapshots = append(snapshots, snap)
-			if snap.ReplayMisses > 0 {
+			// Miss classification: key_absent and body_buffer_failed are
+			// coverage violations under load -- always INVALID. not_committed
+			// misses are produced by the SDK's fail-closed ownership gate in
+			// the setup window between the replay rule becoming poll-visible
+			// (the phase is 'running') and the preload commit installing this
+			// pair's set; once the pair's set IS committed the gate passes and
+			// any further miss counts as key_absent, so not_committed with
+			// Preload.Committed=true is provably pre-load-start noise (an
+			// ambient request 503'd during setup, which fail-closed intends).
+			// If the preload never committed, preloadIncomplete flags INVALID
+			// regardless. Misses the SDK didn't classify (aggregate exceeds
+			// the reason buckets -- e.g. a future reason string) stay INVALID:
+			// an unexplained miss must never read as clean.
+			classified := snap.MissReasons.KeyAbsent + snap.MissReasons.NotCommitted + snap.MissReasons.BodyBufferFailed
+			if snap.MissReasons.KeyAbsent > 0 || snap.MissReasons.BodyBufferFailed > 0 ||
+				snap.ReplayMisses > classified {
 				anyMiss = true
 			}
 			if !snap.Preload.Committed {
