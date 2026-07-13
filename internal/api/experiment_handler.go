@@ -381,7 +381,9 @@ func (s *Server) handleStartPhase(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStopPhase(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	finalStatus := r.URL.Query().Get("status")
-	if err := s.orch.StopPhase(r.Context(), id, finalStatus); err != nil {
+	// Detach from the request context (M2): a client disconnect mid-drain-barrier
+	// must not cancel teardown and wedge the phase at 'draining'.
+	if err := s.orch.StopPhase(context.WithoutCancel(r.Context()), id, finalStatus); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

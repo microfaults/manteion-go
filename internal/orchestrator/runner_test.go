@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"manteion-go/internal/model"
 )
@@ -139,5 +140,37 @@ func TestEnterPhase_BumpsVersionOnResume(t *testing.T) {
 	if v3 := version(); v3 <= v2 {
 		t.Fatalf("resume (fresh=false) of frozen phase did not bump rule version: %d -> %d "+
 			"(M5: SDK 304s forever, frozen service goes live)", v2, v3)
+	}
+}
+
+// TestRecover_DrainingPhaseCompletes pins M2(a): a phase left 'draining' by a
+// crash mid-barrier must be recovered. Recover's switch had no 'draining' case,
+// so the phase wedged forever and advanceExperiment stalled on it. Recovery
+// re-enters the drain barrier (finishPhase's from-set includes 'draining', so the
+// self-CAS re-drives it) and drives the phase to 'completed' with a drain row.
+func TestRecover_DrainingPhaseCompletes(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.WithDrainTimeout(500 * time.Millisecond)
+	o.WithDrainPollInterval(20 * time.Millisecond)
+
+	exp := mkExp(t)
+	base := mkRunningBaseline(t, exp.ID, 0) // persist_cache, running
+	if err := testExpRepo.UpdatePhaseStatus(ctx, base.ID, "draining"); err != nil {
+		t.Fatalf("wedge phase at draining: %v", err)
+	}
+	if err := testExpRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+		t.Fatalf("set experiment running: %v", err)
+	}
+
+	if err := o.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	waitFor(t, "draining phase recovered to completed", 5*time.Second, func() bool {
+		return getPhase(t, base.ID).Status == "completed"
+	})
+	drain, err := testExpRepo.GetPhaseDrain(ctx, base.ID)
+	if err != nil || drain == nil {
+		t.Fatalf("expected a drain row after recovery: drain=%v err=%v", drain, err)
 	}
 }

@@ -430,6 +430,9 @@ func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, sta
 //     retries). All attacks lost → the phase is finalized 'failed'; survivors
 //     → the poller goroutine is respawned; no attacks configured → the phase
 //     auto-completes (it has no driver).
+//   - 'draining' phases (a recording phase that crashed mid-barrier) re-enter
+//     the drain barrier and complete — otherwise they wedge forever and
+//     advanceExperiment stalls on them.
 //   - 'paused' phases are left alone; they wait for an explicit resume.
 //
 // Finally the scheduler re-walks each experiment to cover a crash that
@@ -460,6 +463,8 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 					"phase_id", p.ID)
 			case "running":
 				o.recoverRunningPhase(ctx, p.ID)
+			case "draining":
+				o.recoverDrainingPhase(p.ID)
 			}
 		}
 		// Heal a crash between phases (nothing in flight, next never started).
@@ -531,6 +536,18 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 	o.spawnPoller(phaseID, maxDur)
 	o.logger.Info("orchestrator: recover: running phase restored",
 		"phase_id", phaseID, "drivers", drivers)
+}
+
+// recoverDrainingPhase re-drives a phase that was mid-drain when the process
+// died. finishPhase's from-set includes 'draining', so completing "from
+// draining" self-CASes back into the drain barrier and runs it to terminal.
+// Spawned on a background context (mirroring recoverRunningPhase's auto-complete
+// goroutine): the barrier can block up to the drain timeout, and Recover must
+// return before the API server starts accepting requests.
+func (o *Orchestrator) recoverDrainingPhase(phaseID string) {
+	o.logger.Info("orchestrator: recover: re-entering drain barrier for draining phase",
+		"phase_id", phaseID)
+	go o.finishPhase(context.Background(), phaseID, "completed", "draining")
 }
 
 const reconcileRetries = 3
