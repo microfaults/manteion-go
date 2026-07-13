@@ -113,7 +113,14 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	// poll: a baseline (persist_cache) adds record rules, an isolation phase
 	// (frozen_services) adds replay rules. Bump the rule version so SDKs re-poll
 	// and pick them up (the phase is already 'running' here). Cleared on finish.
-	if fresh && (p.PersistCache || len(p.FrozenServices) > 0) {
+	//
+	// This fires on EVERY enter of a cache-box phase, not just a fresh start (M5):
+	// on resume (fresh=false) the paused phase had dropped out of the synthesized
+	// set, and an unrelated rule edit may have bumped the version past what a
+	// frozen SDK last saw. Without a bump here that SDK 304s forever — the frozen
+	// service never receives its replay rule and runs live (no synthetic delay,
+	// live downstream calls, zero counters) for the rest of the phase.
+	if p.PersistCache || len(p.FrozenServices) > 0 {
 		if err := o.rules.BumpVersion(ctx); err != nil {
 			o.logger.Warn("orchestrator: bump version for cache-box phase start failed",
 				"phase_id", p.ID, "error", err)

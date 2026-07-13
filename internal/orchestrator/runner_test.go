@@ -95,3 +95,49 @@ func TestFinishPhase_StopsLoadBeforeThawAndClear(t *testing.T) {
 		}
 	}
 }
+
+// TestEnterPhase_BumpsVersionOnResume pins M5: the rule version must be bumped on
+// EVERY enter of a cache-box phase, not just a fresh one. Version is the SDK poll
+// gate — a resume (fresh=false) that skips the bump leaves an SDK stuck at its old
+// version 304ing forever, so the frozen service never receives the synthesized
+// replay rule and runs live (no synthetic delay, live downstream calls, zero
+// counters) for the rest of the phase.
+func TestEnterPhase_BumpsVersionOnResume(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")    // nil zeus → no load drivers
+	o.autoComplete = false // don't spawn an async finishPhase that would also bump
+	exp := mkExp(t)
+
+	version := func() uint64 {
+		v, err := o.rules.Version(ctx)
+		if err != nil {
+			t.Fatalf("read rule version: %v", err)
+		}
+		return v
+	}
+
+	// Fresh enter of a cache-box (persist_cache baseline) phase bumps.
+	base := mkRunningBaseline(t, exp.ID, 0)
+	v0 := version()
+	if err := o.enterPhase(ctx, base, true); err != nil {
+		t.Fatalf("enterPhase fresh baseline: %v", err)
+	}
+	if v1 := version(); v1 <= v0 {
+		t.Fatalf("fresh enter of cache-box phase did not bump rule version: %d -> %d", v0, v1)
+	}
+
+	// Resume (fresh=false) of a frozen isolation phase MUST also bump. A live SDK
+	// instance is needed so the freeze fan-out has a target (an empty fleet is a
+	// freeze-gate error, not a no-op).
+	sdk := newFakeSDK(t, true)
+	registerSDK(t, "frontend", sdk.server.URL)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	v2 := version()
+	if err := o.enterPhase(ctx, iso, false); err != nil {
+		t.Fatalf("enterPhase resume isolation: %v", err)
+	}
+	if v3 := version(); v3 <= v2 {
+		t.Fatalf("resume (fresh=false) of frozen phase did not bump rule version: %d -> %d "+
+			"(M5: SDK 304s forever, frozen service goes live)", v2, v3)
+	}
+}
