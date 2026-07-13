@@ -261,6 +261,15 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 
 	o.cancelPoller(phaseID)
 
+	// M1: stop load BEFORE clearing rules and thawing the frozen service. On an
+	// operator StopPhase of a still-firing phase, tail traffic must not hit the
+	// service after it is un-frozen / its replay rule is cleared, or that traffic
+	// is harvested as frozen data (silent, plausible numbers). Both stops are
+	// idempotent — the recording-phase drain barrier already called them; this is
+	// the non-draining operator-stop path, which reaches teardown directly.
+	o.stopZeusAttacks(ctx, pws)
+	o.stopPhaseRuns(ctx, pws)
+
 	// A finished cache-box phase drops out of the synthesized rule set — bump
 	// the rule version so SDKs re-poll and stop recording/replaying. For a
 	// recording (persist_cache) phase this rule-set removal is what the SDK's
@@ -295,9 +304,6 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 			o.logger.Warn("orchestrator: close fault events failed", "phase_id", phaseID, "error", err)
 		}
 	}
-
-	o.stopZeusAttacks(ctx, pws)
-	o.stopPhaseRuns(ctx, pws)
 
 	if status == "completed" {
 		o.harvestPhase(ctx, p, pws, staleness) // exactly once — only the transition winner reaches here
