@@ -17,7 +17,10 @@ func fakeAtroposAdmin(t *testing.T) *httptest.Server {
 	t.Helper()
 
 	eval := atroposdk.NewStaticEvaluator()
-	faultHandler := atroposdk.FaultAdminHandler()
+	// Mount the explicit handler: the zero-arg FaultAdminHandler refuses (409)
+	// once anything in the process has called Configure — including its own
+	// demo-evaluator bootstrap — so it serves at most one request per binary.
+	faultHandler := atroposdk.FaultAdminHandlerWith(&atroposdk.DemoEvaluator{}, nil)
 
 	cb := atroposdk.NewCacheBox(atroposdk.CacheBoxConfig{
 		Store: atroposdk.NewCacheBoxMemStore(100),

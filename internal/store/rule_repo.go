@@ -141,14 +141,26 @@ func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 	return r.scanRules(rows)
 }
 
-// ForService returns enabled rules for a specific service, ordered by priority.
+// ForService returns the enabled rules a service's SDK should currently enforce,
+// ordered by priority. This is the authoritative poll set: the SDK reconciles to
+// EXACTLY this array, so the query is phase-aware (M4) — a rule is served iff it
+// is attached to NO experiment phase, OR attached to a phase that is currently
+// 'running'. A phase-scoped fault rule is therefore dark during the baseline
+// (its phase pending) and stops the instant the measurement window ends ('running'
+// only, deliberately NOT 'draining'), so it neither corrupts the baseline delta
+// nor gets resurrected after finishPhase clears it.
 func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, service, enabled, priority, injection_point,
-			match_labels, action_type, fault_spec_id, fault_composition_id,
-			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
-		FROM rules WHERE service = $1 AND enabled = true
-		ORDER BY priority DESC`, service)
+		SELECT r.id, r.name, r.service, r.enabled, r.priority, r.injection_point,
+			r.match_labels, r.action_type, r.fault_spec_id, r.fault_composition_id,
+			r.cachebox_mode, r.cachebox_key_strategy, r.mode, r.start_policy, r.created_at, r.updated_at
+		FROM rules r
+		WHERE r.service = $1 AND r.enabled = true
+		  AND ( NOT EXISTS (SELECT 1 FROM phase_rules pr WHERE pr.rule_id = r.id)
+		        OR EXISTS (SELECT 1 FROM phase_rules pr
+		                   JOIN experiment_phases p ON p.id = pr.phase_id
+		                   WHERE pr.rule_id = r.id AND p.status = 'running') )
+		ORDER BY r.priority DESC`, service)
 	if err != nil {
 		return nil, fmt.Errorf("rules for service: %w", err)
 	}

@@ -138,3 +138,107 @@ func TestRuleRepo_GetScansEveryColumn(t *testing.T) {
 		t.Errorf("FaultSpecID roundtrip mismatch: got %q want %q", got.Action.FaultSpecID, specID)
 	}
 }
+
+// TestRuleRepo_ForService_PhaseGating pins M4: a rule attached to an experiment
+// phase must be served by ForService (the authoritative SDK poll set) ONLY while
+// that phase is 'running'. Since the SDK reconciles to EXACTLY the poll array and
+// rules.enabled defaults true, a phase-scoped fault rule that leaks into the
+// baseline (phase pending) corrupts every downstream delta; one that lingers past
+// the measurement window (phase draining/completed) is resurrected after teardown.
+// An unattached enabled rule is always present.
+func TestRuleRepo_ForService_PhaseGating(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("phasegate-%d", time.Now().UnixNano())
+	svc := "svc-" + tag
+	specID := "spec-" + tag
+
+	// Seed a fault_spec to satisfy the rules.fault_spec_id FK.
+	spec := &model.FaultSpec{
+		ID: specID, Name: "phasegate-spec", Category: "inline", FaultType: "latency",
+		Host: "process", Params: json.RawMessage(`{"delay":"100ms"}`), CreatedAt: time.Now(),
+	}
+	if err := testFaultRepo.CreateSpec(ctx, spec); err != nil {
+		t.Fatalf("seed fault spec: %v", err)
+	}
+	// Runs LAST (LIFO): after exp + rules are gone, the spec FK is free.
+	t.Cleanup(func() { _ = testFaultRepo.DeleteSpec(context.Background(), specID) })
+
+	mkRule := func(id string, priority int) *model.Rule {
+		return &model.Rule{
+			ID: id, Name: id, Service: svc, Enabled: true, Priority: priority,
+			Mode: "background", StartPolicy: "always_start",
+			Action:    model.RuleAction{Type: "fault_spec", FaultSpecID: specID},
+			Match:     model.MatchCriteria{InjectionPoint: "ingress"},
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}
+	}
+	freeID := "rule-free-" + tag   // never attached to a phase → always served
+	phaseID := "rule-phase-" + tag // attached to one phase → served only while running
+	for _, r := range []*model.Rule{mkRule(freeID, 10), mkRule(phaseID, 20)} {
+		if err := testRuleRepo.Create(ctx, r); err != nil {
+			t.Fatalf("create rule %s: %v", r.ID, err)
+		}
+		rid := r.ID
+		t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rid) })
+	}
+
+	// Experiment + one phase; attach the phase-scoped rule.
+	expRepo := NewExperimentRepo(testDB)
+	exp := &model.Experiment{ID: "exp-" + tag, Name: "phasegate", Status: "planned", CreatedAt: time.Now()}
+	if err := expRepo.Create(ctx, exp); err != nil {
+		t.Fatalf("create experiment: %v", err)
+	}
+	// Runs FIRST (LIFO): cascades experiment_phases + phase_rules, releasing the
+	// ON DELETE RESTRICT on the phase-attached rule before its own cleanup runs.
+	t.Cleanup(func() { _, _ = testDB.Exec("DELETE FROM experiments WHERE id = $1", exp.ID) })
+
+	phase := &model.ExperimentPhase{
+		ID: "phase-" + tag, ExperimentID: exp.ID, Name: "isolation", Position: 0, Status: "pending",
+	}
+	if err := expRepo.CreatePhase(ctx, phase); err != nil {
+		t.Fatalf("create phase: %v", err)
+	}
+	if err := expRepo.AttachPhaseRules(ctx, phase.ID, []string{phaseID}); err != nil {
+		t.Fatalf("attach phase rule: %v", err)
+	}
+
+	setStatus := func(status string) {
+		if _, err := testDB.ExecContext(ctx,
+			`UPDATE experiment_phases SET status = $1::phase_status WHERE id = $2`, status, phase.ID); err != nil {
+			t.Fatalf("set phase status %q: %v", status, err)
+		}
+	}
+	served := func() map[string]bool {
+		rules, err := testRuleRepo.ForService(ctx, svc)
+		if err != nil {
+			t.Fatalf("ForService: %v", err)
+		}
+		m := map[string]bool{}
+		for _, r := range rules {
+			m[r.ID] = true
+		}
+		return m
+	}
+
+	// The unattached rule is present in every phase state; the phase-attached
+	// rule is present ONLY while the phase is 'running'.
+	for _, tc := range []struct {
+		status      string
+		wantPhaseIn bool
+	}{
+		{"pending", false},   // baseline window: an isolation fault must NOT be live
+		{"running", true},    // measurement window: served
+		{"draining", false},  // window closed: faults stop (running only, not draining)
+		{"completed", false}, // torn down: not resurrected
+	} {
+		setStatus(tc.status)
+		got := served()
+		if !got[freeID] {
+			t.Errorf("[phase=%s] unattached rule %s missing; want always served", tc.status, freeID)
+		}
+		if got[phaseID] != tc.wantPhaseIn {
+			t.Errorf("[phase=%s] phase-attached rule %s served=%v, want %v",
+				tc.status, phaseID, got[phaseID], tc.wantPhaseIn)
+		}
+	}
+}

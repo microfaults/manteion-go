@@ -114,8 +114,8 @@ func (o *Orchestrator) classifyDrainTimeout(ctx context.Context, p *model.Experi
 			missing = append(missing, instID) // dead / unreachable
 			continue
 		}
-		if snap.RecordDropped == 0 && received >= snap.RecordPushed {
-			continue // gap closed: manteion received everything; the report was merely lost
+		if snap.RecordDropped == 0 && snap.RecordEnqueued == received {
+			continue // gap closed: every enqueued entry was received; the report was merely lost
 		}
 		missing = append(missing, instID)
 		if snap.RecordEnqueued > received {

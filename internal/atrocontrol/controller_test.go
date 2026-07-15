@@ -53,7 +53,9 @@ func setupAtroposServers(t *testing.T, n int) []string {
 		t.Cleanup(cb.Stop)
 
 		mux := http.NewServeMux()
-		mux.Handle("/admin/fault", atroposdk.FaultAdminHandler())
+		// Explicit handler: the zero-arg FaultAdminHandler 409s once Configure
+		// has run anywhere in the process (its own demo bootstrap included).
+		mux.Handle("/admin/fault", atroposdk.FaultAdminHandlerWith(&atroposdk.DemoEvaluator{}, nil))
 		mux.Handle("/admin/rules", atroposdk.RulesAdminHandler(eval))
 		mux.Handle("/admin/cachebox", atroposdk.CacheBoxAdminHandler(cb))
 		mux.Handle("/admin/cachebox/", atroposdk.CacheBoxAdminHandler(cb))

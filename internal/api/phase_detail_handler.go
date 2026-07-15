@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -132,7 +133,9 @@ func (s *Server) handleResumePhaseFlat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStopPhaseFlat(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status") // "", completed, failed, skipped
-	if err := s.orch.StopPhase(r.Context(), r.PathValue("phaseId"), status); err != nil {
+	// Detach from the request context (M2): a client disconnect mid-drain-barrier
+	// must not cancel teardown and wedge the phase at 'draining'.
+	if err := s.orch.StopPhase(context.WithoutCancel(r.Context()), r.PathValue("phaseId"), status); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "phase not found")
 			return

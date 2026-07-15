@@ -167,6 +167,49 @@ func TestScheduler_RefusesDegradedBaseline(t *testing.T) {
 	}
 }
 
+// TestClassifyDrainTimeout_AmnesiaSnapshotNotClean pins R1: the drain-timeout
+// fidelity fallback must not declare a lossy recording clean. The old closure
+// test (received >= RecordPushed) passed the all-zero snapshot an SDK returns
+// after a crash+restart (0/0/0) whenever received>0, silently marking a lost
+// recording as complete; and RecordPushed was the wrong bound (it ignores
+// enqueued-but-not-pushed entries). The fix requires RecordEnqueued == received.
+func TestClassifyDrainTimeout_AmnesiaSnapshotNotClean(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+
+	exp := id.New("exp")
+	phase := id.New("phase")
+	p := &model.ExperimentPhase{ID: phase, ExperimentID: exp}
+
+	// Neither instance sent a drain report → both take the fidelity fallback.
+	// i-amnesia: an SDK that crashed+restarted answers an all-zero snapshot;
+	// manteion received 3 of its entries, so data was lost → must be degraded.
+	// i-exact: enqueued==received, no drops → genuinely complete → clean.
+	amnesia := newFakeSDK(t, true)
+	amnesia.fidelity = &atroposdk.FidelitySnapshot{RecordEnqueued: 0, RecordPushed: 0, RecordDropped: 0}
+	exact := newFakeSDK(t, true)
+	exact.fidelity = &atroposdk.FidelitySnapshot{RecordEnqueued: 5, RecordPushed: 5, RecordDropped: 0}
+
+	ingestN(t, o, exp, phase, "frontend", "i-amnesia", 1, 3) // received=3
+	ingestN(t, o, exp, phase, "frontend", "i-exact", 1, 5)   // received=5
+
+	expected := map[string]drainTarget{
+		"i-amnesia": {service: "frontend", address: amnesia.server.URL},
+		"i-exact":   {service: "frontend", address: exact.server.URL},
+	}
+	result := o.classifyDrainTimeout(ctx, p, expected)
+
+	if result.Status != "degraded" {
+		t.Fatalf("drain status %q, want degraded (an all-zero amnesia snapshot with received>0 is a lost recording)", result.Status)
+	}
+	if !contains(result.MissingInstances, "i-amnesia") {
+		t.Fatalf("missing_instances %v, want to name i-amnesia", result.MissingInstances)
+	}
+	if contains(result.MissingInstances, "i-exact") {
+		t.Fatalf("missing_instances %v, must NOT name i-exact (enqueued==received, no drops → clean)", result.MissingInstances)
+	}
+}
+
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {
