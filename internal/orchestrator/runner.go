@@ -530,6 +530,7 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 		zeusRunID, err := o.zeusClient.StartRun(ctx, pw.WorkflowID, zeus.RunRequest{
 			RunID:         runID,
 			ExperimentID:  exp.ID,
+			DatasetID:     o.zeusDatasetID,
 			VUs:           pw.VUs,
 			DurationS:     pw.DurationSec,
 			MetaTraceID:   p.ID,
