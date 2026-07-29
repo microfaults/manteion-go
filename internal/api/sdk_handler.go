@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"net/http"
 	"strconv"
 
@@ -217,10 +218,26 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the service's cache-box role BEFORE the 304 fast path. The
+	// cache-box rule is SYNTHESIZED per-service at poll time (MANT-4), not
+	// stored, so starting or ending a phase never bumps rule_version. Folding
+	// the role into the version the client compares against is what makes a
+	// phase transition visible to a polling SDK — without it the SDK sits on
+	// 304 forever, its evaluator never receives the record/replay rule, and a
+	// baseline drains zero entries while every push-side counter reads clean.
+	cbctx, err := s.experiments.ActiveCacheBoxPhaseForService(ctx, service)
+	if err != nil {
+		// Best-effort, matching the synthesis path below: a resolve failure
+		// must not fail the poll, it just leaves the rule set unchanged.
+		s.logger.Warn("poll: resolve cache-box context failed", "service", service, "error", err)
+		cbctx = nil
+	}
+	effectiveVersion := cacheBoxEffectiveVersion(currentVersion, cbctx)
+
 	// 304 Not Modified — client already has the latest desired state. Fault
 	// config changes bump the rule version, so add/remove of manual faults is
 	// delivered through this same fast-path (a 200 follows the bump).
-	if requestedVersion == currentVersion {
+	if requestedVersion == effectiveVersion {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -261,9 +278,7 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	// Recording/replay provenance rides on this rule's CacheBoxContext (INV-5),
 	// replacing the removed global RecordingPhaseID signal. Best-effort: an
 	// error leaves the set unchanged (SDK won't record), never fails the poll.
-	if cbctx, err := s.experiments.ActiveCacheBoxPhaseForService(ctx, service); err != nil {
-		s.logger.Warn("poll: resolve cache-box context failed", "service", service, "error", err)
-	} else if cbctx != nil {
+	if cbctx != nil {
 		compiled = append(compiled, ruleconv.SynthesizeCacheBoxRule(*cbctx))
 	}
 
@@ -277,11 +292,33 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, atroposdk.RuleSync{
-		Version:      currentVersion,
+		Version:      effectiveVersion,
 		Rules:        compiled,
 		ActiveFaults: activeFaults,
 		FreezeCfg:    freezeCfg,
 	})
+}
+
+// cacheBoxEffectiveVersion folds a service's active cache-box role into the
+// polled rule version. rule_version counts stored-rule mutations only, while
+// the cache-box rule is synthesized per-service at poll time — so a phase
+// start/stop is otherwise invisible behind the 304 fast path.
+//
+// It returns currentVersion unchanged when the service has no cache-box role,
+// so the wire value is identical for every service outside a running phase.
+// When a role IS active the mixed-in value is guaranteed to differ (the hash
+// is forced odd, and x^odd != x), so each of no-role → record → replay →
+// no-role transitions delivers exactly one 200. The final transition back to
+// no-role is what hands the SDK the empty rule set that triggers its drain.
+func cacheBoxEffectiveVersion(currentVersion uint64, cb *model.CacheBoxRuleContext) uint64 {
+	if cb == nil {
+		return currentVersion
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(cb.Mode))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(cb.PhaseID))
+	return currentVersion ^ (h.Sum64() | 1)
 }
 
 // handleInit is the startup readiness check for SDK initialization.
