@@ -1,11 +1,14 @@
 package atrocontrol
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,5 +266,35 @@ func TestPushRules(t *testing.T) {
 	intent, ok := ctrl.IntentReader().Get("productcatalog")
 	if !ok || len(intent.Rules) != 1 {
 		t.Fatal("expected rules intent to be set")
+	}
+}
+
+// A fanout failure must name the instance, address, and error — counts alone
+// made the schemeless-address bug undiagnosable from logs.
+func TestLogFanoutIncludesFailureDetail(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	resolver := &fakeResolver{services: map[string][]*model.SDKInstance{
+		"productcatalog": {{ID: "pod-dead", Service: "productcatalog", Address: "127.0.0.1:1"}},
+	}}
+	c := New(atropos.NewClient(), resolver,
+		WithDefaultTimeout(2*time.Second),
+		WithDefaultConcurrency(2),
+		WithLogger(logger),
+	)
+
+	result, err := c.PushRules(context.Background(), "productcatalog", nil)
+	if err != nil {
+		t.Fatalf("PushRules: %v", err)
+	}
+	if len(result.Failed) != 1 {
+		t.Fatalf("expected 1 failed target, got %+v", result)
+	}
+	out := buf.String()
+	for _, want := range []string{"pod-dead", "127.0.0.1:1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("fanout log missing %q; log:\n%s", want, out)
+		}
 	}
 }

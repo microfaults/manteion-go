@@ -128,4 +128,17 @@ func (c *Controller) logFanout(action, service, runID string, result FanoutResul
 		"failed", len(result.Failed),
 		"duration_ms", result.Duration.Milliseconds(),
 	)
+	// Name the culprits: counts alone made client-side failures (e.g. an
+	// unparseable registered address) undiagnosable from logs.
+	const maxLogged = 3
+	for i, f := range result.Failed {
+		if i == maxLogged {
+			c.logger.Warn("atrocontrol.fanout: further failures elided",
+				"action", action, "service", service, "elided", len(result.Failed)-maxLogged)
+			break
+		}
+		c.logger.Warn("atrocontrol.fanout: target failed",
+			"action", action, "service", service, "run_id", runID,
+			"instance", f.InstanceID, "address", f.Address, "error", f.Err)
+	}
 }
