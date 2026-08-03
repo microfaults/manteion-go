@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 type Client struct {
@@ -27,7 +28,20 @@ func NewClient(opts ...Option) *Client {
 	return c
 }
 
+// normalizeURL defaults a scheme onto URLs built from registered SDK
+// addresses. Registrations carry bare host[:port] (the SDK advertises
+// localIPv4()[:port]), which net/http rejects at parse ("first path segment
+// in URL cannot contain colon") or dial — so every fanout/preload/fidelity
+// call would fail client-side before sending a packet.
+func normalizeURL(u string) string {
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	return "http://" + u
+}
+
 func (c *Client) do(ctx context.Context, method, url string, body any) (*http.Response, error) {
+	url = normalizeURL(url)
 	var bodyReader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
@@ -187,5 +188,38 @@ func TestTransportError(t *testing.T) {
 	var txErr *TransportError
 	if !errors.As(err, &txErr) {
 		t.Fatalf("expected TransportError, got %T: %v", err, err)
+	}
+}
+
+// Registered SDK addresses are host:port with no scheme (the SDK advertises
+// localIPv4()[:port]); the client must default them to http:// rather than
+// failing URL parse/dial before any packet is sent.
+func TestPostRulesSchemelessAddress(t *testing.T) {
+	var gotPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /admin/rules", func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	addr := strings.TrimPrefix(srv.URL, "http://") // "127.0.0.1:PORT", as registered
+	if err := NewClient().PostRules(context.Background(), addr, nil); err != nil {
+		t.Fatalf("PostRules with schemeless addr: %v", err)
+	}
+	if gotPath != "/admin/rules" {
+		t.Fatalf("request path = %q, want /admin/rules", gotPath)
+	}
+}
+
+func TestNormalizeURLPassthrough(t *testing.T) {
+	for _, u := range []string{"http://10.0.0.1:8080", "https://svc.local"} {
+		if got := normalizeURL(u + "/x"); got != u+"/x" {
+			t.Fatalf("normalizeURL(%q) = %q, want unchanged", u+"/x", got)
+		}
+	}
+	if got := normalizeURL("10.0.0.1:8080/x"); got != "http://10.0.0.1:8080/x" {
+		t.Fatalf("normalizeURL schemeless = %q, want http:// prefix", got)
 	}
 }
