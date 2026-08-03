@@ -23,7 +23,9 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
 FROM alpine:3.21
 
 RUN apk --no-cache add ca-certificates \
-    && adduser -D -u 1000 manteion
+    && adduser -D -u 1000 manteion \
+    && mkdir -p /var/cache/manteion \
+    && chown manteion:manteion /var/cache/manteion
 
 USER manteion
 WORKDIR /home/manteion
