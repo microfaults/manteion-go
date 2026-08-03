@@ -152,3 +152,32 @@ func TestIngest_CollisionStats(t *testing.T) {
 		t.Fatalf("after new key: divergent=%d identical=%d, want 2,1", d, i)
 	}
 }
+
+// TestEnsureRootCreatesNestedDir: EnsureRoot must create the (possibly
+// nested) store root and prove it writable — the boot-time guard that turns
+// an unwritable cache dir into an immediate exit instead of per-batch
+// ingest 500s minutes into a recording phase.
+func TestEnsureRootCreatesNestedDir(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "nested", "cache")
+	if err := New(root).EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot on creatable root: %v", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("root not created: info=%v err=%v", info, err)
+	}
+}
+
+func TestEnsureRootFailsOnUnwritableParent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission checks")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
+	if err := New(filepath.Join(parent, "cache")).EnsureRoot(); err == nil {
+		t.Fatal("EnsureRoot on unwritable parent: want error, got nil")
+	}
+}

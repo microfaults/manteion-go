@@ -92,6 +92,10 @@ func main() {
 	// Create promql client, cache store, orchestrator, and policy engine.
 	promClient := promql.NewClient(prometheusURL)
 	cs := cachestore.New(cacheDir)
+	if err := cs.EnsureRoot(); err != nil {
+		logger.Error("cache store root not writable", "dir", cacheDir, "error", err)
+		os.Exit(1)
+	}
 	phaseFaultEventRepo := store.NewPhaseFaultEventRepo(database)
 	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, logger)
 	// Drain barrier (MANT-2): MANTEION_DRAIN_TIMEOUT must be ≥ 3× the SDK poll

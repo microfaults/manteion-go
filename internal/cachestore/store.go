@@ -78,6 +78,22 @@ func New(root string) *Store {
 	}
 }
 
+// EnsureRoot creates the store root if absent and verifies it is writable by
+// creating and removing a probe file. Called once at boot so an unwritable
+// cache directory fails the process immediately instead of surfacing as
+// per-batch ingest 500s minutes into a recording phase.
+func (s *Store) EnsureRoot() error {
+	if err := os.MkdirAll(s.root, 0o755); err != nil {
+		return err
+	}
+	probe, err := os.CreateTemp(s.root, ".writeprobe-*")
+	if err != nil {
+		return err
+	}
+	probe.Close()
+	return os.Remove(probe.Name())
+}
+
 func pairKey(experimentID, phaseID string) string {
 	return experimentID + "\x00" + phaseID
 }
