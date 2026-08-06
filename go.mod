@@ -3,7 +3,7 @@ module manteion-go
 go 1.25.5
 
 require (
-	git.ucsc.edu/microfaults/atropos-go v0.0.9-alpha.91bb818
+	git.ucsc.edu/microfaults/atropos-go v0.1.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.4
 	go.opentelemetry.io/otel/trace v1.43.0
