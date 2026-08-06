@@ -16,6 +16,7 @@ import (
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/atropos"
+	"manteion-go/internal/atropostest"
 	"manteion-go/internal/model"
 	"manteion-go/internal/promql"
 )
@@ -53,20 +54,19 @@ func fakePromServerUnavailable(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// fakeSDKServer starts a minimal atropos admin server and returns its URL +
-// a func that returns how many times PostRules has been called.
+// fakeSDKServer starts an atropos admin server (real SDK control surface via
+// atropos.Serve, offline) and returns its URL + a func that returns how many
+// times PostRules has been called.
 func fakeSDKServer(t *testing.T) (url string, pushCount func() int) {
 	t.Helper()
-	eval := atroposdk.NewStaticEvaluator()
+	h := atropostest.NewHandler(t)
 	var count atomic.Int32
-	mux := http.NewServeMux()
-	mux.Handle("/admin/rules", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/admin/rules" {
 			count.Add(1)
 		}
-		atroposdk.RulesAdminHandler(eval).ServeHTTP(w, r)
+		h.ServeHTTP(w, r)
 	}))
-	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv.URL, func() int { return int(count.Load()) }
 }

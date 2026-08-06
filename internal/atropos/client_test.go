@@ -10,35 +10,15 @@ import (
 	"testing"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+	"manteion-go/internal/atropostest"
 	"manteion-go/internal/ruleconv"
 )
 
-// fakeAtroposAdmin builds an httptest server that mimics atropos admin handlers.
+// fakeAtroposAdmin builds an httptest server over the real SDK control
+// surface (atropos.Serve, offline) — the handler a deployed SDK mounts.
 func fakeAtroposAdmin(t *testing.T) *httptest.Server {
 	t.Helper()
-
-	eval := atroposdk.NewStaticEvaluator()
-	// Mount the explicit handler: the zero-arg FaultAdminHandler refuses (409)
-	// once anything in the process has called Configure — including its own
-	// demo-evaluator bootstrap — so it serves at most one request per binary.
-	faultHandler := atroposdk.FaultAdminHandlerWith(&atroposdk.DemoEvaluator{}, nil)
-
-	cb := atroposdk.NewCacheBox(atroposdk.CacheBoxConfig{
-		Store: atroposdk.NewCacheBoxMemStore(100),
-	})
-	t.Cleanup(cb.Stop)
-	cacheboxHandler := atroposdk.CacheBoxAdminHandler(cb)
-	rulesHandler := atroposdk.RulesAdminHandler(eval)
-
-	mux := http.NewServeMux()
-	mux.Handle("/admin/fault", faultHandler)
-	mux.Handle("/admin/rules", rulesHandler)
-	mux.Handle("/admin/cachebox", cacheboxHandler)
-	mux.Handle("/admin/cachebox/", cacheboxHandler)
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
+	return atropostest.NewServer(t)
 }
 
 func TestFaultRoundtrip(t *testing.T) {

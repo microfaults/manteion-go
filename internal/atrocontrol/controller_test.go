@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +13,7 @@ import (
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
 	"manteion-go/internal/atropos"
+	"manteion-go/internal/atropostest"
 	"manteion-go/internal/model"
 	"manteion-go/internal/ruleconv"
 )
@@ -43,29 +42,14 @@ func (f *fakeResolver) ForInstance(_ context.Context, id string) (*model.SDKInst
 	return nil, fmt.Errorf("instance %q not found", id)
 }
 
-// setupAtroposServer starts N independent atropos admin servers, returning
-// their URLs and a cleanup function.
+// setupAtroposServers starts N independent atropos admin servers (real SDK
+// control surface via atropos.Serve, offline), returning their URLs.
+// Cleanup is registered on t.
 func setupAtroposServers(t *testing.T, n int) []string {
 	t.Helper()
 	var urls []string
 	for range n {
-		eval := atroposdk.NewStaticEvaluator()
-		cb := atroposdk.NewCacheBox(atroposdk.CacheBoxConfig{
-			Store: atroposdk.NewCacheBoxMemStore(100),
-		})
-		t.Cleanup(cb.Stop)
-
-		mux := http.NewServeMux()
-		// Explicit handler: the zero-arg FaultAdminHandler 409s once Configure
-		// has run anywhere in the process (its own demo bootstrap included).
-		mux.Handle("/admin/fault", atroposdk.FaultAdminHandlerWith(&atroposdk.DemoEvaluator{}, nil))
-		mux.Handle("/admin/rules", atroposdk.RulesAdminHandler(eval))
-		mux.Handle("/admin/cachebox", atroposdk.CacheBoxAdminHandler(cb))
-		mux.Handle("/admin/cachebox/", atroposdk.CacheBoxAdminHandler(cb))
-
-		srv := httptest.NewServer(mux)
-		t.Cleanup(srv.Close)
-		urls = append(urls, srv.URL)
+		urls = append(urls, atropostest.NewServer(t).URL)
 	}
 	return urls
 }
