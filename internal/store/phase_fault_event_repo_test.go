@@ -28,22 +28,38 @@ func TestListPhasesPaged(t *testing.T) {
 		t.Fatalf("create phase: %v", err)
 	}
 
-	items, total, err := expRepo.ListPhasesPaged(ctx, Page{Limit: 50, Offset: 0})
-	if err != nil {
-		t.Fatalf("list phases paged: %v", err)
+	// Page until the created phase appears rather than asserting it lands on
+	// page 1: the shared test DB carries rows from other suites and earlier
+	// runs, and a fresh pending phase (NULL started_at) sorts after every
+	// started row — with enough leftovers it legitimately lives on a later
+	// page. Bounded by the reported total, so a genuinely missing row still
+	// fails instead of looping.
+	const pageSize = 50
+	var (
+		found *model.PhaseListItem
+		total int
+	)
+	for offset := 0; ; offset += pageSize {
+		items, tot, err := expRepo.ListPhasesPaged(ctx, Page{Limit: pageSize, Offset: offset})
+		if err != nil {
+			t.Fatalf("list phases paged (offset %d): %v", offset, err)
+		}
+		total = tot
+		for _, it := range items {
+			if it.ID == ph.ID {
+				found = it
+				break
+			}
+		}
+		if found != nil || len(items) == 0 || offset+pageSize >= total {
+			break
+		}
 	}
 	if total < 1 {
 		t.Fatalf("total=%d, want >=1", total)
 	}
-	var found *model.PhaseListItem
-	for _, it := range items {
-		if it.ID == ph.ID {
-			found = it
-			break
-		}
-	}
 	if found == nil {
-		t.Fatal("created phase not in page")
+		t.Fatalf("created phase not in any page (total=%d)", total)
 	}
 	if found.ExperimentName != "lp-test" {
 		t.Errorf("experiment_name=%q, want lp-test", found.ExperimentName)
