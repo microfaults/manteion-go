@@ -141,8 +141,8 @@ func TestRuleRepo_GetScansEveryColumn(t *testing.T) {
 
 // TestRuleRepo_ForService_PhaseGating pins M4: a rule attached to an experiment
 // phase must be served by ForService (the authoritative SDK poll set) ONLY while
-// that phase is 'running'. Since the SDK reconciles to EXACTLY the poll array and
-// rules.enabled defaults true, a phase-scoped fault rule that leaks into the
+// that phase is 'running'. Since the SDK reconciles to EXACTLY the poll array, a
+// phase-scoped fault rule that leaks into the
 // baseline (phase pending) corrupts every downstream delta; one that lingers past
 // the measurement window (phase draining/completed) is resurrected after teardown.
 // An unattached enabled rule is always present.
@@ -240,5 +240,48 @@ func TestRuleRepo_ForService_PhaseGating(t *testing.T) {
 			t.Errorf("[phase=%s] phase-attached rule %s served=%v, want %v",
 				tc.status, phaseID, got[phaseID], tc.wantPhaseIn)
 		}
+	}
+}
+
+// TestRuleCreate_DefaultsDisabled pins the creation contract behind the
+// create→attach→enable experiment lifecycle: a rule whose JSON omits
+// "enabled" is created DISABLED, end to end. The zero value governs (the
+// handler adds no defaulting and Create writes the column explicitly, so the
+// DB column default never applies). Restoring a default-true anywhere in the
+// create path would reopen the pre-attachment fault-leak window.
+func TestRuleCreate_DefaultsDisabled(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("defdis-%d", time.Now().UnixNano())
+	specID := "spec-" + tag
+	spec := &model.FaultSpec{
+		ID: specID, Name: "defdis-spec", Category: "inline", FaultType: "latency",
+		Host: "process", Params: json.RawMessage(`{"delay":"100ms"}`), CreatedAt: time.Now(),
+	}
+	if err := testFaultRepo.CreateSpec(ctx, spec); err != nil {
+		t.Fatalf("seed fault spec: %v", err)
+	}
+	t.Cleanup(func() { _ = testFaultRepo.DeleteSpec(context.Background(), specID) })
+
+	// The exact operator payload shape (runbook §3), minus "enabled".
+	body := fmt.Sprintf(`{"id":"rule-%s","name":"defdis","service":"svc-%s","priority":100,
+		"match":{},"action":{"type":"fault_spec","fault_spec_id":"%s"},"mode":"background"}`,
+		tag, tag, specID)
+	var rule model.Rule
+	if err := json.Unmarshal([]byte(body), &rule); err != nil {
+		t.Fatalf("decode rule payload: %v", err)
+	}
+	rule.CreatedAt, rule.UpdatedAt = time.Now(), time.Now()
+
+	if err := testRuleRepo.Create(ctx, &rule); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rule.ID) })
+
+	got, err := testRuleRepo.Get(ctx, rule.ID)
+	if err != nil {
+		t.Fatalf("get rule: %v", err)
+	}
+	if got.Enabled {
+		t.Fatal("rule created without \"enabled\" came back enabled; creation must default to disabled")
 	}
 }

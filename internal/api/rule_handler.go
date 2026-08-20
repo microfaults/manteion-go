@@ -17,6 +17,9 @@ import (
 // @Summary      Create rule
 // @Description  Persist a new rule. Action.Type discriminates between fault_spec,
 // @Description  fault_composition, and cachebox — exactly one payload must be set.
+// @Description  Rules are created DISABLED unless "enabled": true is explicit; for
+// @Description  experiment-attached rules, create → attach → enable (in that order)
+// @Description  is the leak-safe lifecycle.
 // @Tags         rules
 // @Accept       json
 // @Produce      json

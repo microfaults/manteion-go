@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
+	"manteion-go/internal/ruleconv"
 )
 
 // fakeSDK is an httptest SDK control server for orchestrator preload/freeze gate
@@ -27,6 +29,20 @@ type fakeSDK struct {
 	// fidelity, when set, is served at GET /cachebox/fidelity; nil ⇒ 503 (used
 	// to simulate a missing-telemetry instance).
 	fidelity *atroposdk.FidelitySnapshot
+
+	// mu guards pushed, the compiled rule names POSTed to /admin/rules — lets
+	// tests assert the push channel is a strict projection of the poll
+	// predicate (enabled rules only).
+	mu     sync.Mutex
+	pushed []string
+}
+
+// rulesPushed returns the names of every compiled rule the fake received on
+// POST /admin/rules, in arrival order.
+func (f *fakeSDK) rulesPushed() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.pushed...)
 }
 
 func newFakeSDK(t *testing.T, commitOK bool) *fakeSDK {
@@ -53,6 +69,16 @@ func newFakeSDK(t *testing.T, commitOK bool) *fakeSDK {
 	})
 	mux.HandleFunc("POST /cachebox/preload/abort", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /admin/rules", func(w http.ResponseWriter, r *http.Request) {
+		var rules []ruleconv.CompiledRule
+		_ = json.NewDecoder(r.Body).Decode(&rules)
+		f.mu.Lock()
+		for _, cr := range rules {
+			f.pushed = append(f.pushed, cr.Name)
+		}
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("POST /admin/cachebox/delay", func(w http.ResponseWriter, _ *http.Request) {
 		f.freezeHit.Store(true)

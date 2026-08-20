@@ -351,6 +351,13 @@ func (o *Orchestrator) pushPhaseRules(ctx context.Context, p *model.ExperimentPh
 		if err != nil {
 			return fmt.Errorf("load rule %q: %w", pr.RuleID, err)
 		}
+		// Push is a projection of the poll predicate (ForService: enabled AND
+		// attached-to-running — the phase is already 'running' here), never a
+		// second opinion. Pushing a disabled attached rule fired it for up to
+		// one poll interval until the reconciler wiped it (ghost activation).
+		if !r.Enabled {
+			continue
+		}
 		if _, ok := byService[r.Service]; !ok {
 			services = append(services, r.Service)
 		}
