@@ -14,17 +14,31 @@ import (
 // fidelityPullTimeout bounds each per-instance W6 fidelity pull at phase finish.
 const fidelityPullTimeout = 10 * time.Second
 
+// replayFidelity is one frozen service's replay-side aggregate over the W6
+// fidelity snapshots the verdict pass pulls (summed across live instances).
+// It is the authoritative input to phase_service_cache: the SDK's
+// /admin/cachebox Store counters harvest previously read are record-half
+// counters the replay path stopped touching when the record/replay split
+// landed (replay consults the ReplaySet; hits count in the FidelityRegistry),
+// which is how isolation rows harvested hit_rate=0 while verdicts saw hits.
+type replayFidelity struct {
+	ReplayHits   int64
+	ReplayMisses int64
+	AgeMeanMs    float64 // mean replay age across instances (ms)
+}
+
 // collectFidelityVerdict pulls every frozen instance's W6 fidelity snapshot
 // (before thaw, while counters are intact), computes the phase's first-class
-// verdict (INV-6), and persists it. Returns the per-service mean replay age (ms)
-// so harvest can replace its hardcoded-0 staleness with the real number.
+// verdict (INV-6), and persists it. Returns the per-service replay aggregates
+// (hits, misses, mean replay age) — the authoritative source harvest writes
+// into phase_service_cache.
 //
 // Verdict: INVALID if any instance shows a replay miss, an uncommitted preload,
 // a degraded source recording, or missing telemetry (a failed pull); else
 // VALID_WITH_WARNINGS if the recording's divergent-collision rate exceeds 1%;
 // else VALID.
-func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.ExperimentPhase) map[string]float64 {
-	staleness := map[string]float64{}
+func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.ExperimentPhase) map[string]replayFidelity {
+	fidelity := map[string]replayFidelity{}
 	var snapshots []atroposdk.FidelitySnapshot
 	anyMiss, preloadIncomplete, telemetryMissing := false, false, false
 	var ageMaxMs, ageSumMs, ageCount int64
@@ -37,7 +51,7 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 				"phase_id", p.ID, "service", fs.Service, "error", err)
 			continue
 		}
-		var svcAgeSum, svcAgeCount int64
+		var svcAgeSum, svcAgeCount, svcHits, svcMisses int64
 		for _, inst := range instances {
 			snap, err := o.controller.FetchFidelity(ctx, inst.Address, p.ExperimentID, p.ID, fidelityPullTimeout)
 			if err != nil {
@@ -75,9 +89,15 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 			ageCount++
 			svcAgeSum += snap.ReplayAgeMs.Mean
 			svcAgeCount++
+			svcHits += snap.ReplayHits
+			svcMisses += snap.ReplayMisses
 		}
 		if svcAgeCount > 0 {
-			staleness[fs.Service] = float64(svcAgeSum) / float64(svcAgeCount)
+			fidelity[fs.Service] = replayFidelity{
+				ReplayHits:   svcHits,
+				ReplayMisses: svcMisses,
+				AgeMeanMs:    float64(svcAgeSum) / float64(svcAgeCount),
+			}
 		}
 	}
 
@@ -136,5 +156,5 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 	}
 	o.logger.Info("orchestrator: phase verdict",
 		"phase_id", p.ID, "verdict", verdict, "reasons", reasons, "collision_rate", collisionRate)
-	return staleness
+	return fidelity
 }

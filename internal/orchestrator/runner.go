@@ -298,10 +298,11 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 
 	// Fidelity verdict BEFORE thaw (INV-6): pull each frozen instance's W6
 	// snapshot while its counters are intact, compute + persist the verdict, and
-	// carry the real per-service replay age into harvest's staleness metric.
-	var staleness map[string]float64
+	// carry the per-service replay aggregates (hits/misses/age) into harvest —
+	// the same snapshots the verdict trusted, not the SDK's store counters.
+	var fidelity map[string]replayFidelity
 	if status == "completed" && len(p.FrozenServices) > 0 {
-		staleness = o.collectFidelityVerdict(ctx, p)
+		fidelity = o.collectFidelityVerdict(ctx, p)
 	}
 
 	o.thawServices(ctx, p)
@@ -313,7 +314,7 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 	}
 
 	if status == "completed" {
-		o.harvestPhase(ctx, p, pws, staleness) // exactly once — only the transition winner reaches here
+		o.harvestPhase(ctx, p, pws, fidelity) // exactly once — only the transition winner reaches here
 	}
 
 	if _, err := o.experiments.RecomputeExperimentResults(ctx, p.ExperimentID); err != nil {

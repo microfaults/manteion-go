@@ -18,7 +18,7 @@ import (
 // SDK instances into phase_service_cache. Non-fatal throughout — missing or
 // not-yet-ready results are logged and skipped so the phase still completes.
 // Called exactly once per completed phase, by the finishPhase CAS winner.
-func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow, staleness map[string]float64) {
+func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow, fidelity map[string]replayFidelity) {
 	if o.zeusClient != nil {
 		for _, pw := range pws {
 			if pw.ZeusAttackID == "" {
@@ -31,7 +31,7 @@ func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhas
 			}
 		}
 	}
-	o.harvestCacheStats(ctx, p, staleness)
+	o.harvestCacheStats(ctx, p, fidelity)
 }
 
 // harvestAttack fetches the final metrics for one (phase, workflow) attack
@@ -121,54 +121,45 @@ func (o *Orchestrator) harvestAttack(ctx context.Context, p *model.ExperimentPha
 // harvestCacheStats writes phase_service_cache fidelity rows. Two independent
 // passes (mutually exclusive in the normal baseline/isolation split):
 //
-//   - Isolation (frozen services): snapshot live cache-box counters →
+//   - Isolation (frozen services): the per-service replay aggregates from the
+//     W6 fidelity snapshots the verdict pass pulled pre-thaw (MANT-6) —
 //     cache_hit_rate = Σhits/(Σhits+Σmisses), request_count = Σ(hits+misses)
 //     (disambiguates "0 requests" from "all misses"), and recorded_entry_count
 //     = the baseline coverage that was available to replay for this service.
+//     The fidelity snapshot is the ONLY authoritative replay-side counter: the
+//     SDK's /admin/cachebox Store stats are record-half counters the replay
+//     path never touches (record/replay split), and harvesting them is what
+//     produced hit_rate=0 rows against verdicts with hundreds of hits.
 //   - Baseline (persist_cache, no frozen): recording coverage — for each
 //     service that ingested into this phase, recorded_entry_count = number of
 //     entries captured (hit_rate/request_count = 0, no replay happened).
 //
-// cache_exact_match = hit_rate; cache_staleness = the mean replay age (ms) from
-// the W6 fidelity snapshots (MANT-6), or 0 when telemetry was missing.
-// Best-effort throughout: an unreachable service or store error is logged, not fatal.
-func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.ExperimentPhase, staleness map[string]float64) {
+// cache_exact_match = hit_rate; cache_staleness = the mean replay age (ms).
+// Best-effort throughout: missing telemetry or a store error is logged, not fatal.
+func (o *Orchestrator) harvestCacheStats(ctx context.Context, p *model.ExperimentPhase, fidelity map[string]replayFidelity) {
 	// Pass 1 — isolation replay stats.
 	if len(p.FrozenServices) > 0 {
 		baselineCoverage := o.baselineCoverage(ctx, p.ExperimentID)
 		for _, fs := range p.FrozenServices {
-			st, err := o.controller.StatusByService(ctx, fs.Service)
-			if err != nil {
-				o.logger.Warn("orchestrator: cache stats: status by service failed",
-					"phase_id", p.ID, "service", fs.Service, "error", err)
-				continue
-			}
-			var hits, misses int64
-			seen := false
-			for _, inst := range st.Instances {
-				if inst.CacheBox == nil {
-					continue
-				}
-				hits += inst.CacheBox.Store.Hits
-				misses += inst.CacheBox.Store.Misses
-				seen = true
-			}
-			if !seen {
-				o.logger.Info("orchestrator: cache stats: no cache-box stats reachable",
+			f, ok := fidelity[fs.Service]
+			if !ok {
+				// No snapshot reached the verdict pass either — the verdict is
+				// already INVALID(telemetry_missing); there is nothing true to write.
+				o.logger.Info("orchestrator: cache stats: no fidelity telemetry",
 					"phase_id", p.ID, "service", fs.Service)
 				continue
 			}
-			total := hits + misses
+			total := f.ReplayHits + f.ReplayMisses
 			hitRate := 0.0
 			if total > 0 {
-				hitRate = float64(hits) / float64(total)
+				hitRate = float64(f.ReplayHits) / float64(total)
 			}
 			res := &model.PhaseServiceCache{
 				PhaseID:            p.ID,
 				Service:            fs.Service,
 				CacheHitRate:       hitRate,
 				CacheExactMatch:    hitRate,
-				CacheStaleness:     staleness[fs.Service], // real mean replay age (ms) from W6 snapshots (MANT-6); 0 if telemetry missing
+				CacheStaleness:     f.AgeMeanMs,
 				RequestCount:       total,
 				RecordedEntryCount: baselineCoverage[fs.Service],
 			}
