@@ -1,0 +1,80 @@
+# EXP-4 — reproducibility run: exp2's loadspike design, verbatim, at 120 s phases.
+# Purpose: establish the noise band (validity gate G1). Keep IDENTICAL to
+# experiments/2026-08-06-loadspike (incl. the io null-result phase) — a repro
+# run must not "improve" the design.
+# Run from the faults-lab root (workflow file paths resolve against CWD):
+#   python3 manteion-go/tools/expctl/expctl.py preflight
+#   python3 manteion-go/tools/expctl/expctl.py apply -f manteion-go/tools/expctl/examples/exp4-repro-120s.yaml --start --watch
+
+fault_specs:
+  - name: exp4-cpu-spike
+    category: resource
+    fault_type: cpu
+    params: { target_load: 0.5 }        # incremental fraction of cores, duty-cycled
+    duration_ms: 150000                  # outlives the 120 s load window; teardown stops it
+  - name: exp4-mem-pressure
+    category: resource
+    fault_type: memory
+    params: { target_load: 0.5, thrashing: true }   # fraction of cgroup limit, sticky
+    duration_ms: 150000
+  - name: exp4-io-read
+    category: resource
+    fault_type: io
+    params: { mode: read, read_rate: 4194304, file_count: 4, file_size: 8388608, path: /tmp }
+    duration_ms: 150000
+
+rules:  # created DISABLED by expctl; enabled only after experiment attachment (D9)
+  - name: exp4-cpu-catalog
+    service: productcatalogservice
+    fault_spec: exp4-cpu-spike
+    mode: background
+  - name: exp4-mem-rec
+    service: recommendationservice
+    fault_spec: exp4-mem-pressure
+    mode: background
+  - name: exp4-io-currency
+    service: currencyservice
+    fault_spec: exp4-io-read
+    mode: background
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785   # k6 fires FROM vm2; in-cluster names do not resolve there
+  - name: checkout-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+
+# Load rows identical to exp2 (repro fidelity). VU-margin check (gate G2):
+# browse ~20 rps x worst p95 0.27 s ~ 5.4 in-flight of 10; checkout ~15 x 0.25 ~ 3.8 of 5
+# — the checkout pool runs ~75% utilized in the mem phase; assert dropped_iterations == 0.
+experiment:
+  name: exp4-repro-loadspike-120s
+  hypothesis: >
+    H4: exp2's magnitudes reproduce at 120 s phases — catalog-CPU is a tail-only
+    effect transmitted via the rec chain (immunized by freeze), mem-thrash on rec
+    dominates, 4 MB/s read-io on currency stays null. Deltas between this run and
+    2026-08-06 define the noise band all later claims are judged against.
+  phases:
+    - name: p0-baseline
+      persist_cache: true
+      workflows: &load
+        - { workflow: browse-nodeport,   vus: 10, duration_sec: 120 }
+        - { workflow: checkout-nodeport, vus: 5,  duration_sec: 120 }
+    - name: p1-iso-rec
+      frozen_services: &freeze_rec
+        - { service: recommendationservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      workflows: *load
+    - name: p2-cpu-catalog
+      rules: [exp4-cpu-catalog]
+      workflows: *load
+    - name: p3-iso-rec-cpu
+      frozen_services: *freeze_rec
+      rules: [exp4-cpu-catalog]
+      workflows: *load
+    - name: p4-mem-rec
+      rules: [exp4-mem-rec]
+      workflows: *load
+    - name: p5-io-currency
+      rules: [exp4-io-currency]
+      workflows: *load

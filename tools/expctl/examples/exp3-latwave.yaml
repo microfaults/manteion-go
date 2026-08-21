@@ -1,0 +1,79 @@
+# EXP-3 — latency dose-response x freeze x delay-replay (hypothesis wave H1-H3).
+# See docs/plans/EXPERIMENTS-hypothesis-wave-2026-08.md §3 for predictions and
+# falsifiers; run AFTER exp4 establishes the noise band.
+
+fault_specs:
+  - name: exp3-lat-cat-25
+    category: inline
+    fault_type: latency
+    params: { delay: 25ms }
+    duration_ms: 150000
+  - name: exp3-lat-cat-50
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+  - name: exp3-lat-cat-100
+    category: inline
+    fault_type: latency
+    params: { delay: 100ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp3-lat-catalog-25
+    service: productcatalogservice
+    fault_spec: exp3-lat-cat-25
+    mode: inline
+  - name: exp3-lat-catalog-50
+    service: productcatalogservice
+    fault_spec: exp3-lat-cat-50
+    mode: inline
+  - name: exp3-lat-catalog-100
+    service: productcatalogservice
+    fault_spec: exp3-lat-cat-100
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+  - name: checkout-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+
+experiment:
+  name: exp3-latwave
+  hypothesis: >
+    H1: e2e shift is monotone ~linear in injected catalog delay. H2: freezing rec
+    removes exactly the rec-path share; the frontend-direct residual persists.
+    H3: replay_with_delay reintroduces recorded timing (p5-p4 ~ recorded rec->catalog
+    latency; p6 ~ p0 within the exp4 noise band).
+  phases:
+    - name: p0-baseline
+      persist_cache: true
+      workflows: &load
+        - { workflow: browse-nodeport,   vus: 10, duration_sec: 120 }
+        - { workflow: checkout-nodeport, vus: 5,  duration_sec: 120 }
+    - name: p1-lat25
+      rules: [exp3-lat-catalog-25]
+      workflows: *load
+    - name: p2-lat50
+      rules: [exp3-lat-catalog-50]
+      workflows: *load
+    - name: p3-lat100
+      rules: [exp3-lat-catalog-100]
+      workflows: *load
+    - name: p4-lat50-frozen
+      frozen_services:
+        - { service: recommendationservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      rules: [exp3-lat-catalog-50]
+      workflows: *load
+    - name: p5-lat50-frozen-delay
+      frozen_services:
+        - { service: recommendationservice, mode: replay_with_delay, key_strategy: canonical_v2, mutation_policy: deny }
+      rules: [exp3-lat-catalog-50]
+      workflows: *load
+    - name: p6-frozen-delay-only
+      frozen_services:
+        - { service: recommendationservice, mode: replay_with_delay, key_strategy: canonical_v2, mutation_policy: deny }
+      workflows: *load
