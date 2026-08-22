@@ -57,8 +57,8 @@ experiment:
     - name: p0-baseline
       persist_cache: true
       workflows: &load
-        - { workflow: browse-nodeport,   rate_rps: 3, vus: 15, duration_sec: 120 }
-        - { workflow: checkout-nodeport, rate_rps: 2, vus: 10, duration_sec: 120 }
+        - { workflow: browse-nodeport,   rate_rps: 3, vus: 30, duration_sec: 120 }
+        - { workflow: checkout-nodeport, rate_rps: 2, vus: 20, duration_sec: 120 }
     - name: p1-lat25
       rules: [exp3-lat-catalog-25]
       workflows: *load

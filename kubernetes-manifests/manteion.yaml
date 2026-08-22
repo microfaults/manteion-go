@@ -45,7 +45,7 @@ spec:
             # Binds workflow runs to a zeus dataset; without it zeus stages an
             # empty pool map and drives unresolved {{data.*}} traffic.
             - name: MANTEION_ZEUS_DATASET_ID
-              value: "4dbb956b31535120"
+              value: "6ce88928f949a773"
           livenessProbe:
             httpGet:
               path: /healthz
