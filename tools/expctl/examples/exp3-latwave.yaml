@@ -33,13 +33,18 @@ rules:
     fault_spec: exp3-lat-cat-100
     mode: inline
 
+# Load config v2 (post-G2): honest rate_rps at the historically-delivered
+# operating point, think_scale 0.25, VUs per the G2 sizing rule — see
+# exp4-repro-120s.yaml header for the derivation.
 workflows:
   - name: browse-nodeport
     file: zeus-go/k6/flows/online-boutique/browse.json
     base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
   - name: checkout-nodeport
     file: zeus-go/k6/flows/online-boutique/checkout.json
     base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
 
 experiment:
   name: exp3-latwave
@@ -52,8 +57,8 @@ experiment:
     - name: p0-baseline
       persist_cache: true
       workflows: &load
-        - { workflow: browse-nodeport,   vus: 10, duration_sec: 120 }
-        - { workflow: checkout-nodeport, vus: 5,  duration_sec: 120 }
+        - { workflow: browse-nodeport,   rate_rps: 3, vus: 15, duration_sec: 120 }
+        - { workflow: checkout-nodeport, rate_rps: 2, vus: 10, duration_sec: 120 }
     - name: p1-lat25
       rules: [exp3-lat-catalog-25]
       workflows: *load

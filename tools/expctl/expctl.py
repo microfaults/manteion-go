@@ -260,15 +260,24 @@ def cmd_apply(c: Client, args):
     wf_ids = {}
     existing_wfs = items_of(c.get(f"{API}/workflows"))
     for w in cfg.get("workflows", []):
-        hit = resolve_by_name(existing_wfs, w["name"], "workflow")
-        if hit:
-            wf_ids[w["name"]] = hit["id"]
-            plan.append(f"wf    {w['name']} = {hit['id']} (existing)")
-            continue
         doc = read_json_file(w["file"], cfg_dir)
         dsl = doc.get("dsl", doc)  # accept either the tracked file wrapper or a bare doc
         if w.get("base_url"):
             dsl["base_url"] = w["base_url"]
+        if isinstance(w.get("think_scale"), (int, float)):
+            dsl["think_scale"] = w["think_scale"]
+        hit = resolve_by_name(existing_wfs, w["name"], "workflow")
+        if hit:
+            # Declarative apply: the YAML wins over the stored doc, so field
+            # changes (base_url, think_scale, flow edits) actually land on
+            # reuse instead of being silently skipped.
+            wf_ids[w["name"]] = hit["id"]
+            if dry:
+                plan.append(f"wf    {w['name']} = {hit['id']} (existing, would update)")
+            else:
+                c.put(f"{API}/workflows/{hit['id']}", {"name": w["name"], "dsl": dsl})
+                plan.append(f"wf    {w['name']} = {hit['id']} (updated)")
+            continue
         if dry:
             plan.append(f"wf    {w['name']} CREATE from {w['file']}")
             wf_ids[w["name"]] = f"<new:{w['name']}>"

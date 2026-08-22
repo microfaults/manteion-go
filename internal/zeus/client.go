@@ -325,6 +325,7 @@ type RunRequest struct {
 	ExperimentID  string            `json:"experiment_id,omitempty"`
 	DatasetID     string            `json:"dataset_id,omitempty"`
 	VUs           int               `json:"vus,omitempty"`
+	RateRPS       float64           `json:"rate_rps,omitempty"` // offered iteration rate; decouples load from the VU pool (gate G2)
 	DurationS     int               `json:"duration_s,omitempty"`
 	Persona       string            `json:"persona,omitempty"`
 	MetaTraceID   string            `json:"meta_trace_id,omitempty"`

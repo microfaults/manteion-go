@@ -1,7 +1,17 @@
-# EXP-4 — reproducibility run: exp2's loadspike design, verbatim, at 120 s phases.
-# Purpose: establish the noise band (validity gate G1). Keep IDENTICAL to
-# experiments/2026-08-06-loadspike (incl. the io null-result phase) — a repro
-# run must not "improve" the design.
+# EXP-4 — reproducibility run: exp2's loadspike design at 120 s phases.
+# Purpose: establish the noise band (validity gate G1). Phases/faults IDENTICAL
+# to experiments/2026-08-06-loadspike (incl. the io null-result phase).
+#
+# LOAD CONFIG v2 (2026-08-21, post-G2): rate_rps is now honored end-to-end and
+# is set to the load prior runs ACTUALLY DELIVERED (~3 browse / ~2 checkout
+# journeys/s — the nominal 20/15 was never served; ~2/3 of iterations were
+# silently dropped, see experiments/2026-08-21-exp4-repro/ANALYSIS.md G2).
+# think_scale 0.25 cuts persona sleeps 4x (journeys ~13.5s -> ~3.4s), so the
+# VU pools comfortably cover in-flight demand. Sizing rule (gate G2):
+#   maxVUs (= 4 x vus) >= 2 x rate_rps x worst-case iteration duration
+#   browse:  2 x 3 x ~4.1 s = 25  -> vus 15 (maxVUs 60)
+#   checkout: 2 x 2 x ~3.6 s = 15 -> vus 10 (maxVUs 40)
+# Acceptance: requests_dropped == 0 in every phase.
 # Run from the faults-lab root (workflow file paths resolve against CWD):
 #   python3 manteion-go/tools/expctl/expctl.py preflight
 #   python3 manteion-go/tools/expctl/expctl.py apply -f manteion-go/tools/expctl/examples/exp4-repro-120s.yaml --start --watch
@@ -41,13 +51,12 @@ workflows:
   - name: browse-nodeport
     file: zeus-go/k6/flows/online-boutique/browse.json
     base_url: http://2262-cse115b-01.be.ucsc.edu:31785   # k6 fires FROM vm2; in-cluster names do not resolve there
+    think_scale: 0.25
   - name: checkout-nodeport
     file: zeus-go/k6/flows/online-boutique/checkout.json
     base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
 
-# Load rows identical to exp2 (repro fidelity). VU-margin check (gate G2):
-# browse ~20 rps x worst p95 0.27 s ~ 5.4 in-flight of 10; checkout ~15 x 0.25 ~ 3.8 of 5
-# — the checkout pool runs ~75% utilized in the mem phase; assert dropped_iterations == 0.
 experiment:
   name: exp4-repro-loadspike-120s
   hypothesis: >
@@ -59,8 +68,8 @@ experiment:
     - name: p0-baseline
       persist_cache: true
       workflows: &load
-        - { workflow: browse-nodeport,   vus: 10, duration_sec: 120 }
-        - { workflow: checkout-nodeport, vus: 5,  duration_sec: 120 }
+        - { workflow: browse-nodeport,   rate_rps: 3, vus: 15, duration_sec: 120 }
+        - { workflow: checkout-nodeport, rate_rps: 2, vus: 10, duration_sec: 120 }
     - name: p1-iso-rec
       frozen_services: &freeze_rec
         - { service: recommendationservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
