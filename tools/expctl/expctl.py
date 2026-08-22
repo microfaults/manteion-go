@@ -25,6 +25,7 @@ Base URL: --base-url, else $EXPCTL_BASE_URL, else http://localhost:9090
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import os
 import sys
@@ -65,6 +66,10 @@ class Client:
             raise ApiError(method, url, e.code, e.read().decode()[:500]) from None
         except urllib.error.URLError as e:
             raise ApiError(method, url, 0, str(e.reason)) from None
+        except (OSError, http.client.HTTPException) as e:
+            # Covers RemoteDisconnected / connection resets that urllib lets
+            # escape raw — a 20-minute watch over an ssh tunnel WILL see these.
+            raise ApiError(method, url, 0, f"connection error: {e}") from None
 
     def get(self, path):
         return self.req("GET", path)
@@ -374,8 +379,18 @@ def cmd_watch(c: Client, args):
     seen = {}          # phase_id -> last status
     reported = set()   # phase_ids whose results were printed
     started_ms = {}    # phase_id -> epoch ms (for annotation spans)
+    misses = 0         # consecutive failed polls (tunnel blips must not kill the watch)
     while True:
-        exp = c.get(f"{API}/experiments/{exp_id}")
+        try:
+            exp = c.get(f"{API}/experiments/{exp_id}")
+        except ApiError as e:
+            misses += 1
+            warn(f"watch poll failed ({misses}/30): {e}")
+            if misses >= 30:
+                fail("watch: 30 consecutive poll failures — giving up (experiment continues server-side)")
+            time.sleep(min(interval * 2, 30))
+            continue
+        misses = 0
         status = exp.get("status")
         for ph in exp.get("phases") or []:
             pid, pstat, pname = ph["id"], ph.get("status"), ph.get("name")
@@ -437,6 +452,10 @@ def us_ms(v):
     return f"{v / 1000:.1f}ms" if isinstance(v, (int, float)) and v else "-"
 
 
+def ns_ms(v):
+    return f"{v / 1e6:.1f}ms" if isinstance(v, (int, float)) and v else "-"
+
+
 # ---------------------------------------------------------------- results
 GATES = [
     "G1 reproducibility band exists (repeat run) and claims stated vs band",
@@ -466,30 +485,45 @@ def cmd_results(c: Client, args):
             warn(f"phase {pname}: results unavailable: {e}")
             continue
         dump(outdir, f"phase-{pos}-{pname}.json", res)
+        phase_stats = []
         for wf in ph.get("workflows") or []:
             run_id = wf.get("zeus_run_id")
             if run_id:
                 try:
                     stats = c.get(f"{API}/zeus/runs/{run_id}/stats")
-                    dump(outdir, f"phase-{pos}-{pname}-run-{run_id[:8]}-stats.json", stats)
+                    dump(outdir, f"phase-{pos}-{pname}-run-{run_id[-8:]}-stats.json", stats)
+                    phase_stats.append(stats)
                 except ApiError as e:
                     warn(f"zeus stats {run_id}: {e}")
         drain = (res.get("drain") or {}).get("status", "-")
         verdict = (res.get("verdict") or {}).get("verdict", "-")
-        for wr in res.get("workflow_results") or []:
-            rows.append((pos, pname, wr.get("workflow_id", "?")[:14],
-                         wr.get("request_count"), wr.get("error_rate"),
-                         us_ms(wr.get("latency_p50_us")), us_ms(wr.get("latency_p95_us")),
-                         us_ms(wr.get("latency_p99_us")), drain, verdict))
-        if not res.get("workflow_results"):
-            rows.append((pos, pname, "-", "-", "-", "-", "-", "-", drain, verdict))
+        wrs = res.get("workflow_results") or []
+        if wrs:  # attack-driven phases: harvested rows (no dropped counter)
+            for wr in wrs:
+                rows.append((pos, pname, wr.get("workflow_id", "?")[-6:],
+                             wr.get("request_count"), wr.get("error_rate"),
+                             us_ms(wr.get("latency_p50_us")), us_ms(wr.get("latency_p95_us")),
+                             us_ms(wr.get("latency_p99_us")), "-", drain, verdict))
+        elif phase_stats:  # k6 run-driven phases: zeus per-run stats (ns latencies)
+            for st in phase_stats:
+                sent, okc = st.get("requests_sent") or 0, st.get("requests_ok") or 0
+                err = f"{1 - okc / sent:.3f}" if sent else "-"
+                dropped = st.get("requests_dropped", 0)
+                if dropped:
+                    warn(f"phase {pname}: {dropped} requests DROPPED (VU pool saturated) — "
+                         "gate G2 FAIL: percentiles describe surviving load only")
+                rows.append((pos, pname, (st.get("workflow_id") or "?")[-6:], okc, err,
+                             ns_ms(st.get("latency_p50")), ns_ms(st.get("latency_p95")),
+                             ns_ms(st.get("latency_p99")), dropped, drain, verdict))
+        else:
+            rows.append((pos, pname, "-", "-", "-", "-", "-", "-", "-", drain, verdict))
     dump(outdir, "instances.json", c.get(f"{API}/sdk/instances"))
 
     lines = [f"# {exp.get('name')} — results ({dt.date.today()})", "",
              f"Experiment `{exp.get('id')}`, status {exp.get('status')}. "
              f"Hypothesis: {exp.get('hypothesis') or '(none recorded)'}", "",
-             "| # | phase | workflow | n | err | p50 | p95 | p99 | drain | verdict |",
-             "|---|-------|----------|---|-----|-----|-----|-----|-------|---------|"]
+             "| # | phase | workflow | n | err | p50 | p95 | p99 | dropped | drain | verdict |",
+             "|---|-------|----------|---|-----|-----|-----|-----|---------|-------|---------|"]
     for r in rows:
         lines.append("| " + " | ".join(str(x) for x in r) + " |")
     lines += ["", "## Findings", "", "1. TODO", "",
