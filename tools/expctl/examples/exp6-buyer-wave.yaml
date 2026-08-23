@@ -1,0 +1,80 @@
+# EXP-6 — buyer wave: full-mesh flow + diverse-egress cache-box placement.
+# Implements flags F3/F6/F15: the buyer flow fires the commit leg every journey
+# (checkout -> payment/shipping/email/currency/cart all exercised), and the
+# cache-box moves to checkoutservice — the first multi-key, body-keyed replay
+# placement. rec freeze kept as the placement-value contrast.
+#
+# Load: buyers 3/s + browsers 1/s ("mostly checkout" population). Buyer journeys
+# ~5-6 s at think_scale 0.25 -> vus 40 (G2 rule); browse vus 10.
+#
+# DOCUMENTED, NOT FIXED (per ruling): the recording baseline p0 carries the
+# record-path overhead (body buffering + push stream) that no other phase has
+# (validity register C7); p5-plain is a non-recording clean reference for drift,
+# not a C7 fix.
+#
+# Expected fidelity behavior at the checkout placement (this is the experiment):
+# - keys vary by user row (bounded ~50-key space; pinned product/qty) — a few
+#   key_absent misses are possible if baseline coverage misses stragglers;
+# - payment/shipping responses carry txn/tracking ids -> repeated keys with
+#   divergent bodies -> CollisionsDivergent > 0 and possibly
+#   VALID_WITH_WARNINGS. That is a finding about the instrument, not a failure.
+
+fault_specs:
+  - name: exp6-lat-payment
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp6-lat-paymentservice
+    service: paymentservice
+    fault_spec: exp6-lat-payment
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp6-buyer-wave
+  hypothesis: >
+    HB1: the buyer flow exercises all 11 services (payment/shipping/email/checkout
+    server-side rates > 0 in every phase). HB2: freezing checkoutservice's egress
+    yields a measurable e2e delta on the buyer flow even unfaulted — unlike rec,
+    whose stub value is ~0 — because checkout's downstream fan is a large share of
+    the commit journey (placement determines observable value). HB3: 50 ms payment
+    latency degrades buyer e2e in p2 and freezing checkout immunizes it (p3 ~ p1)
+    — first immunity result at a multi-key placement. HB4: checkout recording has
+    many distinct keys; replay hit rate is high with honest divergent-collision
+    reporting on nondeterministic downstream responses.
+  phases:
+    - name: p0-baseline
+      persist_cache: true
+      workflows: &load
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 40, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: p1-iso-checkout
+      frozen_services:
+        - { service: checkoutservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      workflows: *load
+    - name: p2-lat-payment
+      rules: [exp6-lat-paymentservice]
+      workflows: *load
+    - name: p3-iso-checkout-lat-payment
+      frozen_services:
+        - { service: checkoutservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      rules: [exp6-lat-paymentservice]
+      workflows: *load
+    - name: p4-iso-rec
+      frozen_services:
+        - { service: recommendationservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      workflows: *load
+    - name: p5-plain
+      workflows: *load

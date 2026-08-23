@@ -1,0 +1,38 @@
+# EXP-7 — frontier probe: freeze the frontend's ENTIRE egress (whole-mesh stub).
+# Deliberately expected to hit the fail-closed boundary: frontend's cart calls
+# key on per-VU session ids, so the replay phase's fresh sessions produce
+# key_absent misses -> 503s under fail-closed replay -> verdict INVALID and
+# likely a failed phase. That outcome IS the measurement: it documents where
+# baseline coverage breaks for session-keyed egress (validity register D3 /
+# flag F15) and what the e2e floor looks like for whatever does replay.
+# Run AFTER exp6 (separate experiment so its designed failure cannot block
+# clean phases).
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp7-frontier-frontend
+  hypothesis: >
+    Fail-closed boundary probe: frontend egress replay cannot achieve coverage
+    (session-keyed cart calls), so the isolation phase should show key_absent
+    misses, elevated error rate, and an INVALID verdict — demonstrating the
+    coverage limit of egress replay for session-scoped keys, and measuring the
+    web-layer floor on whatever traffic does replay.
+  phases:
+    - name: f0-baseline
+      persist_cache: true
+      workflows: &load
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 40, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: f1-iso-frontend
+      frozen_services:
+        - { service: frontend, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      workflows: *load
