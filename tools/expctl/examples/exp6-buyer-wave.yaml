@@ -55,26 +55,26 @@ experiment:
     many distinct keys; replay hit rate is high with honest divergent-collision
     reporting on nondeterministic downstream responses.
   phases:
-    - name: p0-baseline
-      persist_cache: true
+    - name: p0-plain    # plain-first (2026-08-23 ruling): warm reference before the recording phase
       workflows: &load
-        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 40, duration_sec: 120 }
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 50, duration_sec: 120 }
         - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
-    - name: p1-iso-checkout
+    - name: p1-baseline
+      persist_cache: true
+      workflows: *load
+    - name: p2-iso-checkout
       frozen_services:
         - { service: checkoutservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
       workflows: *load
-    - name: p2-lat-payment
+    - name: p3-lat-payment
       rules: [exp6-lat-paymentservice]
       workflows: *load
-    - name: p3-iso-checkout-lat-payment
+    - name: p4-iso-checkout-lat-payment
       frozen_services:
         - { service: checkoutservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
       rules: [exp6-lat-paymentservice]
       workflows: *load
-    - name: p4-iso-rec
+    - name: p5-iso-rec
       frozen_services:
         - { service: recommendationservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
-      workflows: *load
-    - name: p5-plain
       workflows: *load

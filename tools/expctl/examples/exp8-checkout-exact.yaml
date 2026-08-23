@@ -1,0 +1,65 @@
+# EXP-8 — checkout freeze, take two: exact_with_host keying (no body hash).
+# exp6 showed body-keyed canonical_v2 cannot replay checkoutservice (per-order
+# UUIDs minted into downstream bodies -> one key per order, 100% key_absent).
+# exact_with_host keys on method+host+path+query only: all charges collapse to
+# one key per downstream endpoint — semantically acceptable against stateless
+# fakes, and it unlocks the two blocked hypotheses:
+#   HB2: freezing checkout yields a measurable buyer-e2e delta unfaulted;
+#   HB3b: 50 ms payment latency is immunized by the freeze (p4 ~ p2).
+# Hygiene per 2026-08-23 rulings: plain phase FIRST (p0 = warm reference, no
+# recording), buyer vus 50 (ramp drops), INV-2 agreement: every checkout freeze
+# in this experiment uses exact_with_host, so the baseline records under the
+# same strategy.
+# KNOWN & ACCEPTED: the recording baseline (p1) will degrade buyer traffic
+# (record-path overhead, exp6 finding 4 / exp7 finding 1) — p1 is not a
+# comparison reference; p0-plain is.
+
+fault_specs:
+  - name: exp6-lat-payment
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp6-lat-paymentservice
+    service: paymentservice
+    fault_spec: exp6-lat-payment
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp8-checkout-exact
+  hypothesis: >
+    With exact_with_host keying, checkout egress replay achieves a high hit rate
+    (endpoint-collapsed keys are coverable); HB2: freezing checkout produces a
+    measurable buyer-e2e improvement vs p0-plain; HB3b: the 50 ms payment-latency
+    effect (p3 vs p0) is immunized under the freeze (p4 ~ p2 ~ p0).
+  phases:
+    - name: p0-plain
+      workflows: &load
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 50, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: p1-baseline
+      persist_cache: true
+      workflows: *load
+    - name: p2-iso-checkout
+      frozen_services: &freeze_checkout
+        - { service: checkoutservice, mode: replay, key_strategy: exact_with_host, mutation_policy: deny }
+      workflows: *load
+    - name: p3-lat-payment
+      rules: [exp6-lat-paymentservice]
+      workflows: *load
+    - name: p4-iso-checkout-lat-payment
+      frozen_services: *freeze_checkout
+      rules: [exp6-lat-paymentservice]
+      workflows: *load
