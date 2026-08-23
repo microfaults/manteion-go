@@ -28,6 +28,7 @@ import datetime as dt
 import http.client
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -167,8 +168,9 @@ def cmd_preflight(c: Client, args):
             ttl = d.get("ttl_s")
             note = ""
             if created and ttl:
-                exp_at = dt.datetime.fromisoformat(created.replace("Z", "+00:00")) \
-                    + dt.timedelta(seconds=int(ttl))
+                # Pre-3.11 fromisoformat rejects nanosecond fractions — trim to µs.
+                iso = re.sub(r"\.(\d{6})\d+", r".\1", created.replace("Z", "+00:00"))
+                exp_at = dt.datetime.fromisoformat(iso) + dt.timedelta(seconds=int(ttl))
                 left = exp_at - dt.datetime.now(dt.timezone.utc)
                 note = f" — expires in {left.days}d{left.seconds // 3600}h"
                 if left.days < 2:
