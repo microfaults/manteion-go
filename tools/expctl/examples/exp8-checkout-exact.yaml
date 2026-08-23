@@ -13,6 +13,13 @@
 # KNOWN & ACCEPTED: the recording baseline (p1) will degrade buyer traffic
 # (record-path overhead, exp6 finding 4 / exp7 finding 1) — p1 is not a
 # comparison reference; p0-plain is.
+# p1 load is COVERAGE-sized, not comparison-sized: at full 3/s buyer
+# throughput the record buffer OOM-killed checkoutservice (128Mi limit,
+# exit 137, 2026-08-23 first attempt) — exp6's recording only survived
+# because its own overhead throttled realized load (cold mesh + timeouts);
+# plain-first warmed the mesh and unmasked the full record rate. Under
+# exact_with_host the keyspace is endpoint-sized (~6 keys), so 1/s buyers
+# for 120 s (~40 orders) covers every key with wide margin.
 
 fault_specs:
   - name: exp6-lat-payment
@@ -51,7 +58,9 @@ experiment:
         - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
     - name: p1-baseline
       persist_cache: true
-      workflows: *load
+      workflows:  # coverage-sized (see header): full-rate recording OOMs checkout
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
     - name: p2-iso-checkout
       frozen_services: &freeze_checkout
         - { service: checkoutservice, mode: replay, key_strategy: exact_with_host, mutation_policy: deny }
