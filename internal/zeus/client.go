@@ -385,7 +385,8 @@ func (c *Client) StopRun(ctx context.Context, runID string) error {
 // RunInfo is the subset of GET /api/v1/runs/{id} the orchestrator polls.
 type RunInfo struct {
 	ID     string `json:"id"`
-	Status string `json:"status"` // starting, validating, running, completing, completed, stopped, failed, rejected
+	Status string `json:"status"`           // starting, validating, running, completing, completed, stopped, failed, rejected
+	Reason string `json:"reason,omitempty"` // e.g. "thresholds breached" on a completed run (k6 exit 99)
 }
 
 // GetRun fetches a run's current status.

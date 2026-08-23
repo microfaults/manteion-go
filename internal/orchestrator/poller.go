@@ -93,6 +93,14 @@ func (o *Orchestrator) checkLoadStatuses(ctx context.Context, phaseID string, pw
 			switch info.Status {
 			case "completed", "stopped":
 				completed++
+				// A breached k6 threshold (exit 99) completes the run with a
+				// reason -- a load-health warning, never a phase failure: in
+				// fault experiments a breached error-rate threshold IS the
+				// measurement (e.g. fail-closed frozen phases).
+				if info.Status == "completed" && info.Reason != "" {
+					o.logger.Warn("orchestrator: zeus run completed with load-health warning",
+						"phase_id", phaseID, "run_id", pw.ZeusRunID, "reason", info.Reason)
+				}
 			case "starting", "validating", "running", "completing":
 				// in flight
 			default: // failed, rejected, or unknown

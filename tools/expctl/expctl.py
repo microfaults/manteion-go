@@ -426,6 +426,9 @@ def cmd_watch(c: Client, args):
                     summarize_phase_results(pname, res)
                 except ApiError as e:
                     warn(f"results for {pname}: {e}")
+                for reason in run_health(c, ph).values():
+                    warn(f"  load health: {reason} — client-side k6 gate breached "
+                         "(distinct from drain/verdict; see run reason)")
         if status in ("completed", "failed", "cancelled"):
             log(f"experiment {exp_id} {status}")
             if status != "completed":
@@ -457,6 +460,24 @@ def summarize_phase_results(pname, res):
         log(f"  wf[{wr.get('workflow_id')}]: n={wr.get('request_count')} "
             f"err={wr.get('error_rate')} p50={us_ms(wr.get('latency_p50_us'))} "
             f"p95={us_ms(wr.get('latency_p95_us'))} p99={us_ms(wr.get('latency_p99_us'))}")
+
+
+def run_health(c, ph):
+    """{run_id: reason} for the phase's k6 runs that completed with a reason
+    set — zeus stamps 'thresholds breached' when k6 exits 99 (client-side
+    gates crossed; the run itself completed and its stats are whole)."""
+    out = {}
+    for wf in ph.get("workflows") or []:
+        run_id = wf.get("zeus_run_id")
+        if not run_id:
+            continue
+        try:
+            rn = c.get(f"{API}/zeus/runs/{run_id}")
+        except ApiError:
+            continue
+        if rn.get("status") == "completed" and rn.get("reason"):
+            out[run_id] = rn["reason"]
+    return out
 
 
 def us_ms(v):
@@ -497,6 +518,10 @@ def cmd_results(c: Client, args):
             continue
         dump(outdir, f"phase-{pos}-{pname}.json", res)
         phase_stats = []
+        health = run_health(c, ph)  # run_id -> reason (k6 threshold breach)
+        for run_id, reason in health.items():
+            warn(f"phase {pname}: run {run_id[-8:]} load health: {reason} — "
+                 "client-side k6 gate breached (stats are whole; judge with the reason in view)")
         for wf in ph.get("workflows") or []:
             run_id = wf.get("zeus_run_id")
             if run_id:
@@ -514,7 +539,7 @@ def cmd_results(c: Client, args):
                 rows.append((pos, pname, wr.get("workflow_id", "?")[-6:],
                              wr.get("request_count"), wr.get("error_rate"),
                              us_ms(wr.get("latency_p50_us")), us_ms(wr.get("latency_p95_us")),
-                             us_ms(wr.get("latency_p99_us")), "-", drain, verdict))
+                             us_ms(wr.get("latency_p99_us")), "-", "-", drain, verdict))
         elif phase_stats:  # k6 run-driven phases: zeus per-run stats (ns latencies)
             for st in phase_stats:
                 sent, okc = st.get("requests_sent") or 0, st.get("requests_ok") or 0
@@ -523,18 +548,19 @@ def cmd_results(c: Client, args):
                 if dropped:
                     warn(f"phase {pname}: {dropped} requests DROPPED (VU pool saturated) — "
                          "gate G2 FAIL: percentiles describe surviving load only")
+                breach = health.get(st.get("run_id") or "", "ok")
                 rows.append((pos, pname, (st.get("workflow_id") or "?")[-6:], okc, err,
                              ns_ms(st.get("latency_p50")), ns_ms(st.get("latency_p95")),
-                             ns_ms(st.get("latency_p99")), dropped, drain, verdict))
+                             ns_ms(st.get("latency_p99")), dropped, breach, drain, verdict))
         else:
-            rows.append((pos, pname, "-", "-", "-", "-", "-", "-", "-", drain, verdict))
+            rows.append((pos, pname, "-", "-", "-", "-", "-", "-", "-", "-", drain, verdict))
     dump(outdir, "instances.json", c.get(f"{API}/sdk/instances"))
 
     lines = [f"# {exp.get('name')} — results ({dt.date.today()})", "",
              f"Experiment `{exp.get('id')}`, status {exp.get('status')}. "
              f"Hypothesis: {exp.get('hypothesis') or '(none recorded)'}", "",
-             "| # | phase | workflow | n | err | p50 | p95 | p99 | dropped | drain | verdict |",
-             "|---|-------|----------|---|-----|-----|-----|-----|---------|-------|---------|"]
+             "| # | phase | workflow | n | err | p50 | p95 | p99 | dropped | health | drain | verdict |",
+             "|---|-------|----------|---|-----|-----|-----|-----|---------|--------|-------|---------|"]
     for r in rows:
         lines.append("| " + " | ".join(str(x) for x in r) + " |")
     lines += ["", "## Findings", "", "1. TODO", "",
