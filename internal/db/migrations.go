@@ -109,6 +109,7 @@ var migrations = []migration{
 	{6, "phase_drain: per-phase drain outcome (clean|degraded + detail)", migration6},
 	{7, "phase_verdict: per-phase fidelity verdict (VALID|WARN|INVALID, design doc Q6)", migration7},
 	{8, "phase_workflows: zeus_run_id (k6 workflow-run handle, additive to zeus_attack_id)", migration8},
+	{9, "cachebox_key_strategy: add exact_with_host_norm (id-blind path keying, exp8)", migration9},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -619,4 +620,14 @@ const migration8 = `
 ALTER TABLE phase_workflows ADD COLUMN zeus_run_id TEXT;
 CREATE INDEX idx_phase_workflows_zeus_run ON phase_workflows(zeus_run_id)
     WHERE zeus_run_id IS NOT NULL;
+`
+
+// migration9 adds the id-normalizing exact keyer to cachebox_key_strategy.
+// exact_with_host_norm replaces id-shaped path segments (UUID, hex >= 16,
+// decimal >= 8 digits) with {id} before keying -- built for egress whose
+// paths embed load-time-minted identifiers (exp8: frontend session UUIDs
+// in checkout's cart paths). Keying itself lives in atropos-go >= v0.1.1;
+// deploy the fleet before running an experiment that selects it.
+const migration9 = `
+ALTER TYPE cachebox_key_strategy ADD VALUE IF NOT EXISTS 'exact_with_host_norm';
 `
