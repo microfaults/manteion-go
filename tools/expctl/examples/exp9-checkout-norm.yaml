@@ -1,0 +1,71 @@
+# EXP-9 — checkout freeze, take three: exact_with_host_norm (id-blind paths).
+# exp6: canonical_v2 dies on order UUIDs minted into downstream BODIES.
+# exp8: exact_with_host dies on frontend session UUIDs minted into cart PATHS
+# (GET /cart/{session} is checkout's FIRST egress call; fail-closed chains are
+# all-or-nothing, so 0/343 hits). exact_with_host_norm (atropos >= v0.1.1,
+# manteion migration 9) replaces id-shaped path segments with {id} before
+# keying: all sessions collapse to one cart key per method. Keyspace is ~a
+# dozen endpoint keys — coverage-sized recording (1 rps) stays (full-rate
+# recording OOMs checkout at 128Mi; exp8 attempt 1).
+# Unblocked hypotheses:
+#   HB2: freezing checkout yields a measurable buyer-e2e delta unfaulted;
+#   HB3b: 50 ms payment latency is immunized under the freeze (p4 ~ p2 ~ p0).
+# Expected honest costs: high divergent-collision rate on the recording
+# (per-session carts + per-txn responses folded into few keys) -> phases
+# should land VALID_WITH_WARNINGS, not INVALID; replayed cart bodies carry a
+# foreign session id (checkout never reads it).
+# PRECONDITION: fleet deployed with atropos >= v0.1.1 BEFORE this runs — an
+# older SDK silently keys with plain `exact` while stamping the configured
+# strategy name (mixed-version INV-2 hole).
+
+fault_specs:
+  - name: exp6-lat-payment
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp6-lat-paymentservice
+    service: paymentservice
+    fault_spec: exp6-lat-payment
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp9-checkout-norm
+  hypothesis: >
+    With id-blind path keying (exact_with_host_norm), checkout egress replay
+    achieves a near-total hit rate; HB2: freezing checkout produces a measurable
+    buyer-e2e improvement vs p0-plain; HB3b: the 50 ms payment-latency effect
+    (p3 vs p0) is immunized under the freeze (p4 ~ p2 ~ p0).
+  phases:
+    - name: p0-plain
+      workflows: &load
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 50, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: p1-baseline
+      persist_cache: true
+      workflows:  # coverage-sized: full-rate recording OOMs checkout (exp8 attempt 1)
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: p2-iso-checkout
+      frozen_services: &freeze_checkout
+        - { service: checkoutservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      workflows: *load
+    - name: p3-lat-payment
+      rules: [exp6-lat-paymentservice]
+      workflows: *load
+    - name: p4-iso-checkout-lat-payment
+      frozen_services: *freeze_checkout
+      rules: [exp6-lat-paymentservice]
+      workflows: *load
