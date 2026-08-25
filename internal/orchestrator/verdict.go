@@ -103,15 +103,29 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 
 	// Source recording quality: degraded drain (INVALID) and divergent-collision
 	// rate (warning). Both come from the experiment's baseline recording.
+	// Collision tallies are per-recorded-service (exp6 finding 7: a phase-wide
+	// tally let checkout's divergence contaminate rec's verdict); this phase's
+	// rate is the max over ITS frozen services, with per-service rates in the
+	// warning reasons.
 	degradedBaseline := false
 	collisionRate := 0.0
+	var collisionSvcs []string
 	if baseline, err := o.baselinePhase(ctx, p.ExperimentID); err == nil && baseline != nil {
 		if drain, _ := o.experiments.GetPhaseDrain(ctx, baseline.ID); drain.Degraded() {
 			degradedBaseline = true
 		}
-		div, ident := o.cacheStore.CollisionStats(baseline.ExperimentID, baseline.ID)
-		if div+ident > 0 {
-			collisionRate = float64(div) / float64(div+ident)
+		for _, fs := range p.FrozenServices {
+			div, ident := o.cacheStore.CollisionStats(baseline.ExperimentID, baseline.ID, fs.Service)
+			if div+ident == 0 {
+				continue
+			}
+			rate := float64(div) / float64(div+ident)
+			if rate > 0.01 {
+				collisionSvcs = append(collisionSvcs, fmt.Sprintf("collision_rate:%s:%.4f", fs.Service, rate))
+			}
+			if rate > collisionRate {
+				collisionRate = rate
+			}
 		}
 	}
 
@@ -135,7 +149,7 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 		verdict = model.VerdictInvalid
 	case collisionRate > 0.01:
 		verdict = model.VerdictValidWithWarning
-		reasons = append(reasons, fmt.Sprintf("collision_rate:%.4f", collisionRate))
+		reasons = append(reasons, collisionSvcs...)
 	}
 
 	var ageMeanMs int64

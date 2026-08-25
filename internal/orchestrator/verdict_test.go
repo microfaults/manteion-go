@@ -77,8 +77,8 @@ func TestFinishPhase_WarningOnCollisions(t *testing.T) {
 	exp := mkExp(t)
 	base := mkCompletedBaseline(t, exp.ID, 0)
 	// Same key recorded with two different bodies ⇒ one divergent collision.
-	ingestSig(t, o, exp.ID, base.ID, "i1", 1, "k", "sha-a")
-	ingestSig(t, o, exp.ID, base.ID, "i1", 2, "k", "sha-b")
+	ingestSig(t, o, exp.ID, base.ID, "frontend", "i1", 1, "k", "sha-a")
+	ingestSig(t, o, exp.ID, base.ID, "frontend", "i1", 2, "k", "sha-b")
 	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
 
 	finishIsolationVerdict(t, o, exp.ID, iso.ID, cleanSnapshot())
@@ -89,6 +89,32 @@ func TestFinishPhase_WarningOnCollisions(t *testing.T) {
 	}
 	if v.Verdict != "VALID_WITH_WARNINGS" || v.CollisionRate <= 0.01 {
 		t.Fatalf("verdict = %q rate %v, want VALID_WITH_WARNINGS + rate>1%%", v.Verdict, v.CollisionRate)
+	}
+}
+
+// TestFinishPhase_CollisionAttributionPerService pins the exp6 finding-7 fix:
+// divergence recorded by ANOTHER service in the same baseline must not reach
+// this phase's verdict — collision tallies are per-recorded-service, and the
+// phase reads only the services IT freezes.
+func TestFinishPhase_CollisionAttributionPerService(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	base := mkCompletedBaseline(t, exp.ID, 0)
+	// checkoutservice's recording diverges; frontend's is clean.
+	ingestSig(t, o, exp.ID, base.ID, "checkoutservice", "c1", 1, "k", "sha-a")
+	ingestSig(t, o, exp.ID, base.ID, "checkoutservice", "c1", 2, "k", "sha-b")
+	ingestSig(t, o, exp.ID, base.ID, "frontend", "f1", 1, "k2", "sha-c")
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+
+	finishIsolationVerdict(t, o, exp.ID, iso.ID, cleanSnapshot())
+
+	v, err := testExpRepo.GetPhaseVerdict(ctx, iso.ID)
+	if err != nil || v == nil {
+		t.Fatalf("get verdict: %v", err)
+	}
+	if v.Verdict != "VALID" || v.CollisionRate != 0 {
+		t.Fatalf("verdict = %q rate %v, want VALID with rate 0 (checkout divergence must not bleed into frontend)", v.Verdict, v.CollisionRate)
 	}
 }
 
@@ -117,9 +143,9 @@ func TestFinishPhase_VerdictValidCleanRun(t *testing.T) {
 
 // ingestSig ingests one entry with an explicit (key, body sha) so tests can
 // drive collision detection deterministically.
-func ingestSig(t *testing.T, o *Orchestrator, exp, phase, instance string, batchSeq int, key, sha string) {
+func ingestSig(t *testing.T, o *Orchestrator, exp, phase, service, instance string, batchSeq int, key, sha string) {
 	t.Helper()
-	_, err := o.cacheStore.Ingest(exp, phase, "frontend", instance, batchSeq,
+	_, err := o.cacheStore.Ingest(exp, phase, service, instance, batchSeq,
 		[]atroposdk.CacheBoxWireEntry{{Key: key, StatusCode: 200, ResponseBodySHA256: sha}})
 	if err != nil {
 		t.Fatalf("ingest: %v", err)

@@ -42,8 +42,8 @@ type Store struct {
 	mu           sync.Mutex
 	dedup        map[string]map[string]struct{}              // pair -> "instance\x00batch_seq" -> seen
 	received     map[string]map[string]int64                 // pair -> "service\x00instance"   -> entries persisted
-	seenKeys     map[string]map[string]entrySig              // pair -> cache key -> last-seen signature (collision detection)
-	collisions   map[string]*collisionCounts                 // pair -> divergent/identical tallies
+	seenKeys     map[string]map[string]entrySig              // pair\x00service -> cache key -> last-seen signature (collision detection)
+	collisions   map[string]*collisionCounts                 // pair\x00service -> divergent/identical tallies
 	drainReports map[string]map[string]atroposdk.DrainReport // pair -> instance_id -> latest W3 drain report
 }
 
@@ -167,25 +167,28 @@ func (s *Store) Ingest(experimentID, phaseID, service, instance string, batchSeq
 	}
 	s.received[pair][service+"\x00"+instance] += int64(len(entries))
 
-	s.scanCollisionsLocked(pair, entries)
+	s.scanCollisionsLocked(pair+"\x00"+service, entries)
 
 	return IngestResult{Accepted: len(entries), Duplicate: false}, nil
 }
 
-// scanCollisionsLocked tallies per-phase key collisions (Q3): a repeated key
-// whose (status, body sha) differs from the last sighting is divergent, one
-// that matches is identical. Latest-wins — the signature is always updated.
+// scanCollisionsLocked tallies per-(phase, service) key collisions (Q3): a
+// repeated key whose (status, body sha) differs from the last sighting is
+// divergent, one that matches is identical. Latest-wins — the signature is
+// always updated. Keyed by pair\x00service so one service's nondeterminism
+// never bleeds into another recording's verdict (exp6 finding 7: rec's
+// verdict inherited checkout's divergence when the tally was phase-wide).
 // Caller holds s.mu.
-func (s *Store) scanCollisionsLocked(pair string, entries []atroposdk.CacheBoxWireEntry) {
-	keys := s.seenKeys[pair]
+func (s *Store) scanCollisionsLocked(pairSvc string, entries []atroposdk.CacheBoxWireEntry) {
+	keys := s.seenKeys[pairSvc]
 	if keys == nil {
 		keys = map[string]entrySig{}
-		s.seenKeys[pair] = keys
+		s.seenKeys[pairSvc] = keys
 	}
-	cc := s.collisions[pair]
+	cc := s.collisions[pairSvc]
 	if cc == nil {
 		cc = &collisionCounts{}
-		s.collisions[pair] = cc
+		s.collisions[pairSvc] = cc
 	}
 	for _, e := range entries {
 		sig := entrySig{status: e.StatusCode, bodySHA: entryBodySHA(e)}
@@ -218,12 +221,14 @@ func (s *Store) ReceivedCount(experimentID, phaseID, service, instance string) i
 	return s.received[pairKey(experimentID, phaseID)][service+"\x00"+instance]
 }
 
-// CollisionStats returns the per-phase (divergent, identical) key-collision
-// tallies observed at ingest — the collision-rate input to the phase verdict (MANT-6).
-func (s *Store) CollisionStats(experimentID, phaseID string) (divergent, identical int64) {
+// CollisionStats returns the (divergent, identical) key-collision tallies
+// observed at ingest for one recorded service — the collision-rate input to
+// the phase verdict (MANT-6). In-memory only: a manteion restart zeroes the
+// tallies for already-recorded phases (the NDJSON is not rescanned).
+func (s *Store) CollisionStats(experimentID, phaseID, service string) (divergent, identical int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cc := s.collisions[pairKey(experimentID, phaseID)]; cc != nil {
+	if cc := s.collisions[pairKey(experimentID, phaseID)+"\x00"+service]; cc != nil {
 		return cc.divergent, cc.identical
 	}
 	return 0, 0

@@ -111,7 +111,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: "sha-A"}}); err != nil {
 		t.Fatalf("ingest 1: %v", err)
 	}
-	if d, i := s.CollisionStats("exp-1", "phase-1"); d != 0 || i != 0 {
+	if d, i := s.CollisionStats("exp-1", "phase-1", "frontend"); d != 0 || i != 0 {
 		t.Fatalf("after first sighting: divergent=%d identical=%d, want 0,0", d, i)
 	}
 
@@ -120,7 +120,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: "sha-B"}}); err != nil {
 		t.Fatalf("ingest 2: %v", err)
 	}
-	if d, i := s.CollisionStats("exp-1", "phase-1"); d != 1 || i != 0 {
+	if d, i := s.CollisionStats("exp-1", "phase-1", "frontend"); d != 1 || i != 0 {
 		t.Fatalf("after divergent: divergent=%d identical=%d, want 1,0", d, i)
 	}
 
@@ -130,7 +130,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: "sha-B"}}); err != nil {
 		t.Fatalf("ingest 3: %v", err)
 	}
-	if d, i := s.CollisionStats("exp-1", "phase-1"); d != 1 || i != 1 {
+	if d, i := s.CollisionStats("exp-1", "phase-1", "frontend"); d != 1 || i != 1 {
 		t.Fatalf("after identical: divergent=%d identical=%d, want 1,1", d, i)
 	}
 
@@ -139,7 +139,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 500, ResponseBodySHA256: "sha-B"}}); err != nil {
 		t.Fatalf("ingest 4: %v", err)
 	}
-	if d, i := s.CollisionStats("exp-1", "phase-1"); d != 2 || i != 1 {
+	if d, i := s.CollisionStats("exp-1", "phase-1", "frontend"); d != 2 || i != 1 {
 		t.Fatalf("after status divergence: divergent=%d identical=%d, want 2,1", d, i)
 	}
 
@@ -148,8 +148,28 @@ func TestIngest_CollisionStats(t *testing.T) {
 		[]atroposdk.CacheBoxWireEntry{{Key: "OTHER", StatusCode: 200, ResponseBodySHA256: "sha-C"}}); err != nil {
 		t.Fatalf("ingest 5: %v", err)
 	}
-	if d, i := s.CollisionStats("exp-1", "phase-1"); d != 2 || i != 1 {
+	if d, i := s.CollisionStats("exp-1", "phase-1", "frontend"); d != 2 || i != 1 {
 		t.Fatalf("after new key: divergent=%d identical=%d, want 2,1", d, i)
+	}
+
+	// Per-service isolation: the same key colliding under ANOTHER service
+	// tallies against that service only (exp6 finding 7 — a phase-wide tally
+	// let one service's divergence contaminate another's verdict).
+	for seq := 1; seq <= 2; seq++ {
+		sha := "sha-X"
+		if seq == 2 {
+			sha = "sha-Y"
+		}
+		if _, err := s.Ingest("exp-1", "phase-1", "checkoutservice", "inst-c", seq,
+			[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: sha}}); err != nil {
+			t.Fatalf("ingest checkout %d: %v", seq, err)
+		}
+	}
+	if d, i := s.CollisionStats("exp-1", "phase-1", "checkoutservice"); d != 1 || i != 0 {
+		t.Fatalf("checkoutservice tally: divergent=%d identical=%d, want 1,0", d, i)
+	}
+	if d, i := s.CollisionStats("exp-1", "phase-1", "frontend"); d != 2 || i != 1 {
+		t.Fatalf("frontend tally polluted by checkoutservice: divergent=%d identical=%d, want 2,1", d, i)
 	}
 }
 
