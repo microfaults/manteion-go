@@ -1,0 +1,78 @@
+# EXP-10 — fan-in attribution: who pays for a slow shared leaf?
+# productcatalogservice is the highest-fan-in leaf (frontend, rec, and checkout
+# all read it). Inject +50 ms there, then peel the fan-in edge by edge with
+# freezes (all exact_with_host_norm, v0.1.2 fleet):
+#   p2 fault only            -> full exposure (every catalog edge live)
+#   p3 fault + freeze rec    -> removes ONLY the rec->catalog edge share
+#   p4 fault + freeze frontend -> browse sees zero live egress (total immunity
+#        expected); buyer's checkout leg is ALSO replayed (frontend->checkout
+#        is frontend egress) -> no real orders occur in p4/p5 (semantic note)
+#   p5 fault + freeze frontend+rec -> composition check (expect ~= p4)
+# Edge shares: rec-edge = p2 - p3; frontend-direct = p3 - p4 (p4 ~ p0).
+# First multi-service recording (frontend+rec) and first multi-service freeze
+# phase (p5) — machinery exercise is part of the experiment.
+# Recording is coverage-sized AND frontend is a 128Mi pod like checkout
+# (which OOMed at ~20 obs/s): p1 runs browse 1/s + buyer 0.5/s (~8-10 obs/s,
+# ~180 journeys over ~18 normalized keys).
+# Load emphasis flipped vs exp9: browse is the metric path.
+
+fault_specs:
+  - name: exp10-lat-catalog
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp10-lat-productcatalog
+    service: productcatalogservice
+    fault_spec: exp10-lat-catalog
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp10-fanin-catalog
+  hypothesis: >
+    HX1: +50 ms on catalog transmits to browse e2e in p2. HX2: freezing rec
+    attenuates browse by exactly the rec-path share (partial, p3 between p0 and
+    p2). HX3: freezing frontend makes browse fully immune (p4 ~ p0) because
+    every browse egress edge is replayed. HX4: freezes compose (p5 ~ p4).
+    Buyer contrast rides along (checkout's own catalog edge).
+  phases:
+    - name: p0-plain
+      workflows: &load
+        - { workflow: browse-nodeport, rate_rps: 3, vus: 30, duration_sec: 120 }
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
+    - name: p1-baseline
+      persist_cache: true
+      workflows:  # coverage-sized; frontend records at 128Mi (see header)
+        - { workflow: browse-nodeport, rate_rps: 1,   vus: 15, duration_sec: 120 }
+        - { workflow: buyer-nodeport,  rate_rps: 0.5, vus: 10, duration_sec: 120 }
+    - name: p2-lat-catalog
+      rules: [exp10-lat-productcatalog]
+      workflows: *load
+    - name: p3-lat-catalog-iso-rec
+      frozen_services:
+        - { service: recommendationservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp10-lat-productcatalog]
+      workflows: *load
+    - name: p4-lat-catalog-iso-frontend
+      frozen_services:
+        - { service: frontend, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp10-lat-productcatalog]
+      workflows: *load
+    - name: p5-lat-catalog-iso-both
+      frozen_services:
+        - { service: frontend, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+        - { service: recommendationservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp10-lat-productcatalog]
+      workflows: *load

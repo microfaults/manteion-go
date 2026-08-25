@@ -1,0 +1,44 @@
+# EXP-11 — the async escape hatch: kafka publish vs the freeze boundary.
+# PRECONDITION: checkoutservice deployed with ENABLE_KAFKA=true (bed-side env
+# flip; broker kafka:9092 already wired; revert after the run). Consumer side
+# is GUS (Part I): orderservice reads checkout-requests.
+# Two questions, one experiment:
+#   K1 (async tax): does the fire-and-forget publish cost the buyer anything?
+#      k0-plain (kafka ON) vs exp9c p0-plain (kafka OFF, same load, same day).
+#   K2 (side-effect leak): the cache-box freezes HTTP egress ONLY — a frozen
+#      checkout still executes its kafka publish live. k2 measures real events
+#      escaping an "isolated" phase (topic offsets polled alongside the run).
+#      Expected: leak confirmed -> new validity caveat (freeze boundary is
+#      protocol-scoped, not process-scoped).
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp11-kafka-async
+  hypothesis: >
+    K1: enabling the fire-and-forget kafka publish adds no measurable buyer-e2e
+    cost (k0 ~ exp9c p0 within the ±15 ms band). K2: a frozen checkout keeps
+    publishing real checkout-requests events (offset delta ~ order count in k2)
+    — the freeze boundary is HTTP-scoped and async side effects escape it.
+  phases:
+    - name: k0-plain
+      workflows: &load
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 50, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: k1-baseline
+      persist_cache: true
+      workflows:
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: k2-iso-checkout
+      frozen_services:
+        - { service: checkoutservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      workflows: *load
