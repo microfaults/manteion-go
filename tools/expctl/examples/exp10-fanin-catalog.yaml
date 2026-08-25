@@ -54,9 +54,12 @@ experiment:
         - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
     - name: p1-baseline
       persist_cache: true
-      workflows:  # coverage-sized; frontend records at 128Mi (see header)
-        - { workflow: browse-nodeport, rate_rps: 1,   vus: 15, duration_sec: 120 }
-        - { workflow: buyer-nodeport,  rate_rps: 0.5, vus: 10, duration_sec: 120 }
+      workflows:  # coverage-sized; frontend records at 128Mi (see header).
+        # NOTE: rate_rps must be an INTEGER — k6 constant-arrival-rate rejects
+        # fractional rates (exit 104; zeus backlog: timeUnit support). ~14 obs/s
+        # at 128Mi is the edge of the checkout-OOM regime — INV-3 will catch it.
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 15, duration_sec: 120 }
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
     - name: p2-lat-catalog
       rules: [exp10-lat-productcatalog]
       workflows: *load
