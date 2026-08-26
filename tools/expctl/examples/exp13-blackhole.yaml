@@ -1,0 +1,90 @@
+# EXP-13 — fault-class showcase on the checkout->payment edge (2026-08-25).
+# latency (50ms), error (503 short-circuit), and hang (HTTP-level blackhole —
+# the network-class fault available without the unimplemented proxy wiring),
+# each live vs checkout-frozen. Browse rides along as the per-flow
+# blast-radius control.
+fault_specs:
+  - name: exp13-lat-pay
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+  - name: exp13-err-pay
+    category: inline
+    fault_type: error
+    params: { status_code: 503 }
+    duration_ms: 150000
+  - name: exp13-hang-pay
+    category: inline
+    fault_type: hang
+    params: { duration: 2s }
+    duration_ms: 150000
+
+rules:
+  - name: exp13-rule-lat
+    service: paymentservice
+    fault_spec: exp13-lat-pay
+    mode: inline
+  - name: exp13-rule-err
+    service: paymentservice
+    fault_spec: exp13-err-pay
+    mode: inline
+  - name: exp13-rule-hang
+    service: paymentservice
+    fault_spec: exp13-hang-pay
+    mode: inline
+
+workflows:
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp13-blackhole
+  hypothesis: >
+    Latency (50ms), error (503), and hang (2s blackhole) faults on payment
+    transmit to the buyer flow as +latency, error share, and ~+2s latency
+    respectively; freezing checkout (exact_with_host_norm) contains all three
+    to the frozen level with zero buyer errors. Browse never touches payment
+    and stays flat throughout.
+  phases:
+    - name: p0-warmup
+      workflows: &load
+        - { workflow: buyer-nodeport,  rate_rps: 3, vus: 60, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: p1-plain
+      workflows: *load
+    - name: p2-baseline-rec
+      persist_cache: true
+      workflows:
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 10, duration_sec: 120 }
+    - name: p3-lat-payment
+      rules: [exp13-rule-lat]
+      workflows: *load
+    - name: p4-iso-lat
+      frozen_services: &freeze_checkout
+        - { service: checkoutservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp13-rule-lat]
+      workflows: *load
+    - name: p5-err-payment
+      rules: [exp13-rule-err]
+      workflows: *load
+    - name: p6-iso-err
+      frozen_services: *freeze_checkout
+      rules: [exp13-rule-err]
+      workflows: *load
+    - name: p7-hang-payment
+      rules: [exp13-rule-hang]
+      workflows: *load
+    - name: p8-iso-hang
+      frozen_services: *freeze_checkout
+      rules: [exp13-rule-hang]
+      workflows: *load
+    - name: p9-plain-end
+      workflows: *load

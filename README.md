@@ -115,3 +115,11 @@ database requires dropping the `manteion` database first; the binary re-migrates
 - **manteion-ui** — React operator UI.
 
 Internal research project of the UCSC Faults Lab (Peter Alvaro's group). Not licensed for external use.
+
+## Project report
+
+This component is documented in the UCSC master's project report
+*Safe Evolution and Interventional Fault Attribution in Microservice
+Meshes* (Pranay Mundra, 2026) — Part II, as the control plane of the
+faults-lab instrument. The report experiments' expctl configs live in
+`tools/expctl/examples/` (exp12-dose, exp13-blackhole).

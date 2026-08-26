@@ -1,0 +1,89 @@
+# EXP-12 — latency dose-response x freeze x delay-replay (fresh wave 2026-08-25).
+# The shelved exp3 design rerun with campaign lessons: warmup phase, plain-first
+# non-recording reference, end-of-run plain drift check, integer rate_rps,
+# VU margin sized for the lat100 phase (G2 law: vus >= 2*rate*worst-iteration-s).
+fault_specs:
+  - name: exp12-lat-cat-25
+    category: inline
+    fault_type: latency
+    params: { delay: 25ms }
+    duration_ms: 150000
+  - name: exp12-lat-cat-50
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+  - name: exp12-lat-cat-100
+    category: inline
+    fault_type: latency
+    params: { delay: 100ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp12-lat-catalog-25
+    service: productcatalogservice
+    fault_spec: exp12-lat-cat-25
+    mode: inline
+  - name: exp12-lat-catalog-50
+    service: productcatalogservice
+    fault_spec: exp12-lat-cat-50
+    mode: inline
+  - name: exp12-lat-catalog-100
+    service: productcatalogservice
+    fault_spec: exp12-lat-cat-100
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: checkout-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp12-dose
+  hypothesis: >
+    H1: e2e browse shift is monotone ~linear in injected catalog delay (25/50/100ms).
+    H2: freezing rec at delta=50 removes exactly the rec-path share; the
+    frontend-direct residual persists. H3: replay_with_delay reintroduces recorded
+    rec->catalog timing (p7-p6 ~ recorded latency; p8 ~ plain within band).
+  phases:
+    - name: p0-warmup
+      workflows: &load
+        - { workflow: browse-nodeport,   rate_rps: 3, vus: 40, duration_sec: 120 }
+        - { workflow: checkout-nodeport, rate_rps: 2, vus: 30, duration_sec: 120 }
+    - name: p1-plain
+      workflows: *load
+    - name: p2-baseline-rec
+      persist_cache: true
+      workflows: *load
+    - name: p3-lat25
+      rules: [exp12-lat-catalog-25]
+      workflows: *load
+    - name: p4-lat50
+      rules: [exp12-lat-catalog-50]
+      workflows: *load
+    - name: p5-lat100
+      rules: [exp12-lat-catalog-100]
+      workflows: *load
+    - name: p6-lat50-frozen
+      frozen_services:
+        - { service: recommendationservice, mode: replay, key_strategy: canonical_v2, mutation_policy: deny }
+      rules: [exp12-lat-catalog-50]
+      workflows: *load
+    - name: p7-lat50-frozen-delay
+      frozen_services:
+        - { service: recommendationservice, mode: replay_with_delay, key_strategy: canonical_v2, mutation_policy: deny,
+            synthetic_delay: { p50_us: 2770, p95_us: 5500, p99_us: 8000 } }
+      rules: [exp12-lat-catalog-50]
+      workflows: *load
+    - name: p8-frozen-delay-only
+      frozen_services:
+        - { service: recommendationservice, mode: replay_with_delay, key_strategy: canonical_v2, mutation_policy: deny,
+            synthetic_delay: { p50_us: 2770, p95_us: 5500, p99_us: 8000 } }
+      workflows: *load
+    - name: p9-plain-end
+      workflows: *load
