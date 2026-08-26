@@ -1,0 +1,67 @@
+# EXP-12 — placement-value sweep: one shared-leaf fault, every caller frozen in turn.
+# Catalog +50 ms (highest fan-in leaf), then freeze rec / checkout / frontend one at a
+# time under exact_with_host_norm. exp10 priced the rec and frontend edges for the
+# BROWSE path; the new cell here is p4: does freezing CHECKOUT shield BUYERS from a
+# catalog fault? (Expected: partial — checkout's catalog reads are replayed, but the
+# buyer journey's browse prefix still traverses frontend's live catalog calls.)
+# Recording covers the union of frozen services (rec + checkout + frontend) at
+# coverage rate; per-service record buffers stay under the 128 MiB OOM regime.
+
+fault_specs:
+  - name: exp12-lat-catalog
+    category: inline
+    fault_type: latency
+    params: { delay: 50ms }
+    duration_ms: 150000
+
+rules:
+  - name: exp12-lat-productcatalog
+    service: productcatalogservice
+    fault_spec: exp12-lat-catalog
+    mode: inline
+
+workflows:
+  - name: browse-nodeport
+    file: zeus-go/k6/flows/online-boutique/browse.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+  - name: buyer-nodeport
+    file: zeus-go/k6/flows/online-boutique/checkout-buyer.json
+    base_url: http://2262-cse115b-01.be.ucsc.edu:31785
+    think_scale: 0.25
+
+experiment:
+  name: exp12-placements
+  hypothesis: >
+    Placement value against a catalog fault, per flow: freezing rec removes one call's
+    worth from browse; freezing checkout removes the checkout-side catalog share from
+    buyers but leaves their browse-prefix exposure; freezing frontend removes browse
+    exposure entirely. The three freezes rank placements for this fault.
+  phases:
+    - name: p0-plain
+      workflows: &load
+        - { workflow: browse-nodeport, rate_rps: 2, vus: 20, duration_sec: 120 }
+        - { workflow: buyer-nodeport,  rate_rps: 2, vus: 30, duration_sec: 120 }
+    - name: p1-baseline
+      persist_cache: true
+      workflows:
+        - { workflow: browse-nodeport, rate_rps: 1, vus: 15, duration_sec: 120 }
+        - { workflow: buyer-nodeport,  rate_rps: 1, vus: 20, duration_sec: 120 }
+    - name: p2-lat-catalog
+      rules: [exp12-lat-productcatalog]
+      workflows: *load
+    - name: p3-lat-iso-rec
+      frozen_services:
+        - { service: recommendationservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp12-lat-productcatalog]
+      workflows: *load
+    - name: p4-lat-iso-checkout
+      frozen_services:
+        - { service: checkoutservice, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp12-lat-productcatalog]
+      workflows: *load
+    - name: p5-lat-iso-frontend
+      frozen_services:
+        - { service: frontend, mode: replay, key_strategy: exact_with_host_norm, mutation_policy: deny }
+      rules: [exp12-lat-productcatalog]
+      workflows: *load
