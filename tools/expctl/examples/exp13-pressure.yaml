@@ -1,4 +1,12 @@
 # EXP-13 — resource-pressure matrix on nodes not yet pressured.
+# TIER: EXTENDED (2026-08-27 ruling). Resource faults spend real node
+# resources shared by every colocated pod on this single-VM bed, so their
+# magnitudes attribute per NODE, not per pod. Core-tier experiments are
+# restricted to inline latency-family faults + cache-box (pod-scoped); see
+# docs/research/HYPOTHESIS-REGISTRY-2026-08.md. Also: the mem-catalog dose
+# (0.5 of a 128Mi limit, thrashing) crossed the cgroup ceiling in one run —
+# verified in-phase OOMKill — so this config's mem numbers mix degradation
+# with crash-restart unless the dose is lowered or the limit raised.
 # exp2/exp4 pressured catalog (cpu), rec (memory), currency (io). This run covers the
 # remaining interesting cells: cpu on currency (highest-QPS leaf — every price
 # localization), memory-thrash on catalog (the shared leaf: does mem pressure there

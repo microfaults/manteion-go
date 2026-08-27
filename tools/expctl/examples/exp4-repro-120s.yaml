@@ -1,4 +1,8 @@
 # EXP-4 — reproducibility run: exp2's loadspike design at 120 s phases.
+# TIER: EXTENDED for the resource-fault phases (cpu/mem/io are node-coupled
+# on the single-VM bed — magnitudes attribute per node, not per pod; see
+# docs/research/HYPOTHESIS-REGISTRY-2026-08.md). The freeze phases remain
+# core-tier evidence.
 # Purpose: establish the noise band (validity gate G1). Phases/faults IDENTICAL
 # to experiments/2026-08-06-loadspike (incl. the io null-result phase).
 #
