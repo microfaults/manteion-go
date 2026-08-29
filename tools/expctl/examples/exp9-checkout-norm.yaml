@@ -1,3 +1,4 @@
+# CANONICAL: EXP-1 Containment (2026-08-27 relabel; docs/research/HYPOTHESIS-REGISTRY-2026-08.md)
 # EXP-9 — checkout freeze, take three: exact_with_host_norm (id-blind paths).
 # exp6: canonical_v2 dies on order UUIDs minted into downstream BODIES.
 # exp8: exact_with_host dies on frontend session UUIDs minted into cart PATHS

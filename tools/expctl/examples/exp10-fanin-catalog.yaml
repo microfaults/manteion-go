@@ -1,3 +1,4 @@
+# CANONICAL: EXP-3 Edge attribution (2026-08-27 relabel; docs/research/HYPOTHESIS-REGISTRY-2026-08.md)
 # EXP-10 — fan-in attribution: who pays for a slow shared leaf?
 # productcatalogservice is the highest-fan-in leaf (frontend, rec, and checkout
 # all read it). Inject +50 ms there, then peel the fan-in edge by edge with

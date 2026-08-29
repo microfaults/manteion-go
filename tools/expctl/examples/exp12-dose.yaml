@@ -1,3 +1,4 @@
+# CANONICAL: EXP-2 Dose-response (2026-08-27 relabel; docs/research/HYPOTHESIS-REGISTRY-2026-08.md)
 # EXP-12 — latency dose-response x freeze x delay-replay (fresh wave 2026-08-25).
 # The shelved exp3 design rerun with campaign lessons: warmup phase, plain-first
 # non-recording reference, end-of-run plain drift check, integer rate_rps,

@@ -1,3 +1,4 @@
+# CANONICAL: EXP-4 Placement value (2026-08-27 relabel; docs/research/HYPOTHESIS-REGISTRY-2026-08.md)
 # EXP-12 — placement-value sweep: one shared-leaf fault, every caller frozen in turn.
 # Catalog +50 ms (highest fan-in leaf), then freeze rec / checkout / frontend one at a
 # time under exact_with_host_norm. exp10 priced the rec and frontend edges for the
