@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"manteion-go/internal/model"
 )
@@ -229,25 +232,28 @@ func fromStatusGuard(id, to string, from []string) (string, []any, error) {
 	return "(" + strings.Join(ph, ", ") + ")", args, nil
 }
 
-// UpdateMetadata edits non-state fields. Empty arguments are no-ops.
-func (r *ExperimentRepo) UpdateMetadata(ctx context.Context, id string, name, description, hypothesis string) error {
+// UpdateMetadata edits the non-state fields of an experiment. A nil argument
+// leaves that column untouched; an empty description / hypothesis clears it
+// (NULL, as on Create). Name is required, so an empty one is rejected rather
+// than written. The planned-only guard is the handler's.
+func (r *ExperimentRepo) UpdateMetadata(ctx context.Context, id string, name, description, hypothesis *string) error {
 	sets := []string{}
 	args := []any{id}
-	idx := 2
-	if name != "" {
-		sets = append(sets, fmt.Sprintf("name = $%d", idx))
-		args = append(args, name)
-		idx++
+	set := func(col string, v any) {
+		args = append(args, v)
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
 	}
-	if description != "" {
-		sets = append(sets, fmt.Sprintf("description = $%d", idx))
-		args = append(args, description)
-		idx++
+	if name != nil {
+		if *name == "" {
+			return errors.New("experiment: name required")
+		}
+		set("name", *name)
 	}
-	if hypothesis != "" {
-		sets = append(sets, fmt.Sprintf("hypothesis = $%d", idx))
-		args = append(args, hypothesis)
-		idx++
+	if description != nil {
+		set("description", nullString(*description))
+	}
+	if hypothesis != nil {
+		set("hypothesis", nullString(*hypothesis))
 	}
 	if len(sets) == 0 {
 		return nil
@@ -324,6 +330,77 @@ func (r *ExperimentRepo) GetPhase(ctx context.Context, id string) (*model.Experi
 		return nil, fmt.Errorf("get experiment_phase: %w", err)
 	}
 	return p, nil
+}
+
+// PhaseEdit carries the join-row replacements applied atomically with an
+// UpdatePhase row write. A nil slice leaves that join table untouched; an
+// empty non-nil slice clears it.
+type PhaseEdit struct {
+	Workflows []model.PhaseWorkflow
+	RuleIDs   []string
+}
+
+// UpdatePhase rewrites a phase's editable columns (name, position,
+// frozen_services, persist_cache) and, for each non-nil PhaseEdit slice,
+// replaces its phase_workflows / phase_rules rows — all in one transaction,
+// so a rejected attachment leaves the row untouched. The status guards
+// (pending phase, planned experiment) are the handler's; this is the write.
+// Unique-constraint collisions (name, position, duplicate ids) surface as
+// ErrConflict; the position constraint is deferred, so that one is only
+// raised at commit.
+func (r *ExperimentRepo) UpdatePhase(ctx context.Context, p *model.ExperimentPhase, edit PhaseEdit) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	frozenJSON, err := json.Marshal(p.FrozenServices)
+	if err != nil {
+		return fmt.Errorf("marshal frozen_services: %w", err)
+	}
+	err = execTx(ctx, r.db, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE experiment_phases SET
+				name = $2, position = $3, frozen_services = $4, persist_cache = $5
+			WHERE id = $1`,
+			p.ID, p.Name, p.Position, frozenJSON, p.PersistCache)
+		if err != nil {
+			return fmt.Errorf("update experiment_phase: %w", err)
+		}
+		if err := affectedOrNotFound(res); err != nil {
+			return err
+		}
+		if edit.Workflows != nil {
+			if err := attachPhaseWorkflows(ctx, tx, p.ID, edit.Workflows); err != nil {
+				return err
+			}
+		}
+		if edit.RuleIDs != nil {
+			if err := attachPhaseRules(ctx, tx, p.ID, edit.RuleIDs); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return phaseConflict(err, p)
+}
+
+// phaseConflict maps a unique_violation raised by a phase write to
+// ErrConflict, naming the colliding column; any other error passes through.
+func phaseConflict(err error, p *model.ExperimentPhase) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return err
+	}
+	switch pgErr.ConstraintName {
+	case "experiment_phases_experiment_id_name_key":
+		return fmt.Errorf("phase name %q already used in this experiment: %w", p.Name, ErrConflict)
+	case "experiment_phases_position_unique":
+		return fmt.Errorf("phase position %d already used in this experiment: %w", p.Position, ErrConflict)
+	}
+	detail := pgErr.Detail
+	if detail == "" {
+		detail = pgErr.Message
+	}
+	return fmt.Errorf("%s: %w", detail, ErrConflict)
 }
 
 // RunningExperimentIDs returns the ids of every experiment currently in status
@@ -672,11 +749,14 @@ func scanPhaseRow(scanner interface {
 // AttachPhaseWorkflows replaces the phase_workflows rows for the phase with
 // the supplied slice. Use this on phase create / edit to keep the set in sync.
 func (r *ExperimentRepo) AttachPhaseWorkflows(ctx context.Context, phaseID string, pws []model.PhaseWorkflow) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback()
+	return execTx(ctx, r.db, func(tx *sql.Tx) error {
+		return attachPhaseWorkflows(ctx, tx, phaseID, pws)
+	})
+}
+
+// attachPhaseWorkflows is the delete-reinsert body of AttachPhaseWorkflows,
+// run inside the caller's transaction so UpdatePhase can compose it.
+func attachPhaseWorkflows(ctx context.Context, tx *sql.Tx, phaseID string, pws []model.PhaseWorkflow) error {
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM phase_workflows WHERE phase_id = $1`, phaseID); err != nil {
 		return fmt.Errorf("clear phase_workflows: %w", err)
@@ -697,7 +777,7 @@ func (r *ExperimentRepo) AttachPhaseWorkflows(ctx context.Context, phaseID strin
 			return fmt.Errorf("insert phase_workflow: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ListPhaseWorkflows returns all phase_workflows rows for the phase.
@@ -769,11 +849,14 @@ func (r *ExperimentRepo) UpdatePhaseWorkflowZeusRun(ctx context.Context, phaseID
 // AttachPhaseRules replaces the phase_rules rows for the phase. Position is
 // taken from slice index.
 func (r *ExperimentRepo) AttachPhaseRules(ctx context.Context, phaseID string, ruleIDs []string) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback()
+	return execTx(ctx, r.db, func(tx *sql.Tx) error {
+		return attachPhaseRules(ctx, tx, phaseID, ruleIDs)
+	})
+}
+
+// attachPhaseRules is the delete-reinsert body of AttachPhaseRules, run
+// inside the caller's transaction so UpdatePhase can compose it.
+func attachPhaseRules(ctx context.Context, tx *sql.Tx, phaseID string, ruleIDs []string) error {
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM phase_rules WHERE phase_id = $1`, phaseID); err != nil {
 		return fmt.Errorf("clear phase_rules: %w", err)
@@ -788,7 +871,7 @@ func (r *ExperimentRepo) AttachPhaseRules(ctx context.Context, phaseID string, r
 			return fmt.Errorf("insert phase_rule: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ListPhaseRules returns phase_rules in position order.

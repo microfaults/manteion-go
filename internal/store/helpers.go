@@ -15,6 +15,10 @@ import (
 // ErrNotFound is returned when a Get/Delete finds no matching row.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrConflict is returned when a write collides with an existing row on a
+// unique constraint (Postgres 23505); handlers map it to 409.
+var ErrConflict = errors.New("store: conflict")
+
 // affectedOrNotFound returns ErrNotFound when res affected zero rows,
 // or wraps any RowsAffected error. The canonical post-Exec check for
 // UPDATE/DELETE by primary key. pgx never returns a negative count

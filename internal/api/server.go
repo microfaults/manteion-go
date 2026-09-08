@@ -194,9 +194,12 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// unit. Pause is phase-level state: the experiment row stays 'running'
 	// while its current phase is 'paused' (the experiment_status enum has no
 	// paused label) — /pause, /resume, and /cancel drive the orchestrator FSM.
+	// PUT edits the plan only while it is still one: the experiment must be
+	// planned (and, for a phase, the phase pending); anything later is 409.
 	mux.HandleFunc("POST /api/v1/experiments", s.handleCreateExperiment)
 	mux.HandleFunc("GET /api/v1/experiments", s.handleListExperiments)
 	mux.HandleFunc("GET /api/v1/experiments/{id}", s.handleGetExperiment)
+	mux.HandleFunc("PUT /api/v1/experiments/{id}", s.handleUpdateExperiment)
 	mux.HandleFunc("DELETE /api/v1/experiments/{id}", s.handleDeleteExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/start", s.handleStartExperiment)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/pause", s.handlePauseExperiment)
@@ -218,6 +221,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Phase CRUD + lifecycle.
 	mux.HandleFunc("POST /api/v1/experiments/{id}/phases", s.handleCreatePhase)
 	mux.HandleFunc("GET /api/v1/experiments/{id}/phases/{phaseId}", s.handleGetPhase)
+	mux.HandleFunc("PUT /api/v1/experiments/{id}/phases/{phaseId}", s.handleUpdatePhase)
 	mux.HandleFunc("DELETE /api/v1/experiments/{id}/phases/{phaseId}", s.handleDeletePhase)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/phases/{phaseId}/start", s.handleStartPhase)
 	mux.HandleFunc("POST /api/v1/experiments/{id}/phases/{phaseId}/stop", s.handleStopPhase)

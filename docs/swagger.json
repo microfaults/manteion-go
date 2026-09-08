@@ -185,6 +185,7 @@
                         "type": "string"
                     },
                     "enabled": {
+                        "description": "Enabled gates serving on every channel (poll predicate AND phase-start\npush). Deliberately zero-value FALSE: a create that omits it yields a\ndisabled rule, which is what makes the create\u2192attach\u2192enable experiment\nflow ordering-safe. Do not add default-true anywhere in the create path.",
                         "type": "boolean"
                     },
                     "id": {
@@ -870,7 +871,7 @@
                 ]
             },
             "post": {
-                "description": "Persist a new rule. Action.Type discriminates between fault_spec,\nfault_composition, and cachebox \u2014 exactly one payload must be set.",
+                "description": "Persist a new rule. Action.Type discriminates between fault_spec,\nfault_composition, and cachebox \u2014 exactly one payload must be set.\nRules are created DISABLED unless \"enabled\": true is explicit; for\nexperiment-attached rules, create \u2192 attach \u2192 enable (in that order)\nis the leak-safe lifecycle.",
                 "requestBody": {
                     "content": {
                         "application/json": {
