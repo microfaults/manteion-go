@@ -603,6 +603,39 @@ func (r *ExperimentRepo) ListPhasesPaged(ctx context.Context, p Page) ([]*model.
 	return out, total, rows.Err()
 }
 
+// RecentPhaseIDsForService returns the ids of the most recent phases whose
+// footprint includes service — frozen in the phase's cache-box set, or
+// targeted by a rule the phase attaches — newest-started first (the order
+// ListPhasesPaged uses), never-started phases after, newest-created first
+// among ties (ids are uuidv7). Backs the SDK instance detail's recent_run_ids.
+func (r *ExperimentRepo) RecentPhaseIDsForService(ctx context.Context, service string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT p.id
+		FROM experiment_phases p
+		WHERE p.frozen_services @> jsonb_build_array(jsonb_build_object('service', $1::text))
+		   OR EXISTS (SELECT 1 FROM phase_rules pr
+		              JOIN rules r ON r.id = pr.rule_id
+		              WHERE pr.phase_id = p.id AND r.service = $1::text)
+		ORDER BY p.started_at DESC NULLS LAST, p.id DESC
+		LIMIT $2`, service, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent phases for service: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan recent phase id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // DeletePhase removes one phase and cascades to its workflows/rules/results.
 func (r *ExperimentRepo) DeletePhase(ctx context.Context, id string) error {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM experiment_phases WHERE id = $1`, id)

@@ -169,6 +169,28 @@ func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rul
 	return r.scanRules(rows)
 }
 
+// EnabledForService returns every enabled rule targeting service, ordered by
+// priority (desc) then creation time. This is the instance-scoped view the SDK
+// instance detail reports as active_rule_ids and the kill-switch disables.
+// Unlike ForService it is deliberately NOT phase-gated: a rule attached to a
+// pending phase is dark today but goes live the moment its phase starts, so a
+// kill-switch that skipped it would only be a pause.
+func (r *RuleRepo) EnabledForService(ctx context.Context, service string) ([]*model.Rule, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, name, service, enabled, priority, injection_point,
+			match_labels, action_type, fault_spec_id, fault_composition_id,
+			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
+		FROM rules
+		WHERE service = $1 AND enabled = true
+		ORDER BY priority DESC, created_at`, service)
+	if err != nil {
+		return nil, fmt.Errorf("enabled rules for service: %w", err)
+	}
+	defer rows.Close()
+
+	return r.scanRules(rows)
+}
+
 // Count returns the total number of rules.
 func (r *RuleRepo) Count(ctx context.Context) (int, error) {
 	var n int
