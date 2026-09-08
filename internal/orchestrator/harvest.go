@@ -12,27 +12,42 @@ import (
 	"manteion-go/internal/zeus"
 )
 
-// harvestPhase collects a completed phase's results: per-attack metrics from
-// zeus into phase_workflow_results (+ phase_service_latency when the result
-// names a service), and cache-box fidelity stats from the frozen services'
-// SDK instances into phase_service_cache. Non-fatal throughout — missing or
+// harvestPhase collects a completed phase's results: per-workflow load
+// metrics from zeus into phase_workflow_results (+ phase_service_latency when
+// an attack result names a service), and cache-box fidelity stats from the
+// frozen services' SDK instances into phase_service_cache. A workflow row
+// carrying an attack handle is harvested from the attack result; one carrying
+// only a k6 run handle (the common case — every expctl example phase) from the
+// run's stats snapshot. A row with both keeps the attack result: one writer
+// per (phase, workflow), never two. Non-fatal throughout — missing or
 // not-yet-ready results are logged and skipped so the phase still completes.
 // Called exactly once per completed phase, by the finishPhase CAS winner.
 func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow, fidelity map[string]replayFidelity) {
 	if o.zeusClient != nil {
 		for _, pw := range pws {
-			if pw.ZeusAttackID == "" {
-				continue
-			}
-			if err := o.harvestAttack(ctx, p, pw); err != nil {
-				o.logger.Warn("orchestrator: harvest attack result failed",
-					"phase_id", p.ID, "workflow_id", pw.WorkflowID,
-					"attack_id", pw.ZeusAttackID, "error", err)
+			switch {
+			case pw.ZeusAttackID != "":
+				if err := o.harvestAttack(ctx, p, pw); err != nil {
+					o.logger.Warn("orchestrator: harvest attack result failed",
+						"phase_id", p.ID, "workflow_id", pw.WorkflowID,
+						"attack_id", pw.ZeusAttackID, "error", err)
+				}
+			case pw.ZeusRunID != "":
+				if err := o.harvestRun(ctx, p, pw); err != nil {
+					o.logger.Warn("orchestrator: harvest run stats failed",
+						"phase_id", p.ID, "workflow_id", pw.WorkflowID,
+						"zeus_run_id", pw.ZeusRunID, "error", err)
+				}
 			}
 		}
 	}
 	o.harvestCacheStats(ctx, p, fidelity)
 }
+
+// notReadyBackoff is the wait schedule between asks while zeus is still
+// finalizing a load driver's result — shared by the attack and run paths so
+// both give zeus the same ~7 s to flush before harvest gives up on the row.
+var notReadyBackoff = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 // harvestAttack fetches the final metrics for one (phase, workflow) attack
 // and upserts the result rows. Retries briefly when zeus hasn't finalized
@@ -40,7 +55,7 @@ func (o *Orchestrator) harvestPhase(ctx context.Context, p *model.ExperimentPhas
 func (o *Orchestrator) harvestAttack(ctx context.Context, p *model.ExperimentPhase, pw model.PhaseWorkflow) error {
 	var result *zeus.AttackResultInfo
 	var err error
-	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	backoff := notReadyBackoff
 	for attempt := 0; attempt <= len(backoff); attempt++ {
 		result, err = o.zeusClient.GetAttackResult(ctx, pw.ZeusAttackID)
 		if err == nil {
@@ -116,6 +131,96 @@ func (o *Orchestrator) harvestAttack(ctx context.Context, p *model.ExperimentPha
 		"phase_id", p.ID, "workflow_id", pw.WorkflowID, "attack_id", pw.ZeusAttackID,
 		"p99_us", result.LatencyP99Us, "requests", result.TotalRequests)
 	return nil
+}
+
+// harvestRun fetches the finalized stats snapshot for one (phase, workflow)
+// k6 run and upserts the phase_workflow_results row. Retries on the same
+// schedule as harvestAttack while zeus still serves the "no stats available
+// yet" placeholder. A 404 — zeus restarted since the run completed and lost
+// its in-memory run state — is tolerated: the row is skipped with a
+// stats_unavailable warning and the phase completes without it (there is
+// nothing true to write, and nothing a retry could recover).
+func (o *Orchestrator) harvestRun(ctx context.Context, p *model.ExperimentPhase, pw model.PhaseWorkflow) error {
+	var stats *zeus.RunStats
+	var err error
+	backoff := notReadyBackoff
+	for attempt := 0; attempt <= len(backoff); attempt++ {
+		stats, err = o.zeusClient.GetRunStats(ctx, pw.ZeusRunID)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, zeus.ErrRunNotFound) {
+			o.logger.Warn("orchestrator: run stats unavailable; skipping workflow result",
+				"phase_id", p.ID, "workflow_id", pw.WorkflowID,
+				"zeus_run_id", pw.ZeusRunID, "reason", "stats_unavailable")
+			return nil
+		}
+		if !errors.Is(err, zeus.ErrRunStatsNotReady) {
+			return fmt.Errorf("get run stats: %w", err)
+		}
+		if attempt < len(backoff) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff[attempt]):
+			}
+		}
+	}
+	if stats == nil {
+		o.logger.Warn("orchestrator: run stats not available after retries",
+			"phase_id", p.ID, "workflow_id", pw.WorkflowID, "zeus_run_id", pw.ZeusRunID)
+		return nil
+	}
+
+	res := runStatsToResult(p.ID, pw.WorkflowID, stats)
+	if err := o.experiments.UpsertWorkflowResult(ctx, res); err != nil {
+		return fmt.Errorf("upsert workflow result: %w", err)
+	}
+	o.logger.Info("orchestrator: harvested run stats",
+		"phase_id", p.ID, "workflow_id", pw.WorkflowID, "zeus_run_id", pw.ZeusRunID,
+		"p99_us", res.LatencyP99Us, "requests", res.RequestCount)
+	return nil
+}
+
+// runStatsToResult converts a zeus RunStats snapshot (durations in ns) into
+// the phase_workflow_results row shape (latencies in µs):
+//
+//	request_count   = requests_sent
+//	error_count     = requests_dropped
+//	error_rate      = requests_dropped / requests_sent  (0 when nothing was sent)
+//	throughput_rps  = requests_sent / duration_seconds  (0 when duration is 0)
+//	latency_pXX_us  = latency_pXX / 1000                (integer truncation)
+//	latency_p999_us = latency_p99_us                    (zeus reports no p999; the
+//	                  column is NOT NULL — same convention as the vegeta path)
+//
+// raw_metrics is the RunStats document itself, nanoseconds untouched. Note
+// what zeus puts behind the names: requests_dropped is k6's dropped_iterations
+// (iterations the arrival-rate executor could not schedule), while HTTP-level
+// failures are requests_sent − requests_ok — both survive in raw_metrics.
+func runStatsToResult(phaseID, workflowID string, rs *zeus.RunStats) *model.PhaseWorkflowResult {
+	errorRate := 0.0
+	if rs.RequestsSent > 0 {
+		errorRate = float64(rs.RequestsDropped) / float64(rs.RequestsSent)
+	}
+	throughput := 0.0
+	if rs.Duration > 0 {
+		throughput = float64(rs.RequestsSent) / time.Duration(rs.Duration).Seconds()
+	}
+	p99us := time.Duration(rs.LatencyP99).Microseconds()
+	rawJSON, _ := json.Marshal(rs)
+	return &model.PhaseWorkflowResult{
+		PhaseID:       phaseID,
+		WorkflowID:    workflowID,
+		RequestCount:  rs.RequestsSent,
+		ErrorCount:    rs.RequestsDropped,
+		ErrorRate:     errorRate,
+		ThroughputRPS: throughput,
+		LatencyP50Us:  time.Duration(rs.LatencyP50).Microseconds(),
+		LatencyP95Us:  time.Duration(rs.LatencyP95).Microseconds(),
+		LatencyP99Us:  p99us,
+		LatencyP999Us: p99us, // p999 not reported by zeus; use p99 (as the vegeta path does)
+		RawMetrics:    rawJSON,
+	}
 }
 
 // harvestCacheStats writes phase_service_cache fidelity rows. Two independent
