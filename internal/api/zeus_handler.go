@@ -17,6 +17,13 @@ func (s *Server) zeusProxy(w http.ResponseWriter, r *http.Request) {
 	if archerPath == "" {
 		archerPath = "/"
 	}
+	// Carry the query string through. zeus filters its list endpoints by it
+	// (GET /runs?experiment_id=&status=); forwarding only the path turned
+	// every filtered read into "all runs". RawQuery goes through verbatim so
+	// percent-encoding is neither decoded nor re-applied.
+	if r.URL.RawQuery != "" {
+		archerPath += "?" + r.URL.RawQuery
+	}
 
 	s.logger.Info("zeus proxy",
 		"method", r.Method,
