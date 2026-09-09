@@ -103,8 +103,9 @@ func main() {
 	// isolation phases start from a degraded recording.
 	orch.WithDrainTimeout(envDurationOr("MANTEION_DRAIN_TIMEOUT", 30*time.Second))
 	orch.WithAllowDegradedBaseline(envOr("MANTEION_ALLOW_DEGRADED_BASELINE", "false") == "true")
-	// MANTEION_ZEUS_DATASET_ID binds runs to a zeus dataset. Without it zeus
-	// stages an empty pool map, so a data_schema workflow drives unresolved
+	// MANTEION_ZEUS_DATASET_ID is the fallback zeus dataset for phase workflow
+	// rows that carry no dataset_id of their own. Without either, zeus stages
+	// an empty pool map, so a data_schema workflow drives unresolved
 	// {{data.*}} traffic rather than failing.
 	orch.WithZeusDatasetID(envOr("MANTEION_ZEUS_DATASET_ID", ""))
 	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)

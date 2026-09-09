@@ -538,7 +538,7 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 		zeusRunID, err := o.zeusClient.StartRun(ctx, pw.WorkflowID, zeus.RunRequest{
 			RunID:         runID,
 			ExperimentID:  exp.ID,
-			DatasetID:     o.zeusDatasetID,
+			DatasetID:     runDatasetID(pw.DatasetID, o.zeusDatasetID),
 			VUs:           pw.VUs,
 			RateRPS:       pw.RateRPS,
 			DurationS:     pw.DurationSec,
@@ -566,6 +566,17 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 		}
 	}
 	return started, configured, maxDur, nil
+}
+
+// runDatasetID picks the dataset a phase_workflows row's run binds to: the
+// row's own dataset_id (dataset per workflow, product decision 3), else the
+// process-wide MANTEION_ZEUS_DATASET_ID so plans that predate the column keep
+// working. Attack legs (startPhaseAttacks) carry no dataset either way.
+func runDatasetID(row, fallback string) string {
+	if row != "" {
+		return row
+	}
+	return fallback
 }
 
 // stopPhaseRuns best-effort stops every workflow run recorded on the phase.

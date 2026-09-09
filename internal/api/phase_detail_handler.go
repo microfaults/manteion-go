@@ -15,6 +15,7 @@ type PhaseDetail struct {
 	*model.ExperimentPhase
 	ExperimentName    string                       `json:"experiment_name"`
 	Workflows         []model.PhaseWorkflow        `json:"workflows"`
+	DatasetIDs        []string                     `json:"dataset_ids"` // derived, read-only: union of workflows' dataset_id, first-seen order, [] when none
 	WorkflowResults   []*model.PhaseWorkflowResult `json:"workflow_results"`
 	TotalRequestCount int64                        `json:"total_request_count"`
 	TotalErrorCount   int64                        `json:"total_error_count"`
@@ -71,6 +72,7 @@ func (s *Server) handleGetPhaseDetail(w http.ResponseWriter, r *http.Request) {
 	detail := PhaseDetail{
 		ExperimentPhase:   phase,
 		Workflows:         nilToEmpty(pws),
+		DatasetIDs:        datasetUnion(pws),
 		WorkflowResults:   nilToEmpty(results),
 		TotalRequestCount: totalReq,
 		TotalErrorCount:   totalErr,

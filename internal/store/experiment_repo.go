@@ -688,11 +688,13 @@ func (r *ExperimentRepo) AttachPhaseWorkflows(ctx context.Context, phaseID strin
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO phase_workflows (phase_id, workflow_id, vus, rate_rps,
-				duration_sec, target_url, target_method, zeus_attack_id, zeus_run_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				duration_sec, target_url, target_method, zeus_attack_id, zeus_run_id,
+				dataset_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 			pw.PhaseID, pw.WorkflowID, pw.VUs, nullFloat(pw.RateRPS),
 			pw.DurationSec, nullString(pw.TargetURL), nullString(pw.TargetMethod),
 			nullString(pw.ZeusAttackID), nullString(pw.ZeusRunID),
+			nullString(pw.DatasetID),
 		); err != nil {
 			return fmt.Errorf("insert phase_workflow: %w", err)
 		}
@@ -704,7 +706,7 @@ func (r *ExperimentRepo) AttachPhaseWorkflows(ctx context.Context, phaseID strin
 func (r *ExperimentRepo) ListPhaseWorkflows(ctx context.Context, phaseID string) ([]model.PhaseWorkflow, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT phase_id, workflow_id, vus, rate_rps, duration_sec,
-			target_url, target_method, zeus_attack_id, zeus_run_id
+			target_url, target_method, zeus_attack_id, zeus_run_id, dataset_id
 		FROM phase_workflows WHERE phase_id = $1
 		ORDER BY workflow_id`, phaseID)
 	if err != nil {
@@ -714,13 +716,13 @@ func (r *ExperimentRepo) ListPhaseWorkflows(ctx context.Context, phaseID string)
 	var out []model.PhaseWorkflow
 	for rows.Next() {
 		var (
-			pw                                     model.PhaseWorkflow
-			rateRPS                                sql.NullFloat64
-			targetURL, targetMethod, zeusID, runID sql.NullString
+			pw                                                model.PhaseWorkflow
+			rateRPS                                           sql.NullFloat64
+			targetURL, targetMethod, zeusID, runID, datasetID sql.NullString
 		)
 		if err := rows.Scan(
 			&pw.PhaseID, &pw.WorkflowID, &pw.VUs, &rateRPS, &pw.DurationSec,
-			&targetURL, &targetMethod, &zeusID, &runID,
+			&targetURL, &targetMethod, &zeusID, &runID, &datasetID,
 		); err != nil {
 			return nil, fmt.Errorf("scan phase_workflow: %w", err)
 		}
@@ -731,6 +733,7 @@ func (r *ExperimentRepo) ListPhaseWorkflows(ctx context.Context, phaseID string)
 		pw.TargetMethod = fromNullString(targetMethod)
 		pw.ZeusAttackID = fromNullString(zeusID)
 		pw.ZeusRunID = fromNullString(runID)
+		pw.DatasetID = fromNullString(datasetID)
 		out = append(out, pw)
 	}
 	return out, rows.Err()
