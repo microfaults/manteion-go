@@ -217,11 +217,26 @@ type fakeZeus struct {
 	// runDatasets records the dataset_id each POST .../runs body carried
 	// ("" when absent) so tests can pin the per-row dataset pass-through.
 	runDatasets map[string]string
+
+	// Failure-injection knobs (failure_reason_test.go). runsReject makes
+	// POST .../runs answer that status + body (a zeus refusal); runsDrop makes
+	// it abort the connection without a response (a transport failure, not a
+	// refusal); runReasons is the reason GET /runs/{id} reports next to the
+	// status, as zeus does for failed / rejected / threshold-breached runs.
+	runsReject *fakeReject
+	runsDrop   bool
+	runReasons map[string]string
+}
+
+// fakeReject is a canned non-2xx answer for POST .../runs.
+type fakeReject struct {
+	status int
+	body   string
 }
 
 func newFakeZeus(t *testing.T) *fakeZeus {
 	t.Helper()
-	f := &fakeZeus{attacks: make(map[string]*fakeAttack), runs: make(map[string]string), runDatasets: make(map[string]string)}
+	f := &fakeZeus{attacks: make(map[string]*fakeAttack), runs: make(map[string]string), runDatasets: make(map[string]string), runReasons: make(map[string]string)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/workflows/{id}/runs", func(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +245,17 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 			DatasetID string `json:"dataset_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.mu.Lock()
+		reject, drop := f.runsReject, f.runsDrop
+		f.mu.Unlock()
+		if drop {
+			panic(http.ErrAbortHandler) // close the connection without a response
+		}
+		if reject != nil {
+			w.WriteHeader(reject.status)
+			_, _ = w.Write([]byte(reject.body))
+			return
+		}
 		if req.RunID == "" {
 			req.RunID = id.New("run")
 		}
@@ -243,12 +269,13 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 	mux.HandleFunc("GET /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		st, ok := f.runs[r.PathValue("run_id")]
+		reason := f.runReasons[r.PathValue("run_id")]
 		f.mu.Unlock()
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"id": r.PathValue("run_id"), "status": st})
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": r.PathValue("run_id"), "status": st, "reason": reason})
 	})
 	mux.HandleFunc("DELETE /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()

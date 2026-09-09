@@ -53,6 +53,21 @@ func (c *Client) Do(ctx context.Context, method, path string, body io.Reader) (*
 	return resp, nil
 }
 
+// ResponseError is a non-2xx answer from zeus: Op names the call, Status the
+// HTTP status, Body the (bounded) response body. Its text is the message the
+// call has always returned; the orchestrator reads Status and Body to word a
+// phase's failure reason. A transport failure is never a ResponseError — it
+// stays the *url.Error the request wrapped.
+type ResponseError struct {
+	Op     string
+	Status int
+	Body   string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("zeus: %s: status %d: %s", e.Op, e.Status, e.Body)
+}
+
 // Healthy checks if Archer is reachable by hitting GET /api/v1/status.
 // Returns true if the response is 200 OK.
 func (c *Client) Healthy(ctx context.Context) bool {
@@ -264,7 +279,7 @@ func (c *Client) StartAttack(ctx context.Context, req AttackRequest) (string, er
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("zeus: start attack: status %d: %s", resp.StatusCode, raw)
+		return "", &ResponseError{Op: "start attack", Status: resp.StatusCode, Body: string(raw)}
 	}
 	var ar AttackResponse
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
@@ -403,7 +418,7 @@ func (c *Client) StartRun(ctx context.Context, workflowID string, req RunRequest
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return "", fmt.Errorf("zeus: start run for workflow %q: status %d: %s", workflowID, resp.StatusCode, raw)
+		return "", &ResponseError{Op: fmt.Sprintf("start run for workflow %q", workflowID), Status: resp.StatusCode, Body: string(raw)}
 	}
 	var rr RunResponse
 	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {

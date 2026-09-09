@@ -73,7 +73,7 @@ func (r *ExperimentRepo) Create(ctx context.Context, exp *model.Experiment) erro
 func (r *ExperimentRepo) Get(ctx context.Context, id string) (*model.Experiment, error) {
 	exp, err := scanExperimentRow(r.db.QueryRowContext(ctx, `
 		SELECT id, name, description, hypothesis, status, created_by,
-			created_at, started_at, completed_at
+			created_at, started_at, completed_at, failure_reason
 		FROM experiments WHERE id = $1`, id))
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -109,7 +109,7 @@ func (r *ExperimentRepo) List(ctx context.Context, f ExperimentFilter, p Page) (
 
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, name, description, hypothesis, status, created_by,
-			created_at, started_at, completed_at,
+			created_at, started_at, completed_at, failure_reason,
 			COUNT(*) OVER () AS total_count
 		FROM experiments
 		`+where+`
@@ -126,13 +126,13 @@ func (r *ExperimentRepo) List(ctx context.Context, f ExperimentFilter, p Page) (
 	)
 	for rows.Next() {
 		var (
-			exp                         model.Experiment
-			desc, hypothesis, createdBy sql.NullString
-			startedAt, completedAt      sql.NullTime
+			exp                                        model.Experiment
+			desc, hypothesis, createdBy, failureReason sql.NullString
+			startedAt, completedAt                     sql.NullTime
 		)
 		if err := rows.Scan(
 			&exp.ID, &exp.Name, &desc, &hypothesis, &exp.Status, &createdBy,
-			&exp.CreatedAt, &startedAt, &completedAt, &total,
+			&exp.CreatedAt, &startedAt, &completedAt, &failureReason, &total,
 		); err != nil {
 			return nil, 0, fmt.Errorf("scan experiment: %w", err)
 		}
@@ -141,6 +141,7 @@ func (r *ExperimentRepo) List(ctx context.Context, f ExperimentFilter, p Page) (
 		exp.CreatedBy = fromNullString(createdBy)
 		exp.StartedAt = nullTimeToPtr(startedAt)
 		exp.CompletedAt = nullTimeToPtr(completedAt)
+		exp.FailureReason = fromNullString(failureReason)
 		result = append(result, &exp)
 	}
 	return result, total, rows.Err()
@@ -219,14 +220,67 @@ func (r *ExperimentRepo) TransitionPhase(ctx context.Context, id, to string, fro
 	return n > 0, nil
 }
 
+// FailExperiment is TransitionExperiment to 'failed' that records why in the
+// same statement, so an experiment can never be failed without its reason
+// (migration 11). Same CAS contract: true only for the caller that moved the
+// row out of a `from` status; a loser writes neither the status nor the
+// reason. An empty reason is stored as NULL.
+func (r *ExperimentRepo) FailExperiment(ctx context.Context, id, reason string, from ...string) (bool, error) {
+	guard, args, err := fromStatusGuard(id, reason, from)
+	if err != nil {
+		return false, fmt.Errorf("fail experiment: %w", err)
+	}
+	args[1] = nullString(reason)
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiments SET
+			status         = 'failed',
+			failure_reason = $2,
+			completed_at   = now()
+		WHERE id = $1 AND status::text IN `+guard, args...)
+	if err != nil {
+		return false, fmt.Errorf("fail experiment: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("fail experiment: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// FailPhase is the phase-level twin of FailExperiment: TransitionPhase to
+// 'failed' plus the reason, in one statement.
+func (r *ExperimentRepo) FailPhase(ctx context.Context, id, reason string, from ...string) (bool, error) {
+	guard, args, err := fromStatusGuard(id, reason, from)
+	if err != nil {
+		return false, fmt.Errorf("fail phase: %w", err)
+	}
+	args[1] = nullString(reason)
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE experiment_phases SET
+			status         = 'failed',
+			failure_reason = $2,
+			completed_at   = now()
+		WHERE id = $1 AND status::text IN `+guard, args...)
+	if err != nil {
+		return false, fmt.Errorf("fail phase: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("fail phase: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
 // fromStatusGuard builds the parameterized "($3, $4, ...)" from-set guard and
-// the full args slice (id, to, from...) for the Transition* CAS updates.
-func fromStatusGuard(id, to string, from []string) (string, []any, error) {
+// the full args slice (id, second, from...) for the Transition* / Fail* CAS
+// updates: $2 is the target status for Transition* and the failure reason
+// for Fail* (whose target status is the literal 'failed').
+func fromStatusGuard(id, second string, from []string) (string, []any, error) {
 	if len(from) == 0 {
 		return "", nil, fmt.Errorf("empty from-set")
 	}
 	args := make([]any, 0, len(from)+2)
-	args = append(args, id, to)
+	args = append(args, id, second)
 	ph := make([]string, len(from))
 	for i, f := range from {
 		ph[i] = fmt.Sprintf("$%d", i+3)
@@ -274,13 +328,13 @@ func scanExperimentRow(scanner interface {
 	Scan(dest ...any) error
 }) (*model.Experiment, error) {
 	var (
-		exp                         model.Experiment
-		desc, hypothesis, createdBy sql.NullString
-		startedAt, completedAt      sql.NullTime
+		exp                                        model.Experiment
+		desc, hypothesis, createdBy, failureReason sql.NullString
+		startedAt, completedAt                     sql.NullTime
 	)
 	err := scanner.Scan(
 		&exp.ID, &exp.Name, &desc, &hypothesis, &exp.Status, &createdBy,
-		&exp.CreatedAt, &startedAt, &completedAt,
+		&exp.CreatedAt, &startedAt, &completedAt, &failureReason,
 	)
 	if err != nil {
 		return nil, err
@@ -290,6 +344,7 @@ func scanExperimentRow(scanner interface {
 	exp.CreatedBy = fromNullString(createdBy)
 	exp.StartedAt = nullTimeToPtr(startedAt)
 	exp.CompletedAt = nullTimeToPtr(completedAt)
+	exp.FailureReason = fromNullString(failureReason)
 	return &exp, nil
 }
 
@@ -327,7 +382,7 @@ func (r *ExperimentRepo) CreatePhase(ctx context.Context, p *model.ExperimentPha
 func (r *ExperimentRepo) GetPhase(ctx context.Context, id string) (*model.ExperimentPhase, error) {
 	p, err := scanPhaseRow(r.db.QueryRowContext(ctx, `
 		SELECT id, experiment_id, name, position, status, frozen_services,
-			persist_cache, started_at, completed_at
+			persist_cache, started_at, completed_at, failure_reason
 		FROM experiment_phases WHERE id = $1`, id))
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -436,7 +491,7 @@ func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, er
 func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, experiment_id, name, position, status, frozen_services,
-			persist_cache, started_at, completed_at
+			persist_cache, started_at, completed_at, failure_reason
 		FROM experiment_phases
 		WHERE status = 'running'
 		ORDER BY started_at DESC NULLS LAST`)
@@ -605,7 +660,7 @@ func (r *ExperimentRepo) GetPhaseVerdict(ctx context.Context, phaseID string) (*
 func (r *ExperimentRepo) ListPhasesForExperiment(ctx context.Context, experimentID string) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, experiment_id, name, position, status, frozen_services,
-			persist_cache, started_at, completed_at
+			persist_cache, started_at, completed_at, failure_reason
 		FROM experiment_phases
 		WHERE experiment_id = $1
 		ORDER BY position`, experimentID)
@@ -640,7 +695,7 @@ func (r *ExperimentRepo) ListPhasesPaged(ctx context.Context, p Page) ([]*model.
 	}
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT p.id, p.experiment_id, e.name, p.name, p.position, p.status,
-			p.started_at, p.completed_at,
+			p.started_at, p.completed_at, p.failure_reason,
 			CASE WHEN jsonb_typeof(p.frozen_services) = 'array'
 				THEN jsonb_array_length(p.frozen_services)
 				ELSE 0
@@ -666,16 +721,18 @@ func (r *ExperimentRepo) ListPhasesPaged(ctx context.Context, p Page) ([]*model.
 		var (
 			it                     model.PhaseListItem
 			startedAt, completedAt sql.NullTime
+			failureReason          sql.NullString
 			workflowIDs            []byte
 		)
 		if err := rows.Scan(
 			&it.ID, &it.ExperimentID, &it.ExperimentName, &it.Name, &it.Position, &it.Status,
-			&startedAt, &completedAt, &it.FrozenServiceCount, &workflowIDs, &total,
+			&startedAt, &completedAt, &failureReason, &it.FrozenServiceCount, &workflowIDs, &total,
 		); err != nil {
 			return nil, 0, fmt.Errorf("scan phase list item: %w", err)
 		}
 		it.StartedAt = nullTimeToPtr(startedAt)
 		it.CompletedAt = nullTimeToPtr(completedAt)
+		it.FailureReason = fromNullString(failureReason)
 		if len(workflowIDs) > 0 {
 			if err := json.Unmarshal(workflowIDs, &it.WorkflowIDs); err != nil {
 				return nil, 0, fmt.Errorf("decode workflow_ids: %w", err)
@@ -731,10 +788,11 @@ func scanPhaseRow(scanner interface {
 		p                      model.ExperimentPhase
 		frozenJSON             []byte
 		startedAt, completedAt sql.NullTime
+		failureReason          sql.NullString
 	)
 	if err := scanner.Scan(
 		&p.ID, &p.ExperimentID, &p.Name, &p.Position, &p.Status, &frozenJSON,
-		&p.PersistCache, &startedAt, &completedAt,
+		&p.PersistCache, &startedAt, &completedAt, &failureReason,
 	); err != nil {
 		return nil, err
 	}
@@ -745,6 +803,7 @@ func scanPhaseRow(scanner interface {
 	}
 	p.StartedAt = nullTimeToPtr(startedAt)
 	p.CompletedAt = nullTimeToPtr(completedAt)
+	p.FailureReason = fromNullString(failureReason)
 	return &p, nil
 }
 

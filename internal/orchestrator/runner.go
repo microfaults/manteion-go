@@ -3,7 +3,10 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
@@ -110,19 +113,24 @@ func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus strin
 	if _, err := o.experiments.GetPhase(ctx, phaseID); err != nil {
 		return fmt.Errorf("orchestrator: load phase: %w", err)
 	}
-	o.finishPhase(ctx, phaseID, finalStatus, from...)
+	if finalStatus == "failed" {
+		o.failPhase(ctx, phaseID, operatorFailReason, from...)
+	} else {
+		o.finishPhase(ctx, phaseID, finalStatus, from...)
+	}
 	return nil
 }
 
 // enterPhase runs the phase enter sequence after the running claim. Data
 // errors (broken rules, unloadable workflows, zero startable attacks) fail
-// the phase via finishPhase; fanout errors against an empty/struggling SDK
-// fleet are warnings, matching the legacy FSM.
+// the phase via failPhase, recording the error as the phase's failure
+// reason; fanout errors against an empty/struggling SDK fleet are warnings,
+// matching the legacy FSM.
 func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase, fresh bool) error {
 	fail := func(err error) error {
 		o.logger.Error("orchestrator: phase enter failed",
 			"phase_id", p.ID, "error", err)
-		o.finishPhase(ctx, p.ID, "failed", "running")
+		o.failPhase(ctx, p.ID, failureReason(err), "running")
 		return err
 	}
 
@@ -187,34 +195,39 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	// driver), and a flat vegeta ATTACK against target_url runs additively for
 	// targeted precision load. Start runs first so the DAG is generating traffic
 	// before the additive attacks pile on.
-	runsStarted, runsConfigured, runsMaxDur, err := o.startPhaseRuns(ctx, exp, p)
+	runs, err := o.startPhaseRuns(ctx, exp, p)
 	if err != nil {
 		return fail(err)
 	}
 
-	atkStarted, atkConfigured, atkMaxDur, err := o.startPhaseAttacks(ctx, exp, p)
+	atks, err := o.startPhaseAttacks(ctx, exp, p)
 	if err != nil {
 		return fail(err)
 	}
 
 	// Fail only if drivers were configured but NONE of either kind started --
 	// a workflow may be run-only, attack-only, or both, and losing one kind
-	// while the other runs is a warning, not a phase failure.
-	configured := runsConfigured + atkConfigured
-	started := runsStarted + atkStarted
+	// while the other runs is a warning, not a phase failure. The failure
+	// reason lists why each configured driver did not start.
+	configured := runs.configured + atks.configured
+	started := runs.started + atks.started
 	if configured > 0 && started == 0 {
-		return fail(fmt.Errorf("orchestrator: no load driver could be started (%d configured)", configured))
+		failures := make([]string, 0, len(runs.failures)+len(atks.failures))
+		failures = append(failures, runs.failures...)
+		failures = append(failures, atks.failures...)
+		return fail(fmt.Errorf("orchestrator: no load driver could be started (%d configured): %s",
+			configured, strings.Join(failures, "; ")))
 	}
 
-	maxDur := runsMaxDur
-	if atkMaxDur > maxDur {
-		maxDur = atkMaxDur
+	maxDur := runs.maxDur
+	if atks.maxDur > maxDur {
+		maxDur = atks.maxDur
 	}
 
 	if started > 0 {
 		o.spawnPoller(p.ID, maxDur)
 		o.logger.Info("orchestrator: phase started",
-			"phase_id", p.ID, "runs", runsStarted, "attacks", atkStarted, "fresh", fresh)
+			"phase_id", p.ID, "runs", runs.started, "attacks", atks.started, "fresh", fresh)
 		return nil
 	}
 
@@ -233,18 +246,46 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	return nil
 }
 
-// finishPhase is the single race-safe terminal path for a phase. It
+// failureReason renders an enter-sequence error as the phase's failure
+// reason: the error text without the "orchestrator: " log prefix.
+func failureReason(err error) string {
+	return strings.TrimPrefix(err.Error(), "orchestrator: ")
+}
+
+// finishPhase ends a phase as "completed" or "skipped" — see endPhase for
+// the winner-only contract. A failure goes through failPhase so it always
+// carries its reason; a "failed" here is a programming error and is recorded
+// with a placeholder reason rather than none.
+func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, from ...string) bool {
+	if status == "failed" {
+		o.logger.Error("orchestrator: finishPhase called with status failed and no reason; use failPhase",
+			"phase_id", phaseID)
+		return o.failPhase(ctx, phaseID, "phase failed (no reason recorded)", from...)
+	}
+	return o.endPhase(ctx, phaseID, status, "", from...)
+}
+
+// failPhase ends a phase as "failed", recording reason — what step refused,
+// which workflow / zeus handle, the underlying error text — in the same CAS
+// statement as the transition (store.FailPhase), so a failed phase can never
+// lack its why. Same winner-only contract as finishPhase.
+func (o *Orchestrator) failPhase(ctx context.Context, phaseID, reason string, from ...string) bool {
+	return o.endPhase(ctx, phaseID, "failed", reason, from...)
+}
+
+// endPhase is the single race-safe terminal path for a phase. It
 // atomically transitions phaseID to `status` only if the phase's current
-// status is one of `from`; ONLY the caller that wins that transition runs
-// the side effects: tear down the poller, clear injected rules, thaw frozen
-// services, stop zeus attacks, harvest once for "completed", recompute the
-// experiment rollup, and re-walk the scheduler. Losers are a no-op, which is
-// what makes auto-complete, the poller, StopPhase, and cancellation safe to
-// race. Returns whether this call performed the transition.
+// status is one of `from` (for "failed", together with reason); ONLY the
+// caller that wins that transition runs the side effects: tear down the
+// poller, clear injected rules, thaw frozen services, stop zeus attacks,
+// harvest once for "completed", recompute the experiment rollup, and re-walk
+// the scheduler. Losers are a no-op, which is what makes auto-complete, the
+// poller, StopPhase, and cancellation safe to race. Returns whether this
+// call performed the transition.
 //
 // Callers on a context that the poller teardown is about to cancel (i.e. the
 // poller itself) must pass context.Background().
-func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, from ...string) bool {
+func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason string, from ...string) bool {
 	// Snapshot phase + workflows (frozen services, attack IDs) before the flip.
 	p, err := o.experiments.GetPhase(ctx, phaseID)
 	if err != nil {
@@ -278,7 +319,12 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 		from = []string{"draining"} // now complete from draining
 	}
 
-	transitioned, err := o.experiments.TransitionPhase(ctx, phaseID, status, from...)
+	var transitioned bool
+	if status == "failed" {
+		transitioned, err = o.experiments.FailPhase(ctx, phaseID, reason, from...)
+	} else {
+		transitioned, err = o.experiments.TransitionPhase(ctx, phaseID, status, from...)
+	}
 	if err != nil {
 		o.logger.Error("orchestrator: finish phase: transition failed",
 			"phase_id", phaseID, "status", status, "error", err)
@@ -344,9 +390,36 @@ func (o *Orchestrator) finishPhase(ctx context.Context, phaseID, status string, 
 			"experiment_id", p.ExperimentID, "error", err)
 	}
 
-	o.logger.Info("orchestrator: phase finished", "phase_id", phaseID, "status", status)
+	o.logger.Info("orchestrator: phase finished", "phase_id", phaseID, "status", status, "reason", reason)
 	go o.advanceExperiment(context.Background(), p.ExperimentID)
 	return true
+}
+
+// driverStart is what starting one kind of load driver for a phase yielded:
+// how many workflow rows configured it, how many actually started, the
+// longest configured duration, and one operator-readable line per driver
+// that did not start — the phase's failure reason when none did.
+type driverStart struct {
+	started, configured int
+	maxDur              time.Duration
+	failures            []string
+}
+
+// driverStartFailure words one load driver (kind "run" or "attack") that did
+// not start: a zeus refusal carries zeus's status and body, a transport
+// failure says zeus was unreachable, anything else its own text.
+func driverStartFailure(kind, driverID, workflowID string, err error) string {
+	var re *zeus.ResponseError
+	var ue *url.Error
+	switch {
+	case errors.As(err, &re):
+		return fmt.Sprintf("zeus rejected %s %s for workflow %s: status %d: %s",
+			kind, driverID, workflowID, re.Status, strings.TrimSpace(re.Body))
+	case errors.As(err, &ue):
+		return fmt.Sprintf("start %s %s for workflow %s: zeus unreachable: %v", kind, driverID, workflowID, ue)
+	default:
+		return fmt.Sprintf("start %s %s for workflow %s: %v", kind, driverID, workflowID, err)
+	}
 }
 
 // =========================================================================
@@ -457,14 +530,16 @@ func withDocID(doc json.RawMessage, id string) (json.RawMessage, error) {
 // one). The atk- id is persisted on the row BEFORE StartAttack so crash
 // recovery can always find the handle; when zeus answers with a different
 // id, the row is overwritten with zeus's (recovery must query the id zeus
-// knows). Returns (started, configured, max attack duration).
-func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (started, configured int, maxDur time.Duration, err error) {
+// knows). Each attack that does not start is recorded on the returned
+// driverStart's failures.
+func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (driverStart, error) {
+	var ds driverStart
 	if o.zeusClient == nil {
-		return 0, 0, 0, nil
+		return ds, nil
 	}
 	pws, err := o.experiments.ListPhaseWorkflows(ctx, p.ID)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("orchestrator: list phase workflows: %w", err)
+		return ds, fmt.Errorf("orchestrator: list phase workflows: %w", err)
 	}
 
 	for _, pw := range pws {
@@ -473,12 +548,14 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 				"phase_id", p.ID, "workflow_id", pw.WorkflowID)
 			continue
 		}
-		configured++
+		ds.configured++
 
 		attackID := id.New("atk")
 		if err := o.experiments.UpdatePhaseWorkflowZeusAttack(ctx, p.ID, pw.WorkflowID, attackID); err != nil {
 			o.logger.Error("orchestrator: persist attack id failed",
 				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
+			ds.failures = append(ds.failures, driverStartFailure("attack", attackID, pw.WorkflowID,
+				fmt.Errorf("persist attack id: %w", err)))
 			continue
 		}
 
@@ -507,6 +584,7 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 		if err != nil {
 			o.logger.Error("orchestrator: start attack failed",
 				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
+			ds.failures = append(ds.failures, driverStartFailure("attack", attackID, pw.WorkflowID, err))
 			continue
 		}
 		if zeusID != "" && zeusID != attackID {
@@ -518,12 +596,12 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 			}
 		}
 
-		started++
-		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
-			maxDur = d
+		ds.started++
+		if d := time.Duration(pw.DurationSec) * time.Second; d > ds.maxDur {
+			ds.maxDur = d
 		}
 	}
-	return started, configured, maxDur, nil
+	return ds, nil
 }
 
 // startPhaseRuns launches one k6 workflow run per phase_workflows row,
@@ -531,24 +609,26 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 // experiment_id + meta_trace_id=phase_id tag the traffic so records and
 // traces slice by phase. The run id is persisted BEFORE StartRun so crash
 // recovery can find the handle even if the response is lost; zeus echoes the
-// id back (manteion mints it). Returns (started, configured, max duration).
+// id back (manteion mints it). Each run that does not start is recorded on
+// the returned driverStart's failures.
 //
 // The workflow is already validated-and-registered in zeus by
 // materializePhaseWorkflows, so a StartRun failure here is a live-fleet
 // problem (zeus down, run rejected), logged per-row rather than fatal — the
 // phase can still be driven by additive attacks, and a fully driver-less
-// phase is handled by the caller.
-func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (started, configured int, maxDur time.Duration, err error) {
+// phase is handled by the caller (whose failure reason lists these).
+func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (driverStart, error) {
+	var ds driverStart
 	if o.zeusClient == nil {
-		return 0, 0, 0, nil
+		return ds, nil
 	}
 	pws, err := o.experiments.ListPhaseWorkflows(ctx, p.ID)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("orchestrator: list phase workflows: %w", err)
+		return ds, fmt.Errorf("orchestrator: list phase workflows: %w", err)
 	}
 
 	for _, pw := range pws {
-		configured++
+		ds.configured++
 		runID := id.New("run")
 
 		// Unlike attacks, the run id is stamped only AFTER a successful start:
@@ -570,6 +650,7 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 		if err != nil {
 			o.logger.Error("orchestrator: start run failed",
 				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
+			ds.failures = append(ds.failures, driverStartFailure("run", runID, pw.WorkflowID, err))
 			continue
 		}
 		if zeusRunID == "" {
@@ -582,12 +663,12 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 			// started driver so the phase isn't mistaken for driver-less.
 		}
 
-		started++
-		if d := time.Duration(pw.DurationSec) * time.Second; d > maxDur {
-			maxDur = d
+		ds.started++
+		if d := time.Duration(pw.DurationSec) * time.Second; d > ds.maxDur {
+			ds.maxDur = d
 		}
 	}
-	return started, configured, maxDur, nil
+	return ds, nil
 }
 
 // runDatasetID picks the dataset a phase_workflows row's run binds to: the

@@ -41,6 +41,10 @@ type Experiment struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// FailureReason says why Status is "failed" (migration 11): an operator
+	// stop, or the phase cascade naming the failed phase and its reason.
+	// Empty (key omitted) unless the experiment failed.
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 var validExperimentStatuses = setOf(ExperimentStatusValues...)
@@ -90,6 +94,11 @@ type ExperimentPhase struct {
 	PersistCache   bool             `json:"persist_cache"`
 	StartedAt      *time.Time       `json:"started_at,omitempty"`
 	CompletedAt    *time.Time       `json:"completed_at,omitempty"`
+	// FailureReason says why Status is "failed" (migration 11): which step
+	// refused, which workflow / zeus handle, and the underlying error text —
+	// written by the orchestrator together with the failed transition.
+	// Empty (key omitted) unless the phase failed.
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 var validPhaseStatuses = setOf(PhaseStatusValues...)
@@ -231,6 +240,7 @@ type PhaseListItem struct {
 	Status             string     `json:"status"`
 	StartedAt          *time.Time `json:"started_at,omitempty"`
 	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+	FailureReason      string     `json:"failure_reason,omitempty"` // why Status is "failed"; omitted otherwise
 }
 
 // ---------- Results ----------

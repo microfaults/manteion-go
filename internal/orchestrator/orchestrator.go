@@ -23,11 +23,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
+	"manteion-go/internal/model"
 	"manteion-go/internal/promql"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
@@ -51,7 +53,8 @@ type Orchestrator struct {
 
 	maxPollDuration time.Duration
 	pollInterval    time.Duration
-	autoComplete    bool // auto-complete driver-less phases (off in FSM unit tests)
+	pollGrace       time.Duration // added to the phase duration for the poller's safety-net deadline
+	autoComplete    bool          // auto-complete driver-less phases (off in FSM unit tests)
 
 	// Drain barrier (MANT-2). drainTimeout bounds the wait for every expected
 	// SDK to flush + drain-report; drainPollInterval is how often the gate
@@ -103,6 +106,7 @@ func New(
 		logger:            logger,
 		maxPollDuration:   defaultMaxPollDuration,
 		pollInterval:      defaultZeusPollInterval,
+		pollGrace:         defaultPollGrace,
 		autoComplete:      true,
 		drainTimeout:      30 * time.Second,
 		drainPollInterval: 200 * time.Millisecond,
@@ -137,6 +141,13 @@ func (o *Orchestrator) WithMaxPollDuration(d time.Duration) {
 // WithPollInterval overrides the Zeus poll tick (test seam).
 func (o *Orchestrator) WithPollInterval(d time.Duration) {
 	o.pollInterval = d
+}
+
+// WithPollGrace overrides how far past the configured load duration the
+// poller's safety-net deadline sits (test seam; production keeps
+// defaultPollGrace).
+func (o *Orchestrator) WithPollGrace(d time.Duration) {
+	o.pollGrace = d
 }
 
 // experimentLock returns the per-experiment mutex that serializes
@@ -341,8 +352,18 @@ func (o *Orchestrator) terminateExperiment(ctx context.Context, experimentID, fi
 	lk.Lock()
 	defer lk.Unlock()
 
-	terminated, err := o.experiments.TransitionExperiment(ctx, experimentID, finalStatus,
-		"planned", "running")
+	var (
+		terminated bool
+		err        error
+	)
+	if finalStatus == "failed" {
+		// The operator's own verdict; the phases below are skipped, not failed.
+		terminated, err = o.experiments.FailExperiment(ctx, experimentID, operatorFailReason,
+			"planned", "running")
+	} else {
+		terminated, err = o.experiments.TransitionExperiment(ctx, experimentID, finalStatus,
+			"planned", "running")
+	}
 	if err != nil {
 		return err
 	}
@@ -408,7 +429,7 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 		return
 	}
 
-	anyFailed := false
+	var failed []*model.ExperimentPhase
 	for _, p := range phases {
 		switch p.Status {
 		case "running", "paused", "draining":
@@ -417,13 +438,14 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 			// sequential execution, the pause gate, and the drain gate.
 			return
 		case "failed":
-			anyFailed = true
+			failed = append(failed, p)
 		}
 	}
 
 	// Failure cascade: later phases assume their predecessors ran, so a
-	// failed phase invalidates everything still pending.
-	if anyFailed {
+	// failed phase invalidates everything still pending. The experiment's
+	// reason names the failed phase(s) and carries their own reasons.
+	if len(failed) > 0 {
 		for _, p := range phases {
 			if p.Status != "pending" {
 				continue
@@ -436,7 +458,7 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 					"phase_id", p.ID)
 			}
 		}
-		o.finalizeExperiment(ctx, experimentID, "failed")
+		o.finalizeExperiment(ctx, experimentID, "failed", cascadeReason(failed))
 		return
 	}
 
@@ -456,13 +478,40 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 	}
 
 	// Nothing pending, running, or paused — every phase is terminal.
-	o.finalizeExperiment(ctx, experimentID, "completed")
+	o.finalizeExperiment(ctx, experimentID, "completed", "")
+}
+
+// operatorFailReason is the failure reason of a phase or experiment the
+// operator stopped with status=failed (POST .../stop?status=failed).
+const operatorFailReason = "stopped by operator as failed"
+
+// cascadeReason words an experiment failed by its phases: each failed phase
+// by name with its own reason, in position order.
+func cascadeReason(failed []*model.ExperimentPhase) string {
+	parts := make([]string, 0, len(failed))
+	for _, p := range failed {
+		part := fmt.Sprintf("phase %s failed", p.Name)
+		if p.FailureReason != "" {
+			part += ": " + p.FailureReason
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // finalizeExperiment CASes running → terminal so a concurrent cancel/stop
-// wins instead of being clobbered, then recomputes the rollup.
-func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, status string) {
-	ok, err := o.experiments.TransitionExperiment(ctx, experimentID, status, "running")
+// wins instead of being clobbered, then recomputes the rollup. A "failed"
+// finalization records reason (store.FailExperiment) in the same statement.
+func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, status, reason string) {
+	var (
+		ok  bool
+		err error
+	)
+	if status == "failed" {
+		ok, err = o.experiments.FailExperiment(ctx, experimentID, reason, "running")
+	} else {
+		ok, err = o.experiments.TransitionExperiment(ctx, experimentID, status, "running")
+	}
 	if err != nil {
 		o.logger.Warn("orchestrator: finalize experiment failed",
 			"experiment_id", experimentID, "status", status, "error", err)
@@ -568,24 +617,29 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 	}
 
 	if o.zeusClient != nil {
-		lost := 0
+		var lost []string // one line per driver zeus no longer knows
 		for _, pw := range pws {
-			if pw.ZeusAttackID != "" && !o.reconcileOneAttack(ctx, phaseID, pw.ZeusAttackID) {
-				lost++
+			if pw.ZeusAttackID != "" {
+				if err := o.reconcileOneAttack(ctx, phaseID, pw.ZeusAttackID); err != nil {
+					lost = append(lost, fmt.Sprintf("attack %s for workflow %s: %v", pw.ZeusAttackID, pw.WorkflowID, err))
+				}
 			}
-			if pw.ZeusRunID != "" && !o.reconcileOneRun(ctx, phaseID, pw.ZeusRunID) {
-				lost++
+			if pw.ZeusRunID != "" {
+				if err := o.reconcileOneRun(ctx, phaseID, pw.ZeusRunID); err != nil {
+					lost = append(lost, fmt.Sprintf("run %s for workflow %s: %v", pw.ZeusRunID, pw.WorkflowID, err))
+				}
 			}
 		}
-		if lost == drivers {
+		if len(lost) == drivers {
 			o.logger.Warn("orchestrator: recover: all zeus load drivers lost; marking phase failed",
 				"phase_id", phaseID)
-			o.finishPhase(ctx, phaseID, "failed", "running")
+			o.failPhase(ctx, phaseID, fmt.Sprintf("recovery: all %d zeus load drivers lost after restart: %s",
+				drivers, strings.Join(lost, "; ")), "running")
 			return
 		}
-		if lost > 0 {
+		if len(lost) > 0 {
 			o.logger.Warn("orchestrator: recover: some zeus load drivers lost; continuing with survivors",
-				"phase_id", phaseID, "lost", lost, "total", drivers)
+				"phase_id", phaseID, "lost", len(lost), "total", drivers)
 		}
 	}
 
@@ -613,13 +667,14 @@ var reconcileBackoff = [reconcileRetries]time.Duration{
 }
 
 // reconcileOneAttack calls Zeus.GetAttack with retries to tolerate transient
-// errors. Reports whether zeus still knows the attack.
-func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID string) bool {
+// errors. Returns nil when zeus still knows the attack, else the last error
+// (the failure reason's per-driver text).
+func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID string) error {
 	var lastErr error
 	for attempt := 0; attempt < reconcileRetries; attempt++ {
 		_, err := o.zeusClient.GetAttack(ctx, attackID)
 		if err == nil {
-			return true
+			return nil
 		}
 		lastErr = err
 		if attempt < reconcileRetries-1 {
@@ -628,17 +683,18 @@ func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID
 	}
 	o.logger.Warn("orchestrator: recover: zeus attack not found after retries",
 		"phase_id", phaseID, "attack_id", attackID, "error", lastErr)
-	return false
+	return lastErr
 }
 
-// reconcileOneRun calls Zeus.GetRun with retries. Reports whether zeus still
+// reconcileOneRun calls Zeus.GetRun with retries. Returns nil when zeus still
 // knows the run (the k6 subprocess survives a manteion restart because it
-// runs inside zeus; it is lost only if zeus itself restarted).
-func (o *Orchestrator) reconcileOneRun(ctx context.Context, phaseID, runID string) bool {
+// runs inside zeus; it is lost only if zeus itself restarted), else the last
+// error.
+func (o *Orchestrator) reconcileOneRun(ctx context.Context, phaseID, runID string) error {
 	var lastErr error
 	for attempt := 0; attempt < reconcileRetries; attempt++ {
 		if _, err := o.zeusClient.GetRun(ctx, runID); err == nil {
-			return true
+			return nil
 		} else {
 			lastErr = err
 		}
@@ -648,5 +704,5 @@ func (o *Orchestrator) reconcileOneRun(ctx context.Context, phaseID, runID strin
 	}
 	o.logger.Warn("orchestrator: recover: zeus run not found after retries",
 		"phase_id", phaseID, "run_id", runID, "error", lastErr)
-	return false
+	return lastErr
 }

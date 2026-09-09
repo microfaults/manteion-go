@@ -111,6 +111,7 @@ var migrations = []migration{
 	{8, "phase_workflows: zeus_run_id (k6 workflow-run handle, additive to zeus_attack_id)", migration8},
 	{9, "cachebox_key_strategy: add exact_with_host_norm (id-blind path keying, exp8)", migration9},
 	{10, "phase_workflows: dataset_id (zeus dataset per workflow; NULL = MANTEION_ZEUS_DATASET_ID fallback)", migration10},
+	{11, "experiments + experiment_phases: failure_reason (why a failed row failed)", migration11},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -643,4 +644,18 @@ ALTER TYPE cachebox_key_strategy ADD VALUE IF NOT EXISTS 'exact_with_host_norm';
 // written or any phase claimed. IF NOT EXISTS keeps the step re-runnable.
 const migration10 = `
 ALTER TABLE phase_workflows ADD COLUMN IF NOT EXISTS dataset_id TEXT NULL;
+`
+
+// migration11 records WHY a phase or experiment is 'failed'. Until now the
+// reason (preload gate refused, workflow materialisation failed, zeus
+// rejected a run, the poller's safety-net deadline, recovery lost the zeus
+// handles, an operator stop) only reached the logs, so the UI showed
+// "failed" with no why. The orchestrator writes the column in the same CAS
+// statement as the failed transition (store.FailPhase / FailExperiment), so
+// no fail path can forget it; an experiment failed by the phase cascade names
+// the phase. NULL on every other row, and the API omits the key then.
+// IF NOT EXISTS keeps the step re-runnable.
+const migration11 = `
+ALTER TABLE experiment_phases ADD COLUMN IF NOT EXISTS failure_reason TEXT NULL;
+ALTER TABLE experiments       ADD COLUMN IF NOT EXISTS failure_reason TEXT NULL;
 `
