@@ -209,6 +209,16 @@ type fakeAttack struct {
 	result *zeus.AttackResultInfo
 }
 
+// fakeRunStats is what the fake serves at GET /api/v1/runs/{id}/stats: the
+// "no stats available yet" placeholder for the first `pending` asks, then
+// `stats`. A run with no entry is unknown to the fake (404) — the shape of a
+// zeus that restarted and lost its in-memory run state.
+type fakeRunStats struct {
+	stats   zeus.RunStats
+	pending int
+	calls   int
+}
+
 type fakeZeus struct {
 	mu      sync.Mutex
 	attacks map[string]*fakeAttack
@@ -217,6 +227,10 @@ type fakeZeus struct {
 	// runDatasets records the dataset_id each POST .../runs body carried
 	// ("" when absent) so tests can pin the per-row dataset pass-through.
 	runDatasets map[string]string
+	// runStats / statsMisses back GET /runs/{id}/stats (harvest_test.go):
+	// canned finalized stats per run, and a count of 404s served.
+	runStats    map[string]*fakeRunStats
+	statsMisses map[string]int
 
 	// Failure-injection knobs (failure_reason_test.go). runsReject makes
 	// POST .../runs answer that status + body (a zeus refusal); runsDrop makes
@@ -236,7 +250,14 @@ type fakeReject struct {
 
 func newFakeZeus(t *testing.T) *fakeZeus {
 	t.Helper()
-	f := &fakeZeus{attacks: make(map[string]*fakeAttack), runs: make(map[string]string), runDatasets: make(map[string]string), runReasons: make(map[string]string)}
+	f := &fakeZeus{
+		attacks:     make(map[string]*fakeAttack),
+		runs:        make(map[string]string),
+		runDatasets: make(map[string]string),
+		runReasons:  make(map[string]string),
+		runStats:    make(map[string]*fakeRunStats),
+		statsMisses: make(map[string]int),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/workflows/{id}/runs", func(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +297,25 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"id": r.PathValue("run_id"), "status": st, "reason": reason})
+	})
+	mux.HandleFunc("GET /api/v1/runs/{run_id}/stats", func(w http.ResponseWriter, r *http.Request) {
+		runID := r.PathValue("run_id")
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		st, ok := f.runStats[runID]
+		if !ok {
+			f.statsMisses[runID]++
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "run not found: " + runID})
+			return
+		}
+		st.calls++
+		if st.pending > 0 {
+			st.pending--
+			_ = json.NewEncoder(w).Encode(map[string]string{"run_id": runID, "status": "no stats available yet"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(st.stats)
 	})
 	mux.HandleFunc("DELETE /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -358,6 +398,45 @@ func (f *fakeZeus) attackCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.attacks)
+}
+
+// seedAttack registers an attack the fake already knows, optionally with a
+// finalized result — the state a phase's additive attack is in at harvest.
+func (f *fakeZeus) seedAttack(attackID, status string, result *zeus.AttackResultInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if result != nil {
+		r := *result
+		r.AttackID = attackID
+		result = &r
+	}
+	f.attacks[attackID] = &fakeAttack{status: status, result: result}
+}
+
+// setRunStats makes the fake serve `stats` for runID after `pending`
+// placeholder answers (0 = finalized on the first ask).
+func (f *fakeZeus) setRunStats(runID string, stats zeus.RunStats, pending int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stats.RunID = runID
+	f.runStats[runID] = &fakeRunStats{stats: stats, pending: pending}
+}
+
+// runStatsCalls reports how often the stats endpoint was asked about a run
+// the fake knows; runStatsMisses how often about one it does not (404s).
+func (f *fakeZeus) runStatsCalls(runID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st, ok := f.runStats[runID]; ok {
+		return st.calls
+	}
+	return 0
+}
+
+func (f *fakeZeus) runStatsMisses(runID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.statsMisses[runID]
 }
 
 func (f *fakeZeus) runCount() int {

@@ -472,3 +472,69 @@ func (c *Client) GetRun(ctx context.Context, runID string) (*RunInfo, error) {
 	}
 	return &info, nil
 }
+
+// RunStats mirrors zeus-go's stats.RunStats — the finalized snapshot served
+// by GET /api/v1/runs/{id}/stats once a k6 run has completed. Duration and the
+// latency percentiles are time.Duration values on the zeus side and therefore
+// arrive as integer NANOSECONDS; they are kept as int64 ns here so the wire
+// value survives verbatim (callers convert — phase result rows are in µs).
+type RunStats struct {
+	RunID               string           `json:"run_id"`
+	WorkflowID          string           `json:"workflow_id"`
+	Status              string           `json:"status"`
+	Duration            int64            `json:"duration"` // ns
+	Iterations          int64            `json:"iterations"`
+	RequestsSent        int64            `json:"requests_sent"`
+	RequestsOK          int64            `json:"requests_ok"`
+	RequestsDropped     int64            `json:"requests_dropped"`
+	LatencyP50          int64            `json:"latency_p50"` // ns
+	LatencyP95          int64            `json:"latency_p95"` // ns
+	LatencyP99          int64            `json:"latency_p99"` // ns
+	VariantDistribution map[string]int64 `json:"variant_distribution"`
+	FinalizedAt         time.Time        `json:"finalized_at"`
+}
+
+// runStatsPendingStatus is the status zeus stamps on the 200 placeholder
+// envelope {"run_id": ..., "status": "no stats available yet"} it serves
+// while a run has no finalized snapshot.
+const runStatsPendingStatus = "no stats available yet"
+
+// ErrRunStatsNotReady is returned by GetRunStats while zeus has not finalized
+// the run's stats snapshot (the run is still in flight, or k6 is still
+// flushing). zeus signals this with a 200 placeholder envelope, not a 404, so
+// it is worth a short retry.
+var ErrRunStatsNotReady = fmt.Errorf("zeus: run stats not ready")
+
+// ErrRunNotFound is returned when zeus does not know the run at all (404).
+// Run state is in-memory on the zeus side, so this is what a zeus restart
+// between run completion and harvest looks like: the stats are gone for good
+// and retrying cannot recover them.
+var ErrRunNotFound = fmt.Errorf("zeus: run not found")
+
+// GetRunStats fetches the finalized stats snapshot for a workflow run
+// (GET /api/v1/runs/{id}/stats). Returns ErrRunStatsNotReady while zeus
+// serves the placeholder envelope and ErrRunNotFound on 404 — both sentinels
+// (errors.Is), so a caller can tell "back off and ask again" from "give up".
+func (c *Client) GetRunStats(ctx context.Context, runID string) (*RunStats, error) {
+	resp, err := c.Do(ctx, http.MethodGet, "/runs/"+runID+"/stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("%w: %q", ErrRunNotFound, runID)
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("zeus: get run stats %q: status %d: %s", runID, resp.StatusCode, raw)
+	}
+	var rs RunStats
+	if err := json.NewDecoder(resp.Body).Decode(&rs); err != nil {
+		return nil, fmt.Errorf("zeus: decode run stats: %w", err)
+	}
+	if rs.Status == runStatsPendingStatus {
+		return nil, ErrRunStatsNotReady
+	}
+	return &rs, nil
+}
