@@ -61,7 +61,8 @@ type Orchestrator struct {
 	drainPollInterval     time.Duration
 	allowDegradedBaseline bool
 
-	// zeusDatasetID is the dataset every workflow run binds to
+	// zeusDatasetID is the dataset a workflow run binds to when its
+	// phase_workflows row carries no dataset_id of its own
 	// (MANTEION_ZEUS_DATASET_ID). Empty means "no dataset", which zeus
 	// accepts by staging an EMPTY pool map — so a workflow whose DSL
 	// templates {{data.*}} would drive traffic with unresolved pool
@@ -121,8 +122,9 @@ func (o *Orchestrator) WithDrainPollInterval(d time.Duration) { o.drainPollInter
 // recording (MANTEION_ALLOW_DEGRADED_BASELINE).
 func (o *Orchestrator) WithAllowDegradedBaseline(v bool) { o.allowDegradedBaseline = v }
 
-// WithZeusDatasetID binds every workflow run to a zeus dataset
-// (MANTEION_ZEUS_DATASET_ID). Required for workflows that declare a
+// WithZeusDatasetID sets the fallback zeus dataset for workflow runs whose
+// phase_workflows row has no dataset_id (MANTEION_ZEUS_DATASET_ID). One or
+// the other is required for workflows that declare a
 // data_schema: zeus skips dataset validation when the id is empty and stages
 // an empty pool map, which silently yields unresolved {{data.*}} traffic.
 func (o *Orchestrator) WithZeusDatasetID(v string) { o.zeusDatasetID = v }

@@ -110,6 +110,7 @@ var migrations = []migration{
 	{7, "phase_verdict: per-phase fidelity verdict (VALID|WARN|INVALID, design doc Q6)", migration7},
 	{8, "phase_workflows: zeus_run_id (k6 workflow-run handle, additive to zeus_attack_id)", migration8},
 	{9, "cachebox_key_strategy: add exact_with_host_norm (id-blind path keying, exp8)", migration9},
+	{10, "phase_workflows: dataset_id (zeus dataset per workflow; NULL = MANTEION_ZEUS_DATASET_ID fallback)", migration10},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -630,4 +631,16 @@ CREATE INDEX idx_phase_workflows_zeus_run ON phase_workflows(zeus_run_id)
 // deploy the fleet before running an experiment that selects it.
 const migration9 = `
 ALTER TYPE cachebox_key_strategy ADD VALUE IF NOT EXISTS 'exact_with_host_norm';
+`
+
+// migration10 adds dataset_id to phase_workflows: the zeus dataset the row's
+// k6 workflow run reads (product decision 3: dataset per workflow; a phase's
+// datasets are the union over its rows). NULL keeps the prior behaviour --
+// the run falls back to the process-wide MANTEION_ZEUS_DATASET_ID -- so
+// expctl plans that predate the column keep working unchanged. Both create
+// and both start handlers preflight the referenced ids against zeus's
+// GET /datasets (existence + TTL past the plan length) before any row is
+// written or any phase claimed. IF NOT EXISTS keeps the step re-runnable.
+const migration10 = `
+ALTER TABLE phase_workflows ADD COLUMN IF NOT EXISTS dataset_id TEXT NULL;
 `

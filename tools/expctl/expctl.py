@@ -309,6 +309,11 @@ def cmd_apply(c: Client, args):
             ph["rule_ids"].append(ref)
         for row in p.get("workflows", []):
             wf_ref = row.get("workflow") or row.get("workflow_id")
+            # The API also accepts an optional per-row "dataset_id" (the zeus
+            # dataset that workflow's k6 run reads; omitted = the server's
+            # MANTEION_ZEUS_DATASET_ID fallback) and preflights it at create
+            # and start (422 dataset_missing / dataset_expiring). Not mapped
+            # from the YAML yet -- plans keep using the env fallback.
             ph["workflows"].append({
                 "workflow_id": wf_ids.get(wf_ref, wf_ref),
                 "vus": row.get("vus", 0),

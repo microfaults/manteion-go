@@ -74,6 +74,54 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
+// --- Datasets ---
+
+// Dataset is one entry of GET /api/v1/datasets: the summary zeus serves per
+// dataset (id, name, source, size_bytes, ttl_s, created_at). zeus holds
+// datasets in memory and deletes one once CreatedAt + TTLS has passed;
+// TTLS <= 0 means it never expires (zeus's store maps a non-positive TTL to
+// no expiration).
+type Dataset struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Source    string    `json:"source"`
+	SizeBytes int64     `json:"size_bytes"`
+	TTLS      int       `json:"ttl_s"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ExpiresAt returns when zeus will delete the dataset, or the zero time when
+// it never expires (TTLS <= 0).
+func (d Dataset) ExpiresAt() time.Time {
+	if d.TTLS <= 0 {
+		return time.Time{}
+	}
+	return d.CreatedAt.Add(time.Duration(d.TTLS) * time.Second)
+}
+
+// ListDatasets fetches every dataset zeus currently holds (GET
+// /api/v1/datasets). A non-200 answer or a transport failure is an error:
+// callers gating on dataset presence must fail closed rather than read an
+// unreachable zeus as "no datasets".
+func (c *Client) ListDatasets(ctx context.Context) ([]Dataset, error) {
+	resp, err := c.Do(ctx, http.MethodGet, "/datasets", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("zeus: list datasets: status %d: %s", resp.StatusCode, raw)
+	}
+	var env struct {
+		Datasets []Dataset `json:"datasets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return nil, fmt.Errorf("zeus: decode datasets: %w", err)
+	}
+	return env.Datasets, nil
+}
+
 // workflowEnvelope is the request body for zeus's workflow register and
 // stateless validate endpoints: {"workflow": <DSL v2 doc>, "overwrite"?: bool}.
 type workflowEnvelope struct {
