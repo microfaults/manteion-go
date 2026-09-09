@@ -151,16 +151,47 @@ func (o *Orchestrator) experimentLock(experimentID string) *sync.Mutex {
 	return lk
 }
 
+// experimentStatus re-reads an experiment's status after a lost CAS race, ""
+// when the row cannot be read.
+func (o *Orchestrator) experimentStatus(ctx context.Context, experimentID string) string {
+	exp, err := o.experiments.Get(ctx, experimentID)
+	if err != nil {
+		return ""
+	}
+	return exp.Status
+}
+
+func notPlanned(experimentID, current string) error {
+	return invalidState("experiment", experimentID, current, "planned",
+		fmt.Sprintf("orchestrator: experiment %q is not planned", experimentID))
+}
+
+func notRunning(experimentID, current string) error {
+	return invalidState("experiment", experimentID, current, "running",
+		fmt.Sprintf("orchestrator: experiment %q is not running (status=%s)", experimentID, current))
+}
+
 // StartExperiment transitions an experiment from "planned" to "running" and
-// starts its first pending phase via the scheduler. Returns an error if the
-// experiment has no phases or is not planned.
+// starts its first pending phase via the scheduler. An unknown id is
+// store.ErrNotFound, a non-planned experiment *ErrInvalidState, a plan
+// without phases ErrValidation, and an admission refusal *ErrServiceOverlap.
 func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string) error {
+	// Load first so an unknown id is ErrNotFound (not "no phases") and a
+	// non-planned experiment is refused before admission control runs; the
+	// CAS below remains the authoritative claim.
+	exp, err := o.experiments.Get(ctx, experimentID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: load experiment: %w", err)
+	}
+	if exp.Status != "planned" {
+		return notPlanned(experimentID, exp.Status)
+	}
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
 	if err != nil {
 		return fmt.Errorf("orchestrator: list phases: %w", err)
 	}
 	if len(phases) == 0 {
-		return errors.New("orchestrator: experiment has no phases")
+		return validationError(errors.New("orchestrator: experiment has no phases"))
 	}
 
 	// Admission control (MANT-5): refuse a service footprint that overlaps a
@@ -182,7 +213,8 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 		return fmt.Errorf("orchestrator: claim experiment: %w", err)
 	}
 	if !claimed {
-		return fmt.Errorf("orchestrator: experiment %q is not planned", experimentID)
+		// A concurrent start won the claim; report whatever status it left.
+		return notPlanned(experimentID, o.experimentStatus(ctx, experimentID))
 	}
 
 	o.advanceExperiment(ctx, experimentID)
@@ -205,7 +237,7 @@ func (o *Orchestrator) PauseExperiment(ctx context.Context, experimentID string)
 		return err
 	}
 	if exp.Status != "running" {
-		return fmt.Errorf("orchestrator: experiment %q is not running (status=%s)", experimentID, exp.Status)
+		return notRunning(experimentID, exp.Status)
 	}
 
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
@@ -225,7 +257,8 @@ func (o *Orchestrator) PauseExperiment(ctx context.Context, experimentID string)
 		paused++
 	}
 	if paused == 0 {
-		return fmt.Errorf("orchestrator: experiment %q has no running phase to pause", experimentID)
+		return invalidState("experiment", experimentID, exp.Status, "running phase",
+			fmt.Sprintf("orchestrator: experiment %q has no running phase to pause", experimentID))
 	}
 	o.logger.Info("orchestrator: experiment paused", "experiment_id", experimentID)
 	return nil
@@ -245,7 +278,7 @@ func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string
 	}
 	if exp.Status != "running" {
 		lk.Unlock()
-		return fmt.Errorf("orchestrator: experiment %q is not running (status=%s)", experimentID, exp.Status)
+		return notRunning(experimentID, exp.Status)
 	}
 
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
@@ -267,7 +300,8 @@ func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string
 	}
 	if resumed == 0 {
 		lk.Unlock()
-		return fmt.Errorf("orchestrator: experiment %q has no paused phase to resume", experimentID)
+		return invalidState("experiment", experimentID, exp.Status, "paused phase",
+			fmt.Sprintf("orchestrator: experiment %q has no paused phase to resume", experimentID))
 	}
 	o.logger.Info("orchestrator: experiment resumed", "experiment_id", experimentID)
 	lk.Unlock()
@@ -293,7 +327,7 @@ func (o *Orchestrator) StopExperiment(ctx context.Context, experimentID, finalSt
 		finalStatus = "cancelled"
 	case "completed", "failed", "cancelled":
 	default:
-		return fmt.Errorf("orchestrator: invalid final status %q", finalStatus)
+		return validationError(fmt.Errorf("orchestrator: invalid final status %q", finalStatus))
 	}
 	return o.terminateExperiment(ctx, experimentID, finalStatus)
 }
@@ -311,7 +345,13 @@ func (o *Orchestrator) terminateExperiment(ctx context.Context, experimentID, fi
 		return err
 	}
 	if !terminated {
-		return fmt.Errorf("orchestrator: experiment %q is already terminal", experimentID)
+		// Nothing matched the from-set: the row is missing or already terminal.
+		exp, err := o.experiments.Get(ctx, experimentID)
+		if err != nil {
+			return fmt.Errorf("orchestrator: load experiment: %w", err)
+		}
+		return invalidState("experiment", experimentID, exp.Status, "planned|running",
+			fmt.Sprintf("orchestrator: experiment %q is already terminal", experimentID))
 	}
 
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)

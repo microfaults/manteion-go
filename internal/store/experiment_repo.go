@@ -51,7 +51,7 @@ type ExperimentFilter struct {
 // via the dedicated Attach* / CreatePhase methods.
 func (r *ExperimentRepo) Create(ctx context.Context, exp *model.Experiment) error {
 	if err := exp.Validate(); err != nil {
-		return err
+		return validationError(err)
 	}
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO experiments (id, name, description, hypothesis, status,
@@ -61,6 +61,9 @@ func (r *ExperimentRepo) Create(ctx context.Context, exp *model.Experiment) erro
 		exp.Status, nullString(exp.CreatedBy), exp.CreatedAt, exp.StartedAt, exp.CompletedAt,
 	)
 	if err != nil {
+		if code, _ := pgViolation(err); code == pgUniqueViolation {
+			return fmt.Errorf("experiment id %q already exists: %w", exp.ID, ErrConflict)
+		}
 		return fmt.Errorf("insert experiment: %w", err)
 	}
 	return nil
@@ -245,7 +248,7 @@ func (r *ExperimentRepo) UpdateMetadata(ctx context.Context, id string, name, de
 	}
 	if name != nil {
 		if *name == "" {
-			return errors.New("experiment: name required")
+			return validationError(errors.New("experiment: name required"))
 		}
 		set("name", *name)
 	}
@@ -298,7 +301,7 @@ func scanExperimentRow(scanner interface {
 // the position (or letting NextPhasePosition do it).
 func (r *ExperimentRepo) CreatePhase(ctx context.Context, p *model.ExperimentPhase) error {
 	if err := p.Validate(); err != nil {
-		return err
+		return validationError(err)
 	}
 	frozenJSON, err := json.Marshal(p.FrozenServices)
 	if err != nil {
@@ -312,7 +315,10 @@ func (r *ExperimentRepo) CreatePhase(ctx context.Context, p *model.ExperimentPha
 		frozenJSON, p.PersistCache, p.StartedAt, p.CompletedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("insert experiment_phase: %w", err)
+		if code, constraint := pgViolation(err); code == pgForeignKeyViolation && constraint == "experiment_phases_experiment_id_fkey" {
+			return fmt.Errorf("experiment %q: %w", p.ExperimentID, ErrNotFound)
+		}
+		return phaseConflict(fmt.Errorf("insert experiment_phase: %w", err), p)
 	}
 	return nil
 }
@@ -350,7 +356,7 @@ type PhaseEdit struct {
 // raised at commit.
 func (r *ExperimentRepo) UpdatePhase(ctx context.Context, p *model.ExperimentPhase, edit PhaseEdit) error {
 	if err := p.Validate(); err != nil {
-		return err
+		return validationError(err)
 	}
 	frozenJSON, err := json.Marshal(p.FrozenServices)
 	if err != nil {
@@ -764,7 +770,7 @@ func attachPhaseWorkflows(ctx context.Context, tx *sql.Tx, phaseID string, pws [
 	for i, pw := range pws {
 		pw.PhaseID = phaseID
 		if err := (&pw).Validate(); err != nil {
-			return fmt.Errorf("phase_workflows[%d]: %w", i, err)
+			return validationError(fmt.Errorf("phase_workflows[%d]: %w", i, err))
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO phase_workflows (phase_id, workflow_id, vus, rate_rps,
@@ -774,6 +780,13 @@ func attachPhaseWorkflows(ctx context.Context, tx *sql.Tx, phaseID string, pws [
 			pw.DurationSec, nullString(pw.TargetURL), nullString(pw.TargetMethod),
 			nullString(pw.ZeusAttackID), nullString(pw.ZeusRunID),
 		); err != nil {
+			switch code, constraint := pgViolation(err); {
+			case code == pgForeignKeyViolation && constraint == "phase_workflows_workflow_id_fkey":
+				return validationError(fmt.Errorf("phase_workflows[%d]: unknown workflow_id %q", i, pw.WorkflowID))
+			case code == pgUniqueViolation:
+				// The phase's rows were just cleared, so the collision is within this list.
+				return validationError(fmt.Errorf("phase_workflows[%d]: duplicate workflow_id %q", i, pw.WorkflowID))
+			}
 			return fmt.Errorf("insert phase_workflow: %w", err)
 		}
 	}
@@ -863,11 +876,17 @@ func attachPhaseRules(ctx context.Context, tx *sql.Tx, phaseID string, ruleIDs [
 	}
 	for i, rid := range ruleIDs {
 		if rid == "" {
-			return fmt.Errorf("attach phase rules: empty rule_id at position %d", i)
+			return validationError(fmt.Errorf("attach phase rules: empty rule_id at position %d", i))
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO phase_rules (phase_id, rule_id, position)
 			VALUES ($1, $2, $3)`, phaseID, rid, i); err != nil {
+			switch code, constraint := pgViolation(err); {
+			case code == pgForeignKeyViolation && constraint == "phase_rules_rule_id_fkey":
+				return validationError(fmt.Errorf("rule_ids[%d]: unknown rule_id %q", i, rid))
+			case code == pgUniqueViolation:
+				return validationError(fmt.Errorf("rule_ids[%d]: duplicate rule_id %q", i, rid))
+			}
 			return fmt.Errorf("insert phase_rule: %w", err)
 		}
 	}

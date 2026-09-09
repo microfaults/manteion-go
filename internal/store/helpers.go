@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrNotFound is returned when a Get/Delete finds no matching row.
@@ -18,6 +20,42 @@ var ErrNotFound = errors.New("store: not found")
 // ErrConflict is returned when a write collides with an existing row on a
 // unique constraint (Postgres 23505); handlers map it to 409.
 var ErrConflict = errors.New("store: conflict")
+
+// ErrValidation tags a write refused because the value itself is invalid —
+// a model.Validate failure, an unknown workflow/rule id (foreign key) — as
+// opposed to a state or uniqueness conflict; handlers map it to 422. The
+// tagged error keeps its text: errors.Is(err, ErrValidation) reports it.
+var ErrValidation = errors.New("store: validation")
+
+// validationError tags err with ErrValidation without altering its text.
+func validationError(err error) error { return &taggedError{err: err, tag: ErrValidation} }
+
+// taggedError is a message-preserving wrapper: Error and Unwrap are the
+// wrapped error's; Is additionally matches tag.
+type taggedError struct {
+	err error
+	tag error
+}
+
+func (e *taggedError) Error() string        { return e.err.Error() }
+func (e *taggedError) Unwrap() error        { return e.err }
+func (e *taggedError) Is(target error) bool { return target == e.tag }
+
+// Postgres SQLSTATEs the repos classify.
+const (
+	pgUniqueViolation     = "23505"
+	pgForeignKeyViolation = "23503"
+)
+
+// pgViolation returns the SQLSTATE and constraint name of the Postgres error
+// in err's chain, or empty strings when there is none.
+func pgViolation(err error) (code, constraint string) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", ""
+	}
+	return pgErr.Code, pgErr.ConstraintName
+}
 
 // affectedOrNotFound returns ErrNotFound when res affected zero rows,
 // or wraps any RowsAffected error. The canonical post-Exec check for

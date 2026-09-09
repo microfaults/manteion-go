@@ -53,8 +53,7 @@ func (o *Orchestrator) checkServiceOverlap(ctx context.Context, experimentID str
 		}
 		if len(shared) > 0 {
 			sort.Strings(shared)
-			return fmt.Errorf("experiment %q cannot start: services %v overlap running experiment %q; "+
-				"wait for it to finish or stop it", experimentID, shared, rid)
+			return &ErrServiceOverlap{ExperimentID: experimentID, RunningExperimentID: rid, Services: shared}
 		}
 	}
 	return nil

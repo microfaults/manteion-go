@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -33,6 +34,15 @@ import (
 //       ...
 //     ]
 //   }
+//
+// Errors carry the coded envelope (error_response.go): {"error", "code",
+// ...}. Malformed JSON is 400 bad_json; a well-formed plan the server
+// rejects (empty name, vus/duration <= 0, cache-box strategy disagreement,
+// unknown workflow/rule ids, mutation_policy) is 422 validation; unknown
+// ids are 404 not_found; unique collisions are 409 conflict; lifecycle
+// refusals are 409 invalid_state with "status"; an admission refusal is 409
+// service_overlap with "running_experiment_id" + "services"; zeus down
+// during a start is 502 zeus_unreachable; anything else is 500 internal.
 // =========================================================================
 
 // Wire-shape naming convention:
@@ -111,26 +121,25 @@ type phaseDetail struct {
 	RuleIDs   []string              `json:"rule_ids"`
 }
 
+// writeBadJSON is the 400 bad_json refusal for an undecodable body.
+func writeBadJSON(w http.ResponseWriter, err error) {
+	writeErrorCode(w, http.StatusBadRequest, codeBadJSON, "invalid JSON: "+err.Error(), nil)
+}
+
+// writeValidation is the 422 validation refusal for a well-formed request
+// the plan rejects.
+func writeValidation(w http.ResponseWriter, msg string) {
+	writeErrorCode(w, http.StatusUnprocessableEntity, codeValidation, msg, nil)
+}
+
 func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) {
 	var req createExperimentRequest
 	if err := readJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeBadJSON(w, err)
 		return
 	}
 	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name required")
-		return
-	}
-
-	// INV-2 (MANT-4d): every phase touching a service must agree on its
-	// cache-box key strategy + headers, so record and replay of that service
-	// derive identical keys. Reject upfront, before any row is written.
-	phasesForCheck := make([]model.ExperimentPhase, len(req.Phases))
-	for i, ph := range req.Phases {
-		phasesForCheck[i] = model.ExperimentPhase{FrozenServices: ph.FrozenServices}
-	}
-	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeValidation(w, "name required")
 		return
 	}
 
@@ -147,12 +156,13 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		exp.ID = generateID("exp")
 	}
 
-	ctx := r.Context()
-	if err := s.experiments.Create(ctx, exp); err != nil {
-		s.logger.Error("create experiment failed", "error", err)
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	// Build and validate the whole plan before writing any of it, so a 422
+	// for a bad phase or workflow config leaves nothing behind. INV-2
+	// (MANT-4d): every phase touching a service must agree on its cache-box
+	// key strategy + headers, so record and replay of that service derive
+	// identical keys.
+	phases := make([]*model.ExperimentPhase, len(req.Phases))
+	phasesForCheck := make([]model.ExperimentPhase, len(req.Phases))
 	for i, ph := range req.Phases {
 		pos := 0 // phases[] positions are caller-supplied; unchanged zero default
 		if ph.Position != nil {
@@ -168,25 +178,52 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 			PersistCache:   ph.PersistCache,
 		}
 		if phase.Name == "" {
-			writeError(w, http.StatusBadRequest, "phase name required")
+			writeValidation(w, "phase name required")
 			return
 		}
+		if err := phase.Validate(); err != nil {
+			writeValidation(w, fmt.Sprintf("phases[%d]: %v", i, err))
+			return
+		}
+		for j, pw := range ph.Workflows {
+			pw.PhaseID = phase.ID
+			if err := (&pw).Validate(); err != nil {
+				writeValidation(w, fmt.Sprintf("phases[%d].workflows[%d]: %v", i, j, err))
+				return
+			}
+		}
+		phases[i] = phase
+		phasesForCheck[i] = model.ExperimentPhase{FrozenServices: ph.FrozenServices}
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+
+	ctx := r.Context()
+	if err := s.experiments.Create(ctx, exp); err != nil {
+		s.logger.Error("create experiment failed", "error", err)
+		writeMappedError(w, err)
+		return
+	}
+	for i, ph := range req.Phases {
+		phase := phases[i]
 		if err := s.experiments.CreatePhase(ctx, phase); err != nil {
 			s.logger.Error("create phase failed", "error", err, "phase_index", i)
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeMappedError(w, err)
 			return
 		}
 		if len(ph.Workflows) > 0 {
 			if err := s.experiments.AttachPhaseWorkflows(ctx, phase.ID, ph.Workflows); err != nil {
 				s.logger.Error("attach phase workflows failed", "error", err, "phase_id", phase.ID)
-				writeError(w, http.StatusBadRequest, err.Error())
+				writeMappedError(w, err)
 				return
 			}
 		}
 		if len(ph.RuleIDs) > 0 {
 			if err := s.experiments.AttachPhaseRules(ctx, phase.ID, ph.RuleIDs); err != nil {
 				s.logger.Error("attach phase rules failed", "error", err, "phase_id", phase.ID)
-				writeError(w, http.StatusBadRequest, err.Error())
+				writeMappedError(w, err)
 				return
 			}
 		}
@@ -195,7 +232,7 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 	resp, err := s.composeExperimentDetail(ctx, exp.ID)
 	if err != nil {
 		s.logger.Error("compose detail failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "experiment created but detail unavailable")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "experiment created but detail unavailable", nil)
 		return
 	}
 	writeJSON(w, http.StatusCreated, resp)
@@ -210,7 +247,7 @@ func (s *Server) handleListExperiments(w http.ResponseWriter, r *http.Request) {
 		filter, store.Page{Limit: limit, Offset: offset})
 	if err != nil {
 		s.logger.Error("list experiments failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to list experiments")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to list experiments", nil)
 		return
 	}
 	writePage(w, http.StatusOK, exps, total, limit, offset)
@@ -219,13 +256,11 @@ func (s *Server) handleListExperiments(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	resp, err := s.composeExperimentDetail(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "experiment not found")
-		return
-	}
 	if err != nil {
-		s.logger.Error("get experiment failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to get experiment")
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("get experiment failed", "error", err)
+		}
+		writeErrorFor(w, err, "experiment", "failed to get experiment")
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -238,42 +273,37 @@ func (s *Server) handleUpdateExperiment(w http.ResponseWriter, r *http.Request) 
 	id := r.PathValue("id")
 	var req updateExperimentRequest
 	if err := readJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeBadJSON(w, err)
 		return
 	}
 	if req.Name != nil && *req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name may not be empty")
+		writeValidation(w, "name may not be empty")
 		return
 	}
 
 	ctx := r.Context()
 	exp, err := s.experiments.Get(ctx, id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "experiment not found")
-		return
-	}
 	if err != nil {
-		s.logger.Error("get experiment failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to get experiment")
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("get experiment failed", "error", err)
+		}
+		writeErrorFor(w, err, "experiment", "failed to get experiment")
 		return
 	}
 	if exp.Status != "planned" {
-		writeError(w, http.StatusConflict, "experiment must be planned to edit")
+		writeErrorCode(w, http.StatusConflict, codeInvalidState, "experiment must be planned to edit",
+			map[string]any{"status": exp.Status})
 		return
 	}
 	if err := s.experiments.UpdateMetadata(ctx, id, req.Name, req.Description, req.Hypothesis); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "experiment not found")
-			return
-		}
 		s.logger.Error("update experiment failed", "error", err, "experiment_id", id)
-		writeError(w, http.StatusInternalServerError, "failed to update experiment")
+		writeErrorFor(w, err, "experiment", "failed to update experiment")
 		return
 	}
 	resp, err := s.composeExperimentDetail(ctx, id)
 	if err != nil {
 		s.logger.Error("compose detail failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "experiment updated but detail unavailable")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "experiment updated but detail unavailable", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -282,12 +312,10 @@ func (s *Server) handleUpdateExperiment(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleDeleteExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.experiments.Delete(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "experiment not found")
-			return
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("delete experiment failed", "error", err)
 		}
-		s.logger.Error("delete experiment failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to delete experiment")
+		writeErrorFor(w, err, "experiment", "failed to delete experiment")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -297,12 +325,12 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.orch.StartExperiment(r.Context(), id); err != nil {
 		s.logger.Error("start experiment failed", "error", err, "experiment_id", id)
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
 	resp, err := s.composeExperimentDetail(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "experiment started but detail unavailable")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "experiment started but detail unavailable", nil)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, resp)
@@ -315,12 +343,8 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.orch.PauseExperiment(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "experiment not found")
-			return
-		}
 		s.logger.Error("pause experiment failed", "experiment_id", id, "error", err)
-		writeError(w, http.StatusConflict, err.Error())
+		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
@@ -329,12 +353,8 @@ func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.orch.ResumeExperiment(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "experiment not found")
-			return
-		}
 		s.logger.Error("resume experiment failed", "experiment_id", id, "error", err)
-		writeError(w, http.StatusConflict, err.Error())
+		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
@@ -343,12 +363,8 @@ func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleCancelExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.orch.CancelExperiment(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "experiment not found")
-			return
-		}
 		s.logger.Error("cancel experiment failed", "experiment_id", id, "error", err)
-		writeError(w, http.StatusConflict, err.Error())
+		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
@@ -359,7 +375,7 @@ func (s *Server) handleStopExperiment(w http.ResponseWriter, r *http.Request) {
 	finalStatus := r.URL.Query().Get("status")
 	if err := s.orch.StopExperiment(r.Context(), id, finalStatus); err != nil {
 		s.logger.Error("stop experiment failed", "error", err, "experiment_id", id)
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -373,11 +389,11 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 	expID := r.PathValue("id")
 	var req createPhaseRequest
 	if err := readJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeBadJSON(w, err)
 		return
 	}
 	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name required")
+		writeValidation(w, "name required")
 		return
 	}
 
@@ -390,7 +406,7 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 		next, err := s.experiments.NextPhasePosition(ctx, expID)
 		if err != nil {
 			s.logger.Error("next phase position failed", "error", err, "experiment_id", expID)
-			writeError(w, http.StatusInternalServerError, "failed to allocate phase position")
+			writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to allocate phase position", nil)
 			return
 		}
 		pos = next
@@ -405,19 +421,20 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 		FrozenServices: req.FrozenServices,
 		PersistCache:   req.PersistCache,
 	}
+	// A missing parent surfaces from the insert as ErrNotFound.
 	if err := s.experiments.CreatePhase(ctx, phase); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
 	if len(req.Workflows) > 0 {
 		if err := s.experiments.AttachPhaseWorkflows(ctx, phase.ID, req.Workflows); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeMappedError(w, err)
 			return
 		}
 	}
 	if len(req.RuleIDs) > 0 {
 		if err := s.experiments.AttachPhaseRules(ctx, phase.ID, req.RuleIDs); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeMappedError(w, err)
 			return
 		}
 	}
@@ -427,12 +444,8 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetPhase(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	phase, err := s.experiments.GetPhase(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "phase not found")
-		return
-	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to get phase")
+		writeErrorFor(w, err, "phase", "failed to get phase")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.composePhaseDetail(r.Context(), phase))
@@ -445,11 +458,11 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 	expID, phaseID := r.PathValue("id"), r.PathValue("phaseId")
 	var req updatePhaseRequest
 	if err := readJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeBadJSON(w, err)
 		return
 	}
 	if req.Name != nil && *req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name may not be empty")
+		writeValidation(w, "name may not be empty")
 		return
 	}
 
@@ -476,7 +489,7 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 	siblings, err := s.experiments.ListPhasesForExperiment(ctx, expID)
 	if err != nil {
 		s.logger.Error("list phases failed", "error", err, "experiment_id", expID)
-		writeError(w, http.StatusInternalServerError, "failed to list phases")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to list phases", nil)
 		return
 	}
 	phasesForCheck := make([]model.ExperimentPhase, 0, len(siblings))
@@ -487,20 +500,13 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 		phasesForCheck = append(phasesForCheck, model.ExperimentPhase{FrozenServices: p.FrozenServices})
 	}
 	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeValidation(w, err.Error())
 		return
 	}
 
 	edit := store.PhaseEdit{Workflows: req.Workflows, RuleIDs: req.RuleIDs}
 	if err := s.experiments.UpdatePhase(ctx, phase, edit); err != nil {
-		switch {
-		case errors.Is(err, store.ErrConflict):
-			writeError(w, http.StatusConflict, err.Error())
-		case errors.Is(err, store.ErrNotFound):
-			writeError(w, http.StatusNotFound, "phase not found")
-		default:
-			writeError(w, http.StatusBadRequest, err.Error())
-		}
+		writeErrorFor(w, err, "phase", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s.composePhaseDetail(ctx, phase))
@@ -508,35 +514,36 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 
 // editablePhase loads phaseID under expID and writes the refusal when it is
 // not editable: 404 unless the phase exists and belongs to the experiment,
-// 409 unless the experiment is planned and the phase pending. ok is false
-// once a response has been written.
+// 409 invalid_state (carrying the offending status) unless the experiment is
+// planned and the phase pending. ok is false once a response has been
+// written.
 func (s *Server) editablePhase(ctx context.Context, w http.ResponseWriter, expID, phaseID string) (phase *model.ExperimentPhase, ok bool) {
 	phase, err := s.experiments.GetPhase(ctx, phaseID)
 	if errors.Is(err, store.ErrNotFound) || (err == nil && phase.ExperimentID != expID) {
-		writeError(w, http.StatusNotFound, "phase not found")
+		writeErrorCode(w, http.StatusNotFound, codeNotFound, "phase not found", nil)
 		return nil, false
 	}
 	if err != nil {
 		s.logger.Error("get phase failed", "error", err, "phase_id", phaseID)
-		writeError(w, http.StatusInternalServerError, "failed to get phase")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to get phase", nil)
 		return nil, false
 	}
 	exp, err := s.experiments.Get(ctx, expID)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "experiment not found")
-		return nil, false
-	}
 	if err != nil {
-		s.logger.Error("get experiment failed", "error", err, "experiment_id", expID)
-		writeError(w, http.StatusInternalServerError, "failed to get experiment")
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("get experiment failed", "error", err, "experiment_id", expID)
+		}
+		writeErrorFor(w, err, "experiment", "failed to get experiment")
 		return nil, false
 	}
 	if exp.Status != "planned" {
-		writeError(w, http.StatusConflict, "experiment must be planned to edit")
+		writeErrorCode(w, http.StatusConflict, codeInvalidState, "experiment must be planned to edit",
+			map[string]any{"status": exp.Status})
 		return nil, false
 	}
 	if phase.Status != "pending" {
-		writeError(w, http.StatusConflict, "phase must be pending to edit")
+		writeErrorCode(w, http.StatusConflict, codeInvalidState, "phase must be pending to edit",
+			map[string]any{"status": phase.Status})
 		return nil, false
 	}
 	return phase, true
@@ -545,11 +552,10 @@ func (s *Server) editablePhase(ctx context.Context, w http.ResponseWriter, expID
 func (s *Server) handleDeletePhase(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	if err := s.experiments.DeletePhase(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "phase not found")
-			return
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("delete phase failed", "error", err, "phase_id", id)
 		}
-		writeError(w, http.StatusInternalServerError, "failed to delete phase")
+		writeErrorFor(w, err, "phase", "failed to delete phase")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -558,7 +564,8 @@ func (s *Server) handleDeletePhase(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStartPhase(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	if err := s.orch.StartPhase(r.Context(), id); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		s.logger.Error("start phase failed", "error", err, "phase_id", id)
+		writeErrorFor(w, err, "phase", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -570,7 +577,8 @@ func (s *Server) handleStopPhase(w http.ResponseWriter, r *http.Request) {
 	// Detach from the request context (M2): a client disconnect mid-drain-barrier
 	// must not cancel teardown and wedge the phase at 'draining'.
 	if err := s.orch.StopPhase(context.WithoutCancel(r.Context()), id, finalStatus); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		s.logger.Error("stop phase failed", "error", err, "phase_id", id)
+		writeErrorFor(w, err, "phase", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -600,27 +608,27 @@ func (s *Server) handlePhaseResults(w http.ResponseWriter, r *http.Request) {
 
 	wfRes, err := s.experiments.ListWorkflowResultsForPhase(ctx, phaseID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load workflow results")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to load workflow results", nil)
 		return
 	}
 	svcLat, err := s.experiments.ListServiceLatencyForPhase(ctx, phaseID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load service latency")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to load service latency", nil)
 		return
 	}
 	svcCache, err := s.experiments.ListServiceCacheForPhase(ctx, phaseID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load service cache")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to load service cache", nil)
 		return
 	}
 	verdict, err := s.experiments.GetPhaseVerdict(ctx, phaseID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load phase verdict")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to load phase verdict", nil)
 		return
 	}
 	drain, err := s.experiments.GetPhaseDrain(ctx, phaseID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load phase drain")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to load phase drain", nil)
 		return
 	}
 
@@ -638,7 +646,7 @@ func (s *Server) handleExperimentResults(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	res, err := s.experiments.RecomputeExperimentResults(ctx, id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to compute results")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to compute results", nil)
 		return
 	}
 	if res == nil {

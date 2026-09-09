@@ -22,7 +22,10 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 ## Body and response types
 
 - Use Go model types directly: `{object} model.Rule`, `{array} model.Workflow`
-- Use `api.ErrorResponse` for all 4xx/5xx responses
+- Use `api.ErrorResponse` for all 4xx/5xx responses. The experiment and phase
+  handlers additionally emit a machine-readable `code` (and code-specific
+  fields) on top of `error` — see the error-envelope table in `CLAUDE.md`;
+  the swag schema documents the common `error` field only
 - For path/query params, use `@Param name in type required "description"`
 
 ## Streaming endpoints (SSE)

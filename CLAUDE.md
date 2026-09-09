@@ -92,6 +92,21 @@ manteion-go (Controller)
 | Phases (run-details) | `GET /api/v1/phases`, `GET ./{phaseId}`, `GET ./{phaseId}/faults`, `POST ./{phaseId}/pause\|resume\|stop`. A "run" = a phase; live panels (steps/events/resources) are the v2 follow-on. |
 | Zeus proxy | `POST/GET /api/v1/zeus/workflows`, `GET/DELETE ./{id}`, `POST ./{id}/validate`, `POST/GET ./{id}/runs`; `GET /api/v1/zeus/runs`, `GET/DELETE ./{run_id}`, `GET ./{run_id}/events`, `GET ./{run_id}/stats`; `POST/GET /api/v1/zeus/datasets`, `GET/DELETE ./{id}`, `POST ./{id}/upload`, `GET ./{id}/sample` → Archer. Attacks NOT proxied (orchestrator-managed). |
 
+**Error envelope.** Every handler returns `{"error": "<message>"}` on 4xx/5xx (`api.ErrorResponse`; expctl and the UI's generic path read `error`). The experiment and phase handlers (both route groups above) add a machine-readable `code` plus code-specific fields — `internal/api/error_response.go` (`writeErrorCode`, `errorEnvelope`). Rules / faults / SDK handlers still emit the bare envelope.
+
+| Status | `code` | When | Extra fields |
+|---|---|---|---|
+| 400 | `bad_json` | body is not valid JSON | — |
+| 404 | `not_found` | unknown experiment / phase id (`store.ErrNotFound`) | — |
+| 409 | `conflict` | unique collision: experiment id, phase name or position (`store.ErrConflict`) | — |
+| 409 | `invalid_state` | lifecycle refusal — not planned / not running / phase not pending or paused / already terminal / plan-only PUT (`orchestrator.ErrInvalidState`) | `status`: the current experiment or phase status |
+| 409 | `service_overlap` | admission control (INV-5): the footprint overlaps a running experiment (`orchestrator.ErrServiceOverlap`) | `running_experiment_id`, `services` (sorted) |
+| 422 | `validation` | well-formed but rejected: empty name, vus/duration ≤ 0, cache-box strategy disagreement, unknown workflow/rule id, mutation_policy, no phases, unknown `?status=` (`store.ErrValidation`, `orchestrator.ErrValidation`) | — |
+| 502 | `zeus_unreachable` | transport failure talking to zeus while starting/resuming a phase (`orchestrator.ErrZeusUnreachable`); the phase is finalized `failed` | — |
+| 500 | `internal` | anything unclassified | — |
+
+Typed errors wrap with `%w` and keep their historical log text; classify with `errors.As` / `errors.Is`, never by parsing `error`.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
