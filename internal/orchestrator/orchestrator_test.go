@@ -214,16 +214,20 @@ type fakeZeus struct {
 	attacks map[string]*fakeAttack
 	runs    map[string]string // run id -> status
 	srv     *httptest.Server
+	// runDatasets records the dataset_id each POST .../runs body carried
+	// ("" when absent) so tests can pin the per-row dataset pass-through.
+	runDatasets map[string]string
 }
 
 func newFakeZeus(t *testing.T) *fakeZeus {
 	t.Helper()
-	f := &fakeZeus{attacks: make(map[string]*fakeAttack), runs: make(map[string]string)}
+	f := &fakeZeus{attacks: make(map[string]*fakeAttack), runs: make(map[string]string), runDatasets: make(map[string]string)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/workflows/{id}/runs", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			RunID string `json:"run_id"`
+			RunID     string `json:"run_id"`
+			DatasetID string `json:"dataset_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.RunID == "" {
@@ -231,6 +235,7 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 		}
 		f.mu.Lock()
 		f.runs[req.RunID] = "running"
+		f.runDatasets[req.RunID] = req.DatasetID
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{"run_id": req.RunID, "status": "running"})
@@ -332,6 +337,15 @@ func (f *fakeZeus) runCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.runs)
+}
+
+// runDataset returns the dataset_id the run was started with ("" when the
+// request carried none) and whether the fake saw the run at all.
+func (f *fakeZeus) runDataset(runID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ds, ok := f.runDatasets[runID]
+	return ds, ok
 }
 
 // completeAllRuns marks every started workflow run completed so the poller

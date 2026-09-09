@@ -119,6 +119,9 @@ type phaseDetail struct {
 	*model.ExperimentPhase
 	Workflows []model.PhaseWorkflow `json:"workflows"`
 	RuleIDs   []string              `json:"rule_ids"`
+	// DatasetIDs is derived, read-only: the set-union of the workflows'
+	// dataset_id in first-seen order ([] when none); write it per workflow.
+	DatasetIDs []string `json:"dataset_ids"`
 }
 
 // writeBadJSON is the 400 bad_json refusal for an undecodable body.
@@ -140,6 +143,12 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.Name == "" {
 		writeValidation(w, "name required")
+		return
+	}
+	// Dataset preflight (dataset_preflight.go): every dataset the plan
+	// references must exist in zeus and outlive the plan — 422
+	// dataset_missing / dataset_expiring, 502 when zeus cannot be asked.
+	if !s.preflightRequestPlan(w, r, req.Phases) {
 		return
 	}
 
@@ -323,6 +332,11 @@ func (s *Server) handleDeleteExperiment(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Dataset preflight over the phases still to run: zeus keeps datasets in
+	// memory with a TTL, so what passed at create may be gone by now.
+	if !s.preflightExperimentDatasets(w, r, id) {
+		return
+	}
 	if err := s.orch.StartExperiment(r.Context(), id); err != nil {
 		s.logger.Error("start experiment failed", "error", err, "experiment_id", id)
 		writeErrorFor(w, err, "experiment", err.Error())
@@ -394,6 +408,11 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" {
 		writeValidation(w, "name required")
+		return
+	}
+	// Dataset preflight for the new phase alone; the whole plan is checked
+	// again at start, the gate before any load.
+	if !s.preflightRequestPlan(w, r, []createPhaseRequest{req}) {
 		return
 	}
 
@@ -563,6 +582,9 @@ func (s *Server) handleDeletePhase(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStartPhase(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
+	if !s.preflightPhaseDatasets(w, r, id) {
+		return
+	}
 	if err := s.orch.StartPhase(r.Context(), id); err != nil {
 		s.logger.Error("start phase failed", "error", err, "phase_id", id)
 		writeErrorFor(w, err, "phase", err.Error())
@@ -690,7 +712,7 @@ func (s *Server) composePhaseDetail(ctx context.Context, p *model.ExperimentPhas
 	for i, pr := range prs {
 		ruleIDs[i] = pr.RuleID
 	}
-	return &phaseDetail{ExperimentPhase: p, Workflows: pws, RuleIDs: ruleIDs}
+	return &phaseDetail{ExperimentPhase: p, Workflows: pws, RuleIDs: ruleIDs, DatasetIDs: datasetUnion(pws)}
 }
 
 // nilToEmpty replaces a nil slice with an empty slice so the JSON
