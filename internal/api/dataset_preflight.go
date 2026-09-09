@@ -33,7 +33,6 @@ import (
 const (
 	codeDatasetMissing  = "dataset_missing"
 	codeDatasetExpiring = "dataset_expiring"
-	codeZeusUnreachable = "zeus_unreachable"
 
 	// datasetPreflightSlack pads the plan length: phase enter/teardown, poll
 	// lag and the harvest all run after the last k6 iteration.
