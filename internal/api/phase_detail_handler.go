@@ -33,7 +33,7 @@ func (s *Server) handleListPhases(w http.ResponseWriter, r *http.Request) {
 	items, total, err := s.experiments.ListPhasesPaged(r.Context(), store.Page{Limit: limit, Offset: offset})
 	if err != nil {
 		s.logger.Error("list phases failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to list phases")
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to list phases", nil)
 		return
 	}
 	writePage(w, http.StatusOK, items, total, limit, offset)
@@ -43,13 +43,11 @@ func (s *Server) handleGetPhaseDetail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	ctx := r.Context()
 	phase, err := s.experiments.GetPhase(ctx, id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "phase not found")
-		return
-	}
 	if err != nil {
-		s.logger.Error("get phase detail failed", "phase_id", id, "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to get phase")
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("get phase detail failed", "phase_id", id, "error", err)
+		}
+		writeErrorFor(w, err, "phase", "failed to get phase")
 		return
 	}
 	exp, _ := s.experiments.Get(ctx, phase.ExperimentID)
@@ -86,12 +84,8 @@ func (s *Server) handleGetPhaseFaults(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	ctx := r.Context()
 	phase, err := s.experiments.GetPhase(ctx, id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "phase not found")
-		return
-	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to get phase")
+		writeErrorFor(w, err, "phase", "failed to get phase")
 		return
 	}
 	rules, _ := s.experiments.ListPhaseRules(ctx, id)
@@ -106,41 +100,41 @@ func (s *Server) handleGetPhaseFaults(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// The flat phase actions share the lifecycle envelope with the nested
+// /experiments/{id}/phases/{phaseId}/... routes: 404 not_found for an
+// unknown phase, 409 invalid_state (with "status") for a phase the
+// transition does not accept, 422 validation for an unknown final status,
+// 502 zeus_unreachable when a resume cannot reach zeus.
+
 func (s *Server) handlePausePhaseFlat(w http.ResponseWriter, r *http.Request) {
-	if err := s.orch.PausePhase(r.Context(), r.PathValue("phaseId")); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "phase not found")
-			return
-		}
-		writeError(w, http.StatusConflict, err.Error())
+	id := r.PathValue("phaseId")
+	if err := s.orch.PausePhase(r.Context(), id); err != nil {
+		s.logger.Error("pause phase failed", "error", err, "phase_id", id)
+		writeErrorFor(w, err, "phase", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
 }
 
 func (s *Server) handleResumePhaseFlat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("phaseId")
 	// StartPhase resumes a paused phase (and would start a pending one).
-	if err := s.orch.StartPhase(r.Context(), r.PathValue("phaseId")); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "phase not found")
-			return
-		}
-		writeError(w, http.StatusConflict, err.Error())
+	if err := s.orch.StartPhase(r.Context(), id); err != nil {
+		s.logger.Error("resume phase failed", "error", err, "phase_id", id)
+		writeErrorFor(w, err, "phase", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
 }
 
 func (s *Server) handleStopPhaseFlat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("phaseId")
 	status := r.URL.Query().Get("status") // "", completed, failed, skipped
 	// Detach from the request context (M2): a client disconnect mid-drain-barrier
 	// must not cancel teardown and wedge the phase at 'draining'.
-	if err := s.orch.StopPhase(context.WithoutCancel(r.Context()), r.PathValue("phaseId"), status); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "phase not found")
-			return
-		}
-		writeError(w, http.StatusConflict, err.Error())
+	if err := s.orch.StopPhase(context.WithoutCancel(r.Context()), id, status); err != nil {
+		s.logger.Error("stop phase failed", "error", err, "phase_id", id)
+		writeErrorFor(w, err, "phase", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)

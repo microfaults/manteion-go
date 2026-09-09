@@ -50,7 +50,7 @@ func newEditTestEnv(t *testing.T) *editTestEnv {
 	expRepo := store.NewExperimentRepo(database)
 	return &editTestEnv{
 		t: t, ctx: ctx, db: database, exp: expRepo,
-		s: &Server{experiments: expRepo, logger: discardLogger()},
+		s: &Server{experiments: expRepo, logger: discardLogger(), orch: newTestOrch(t, database, "")},
 	}
 }
 
@@ -226,17 +226,15 @@ func TestHandleUpdateExperiment(t *testing.T) {
 		exp := e.experiment("planned")
 		url, pv := target(exp.ID)
 		w := e.do(e.s.handleUpdateExperiment, http.MethodPut, url, `{"name":""}`, pv)
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
-		}
+		decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")
 	})
 
 	t.Run("running experiment is not editable", func(t *testing.T) {
 		exp := e.experiment("running")
 		url, pv := target(exp.ID)
 		w := e.do(e.s.handleUpdateExperiment, http.MethodPut, url, `{"name":"nope"}`, pv)
-		if w.Code != http.StatusConflict {
-			t.Fatalf("status=%d body=%s, want 409", w.Code, w.Body.String())
+		if body := decodeErrBody(t, w, http.StatusConflict, "invalid_state"); body["status"] != "running" {
+			t.Errorf("status=%v, want running", body["status"])
 		}
 		if !strings.Contains(w.Body.String(), "experiment must be planned to edit") {
 			t.Errorf("body=%s, want the planned-only message", w.Body.String())
@@ -253,9 +251,7 @@ func TestHandleUpdateExperiment(t *testing.T) {
 	t.Run("unknown experiment", func(t *testing.T) {
 		url, pv := target("exp-nope")
 		w := e.do(e.s.handleUpdateExperiment, http.MethodPut, url, `{"name":"x"}`, pv)
-		if w.Code != http.StatusNotFound {
-			t.Fatalf("status=%d body=%s, want 404", w.Code, w.Body.String())
-		}
+		decodeErrBody(t, w, http.StatusNotFound, "not_found")
 	})
 }
 
@@ -335,8 +331,8 @@ func TestHandleUpdatePhase(t *testing.T) {
 		}
 		url, pv := target(exp.ID, ph.ID)
 		w := e.do(e.s.handleUpdatePhase, http.MethodPut, url, `{"name":"nope"}`, pv)
-		if w.Code != http.StatusConflict {
-			t.Fatalf("status=%d body=%s, want 409", w.Code, w.Body.String())
+		if body := decodeErrBody(t, w, http.StatusConflict, "invalid_state"); body["status"] != "completed" {
+			t.Errorf("status=%v, want completed", body["status"])
 		}
 		if !strings.Contains(w.Body.String(), "phase must be pending to edit") {
 			t.Errorf("body=%s, want the pending-only message", w.Body.String())
@@ -355,8 +351,8 @@ func TestHandleUpdatePhase(t *testing.T) {
 		ph := e.phase(exp, "pending-in-running", 0)
 		url, pv := target(exp.ID, ph.ID)
 		w := e.do(e.s.handleUpdatePhase, http.MethodPut, url, `{"name":"nope"}`, pv)
-		if w.Code != http.StatusConflict {
-			t.Fatalf("status=%d body=%s, want 409", w.Code, w.Body.String())
+		if body := decodeErrBody(t, w, http.StatusConflict, "invalid_state"); body["status"] != "running" {
+			t.Errorf("status=%v, want running", body["status"])
 		}
 		if !strings.Contains(w.Body.String(), "experiment must be planned to edit") {
 			t.Errorf("body=%s, want the planned-only message", w.Body.String())
@@ -393,9 +389,7 @@ func TestHandleUpdatePhase(t *testing.T) {
 		url, pv := target(exp.ID, ph.ID)
 		body := `{"frozen_services":[{"service":"frontend","mode":"replay","key_strategy":"exact_with_host","mutation_policy":"deny"}]}`
 		w := e.do(e.s.handleUpdatePhase, http.MethodPut, url, body, pv)
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
-		}
+		decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")
 		if !strings.Contains(w.Body.String(), "disagreement") {
 			t.Errorf("body=%s, want the INV-2 disagreement message", w.Body.String())
 		}
@@ -414,15 +408,11 @@ func TestHandleUpdatePhase(t *testing.T) {
 		ph := e.phase(exp, "free", 1)
 		url, pv := target(exp.ID, ph.ID)
 		w := e.do(e.s.handleUpdatePhase, http.MethodPut, url, `{"name":"taken"}`, pv)
-		if w.Code != http.StatusConflict {
-			t.Errorf("duplicate name: status=%d body=%s, want 409", w.Code, w.Body.String())
-		}
+		decodeErrBody(t, w, http.StatusConflict, "conflict")
 		// (experiment_id, position) is DEFERRABLE INITIALLY DEFERRED, so the
 		// violation only surfaces at commit — it must still map to 409.
 		w = e.do(e.s.handleUpdatePhase, http.MethodPut, url, `{"position":0}`, pv)
-		if w.Code != http.StatusConflict {
-			t.Errorf("duplicate position: status=%d body=%s, want 409", w.Code, w.Body.String())
-		}
+		decodeErrBody(t, w, http.StatusConflict, "conflict")
 		stored, err := e.exp.GetPhase(e.ctx, ph.ID)
 		if err != nil {
 			t.Fatalf("get phase: %v", err)

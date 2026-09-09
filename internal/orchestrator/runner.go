@@ -36,7 +36,8 @@ func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 	case "paused":
 		fresh = false
 	default:
-		return fmt.Errorf("orchestrator: phase %q not startable from status %q", phaseID, p.Status)
+		return invalidState("phase", phaseID, p.Status, "pending|paused",
+			fmt.Sprintf("orchestrator: phase %q not startable from status %q", phaseID, p.Status))
 	}
 
 	claimed, err := o.experiments.TransitionPhase(ctx, phaseID, "running", p.Status)
@@ -44,11 +45,22 @@ func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 		return fmt.Errorf("orchestrator: claim phase: %w", err)
 	}
 	if !claimed {
-		// A concurrent start/pause/finish won the race.
-		return fmt.Errorf("orchestrator: phase %q is no longer %s", phaseID, p.Status)
+		// A concurrent start/pause/finish won the race; report what it left.
+		return invalidState("phase", phaseID, o.phaseStatus(ctx, phaseID), p.Status,
+			fmt.Sprintf("orchestrator: phase %q is no longer %s", phaseID, p.Status))
 	}
 
 	return o.enterPhase(ctx, p, fresh)
+}
+
+// phaseStatus re-reads a phase's status after a lost CAS race, "" when the
+// row cannot be read.
+func (o *Orchestrator) phaseStatus(ctx context.Context, phaseID string) string {
+	p, err := o.experiments.GetPhase(ctx, phaseID)
+	if err != nil {
+		return ""
+	}
+	return p.Status
 }
 
 // PausePhase suspends a running phase: the poller and zeus attacks stop, but
@@ -60,7 +72,13 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 		return fmt.Errorf("orchestrator: pause phase: %w", err)
 	}
 	if !paused {
-		return fmt.Errorf("orchestrator: phase %q is not running", phaseID)
+		// Nothing matched: the phase is missing or not running.
+		p, err := o.experiments.GetPhase(ctx, phaseID)
+		if err != nil {
+			return fmt.Errorf("orchestrator: load phase: %w", err)
+		}
+		return invalidState("phase", phaseID, p.Status, "running",
+			fmt.Sprintf("orchestrator: phase %q is not running", phaseID))
 	}
 
 	o.cancelPoller(phaseID)
@@ -76,7 +94,8 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 
 // StopPhase is the operator terminal entry point: finalize a phase as
 // completed/failed/skipped (default completed). Idempotent — a no-op if the
-// phase already reached a terminal state.
+// phase already reached a terminal state. An unknown phase is
+// store.ErrNotFound; an unknown final status is ErrValidation.
 func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus string) error {
 	from := []string{"running", "paused", "draining"}
 	switch finalStatus {
@@ -86,7 +105,10 @@ func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus strin
 	case "skipped":
 		from = append(from, "pending") // skipping a never-started phase is legal
 	default:
-		return fmt.Errorf("orchestrator: invalid phase final status %q", finalStatus)
+		return validationError(fmt.Errorf("orchestrator: invalid phase final status %q", finalStatus))
+	}
+	if _, err := o.experiments.GetPhase(ctx, phaseID); err != nil {
+		return fmt.Errorf("orchestrator: load phase: %w", err)
 	}
 	o.finishPhase(ctx, phaseID, finalStatus, from...)
 	return nil
@@ -407,7 +429,7 @@ func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID st
 			return fmt.Errorf("stamp workflow id %q: %w", wf.ID, err)
 		}
 		if err := o.zeusClient.RegisterWorkflow(ctx, doc); err != nil {
-			return fmt.Errorf("register workflow %q in zeus: %w", wf.ID, err)
+			return zeusError(fmt.Sprintf("register workflow %q in zeus", wf.ID), err)
 		}
 	}
 	return nil
