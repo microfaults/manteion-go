@@ -40,8 +40,11 @@ type Server struct {
 	faultStore       FaultStore
 	faultConfigs     *store.FaultConfigRepo
 	sdk              *store.SDKRepo
+	sdkInstances     sdkInstanceReader // same as sdk; separate field so tests can inject a fake
+	serviceRules     serviceRuleStore  // same as rules; separate field so tests can inject a fake
 	experiments      *store.ExperimentRepo
-	phaseReader      phaseReader // same as experiments; separate field so ingest tests can inject a fake
+	phaseHistory     recentPhaseLister // same as experiments; separate field so tests can inject a fake
+	phaseReader      phaseReader       // same as experiments; separate field so ingest tests can inject a fake
 	phaseFaultEvents *store.PhaseFaultEventRepo
 	workflows        *store.WorkflowRepo
 	workloads        *store.WorkloadRepo
@@ -84,7 +87,10 @@ func NewServer(
 		faultStore:       faultStore,
 		faultConfigs:     faultConfigs,
 		sdk:              sdk,
+		sdkInstances:     sdk,
+		serviceRules:     rules,
 		experiments:      experiments,
+		phaseHistory:     experiments,
 		phaseReader:      experiments,
 		phaseFaultEvents: phaseFaultEvents,
 		workflows:        workflows,
@@ -239,6 +245,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/sdk/register", s.handleRegister)
 	mux.HandleFunc("DELETE /api/v1/sdk/register/{id}", s.handleDeregister)
 	mux.HandleFunc("GET /api/v1/sdk/instances", s.handleListInstances)
+	mux.HandleFunc("GET /api/v1/sdk/instances/{id}", s.handleGetInstance)
+	mux.HandleFunc("POST /api/v1/sdk/instances/{id}/kill-switch", s.handleInstanceKillSwitch)
 	mux.HandleFunc("GET /api/v1/sdk/rules", s.handlePollRules)
 	mux.HandleFunc("GET /api/v1/sdk/init", s.handleInit)
 	mux.HandleFunc("GET /api/v1/sdk/events", s.handleSSEEvents)

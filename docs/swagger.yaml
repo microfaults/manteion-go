@@ -6,6 +6,66 @@ components:
           example: validation failed
           type: string
       type: object
+    api.KillSwitchResult:
+      properties:
+        at:
+          type: string
+        disabled_rule_ids:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+      type: object
+    api.SDKInstanceDetail:
+      properties:
+        active_rule_ids:
+          description: "ActiveRuleIDs is every enabled rule targeting the instance's\
+            \ service,\npriority order \u2014 the set the kill-switch disables. It\
+            \ is broader than\nthe poll set: a rule attached to a pending phase is\
+            \ listed here but is\nonly served once its phase runs (see RuleRepo.ForService)."
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        address:
+          type: string
+        id:
+          type: string
+        last_poll_at:
+          type: string
+        poll_interval_ms:
+          description: SDK's configured poll cadence
+          type: integer
+        recent_run_ids:
+          description: 'RecentRunIDs is the ids of the most recent phases (up to 5,
+            newest-
+
+            started first) that froze this service or attached a rule targeting it.
+
+            A "run" is a phase (see /api/v1/phases).'
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        registered_at:
+          type: string
+        routes:
+          description: "Routes is the HTTP route inventory the service published at\n\
+            registration. Optional \u2014 services may register without routes\n(e.g.\
+            \ gRPC services). Aggregated across instances by the\nworkflow-builder\
+            \ catalog handler."
+          items:
+            $ref: '#/components/schemas/model.SDKRoute'
+          type: array
+          uniqueItems: false
+        service:
+          type: string
+        status:
+          description: "\"alive\",\"stale\",\"dead\" \u2014 computed from poll staleness"
+          type: string
+        version:
+          type: string
+      type: object
     model.CacheBoxRuleConfig:
       description: when type=cachebox
       properties:
@@ -750,6 +810,79 @@ paths:
                 $ref: '#/components/schemas/api.ErrorResponse'
           description: Internal Server Error
       summary: List SDK instances
+      tags:
+      - sdk
+  /sdk/instances/{id}:
+    get:
+      description: "Returns the instance's list row (status computed alive/stale/dead\n\
+        from last-poll-at) plus active_rule_ids \u2014 every enabled rule\ntargeting\
+        \ the instance's service, the set the kill-switch disables \u2014\nand recent_run_ids\
+        \ \u2014 the most recent phases (up to 5, newest first)\nthat froze the service\
+        \ or attached a rule targeting it."
+      parameters:
+      - description: Instance ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.SDKInstanceDetail'
+          description: OK
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: instance not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: Get SDK instance
+      tags:
+      - sdk
+  /sdk/instances/{id}/kill-switch:
+    post:
+      description: "Disables every currently-enabled rule whose service matches the\n\
+        instance's service, through the same full rule update as\nPUT /rules/{id}\
+        \ \u2014 the rule version bumps once per rule, so polling\nSDKs converge on\
+        \ their next poll (SSE subscribers are nudged too).\nIdempotent: a repeat\
+        \ call reports an empty disabled_rule_ids."
+      parameters:
+      - description: Instance ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.KillSwitchResult'
+          description: OK
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: instance not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: "lookup failed, or some rules could not be disabled \u2014\
+            \ retry; rules already disabled stay disabled"
+      summary: Kill-switch an SDK instance's rules
       tags:
       - sdk
   /sdk/register:
