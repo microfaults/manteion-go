@@ -50,14 +50,30 @@ import (
 // createPhaseRequest is the per-phase shape inside POST /experiments and
 // POST /experiments/{id}/phases.
 type createPhaseRequest struct {
-	Name           string                 `json:"name"`
-	Position       int                    `json:"position"`
+	Name string `json:"name"`
+	// Position is optional. POST /experiments/{id}/phases appends (max+1)
+	// when it is omitted and honours an explicit 0; inside POST /experiments
+	// the phases[] entries default to 0 when omitted, so callers there send
+	// explicit positions.
+	Position       *int                   `json:"position,omitempty"`
 	FrozenServices []model.CacheBoxConfig `json:"frozen_services"`
 	PersistCache   bool                   `json:"persist_cache"`
 	// Workflows carries full PhaseWorkflow attack config per (phase, workflow).
 	Workflows []model.PhaseWorkflow `json:"workflows"`
 	// RuleIDs is a bare-reference list resolved to phase_rules rows.
 	RuleIDs []string `json:"rule_ids"`
+}
+
+// updatePhaseRequest is the PUT /experiments/{id}/phases/{phaseId} body:
+// createPhaseRequest with every field optional. Omitted = unchanged. The
+// three lists distinguish omitted (nil, untouched) from empty (cleared).
+type updatePhaseRequest struct {
+	Name           *string                `json:"name,omitempty"`
+	Position       *int                   `json:"position,omitempty"`
+	PersistCache   *bool                  `json:"persist_cache,omitempty"`
+	FrozenServices []model.CacheBoxConfig `json:"frozen_services,omitempty"`
+	Workflows      []model.PhaseWorkflow  `json:"workflows,omitempty"`
+	RuleIDs        []string               `json:"rule_ids,omitempty"`
 }
 
 type createExperimentRequest struct {
@@ -69,6 +85,15 @@ type createExperimentRequest struct {
 	// Workflows are attached per-phase (phase_workflows); the experiment's
 	// workflow list is derivable as the union across phases.
 	Phases []createPhaseRequest `json:"phases"`
+}
+
+// updateExperimentRequest is the PUT /experiments/{id} body. An omitted
+// field keeps its value; description / hypothesis may be cleared with an
+// empty string, name may not.
+type updateExperimentRequest struct {
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Hypothesis  *string `json:"hypothesis,omitempty"`
 }
 
 // experimentDetailResponse is the GET /experiments/{id} payload — the full
@@ -129,11 +154,15 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	for i, ph := range req.Phases {
+		pos := 0 // phases[] positions are caller-supplied; unchanged zero default
+		if ph.Position != nil {
+			pos = *ph.Position
+		}
 		phase := &model.ExperimentPhase{
 			ID:             generateID("phase"),
 			ExperimentID:   exp.ID,
 			Name:           ph.Name,
-			Position:       ph.Position,
+			Position:       pos,
 			Status:         "pending",
 			FrozenServices: ph.FrozenServices,
 			PersistCache:   ph.PersistCache,
@@ -197,6 +226,54 @@ func (s *Server) handleGetExperiment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Error("get experiment failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to get experiment")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleUpdateExperiment edits name / description / hypothesis. Only a
+// planned experiment is editable: once it starts, the plan is the record of
+// what ran.
+func (s *Server) handleUpdateExperiment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req updateExperimentRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Name != nil && *req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name may not be empty")
+		return
+	}
+
+	ctx := r.Context()
+	exp, err := s.experiments.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "experiment not found")
+		return
+	}
+	if err != nil {
+		s.logger.Error("get experiment failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to get experiment")
+		return
+	}
+	if exp.Status != "planned" {
+		writeError(w, http.StatusConflict, "experiment must be planned to edit")
+		return
+	}
+	if err := s.experiments.UpdateMetadata(ctx, id, req.Name, req.Description, req.Hypothesis); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "experiment not found")
+			return
+		}
+		s.logger.Error("update experiment failed", "error", err, "experiment_id", id)
+		writeError(w, http.StatusInternalServerError, "failed to update experiment")
+		return
+	}
+	resp, err := s.composeExperimentDetail(ctx, id)
+	if err != nil {
+		s.logger.Error("compose detail failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "experiment updated but detail unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -305,13 +382,18 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	// Allow caller to omit position; we'll append.
-	pos := req.Position
-	if pos == 0 {
+	// An omitted position appends; an explicit one (including 0) is honoured.
+	var pos int
+	if req.Position != nil {
+		pos = *req.Position
+	} else {
 		next, err := s.experiments.NextPhasePosition(ctx, expID)
-		if err == nil {
-			pos = next
+		if err != nil {
+			s.logger.Error("next phase position failed", "error", err, "experiment_id", expID)
+			writeError(w, http.StatusInternalServerError, "failed to allocate phase position")
+			return
 		}
+		pos = next
 	}
 
 	phase := &model.ExperimentPhase{
@@ -354,6 +436,110 @@ func (s *Server) handleGetPhase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.composePhaseDetail(r.Context(), phase))
+}
+
+// handleUpdatePhase edits a pending phase of a planned experiment. Scalars
+// and frozen_services are patched; workflows / rule_ids, when present,
+// replace the attachments wholesale (the create-time delete-reinsert path).
+func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
+	expID, phaseID := r.PathValue("id"), r.PathValue("phaseId")
+	var req updatePhaseRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Name != nil && *req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name may not be empty")
+		return
+	}
+
+	ctx := r.Context()
+	phase, ok := s.editablePhase(ctx, w, expID, phaseID)
+	if !ok {
+		return
+	}
+	if req.Name != nil {
+		phase.Name = *req.Name
+	}
+	if req.Position != nil {
+		phase.Position = *req.Position
+	}
+	if req.PersistCache != nil {
+		phase.PersistCache = *req.PersistCache
+	}
+	if req.FrozenServices != nil {
+		phase.FrozenServices = req.FrozenServices
+	}
+
+	// INV-2 (MANT-4d) is experiment-wide: re-check every phase with the
+	// edited one substituted, before anything is written.
+	siblings, err := s.experiments.ListPhasesForExperiment(ctx, expID)
+	if err != nil {
+		s.logger.Error("list phases failed", "error", err, "experiment_id", expID)
+		writeError(w, http.StatusInternalServerError, "failed to list phases")
+		return
+	}
+	phasesForCheck := make([]model.ExperimentPhase, 0, len(siblings))
+	for _, p := range siblings {
+		if p.ID == phase.ID {
+			p = phase
+		}
+		phasesForCheck = append(phasesForCheck, model.ExperimentPhase{FrozenServices: p.FrozenServices})
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	edit := store.PhaseEdit{Workflows: req.Workflows, RuleIDs: req.RuleIDs}
+	if err := s.experiments.UpdatePhase(ctx, phase, edit); err != nil {
+		switch {
+		case errors.Is(err, store.ErrConflict):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "phase not found")
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, s.composePhaseDetail(ctx, phase))
+}
+
+// editablePhase loads phaseID under expID and writes the refusal when it is
+// not editable: 404 unless the phase exists and belongs to the experiment,
+// 409 unless the experiment is planned and the phase pending. ok is false
+// once a response has been written.
+func (s *Server) editablePhase(ctx context.Context, w http.ResponseWriter, expID, phaseID string) (phase *model.ExperimentPhase, ok bool) {
+	phase, err := s.experiments.GetPhase(ctx, phaseID)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && phase.ExperimentID != expID) {
+		writeError(w, http.StatusNotFound, "phase not found")
+		return nil, false
+	}
+	if err != nil {
+		s.logger.Error("get phase failed", "error", err, "phase_id", phaseID)
+		writeError(w, http.StatusInternalServerError, "failed to get phase")
+		return nil, false
+	}
+	exp, err := s.experiments.Get(ctx, expID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "experiment not found")
+		return nil, false
+	}
+	if err != nil {
+		s.logger.Error("get experiment failed", "error", err, "experiment_id", expID)
+		writeError(w, http.StatusInternalServerError, "failed to get experiment")
+		return nil, false
+	}
+	if exp.Status != "planned" {
+		writeError(w, http.StatusConflict, "experiment must be planned to edit")
+		return nil, false
+	}
+	if phase.Status != "pending" {
+		writeError(w, http.StatusConflict, "phase must be pending to edit")
+		return nil, false
+	}
+	return phase, true
 }
 
 func (s *Server) handleDeletePhase(w http.ResponseWriter, r *http.Request) {
