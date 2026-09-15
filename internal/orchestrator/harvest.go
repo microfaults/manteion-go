@@ -186,21 +186,26 @@ func (o *Orchestrator) harvestRun(ctx context.Context, p *model.ExperimentPhase,
 // the phase_workflow_results row shape (latencies in µs):
 //
 //	request_count   = requests_sent
-//	error_count     = requests_dropped
-//	error_rate      = requests_dropped / requests_sent  (0 when nothing was sent)
+//	error_count     = requests_sent − requests_ok       (HTTP failures; clamped at 0)
+//	error_rate      = error_count / requests_sent       (0 when nothing was sent)
 //	throughput_rps  = requests_sent / duration_seconds  (0 when duration is 0)
 //	latency_pXX_us  = latency_pXX / 1000                (integer truncation)
 //	latency_p999_us = latency_p99_us                    (zeus reports no p999; the
 //	                  column is NOT NULL — same convention as the vegeta path)
 //
-// raw_metrics is the RunStats document itself, nanoseconds untouched. Note
-// what zeus puts behind the names: requests_dropped is k6's dropped_iterations
-// (iterations the arrival-rate executor could not schedule), while HTTP-level
-// failures are requests_sent − requests_ok — both survive in raw_metrics.
+// raw_metrics is the RunStats document itself, nanoseconds untouched. requests_dropped
+// is k6's dropped_iterations: iterations the arrival-rate executor could not
+// schedule because the VU pool ran out. That is a load-delivery shortfall
+// counted in iterations, not failed requests, so it never feeds error_count;
+// it survives in raw_metrics for the UI's load-health line.
 func runStatsToResult(phaseID, workflowID string, rs *zeus.RunStats) *model.PhaseWorkflowResult {
+	errorCount := rs.RequestsSent - rs.RequestsOK
+	if errorCount < 0 {
+		errorCount = 0
+	}
 	errorRate := 0.0
 	if rs.RequestsSent > 0 {
-		errorRate = float64(rs.RequestsDropped) / float64(rs.RequestsSent)
+		errorRate = float64(errorCount) / float64(rs.RequestsSent)
 	}
 	throughput := 0.0
 	if rs.Duration > 0 {
@@ -212,7 +217,7 @@ func runStatsToResult(phaseID, workflowID string, rs *zeus.RunStats) *model.Phas
 		PhaseID:       phaseID,
 		WorkflowID:    workflowID,
 		RequestCount:  rs.RequestsSent,
-		ErrorCount:    rs.RequestsDropped,
+		ErrorCount:    errorCount,
 		ErrorRate:     errorRate,
 		ThroughputRPS: throughput,
 		LatencyP50Us:  time.Duration(rs.LatencyP50).Microseconds(),

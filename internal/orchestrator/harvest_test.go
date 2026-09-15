@@ -80,7 +80,7 @@ func k6RunStats(workflowID string) zeus.RunStats {
 	return zeus.RunStats{
 		WorkflowID: workflowID, Status: "completed",
 		Duration: 10_000_000_000, Iterations: 50,
-		RequestsSent: 250, RequestsOK: 240, RequestsDropped: 10,
+		RequestsSent: 250, RequestsOK: 235, RequestsDropped: 10,
 		LatencyP50: 1_500_000, LatencyP95: 4_000_000, LatencyP99: 12_345_678,
 		VariantDistribution: map[string]int64{"a": 30, "b": 20},
 		FinalizedAt:         time.Now().UTC().Truncate(time.Second),
@@ -133,13 +133,14 @@ func TestHarvest_RunOnlyRowPersistsRunStats(t *testing.T) {
 	if got.WorkflowID != wfID {
 		t.Errorf("workflow_id = %q, want %q", got.WorkflowID, wfID)
 	}
-	// request_count = requests_sent, error_count = requests_dropped.
-	if got.RequestCount != 250 || got.ErrorCount != 10 {
-		t.Errorf("request_count=%d error_count=%d, want 250/10", got.RequestCount, got.ErrorCount)
+	// request_count = requests_sent; error_count = HTTP failures = sent − ok.
+	// The 10 dropped iterations are a load shortfall, not request errors.
+	if got.RequestCount != 250 || got.ErrorCount != 15 {
+		t.Errorf("request_count=%d error_count=%d, want 250/15", got.RequestCount, got.ErrorCount)
 	}
-	// error_rate = dropped / sent; throughput_rps = sent / duration_seconds.
-	if math.Abs(got.ErrorRate-0.04) > 1e-12 {
-		t.Errorf("error_rate = %v, want 0.04 (10/250)", got.ErrorRate)
+	// error_rate = (sent − ok) / sent; throughput_rps = sent / duration_seconds.
+	if math.Abs(got.ErrorRate-0.06) > 1e-12 {
+		t.Errorf("error_rate = %v, want 0.06 (15/250)", got.ErrorRate)
 	}
 	if math.Abs(got.ThroughputRPS-25.0) > 1e-9 {
 		t.Errorf("throughput_rps = %v, want 25 (250 req / 10 s)", got.ThroughputRPS)
@@ -309,9 +310,13 @@ func TestRunStatsToResult_ZeroGuards(t *testing.T) {
 	if empty.RequestCount != 0 || empty.ErrorCount != 0 || empty.ErrorRate != 0 || empty.ThroughputRPS != 0 {
 		t.Errorf("empty run → %+v, want all-zero counters", empty)
 	}
-	noDuration := runStatsToResult("phase-1", "wf-1", &zeus.RunStats{RequestsSent: 10, RequestsDropped: 10, LatencyP99: 999})
+	noDuration := runStatsToResult("phase-1", "wf-1", &zeus.RunStats{RequestsSent: 10, LatencyP99: 999})
 	if noDuration.ErrorRate != 1 || noDuration.ThroughputRPS != 0 {
 		t.Errorf("zero-duration run → error_rate=%v throughput=%v, want 1/0", noDuration.ErrorRate, noDuration.ThroughputRPS)
+	}
+	// ok > sent cannot come from zeus, but must never yield a negative count.
+	if odd := runStatsToResult("phase-1", "wf-1", &zeus.RunStats{RequestsSent: 5, RequestsOK: 7}); odd.ErrorCount != 0 || odd.ErrorRate != 0 {
+		t.Errorf("ok > sent → error_count=%d error_rate=%v, want 0/0", odd.ErrorCount, odd.ErrorRate)
 	}
 	if noDuration.LatencyP99Us != 0 || noDuration.LatencyP999Us != 0 {
 		t.Errorf("999 ns → p99=%d p999=%d µs, want 0/0 (sub-µs truncates)", noDuration.LatencyP99Us, noDuration.LatencyP999Us)
@@ -320,5 +325,37 @@ func TestRunStatsToResult_ZeroGuards(t *testing.T) {
 		if err := r.Validate(); err != nil {
 			t.Errorf("%+v fails Validate: %v", r, err)
 		}
+	}
+}
+
+// TestRunStatsToResult_DroppedIterationsAreNotErrors pins the VM1 finding of
+// 2026-09-14: three browse runs reported ~24% "errors" while zeus saw every
+// request succeed. requests_dropped is k6's dropped_iterations (the
+// arrival-rate executor ran out of VUs) — a load-delivery shortfall counted in
+// iterations, not failed requests. It must not leak into error_count.
+func TestRunStatsToResult_DroppedIterationsAreNotErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		rs        zeus.RunStats
+		wantCount int64
+		wantRate  float64
+	}{
+		{"all ok, iterations dropped (VM1 run-01a09720)", zeus.RunStats{RequestsSent: 903, RequestsOK: 903, RequestsDropped: 218, Duration: int64(63 * time.Second)}, 0, 0},
+		{"real HTTP failures, nothing dropped", zeus.RunStats{RequestsSent: 200, RequestsOK: 150, Duration: int64(10 * time.Second)}, 50, 0.25},
+		{"both", zeus.RunStats{RequestsSent: 400, RequestsOK: 380, RequestsDropped: 90, Duration: int64(10 * time.Second)}, 20, 0.05},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runStatsToResult("phase-1", "wf-1", &tc.rs)
+			if got.ErrorCount != tc.wantCount || math.Abs(got.ErrorRate-tc.wantRate) > 1e-12 {
+				t.Errorf("error_count=%d error_rate=%v, want %d/%v", got.ErrorCount, got.ErrorRate, tc.wantCount, tc.wantRate)
+			}
+			if got.RequestCount != tc.rs.RequestsSent {
+				t.Errorf("request_count=%d, want %d", got.RequestCount, tc.rs.RequestsSent)
+			}
+			if err := got.Validate(); err != nil {
+				t.Errorf("fails Validate: %v", err)
+			}
+		})
 	}
 }
