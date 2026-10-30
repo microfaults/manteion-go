@@ -48,6 +48,22 @@ type SDKInstance struct {
 	// (e.g. gRPC services). Aggregated across instances by the
 	// workflow-builder catalog handler.
 	Routes []SDKRoute `json:"routes,omitempty"`
+	// Host names the instrument host that registered ("in-process" | "sidecar");
+	// stored as host_kind — "host" already means fault placement elsewhere.
+	Host string `json:"host,omitempty"`
+	// Capabilities lists the fault categories the host executes
+	// (inline|network|resource|cachebox). Absent = all (the wire contract).
+	Capabilities []string `json:"capabilities,omitempty"`
+	// Observed state (desired-state protocol v1): what the instance last told
+	// us it holds. ObservedGeneration comes from the poll's version param and
+	// the status report; the rest only from POST /api/v1/sdk/status.
+	ObservedGeneration  uint64            `json:"observed_generation"`
+	ObservedEtag        string            `json:"observed_etag,omitempty"`
+	ObservedUnsupported []UnsupportedRule `json:"observed_unsupported,omitempty"`
+	ObservedErrors      []string          `json:"observed_errors,omitempty"`
+	ReplaySetID         string            `json:"replay_set_id,omitempty"`
+	ReplaySetState      string            `json:"replay_set_state,omitempty"` // fetching|committed|failed
+	ObservedAt          *time.Time        `json:"observed_at,omitempty"`
 }
 
 func (i *SDKInstance) Validate() error {

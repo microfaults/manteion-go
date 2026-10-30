@@ -59,6 +59,7 @@ func truncateAll(conn *sql.DB) {
 		"workflows",
 		"policy_rules",
 		"sdk_instances",
+		"service_generations",
 		"rules",
 		"fault_composition_members",
 		"fault_compositions",

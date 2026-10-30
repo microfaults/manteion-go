@@ -112,6 +112,7 @@ var migrations = []migration{
 	{9, "cachebox_key_strategy: add exact_with_host_norm (id-blind path keying, exp8)", migration9},
 	{10, "phase_workflows: dataset_id (zeus dataset per workflow; NULL = MANTEION_ZEUS_DATASET_ID fallback)", migration10},
 	{11, "experiments + experiment_phases: failure_reason (why a failed row failed)", migration11},
+	{12, "sdk_instances: host/capabilities + observed state; service_generations (desired-state v1)", migration12},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -658,4 +659,29 @@ ALTER TABLE phase_workflows ADD COLUMN IF NOT EXISTS dataset_id TEXT NULL;
 const migration11 = `
 ALTER TABLE experiment_phases ADD COLUMN IF NOT EXISTS failure_reason TEXT NULL;
 ALTER TABLE experiments       ADD COLUMN IF NOT EXISTS failure_reason TEXT NULL;
+`
+
+// migration12 is the desired-state protocol v1 (docs/plans/2026-10-30-desired-state-*):
+// what each SDK instance advertised at registration (host, capabilities) and
+// what it has observed since (generation, etag, unsupported rules, errors,
+// replay-set state), plus the per-service generation the materializer stamps
+// on every document. Absent service row = generation 1. Lists are JSONB
+// (the schema has no TEXT[] columns); IF NOT EXISTS keeps the step re-runnable.
+const migration12 = `
+ALTER TABLE sdk_instances
+    ADD COLUMN IF NOT EXISTS host_kind            TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS capabilities         JSONB,
+    ADD COLUMN IF NOT EXISTS observed_generation  BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS observed_etag        TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS observed_unsupported JSONB,
+    ADD COLUMN IF NOT EXISTS observed_errors      JSONB,
+    ADD COLUMN IF NOT EXISTS replay_set_id        TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS replay_set_state     TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS observed_at          TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS service_generations (
+    service    TEXT PRIMARY KEY,
+    generation BIGINT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `
