@@ -56,12 +56,32 @@ func TestSDKRepo_ObservedStateRoundTrip(t *testing.T) {
 		t.Errorf("last_poll_at not touched by RecordPoll: %v", got.LastPollAt)
 	}
 
-	// A report without replay_set keeps the stored replay fields; empty lists clear.
+	// The report is a full snapshot, so one carrying a replay_set overwrites a
+	// row that already holds one: the same artifact going fetching -> committed.
+	if err := repo.RecordStatus(ctx, inst.ID, model.ObservedStatus{
+		AppliedGeneration: 7, Etag: "7-abcdef0123456789",
+		Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}},
+		Errors:      []string{"rule x: decode: boom"},
+		ReplaySet:   &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"},
+	}); err != nil {
+		t.Fatalf("record status (commit): %v", err)
+	}
+	got, _ = repo.Get(ctx, inst.ID)
+	if got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "committed" ||
+		len(got.ObservedUnsupported) != 1 || len(got.ObservedErrors) != 1 {
+		t.Errorf("after commit report: %+v", got)
+	}
+
+	// A report without replay_set means the instance holds none (after a thaw or
+	// phase end): both replay columns clear, and so do the empty lists and the
+	// etag while the generation moves on. Keeping the stored committed state
+	// would let a recurring artifact id (a content hash) look already held.
 	if err := repo.RecordStatus(ctx, inst.ID, model.ObservedStatus{AppliedGeneration: 8}); err != nil {
 		t.Fatalf("record status 2: %v", err)
 	}
 	got, _ = repo.Get(ctx, inst.ID)
-	if got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "fetching" || len(got.ObservedUnsupported) != 0 || len(got.ObservedErrors) != 0 {
+	if got.ReplaySetID != "" || got.ReplaySetState != "" || len(got.ObservedUnsupported) != 0 || len(got.ObservedErrors) != 0 ||
+		got.ObservedGeneration != 8 || got.ObservedEtag != "" {
 		t.Errorf("after second status: %+v", got)
 	}
 

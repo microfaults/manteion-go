@@ -27,9 +27,10 @@ func ValidReplaySetState(s string) bool {
 	return false
 }
 
-// ObservedStatus is what POST /api/v1/sdk/status persists. Unsupported and
-// Errors replace the previous report (empty clears); a nil ReplaySet keeps the
-// stored replay fields (the report carries it only when the state changed).
+// ObservedStatus is what POST /api/v1/sdk/status persists. The report is a full
+// snapshot of what the instance holds, so every field replaces the stored one:
+// empty Unsupported and Errors clear, and an absent (nil) ReplaySet means the
+// instance holds none and clears the stored id/state.
 type ObservedStatus struct {
 	AppliedGeneration uint64
 	Etag              string

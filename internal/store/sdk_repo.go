@@ -244,7 +244,12 @@ func (r *SDKRepo) RecordPoll(ctx context.Context, id string, observedGeneration 
 	return affectedOrNotFound(res)
 }
 
-// RecordStatus stores an instance's POST /api/v1/sdk/status report.
+// RecordStatus stores an instance's POST /api/v1/sdk/status report. The report
+// is a full snapshot of what the instance holds, so every observed column is
+// overwritten: an absent ReplaySet means the instance holds no set and clears
+// the stored id and state (keeping them would leave a stale committed/failed
+// state behind after a thaw or phase end, and artifact ids are content hashes
+// that can recur).
 func (r *SDKRepo) RecordStatus(ctx context.Context, id string, st model.ObservedStatus) error {
 	unsupported, err := jsonbOrNull(st.Unsupported)
 	if err != nil {
@@ -254,19 +259,18 @@ func (r *SDKRepo) RecordStatus(ctx context.Context, id string, st model.Observed
 	if err != nil {
 		return fmt.Errorf("marshal observed errors: %w", err)
 	}
-	replayID, replayState, setReplay := "", "", false
+	replayID, replayState := "", ""
 	if st.ReplaySet != nil {
-		replayID, replayState, setReplay = st.ReplaySet.ID, st.ReplaySet.State, true
+		replayID, replayState = st.ReplaySet.ID, st.ReplaySet.State
 	}
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE sdk_instances SET
 			observed_generation = $2, observed_etag = $3,
 			observed_unsupported = $4, observed_errors = $5,
-			replay_set_id    = CASE WHEN $6 THEN $7 ELSE replay_set_id END,
-			replay_set_state = CASE WHEN $6 THEN $8 ELSE replay_set_state END,
+			replay_set_id = $6, replay_set_state = $7,
 			observed_at = now()
 		WHERE id = $1`,
-		id, st.AppliedGeneration, st.Etag, unsupported, errs, setReplay, replayID, replayState)
+		id, st.AppliedGeneration, st.Etag, unsupported, errs, replayID, replayState)
 	if err != nil {
 		return fmt.Errorf("record status: %w", err)
 	}
