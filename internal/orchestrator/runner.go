@@ -13,6 +13,7 @@ import (
 
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/zeus"
@@ -743,7 +744,7 @@ func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
 // SDK inherits the freeze until plan 2 derives it from the frozen phase.
 func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) error {
 	for _, fs := range p.FrozenServices {
-		result, err := o.controller.FreezeService(ctx, fs.Service, freezeDelayRequest(p, fs))
+		result, err := o.controller.FreezeService(ctx, fs.Service, desired.FreezeDelayRequest(p, fs))
 		if err != nil {
 			return fmt.Errorf("freeze %q: %w", fs.Service, err)
 		}
@@ -753,32 +754,6 @@ func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPh
 		}
 	}
 	return nil
-}
-
-// freezeDelayRequest builds the SDK freeze command for one frozen service: its
-// fitted synthetic-delay distribution plus the authoritative CacheBoxContext
-// (§W1) scoping the freeze to (experiment_id, phase_id) with the service's key
-// strategy. The context is provenance/forward-compat — replay itself is driven
-// by the poll-synthesized replay rule (MANT-4).
-func freezeDelayRequest(p *model.ExperimentPhase, fs model.CacheBoxConfig) atroposdk.DelayRequest {
-	delay := atroposdk.DelayRequest{}
-	if fs.SyntheticDelay != nil {
-		if fs.SyntheticDelay.FitMu != nil {
-			delay.Mu = *fs.SyntheticDelay.FitMu
-		}
-		if fs.SyntheticDelay.FitSigma != nil {
-			delay.Sigma = *fs.SyntheticDelay.FitSigma
-		}
-	}
-	strat := model.ResolveKeyStrategy(fs.KeyStrategy)
-	delay.Context = &atroposdk.CacheBoxContext{
-		ExperimentID:    p.ExperimentID,
-		PhaseID:         p.ID,
-		KeyStrategy:     strat,
-		StrategyVersion: model.KeyStrategyVersion(strat),
-		KeyHeaders:      fs.KeyHeaders,
-	}
-	return delay
 }
 
 // stopZeusAttacks stops each of the phase's running zeus attacks. Best-effort:

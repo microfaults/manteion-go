@@ -1,4 +1,4 @@
-package orchestrator
+package desired
 
 import (
 	"testing"
@@ -19,7 +19,7 @@ func TestFreezeCommand_CarriesContext(t *testing.T) {
 		SyntheticDelay: &model.SyntheticDelayConfig{FitMu: &mu, FitSigma: &sigma},
 	}
 
-	req := freezeDelayRequest(p, fs)
+	req := FreezeDelayRequest(p, fs)
 	if req.Mu != mu || req.Sigma != sigma {
 		t.Fatalf("delay = (mu=%v, sigma=%v), want (%v, %v)", req.Mu, req.Sigma, mu, sigma)
 	}
@@ -37,7 +37,7 @@ func TestFreezeCommand_CarriesContext(t *testing.T) {
 	}
 
 	// Empty key_strategy defaults to canonical_v2 (wire version 2).
-	def := freezeDelayRequest(p, model.CacheBoxConfig{Service: "cart"})
+	def := FreezeDelayRequest(p, model.CacheBoxConfig{Service: "cart"})
 	if def.Context.KeyStrategy != "canonical_v2" || def.Context.StrategyVersion != 2 {
 		t.Fatalf("default strategy = (%s, v%d), want (canonical_v2, v2)", def.Context.KeyStrategy, def.Context.StrategyVersion)
 	}
