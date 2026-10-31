@@ -74,6 +74,7 @@ func (g *Generations) Notify(service string, generation uint64) {
 // timeout elapses, and returns the generation it last read. A timeout is not
 // an error (the caller answers 304); ctx.Err() is.
 func (g *Generations) Wait(ctx context.Context, service string, after uint64, timeout time.Duration) (uint64, error) {
+	// Subscribe before the first read so a bump landing between the read and the sleep is never lost.
 	ch := g.subscribe(service)
 	defer g.unsubscribe(service, ch)
 	deadline := time.NewTimer(timeout)
