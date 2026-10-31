@@ -110,7 +110,10 @@ func (s *Server) handleGetPhaseFaults(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePausePhaseFlat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
-	if err := s.orch.PausePhase(r.Context(), id); err != nil {
+	// Detach from the request context, as stop does: once the phase is marked
+	// paused, a client disconnect must not skip stopping its load and the
+	// generation bump that wakes the held long-polls.
+	if err := s.orch.PausePhase(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Error("pause phase failed", "error", err, "phase_id", id)
 		writeErrorFor(w, err, "phase", err.Error())
 		return

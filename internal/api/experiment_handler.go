@@ -356,7 +356,10 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 // paused phase gates the orchestrator's scheduler.
 func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.orch.PauseExperiment(r.Context(), id); err != nil {
+	// Detach from the request context, as stop does: once a phase is marked
+	// paused, a client disconnect must not skip stopping its load and the
+	// generation bump that wakes the held long-polls.
+	if err := s.orch.PauseExperiment(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Error("pause experiment failed", "experiment_id", id, "error", err)
 		writeErrorFor(w, err, "experiment", err.Error())
 		return
