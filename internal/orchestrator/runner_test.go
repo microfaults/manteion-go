@@ -134,13 +134,24 @@ func TestEnterPhase_BumpsGenerationOnEveryEnter(t *testing.T) {
 	}
 	o.WithConvergeTimeout(5 * time.Second) // returns once the instance acks
 	instID := registerSDK(t, "frontend", newFakeSDK(t).server.URL)
-	ackGenerations(t, o, instID, "frontend", artifacts["frontend"])
+	// The instance acks only once the resume's barrier has looked at it.
+	spy := spyOnLooks(o, "frontend")
+	simulateInstance(t, o, spy.looked, instID, "frontend", committedSet(artifacts["frontend"]))
 	f1 := gen("frontend")
 	if err := o.enterPhase(ctx, iso, false); err != nil {
 		t.Fatalf("enterPhase resume isolation: %v", err)
 	}
 	if gen("frontend") != f1+1 {
 		t.Fatalf("resume of frozen phase did not bump frontend: %d → %d", f1, gen("frontend"))
+	}
+	// The resume returned only once the fleet held what it bumped for.
+	inst, err := testSDKRepo.Get(ctx, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.ObservedGeneration < f1+1 || inst.ReplaySetID != artifacts["frontend"] || inst.ReplaySetState != "committed" {
+		t.Fatalf("instance observed=%d replay_set=%q/%q, want observed >= %d holding %s committed: the resume did not wait for its fleet",
+			inst.ObservedGeneration, inst.ReplaySetID, inst.ReplaySetState, f1+1, artifacts["frontend"])
 	}
 }
 

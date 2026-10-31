@@ -308,8 +308,10 @@ func TestEnterPhase_ConvergesWhenInstancesAck(t *testing.T) {
 	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
 	sdk := newFakeSDK(t)
 	instID := registerSDK(t, "frontend", sdk.server.URL)
-	// The artifact id is only known once built; ack whatever is assigned.
-	ackAssigned(t, o, instID, iso.ID, "frontend", "committed")
+	// The artifact id is only known once built; commit whatever is assigned,
+	// but only once the barrier has looked at the instance.
+	spy := spyOnLooks(o, "frontend")
+	simulateInstance(t, o, spy.looked, instID, "frontend", assignedSet(o, iso.ID, "frontend", "committed"))
 
 	if err := o.enterPhase(ctx, iso, true); err != nil {
 		t.Fatalf("enterPhase: %v", err)
@@ -320,6 +322,16 @@ func TestEnterPhase_ConvergesWhenInstancesAck(t *testing.T) {
 	}
 	if got := getPhase(t, iso.ID).Status; got != "running" {
 		t.Fatalf("phase status = %q, want running", got)
+	}
+	// The entry returned only once the fleet held what it bumped for.
+	target, _ := o.generations.Get(ctx, "frontend")
+	inst, err := testSDKRepo.Get(ctx, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.ObservedGeneration < target || inst.ReplaySetID != a.ID || inst.ReplaySetState != "committed" {
+		t.Fatalf("instance observed=%d replay_set=%q/%q, want observed >= %d holding %s committed: the entry did not wait for its fleet",
+			inst.ObservedGeneration, inst.ReplaySetID, inst.ReplaySetState, target, a.ID)
 	}
 }
 

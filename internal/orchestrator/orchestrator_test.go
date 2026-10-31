@@ -98,12 +98,7 @@ func TestMain(m *testing.M) {
 func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	controller := atrocontrol.New(
-		atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: time.Second})),
-		&atrocontrol.RepoResolver{Repo: testSDKRepo},
-		atrocontrol.WithDefaultTimeout(time.Second),
-		atrocontrol.WithLogger(logger),
-	)
+	controller := newTestController(&atrocontrol.RepoResolver{Repo: testSDKRepo}, logger)
 	var zc *zeus.Client
 	if zeusURL != "" {
 		zc = zeus.NewClient(zeusURL)
@@ -123,6 +118,17 @@ func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 	o.WithConvergeTimeout(300 * time.Millisecond)
 	o.WithConvergePollInterval(20 * time.Millisecond)
 	return o
+}
+
+// newTestController is the atrocontrol controller the tests' orchestrators
+// use: instances resolved through resolver, one-second instance calls.
+func newTestController(resolver atrocontrol.InstanceResolver, logger *slog.Logger) *atrocontrol.Controller {
+	return atrocontrol.New(
+		atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: time.Second})),
+		resolver,
+		atrocontrol.WithDefaultTimeout(time.Second),
+		atrocontrol.WithLogger(logger),
+	)
 }
 
 // mkExperiment creates a planned experiment with n pending phases.

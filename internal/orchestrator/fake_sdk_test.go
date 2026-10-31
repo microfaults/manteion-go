@@ -11,6 +11,7 @@ import (
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
+	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 )
@@ -51,6 +52,37 @@ func newFakeSDK(t *testing.T) *fakeSDK {
 	return f
 }
 
+// lookSpy is the registry the convergence barrier reads (through the
+// atrocontrol controller): every look at service is counted and announced on
+// looked, without ever blocking.
+type lookSpy struct {
+	atrocontrol.InstanceResolver
+	service string
+	looked  chan struct{}
+	looks   atomic.Int64
+}
+
+func (s *lookSpy) ForService(ctx context.Context, service string) ([]*model.SDKInstance, error) {
+	if service == s.service {
+		s.looks.Add(1)
+		select {
+		case s.looked <- struct{}{}:
+		default:
+		}
+	}
+	return s.InstanceResolver.ForService(ctx, service)
+}
+
+// spyOnLooks points o's controller at a lookSpy for service. A simulated
+// instance started on its looked channel acks only once the barrier has
+// looked at it, so an entry that returned without waiting leaves the instance
+// behind, where its row shows it.
+func spyOnLooks(o *Orchestrator, service string) *lookSpy {
+	spy := &lookSpy{InstanceResolver: &atrocontrol.RepoResolver{Repo: testSDKRepo}, service: service, looked: make(chan struct{}, 1)}
+	o.controller = newTestController(spy, o.logger)
+	return spy
+}
+
 func writeTestJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -75,12 +107,18 @@ func registerSDK(t *testing.T, service, addr string) string {
 // the replay set committed under it. Stops at test cleanup.
 func ackGenerations(t *testing.T, o *Orchestrator, instanceID, service, artifact string) {
 	t.Helper()
-	simulateInstance(t, o, instanceID, service, func(context.Context) *model.ObservedStatus {
+	simulateInstance(t, o, nil, instanceID, service, committedSet(artifact))
+}
+
+// committedSet is the status report of an instance holding artifact
+// committed; "" reports no replay set.
+func committedSet(artifact string) func(context.Context) *model.ObservedStatus {
+	return func(context.Context) *model.ObservedStatus {
 		if artifact == "" {
 			return nil
 		}
 		return &model.ObservedStatus{ReplaySet: &model.ReplaySetStatus{ID: artifact, State: "committed"}}
-	})
+	}
 }
 
 // ackAssigned is ackGenerations for a replay set that is not built yet: every
@@ -89,25 +127,39 @@ func ackGenerations(t *testing.T, o *Orchestrator, instanceID, service, artifact
 // as the instance's errors. Stops at test cleanup.
 func ackAssigned(t *testing.T, o *Orchestrator, instanceID, phaseID, service, state string, errs ...string) {
 	t.Helper()
-	simulateInstance(t, o, instanceID, service, func(ctx context.Context) *model.ObservedStatus {
+	simulateInstance(t, o, nil, instanceID, service, assignedSet(o, phaseID, service, state, errs...))
+}
+
+// assignedSet is the status report of an instance holding, in state, the set
+// assigned to (phaseID, service) once there is one, with errs as its errors.
+func assignedSet(o *Orchestrator, phaseID, service, state string, errs ...string) func(context.Context) *model.ObservedStatus {
+	return func(ctx context.Context) *model.ObservedStatus {
 		a, err := o.artifacts.ForPhaseService(ctx, phaseID, service)
 		if err != nil || a == nil {
 			return nil
 		}
 		return &model.ObservedStatus{Errors: errs, ReplaySet: &model.ReplaySetStatus{ID: a.ID, State: state}}
-	})
+	}
 }
 
 // simulateInstance runs the loop behind ackGenerations and ackAssigned on a
 // goroutine that makes no testing.T calls: every 20ms it records the
 // service's current generation as the instance's observed one (a poll) and,
 // when report returns a status, stores it applied at that generation (a status
-// report). It stops when the test is cleaned up.
-func simulateInstance(t *testing.T, o *Orchestrator, instanceID, service string, report func(context.Context) *model.ObservedStatus) {
+// report). With start non-nil the loop begins only once start delivers (a
+// lookSpy's first look). It stops when the test is cleaned up.
+func simulateInstance(t *testing.T, o *Orchestrator, start <-chan struct{}, instanceID, service string, report func(context.Context) *model.ObservedStatus) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() {
+		if start != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-start:
+			}
+		}
 		tick := time.NewTicker(20 * time.Millisecond)
 		defer tick.Stop()
 		for {
