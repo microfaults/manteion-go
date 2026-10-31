@@ -2,12 +2,14 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"manteion-go/internal/id"
+	"manteion-go/internal/store"
 )
 
 // An entry acts on its phase only while its claim is the phase's current
@@ -60,10 +62,23 @@ func TestEntryClaim_StaleClaimLeavesTheNewerEntryAlone(t *testing.T) {
 // leave the status running and pass both checks, and the superseded entry
 // starts load next to the newer one. Here the read waits on a table lock
 // while a newer entry claims the phase (a pause and a resume, in memory: the
-// status ends where it started, running).
+// status ends where it started, running). The orchestrator reads phases over
+// one connection of its own, so the test knows the read is waiting by that
+// connection's backend pid, whatever else waits on the table.
 func TestEntryHolds_ReadsTheStatusBeforeTheClaim(t *testing.T) {
 	ctx := context.Background()
 	o := newOrch(t, "")
+	reader, err := sql.Open("pgx", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	reader.SetMaxOpenConns(1) // every read below runs on this one backend
+	var readerPID int
+	if err := reader.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&readerPID); err != nil {
+		t.Fatalf("read the reader's backend pid: %v", err)
+	}
+	o.experiments = store.NewExperimentRepo(reader)
 	_, phases := mkExperiment(t, 1)
 	ph := phases[0]
 	if err := testExpRepo.UpdatePhaseStatus(ctx, ph.ID, "running"); err != nil {
@@ -84,11 +99,10 @@ func TestEntryHolds_ReadsTheStatusBeforeTheClaim(t *testing.T) {
 	held := make(chan error, 1)
 	go func() { held <- o.entryHolds(ctx, ph.ID, claim) }()
 	waitFor(t, "the status read to wait on the lock", 5*time.Second, func() bool {
-		var n int
-		err := testDB.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
-			  AND query LIKE '%FROM experiment_phases WHERE id = %'`).Scan(&n)
-		return err == nil && n > 0
+		var waiting bool
+		err := testDB.QueryRowContext(ctx,
+			`SELECT coalesce(wait_event_type = 'Lock', false) FROM pg_stat_activity WHERE pid = $1`, readerPID).Scan(&waiting)
+		return err == nil && waiting
 	})
 	o.claimPhase(ph.ID) // a pause and a resume land while the read is in flight
 	if err := tx.Rollback(); err != nil {

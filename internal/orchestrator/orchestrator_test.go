@@ -48,6 +48,7 @@ import (
 // ----------------------------------------------------------------------------
 
 var (
+	testDSN          string // the database the harness opened, for a test that needs a connection of its own
 	testDB           *sql.DB
 	testExpRepo      *store.ExperimentRepo
 	testRuleRepo     *store.RuleRepo
@@ -68,6 +69,7 @@ func TestMain(m *testing.M) {
 	if dsn == "" {
 		dsn = "postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable"
 	}
+	testDSN = dsn
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
