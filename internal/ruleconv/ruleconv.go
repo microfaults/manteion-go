@@ -128,6 +128,20 @@ func compileRule(r *model.Rule, specs FaultSpecResolver, comps FaultCompositionR
 			Mode:        r.Action.CacheBox.Mode,
 			KeyStrategy: r.Action.CacheBox.KeyStrategy,
 		}
+		// A rule served through a running phase (RuleRepo.ForService names it)
+		// records and replays as that phase's: the SDK stamps what it records
+		// with, and checks what it replays against, the context's pair. A rule
+		// attached to no phase has no pair to take, so it compiles without a
+		// context, as it always has.
+		if r.ServedPhaseID != "" {
+			strat := model.ResolveKeyStrategy(r.Action.CacheBox.KeyStrategy)
+			cr.CacheBox.Context = &atroposdk.CacheBoxContext{
+				ExperimentID:    r.ServedExperimentID,
+				PhaseID:         r.ServedPhaseID,
+				KeyStrategy:     strat,
+				StrategyVersion: model.KeyStrategyVersion(strat),
+			}
+		}
 	}
 
 	return cr, nil

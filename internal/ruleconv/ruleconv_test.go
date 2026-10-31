@@ -2,7 +2,10 @@ package ruleconv
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
+
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
 	"manteion-go/internal/model"
 )
@@ -317,5 +320,63 @@ func TestCompileRule_CompositionWithDirection(t *testing.T) {
 	}
 	if members[1].Direction != "downstream" {
 		t.Errorf("member[1] direction: %q", members[1].Direction)
+	}
+}
+
+// TestCompileRule_CacheBoxAttachedPhaseContext pins who owns what a
+// user-authored cache-box rule records and replays. A rule served through a
+// running phase (the poll set names it: RuleRepo.ForService sets
+// ServedPhaseID and ServedExperimentID) compiles with that phase's context, so
+// its entries are recorded under, and replayed against, the phase's pair; a rule
+// attached to no phase compiles without one, as before. The strategy and its
+// wire version come from the rule's own config, defaulted like a frozen
+// service's.
+func TestCompileRule_CacheBoxAttachedPhaseContext(t *testing.T) {
+	cachebox := func(strategy string) *model.Rule {
+		return &model.Rule{
+			ID: "rule-cb", Name: "cb", Service: "frontend", Mode: "inline",
+			Action: model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "replay", KeyStrategy: strategy}},
+		}
+	}
+
+	for _, tc := range []struct {
+		name, strategy string
+		want           atroposdk.CacheBoxContext
+	}{
+		{"legacy strategy", "exact",
+			atroposdk.CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-iso", KeyStrategy: "exact", StrategyVersion: 1}},
+		{"canonical_v2", "canonical_v2",
+			atroposdk.CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-iso", KeyStrategy: "canonical_v2", StrategyVersion: 2}},
+		{"no strategy resolves to the default", "",
+			atroposdk.CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-iso", KeyStrategy: "canonical_v2", StrategyVersion: 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := cachebox(tc.strategy)
+			r.ServedPhaseID, r.ServedExperimentID = "phase-iso", "exp-1"
+			got, err := CompileRule(r, mapSpecResolver{})
+			if err != nil {
+				t.Fatalf("CompileRule: %v", err)
+			}
+			if got.CacheBox == nil {
+				t.Fatal("CacheBox = nil")
+			}
+			if !reflect.DeepEqual(got.CacheBox.Context, &tc.want) {
+				t.Errorf("Context = %+v, want %+v", got.CacheBox.Context, &tc.want)
+			}
+			// The rule's own action is compiled as before.
+			if got.CacheBox.Mode != "replay" || got.CacheBox.KeyStrategy != tc.strategy {
+				t.Errorf("CacheBox = {mode:%q key_strategy:%q}, want the rule's own {replay %q}",
+					got.CacheBox.Mode, got.CacheBox.KeyStrategy, tc.strategy)
+			}
+		})
+	}
+
+	// Attached to no phase: nothing to take a pair from.
+	got, err := CompileRule(cachebox("exact"), mapSpecResolver{})
+	if err != nil {
+		t.Fatalf("CompileRule (unattached): %v", err)
+	}
+	if got.CacheBox == nil || got.CacheBox.Context != nil {
+		t.Errorf("unattached rule: CacheBox = %+v, want a cache-box action with no context", got.CacheBox)
 	}
 }

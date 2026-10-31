@@ -240,24 +240,39 @@ func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 // pending) and stops the instant the measurement window ends ('running' only,
 // deliberately NOT 'draining'), so it neither corrupts the baseline delta nor
 // gets resurrected after finishPhase clears it.
+//
+// Each rule also carries the running phase it is served through (ServedPhaseID
+// and ServedExperimentID, empty for a rule attached to no phase), which the
+// compiler turns into a cache-box rule's context. A rule on several running
+// phases is still one row, under the first of them in the order running phases
+// are considered everywhere else (newest-started, a missing start time last,
+// then id: ListRunningPhases), so it names the phase the synthesized cache-box
+// rule names. The join is LIMIT 1 per rule for that reason; it must never
+// multiply rows, which would deliver the rule once per phase.
 func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT r.id, r.name, r.service, r.enabled, r.priority, r.injection_point,
 			r.match_labels, r.action_type, r.fault_spec_id, r.fault_composition_id,
-			r.cachebox_mode, r.cachebox_key_strategy, r.mode, r.start_policy, r.created_at, r.updated_at
+			r.cachebox_mode, r.cachebox_key_strategy, r.mode, r.start_policy, r.created_at, r.updated_at,
+			rp.id, rp.experiment_id
 		FROM rules r
+		LEFT JOIN LATERAL (
+			SELECT p.id, p.experiment_id
+			FROM phase_rules pr
+			JOIN experiment_phases p ON p.id = pr.phase_id
+			WHERE pr.rule_id = r.id AND p.status = 'running'
+			ORDER BY p.started_at DESC NULLS LAST, p.id
+			LIMIT 1) rp ON true
 		WHERE r.service = $1 AND r.enabled = true
-		  AND ( NOT EXISTS (SELECT 1 FROM phase_rules pr WHERE pr.rule_id = r.id)
-		        OR EXISTS (SELECT 1 FROM phase_rules pr
-		                   JOIN experiment_phases p ON p.id = pr.phase_id
-		                   WHERE pr.rule_id = r.id AND p.status = 'running') )
+		  AND ( rp.id IS NOT NULL
+		        OR NOT EXISTS (SELECT 1 FROM phase_rules pr WHERE pr.rule_id = r.id) )
 		ORDER BY r.priority DESC, r.created_at, r.id`, service)
 	if err != nil {
 		return nil, fmt.Errorf("rules for service: %w", err)
 	}
 	defer rows.Close()
 
-	return r.scanRules(rows)
+	return r.scanServedRules(rows)
 }
 
 // EnabledForService returns every enabled rule targeting service, ordered by
@@ -345,22 +360,41 @@ func (r *RuleRepo) scanRule(row *sql.Row) (*model.Rule, error) {
 
 // scanRules scans multiple rule rows.
 func (r *RuleRepo) scanRules(rows *sql.Rows) ([]*model.Rule, error) {
+	return scanRuleRows(rows, false)
+}
+
+// scanServedRules scans ForService's rows: the rule columns, then the running
+// phase the rule is served through as (id, experiment_id), both NULL for a rule
+// attached to no phase.
+func (r *RuleRepo) scanServedRules(rows *sql.Rows) ([]*model.Rule, error) {
+	return scanRuleRows(rows, true)
+}
+
+// scanRuleRows scans rule rows; served says the query selects the served phase's
+// two columns after the rule's own.
+func scanRuleRows(rows *sql.Rows, served bool) ([]*model.Rule, error) {
 	var result []*model.Rule
 	for rows.Next() {
 		var rule model.Rule
 		var injPoint, faultSpecID, faultCompID, cbMode, cbKeyStrategy sql.NullString
+		var servedPhaseID, servedExperimentID sql.NullString
 		var labelsJSON []byte
 
-		err := rows.Scan(
+		dest := []any{
 			&rule.ID, &rule.Name, &rule.Service, &rule.Enabled, &rule.Priority,
 			&injPoint, &labelsJSON, &rule.Action.Type, &faultSpecID, &faultCompID,
 			&cbMode, &cbKeyStrategy, &rule.Mode, &rule.StartPolicy, &rule.CreatedAt, &rule.UpdatedAt,
-		)
-		if err != nil {
+		}
+		if served {
+			dest = append(dest, &servedPhaseID, &servedExperimentID)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("scan rule row: %w", err)
 		}
 
 		rule.Match.InjectionPoint = fromNullString(injPoint)
+		rule.ServedPhaseID = fromNullString(servedPhaseID)
+		rule.ServedExperimentID = fromNullString(servedExperimentID)
 		populateRuleAction(&rule, faultSpecID, faultCompID, cbMode, cbKeyStrategy)
 
 		if labelsJSON != nil {

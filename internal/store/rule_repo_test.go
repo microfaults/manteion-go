@@ -417,6 +417,235 @@ func TestRuleRepo_EqualPriorityAndAgeBreakByID(t *testing.T) {
 	}
 }
 
+// createCacheBoxRule persists an enabled cache-box rule and removes it at
+// cleanup. Register an experiment cleanup (seedPhase) after calling it:
+// cleanups run last-in first-out, and a rule attached to a phase cannot be
+// deleted until its experiment, and with it the phase_rules row, is gone.
+func createCacheBoxRule(t *testing.T, svc, id string, priority int, createdAt time.Time) *model.Rule {
+	t.Helper()
+	rule := &model.Rule{ID: id, Name: id, Service: svc, Enabled: true, Priority: priority, Mode: "inline",
+		Action:    model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "replay", KeyStrategy: "exact"}},
+		CreatedAt: createdAt, UpdatedAt: createdAt}
+	if err := testRuleRepo.Create(context.Background(), rule); err != nil {
+		t.Fatalf("create rule %s: %v", id, err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), id) })
+	return rule
+}
+
+// seedPhase persists an experiment with one phase in the given state, attaches
+// the rules to the phase, and removes the experiment (the phase and its
+// phase_rules go with it) at cleanup.
+func seedPhase(t *testing.T, tag, name, status string, startedAt *time.Time, ruleIDs ...string) *model.ExperimentPhase {
+	t.Helper()
+	ctx := context.Background()
+	repo := NewExperimentRepo(testDB)
+	exp := &model.Experiment{ID: "exp-" + name + "-" + tag, Name: "exp-" + name + "-" + tag, Status: "running", CreatedAt: time.Now()}
+	if err := repo.Create(ctx, exp); err != nil {
+		t.Fatalf("create experiment %s: %v", exp.ID, err)
+	}
+	t.Cleanup(func() { _, _ = testDB.Exec("DELETE FROM experiments WHERE id = $1", exp.ID) })
+	p := &model.ExperimentPhase{ID: "phase-" + name + "-" + tag, ExperimentID: exp.ID, Name: "isolation", Position: 0,
+		Status: status, StartedAt: startedAt}
+	if err := repo.CreatePhase(ctx, p); err != nil {
+		t.Fatalf("create phase %s: %v", p.ID, err)
+	}
+	if err := repo.AttachPhaseRules(ctx, p.ID, ruleIDs); err != nil {
+		t.Fatalf("attach rules to %s: %v", p.ID, err)
+	}
+	return p
+}
+
+// TestRuleRepo_ForServiceCarriesRunningPhase pins the phase a rule is served
+// through. A rule attached to a phase is dark until the phase runs, and then the
+// poll set carries the (experiment, phase) pair the compiler takes a cache-box
+// rule's context from; a rule attached to no phase carries none. Only ForService
+// sets the pair: it is the poll set's, not part of what is stored.
+func TestRuleRepo_ForServiceCarriesRunningPhase(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("servedphase-%d", time.Now().UnixNano())
+	svc := "svc-" + tag
+	at := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+
+	free := createCacheBoxRule(t, svc, "free-"+tag, 1, at)         // attached to no phase
+	attached := createCacheBoxRule(t, svc, "attached-"+tag, 2, at) // attached to one phase
+	phase := seedPhase(t, tag, "iso", "pending", nil, attached.ID)
+
+	served := func() map[string]*model.Rule {
+		t.Helper()
+		rules, err := testRuleRepo.ForService(ctx, svc)
+		if err != nil {
+			t.Fatalf("ForService: %v", err)
+		}
+		byID := map[string]*model.Rule{}
+		for _, r := range rules {
+			byID[r.ID] = r
+		}
+		return byID
+	}
+	wantNoPhase := func(step string, r *model.Rule) {
+		t.Helper()
+		if r == nil {
+			t.Fatalf("%s: the unattached rule %s is not served", step, free.ID)
+		}
+		if r.ServedPhaseID != "" || r.ServedExperimentID != "" {
+			t.Errorf("%s: unattached rule carries phase (%q, %q), want none", step, r.ServedExperimentID, r.ServedPhaseID)
+		}
+	}
+
+	// Pending: the attached rule is dark, the unattached one names no phase.
+	got := served()
+	if got[attached.ID] != nil {
+		t.Errorf("pending phase: attached rule is served")
+	}
+	wantNoPhase("pending phase", got[free.ID])
+
+	// Running: the attached rule is served under the phase it is attached to.
+	if _, err := testDB.ExecContext(ctx,
+		`UPDATE experiment_phases SET status = 'running' WHERE id = $1`, phase.ID); err != nil {
+		t.Fatalf("start phase: %v", err)
+	}
+	got = served()
+	a := got[attached.ID]
+	if a == nil {
+		t.Fatalf("running phase: attached rule is not served")
+	}
+	if a.ServedPhaseID != phase.ID || a.ServedExperimentID != phase.ExperimentID {
+		t.Errorf("running phase: attached rule carries (%q, %q), want (%q, %q)",
+			a.ServedExperimentID, a.ServedPhaseID, phase.ExperimentID, phase.ID)
+	}
+	wantNoPhase("running phase", got[free.ID])
+
+	// No other read names a phase: the rule as stored has none.
+	stored, err := testRuleRepo.Get(ctx, attached.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	enabled, err := testRuleRepo.EnabledForService(ctx, svc)
+	if err != nil {
+		t.Fatalf("EnabledForService: %v", err)
+	}
+	reads := map[string][]*model.Rule{"Get": {stored}, "EnabledForService": enabled}
+	for name, rules := range reads {
+		for _, r := range rules {
+			if r.ServedPhaseID != "" || r.ServedExperimentID != "" {
+				t.Errorf("%s: rule %s carries phase (%q, %q), want none", name, r.ID, r.ServedExperimentID, r.ServedPhaseID)
+			}
+		}
+	}
+}
+
+// TestRuleRepo_ForServiceNamesTheFirstRunningPhase pins which phase a rule
+// attached to several running phases is served under, and that it is served
+// once. Phases of different experiments can run together, and the rule's
+// context must name the one the synthesized cache-box rule names: the first in
+// ListRunningPhases order (newest-started, a missing start time last, then id),
+// the order ActiveCacheBoxPhaseForService and FrozenServiceForService walk.
+// A join that kept a row per attached phase would deliver the rule once per
+// phase, each under a different pair, so the poll set is checked whole, in
+// order, under the default plan and under a sequential scan.
+func TestRuleRepo_ForServiceNamesTheFirstRunningPhase(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("servedmany-%d", time.Now().UnixNano())
+	svc := "svc-" + tag
+	t0 := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	at := func(d time.Duration) *time.Time { ts := t0.Add(d); return &ts }
+
+	// multi is attached to all three phases; high and low bracket it.
+	high := createCacheBoxRule(t, svc, "high-"+tag, 9, t0)
+	multi := createCacheBoxRule(t, svc, "multi-"+tag, 5, t0)
+	low := createCacheBoxRule(t, svc, "low-"+tag, 1, t0)
+
+	// Created in reverse id order, so a tie left to the scan would go the wrong
+	// way. a is running without a start time.
+	z := seedPhase(t, tag, "z", "running", at(2*time.Minute), multi.ID)
+	m := seedPhase(t, tag, "m", "running", at(time.Minute), multi.ID)
+	a := seedPhase(t, tag, "a", "running", nil, multi.ID)
+	experimentOf := map[string]string{z.ID: z.ExperimentID, m.ID: m.ExperimentID, a.ID: a.ExperimentID}
+
+	setStatus := func(p *model.ExperimentPhase, status string) {
+		t.Helper()
+		if _, err := testDB.ExecContext(ctx,
+			`UPDATE experiment_phases SET status = $2::phase_status WHERE id = $1`, p.ID, status); err != nil {
+			t.Fatalf("set %s to %s: %v", p.ID, status, err)
+		}
+	}
+	setStarted := func(p *model.ExperimentPhase, startedAt *time.Time) {
+		t.Helper()
+		if _, err := testDB.ExecContext(ctx,
+			`UPDATE experiment_phases SET started_at = $2 WHERE id = $1`, p.ID, startedAt); err != nil {
+			t.Fatalf("set %s started at %v: %v", p.ID, startedAt, err)
+		}
+	}
+	// firstRunning is the answer the cache-box role gives: the first of the
+	// rule's phases in the order running phases are considered.
+	expRepo := NewExperimentRepo(testDB)
+	firstRunning := func() string {
+		t.Helper()
+		running, err := expRepo.ListRunningPhases(ctx)
+		if err != nil {
+			t.Fatalf("ListRunningPhases: %v", err)
+		}
+		for _, p := range running {
+			if _, ours := experimentOf[p.ID]; ours {
+				return p.ID
+			}
+		}
+		return ""
+	}
+	repos := []struct {
+		plan string
+		repo *RuleRepo
+	}{
+		{"default plan", testRuleRepo},
+		{"sequential scan", planRepo(t, "SET enable_indexscan = off", "SET enable_bitmapscan = off")},
+	}
+	check := func(step, wantPhase string) {
+		t.Helper()
+		if got := firstRunning(); got != wantPhase {
+			t.Fatalf("%s: ListRunningPhases puts %q first among the rule's phases, want %q", step, got, wantPhase)
+		}
+		want := []string{high.ID, multi.ID, low.ID}
+		if wantPhase == "" { // no attached phase runs: the rule is dark
+			want = []string{high.ID, low.ID}
+		}
+		for _, r := range repos {
+			got, err := r.repo.ForService(ctx, svc)
+			if err != nil {
+				t.Fatalf("%s: ForService (%s): %v", step, r.plan, err)
+			}
+			if !slices.Equal(ruleIDs(got), want) {
+				t.Errorf("%s: ForService (%s) = %v, want %v (each rule once, in poll order)", step, r.plan, ruleIDs(got), want)
+				continue
+			}
+			for _, rule := range got {
+				wantP, wantE := "", ""
+				if rule.ID == multi.ID {
+					wantP, wantE = wantPhase, experimentOf[wantPhase]
+				}
+				if rule.ServedPhaseID != wantP || rule.ServedExperimentID != wantE {
+					t.Errorf("%s: ForService (%s): rule %s carries (%q, %q), want (%q, %q)",
+						step, r.plan, rule.ID, rule.ServedExperimentID, rule.ServedPhaseID, wantE, wantP)
+				}
+			}
+		}
+	}
+
+	check("z started last", z.ID)
+	setStatus(z, "completed") // not running: out of the running set, whatever its start time
+	check("z completed: m beats a, which has no start time", m.ID)
+	setStatus(m, "paused")
+	check("m paused: a is the only one running", a.ID)
+	// m resumes and a gets m's start time: the lower id, a, comes first. m's
+	// phase was created before a's, so a tie left to the scan would pick m.
+	setStatus(m, "running")
+	setStarted(a, at(time.Minute))
+	check("m and a started together", a.ID)
+	setStatus(m, "completed")
+	setStatus(a, "completed")
+	check("nothing running", "")
+}
+
 // TestRuleCreate_DefaultsDisabled pins the creation contract behind the
 // create→attach→enable experiment lifecycle: a rule whose JSON omits
 // "enabled" is created DISABLED, end to end. The zero value governs (the

@@ -329,6 +329,54 @@ func TestMaterialize_ETagCoversFreezeAndReplaySet(t *testing.T) {
 	}
 }
 
+// A user-authored cache-box rule that the rule source reports as served through
+// a running phase reaches the document with that phase's context, beside the
+// synthesized rule, and moves the ETag: the instance records and replays under
+// the phase, and converges on the document that says so. Unattached, the same
+// rule carries none.
+func TestMaterialize_UserCacheBoxRuleCarriesItsServedPhase(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newTestMaterializer(5)
+	contextOf := func(d Document) *atroposdk.CacheBoxContext {
+		t.Helper()
+		for _, r := range d.Rules {
+			if r.Name == "r-cb" {
+				return r.CacheBox.Context
+			}
+		}
+		t.Fatal("rule r-cb is not in the document")
+		return nil
+	}
+
+	unattached, err := m.Materialize(ctx, "cart", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := contextOf(unattached); c != nil {
+		t.Fatalf("unattached rule carries context %+v, want none", c)
+	}
+
+	for _, r := range m.Rules.(*fakeRules).rules {
+		if r.ID == "r-cb" {
+			r.ServedPhaseID, r.ServedExperimentID = "phase-served", "exp-served"
+		}
+	}
+	served, err := m.Materialize(ctx, "cart", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &atroposdk.CacheBoxContext{ExperimentID: "exp-served", PhaseID: "phase-served", KeyStrategy: "exact", StrategyVersion: 1}
+	if got := contextOf(served); !reflect.DeepEqual(got, want) {
+		t.Errorf("served rule context = %+v, want %+v", got, want)
+	}
+	if served.ETag == unattached.ETag {
+		t.Error("the rule gaining a context did not change the ETag")
+	}
+	if !strings.Contains(ruleNames(served), "cachebox:replay:phase-iso") {
+		t.Errorf("rules = %s, want the synthesized rule beside it", ruleNames(served))
+	}
+}
+
 // A replay set goes only to an instance that can hold one: the document of a
 // cache-box host carries it and moves its ETag, one without a cache-box does
 // not get it.

@@ -1,6 +1,8 @@
 package model
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,5 +80,30 @@ func TestMatchCriteria_Validate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestRule_ServedPhaseIsNotOnTheWire pins that the running phase a rule is
+// served through (set only by RuleRepo.ForService, read by the compiler) never
+// crosses the REST boundary: it is not in a rule's JSON, and a request body
+// cannot set it under either spelling.
+func TestRule_ServedPhaseIsNotOnTheWire(t *testing.T) {
+	out, err := json.Marshal(Rule{ID: "r1", ServedPhaseID: "phase-iso", ServedExperimentID: "exp-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, leaked := range []string{"phase-iso", "exp-1", "served"} {
+		if strings.Contains(strings.ToLower(string(out)), leaked) {
+			t.Errorf("marshalled rule %s contains %q", out, leaked)
+		}
+	}
+
+	var in Rule
+	body := `{"id":"r1","ServedPhaseID":"phase-x","served_phase_id":"phase-x","ServedExperimentID":"exp-x","served_experiment_id":"exp-x"}`
+	if err := json.Unmarshal([]byte(body), &in); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if in.ServedPhaseID != "" || in.ServedExperimentID != "" {
+		t.Errorf("a request body set the served pair: %+v", in)
 	}
 }

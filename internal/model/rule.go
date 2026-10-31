@@ -31,6 +31,14 @@ type Rule struct {
 	StartPolicy string        `json:"start_policy,omitempty"` // "deduplicate_by_rule" (default) | "always_start"
 	CreatedAt   time.Time     `json:"created_at"`
 	UpdatedAt   time.Time     `json:"updated_at"`
+
+	// ServedPhaseID and ServedExperimentID name the running phase the rule is
+	// served through: the pair a cache-box rule compiles its context from, so
+	// what it records and replays belongs to that phase. Set only by
+	// RuleRepo.ForService (the poll set); empty on every other read and for a
+	// rule attached to no phase. Never stored and never on the wire.
+	ServedPhaseID      string `json:"-"`
+	ServedExperimentID string `json:"-"`
 }
 
 var validStartPolicies = setOf(StartPolicyValues...)
