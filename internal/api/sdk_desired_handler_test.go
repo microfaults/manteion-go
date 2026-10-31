@@ -714,8 +714,9 @@ func TestEtagMatches(t *testing.T) {
 
 // version is the generation the instance holds, recorded with the poll. Absent
 // or unparseable reads as 0 and is still recorded (a bad version never costs
-// the poll its last_poll_at); a value sdk_instances' BIGINT cannot hold is
-// refused with 400 before the store is touched, where the write would fail.
+// the poll its last_poll_at). So does a value sdk_instances' BIGINT cannot hold
+// (the write would fail): an SDK still holding a pre-long-poll version, which
+// can exceed MaxInt64, must be served the document, never stranded on a 400.
 func TestHandlePollRules_ObservedVersion(t *testing.T) {
 	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
 	s := fx.server()
@@ -729,22 +730,19 @@ func TestHandlePollRules_ObservedVersion(t *testing.T) {
 		{"&version=-1", 0},
 		{"&version=7", 7},
 		{"&version=9223372036854775807", math.MaxInt64},
+		{"&version=9223372036854775808", 0},  // MaxInt64+1
+		{"&version=18446744073709551615", 0}, // MaxUint64
+		{"&version=99999999999999999999", 0}, // overflows uint64
 	} {
 		fx.reg.polls = nil
-		if w := pollWith(t, s, "service=cartservice&instance_id=cart-1"+tc.query, nil); w.Code != http.StatusOK {
-			t.Errorf("%q: status = %d, want 200", tc.query, w.Code)
+		w := pollWith(t, s, "service=cartservice&instance_id=cart-1"+tc.query, nil)
+		if w.Code != http.StatusOK {
+			t.Errorf("%q: status = %d body = %s, want 200", tc.query, w.Code, w.Body.String())
+		} else if got := ruleNamesOf(t, w.Body.Bytes()); len(got) != 3 {
+			t.Errorf("%q: rules = %v, want the whole document", tc.query, got)
 		}
 		if want := []polled{{"cart-1", tc.want}}; !slices.Equal(fx.reg.polls, want) {
 			t.Errorf("%q: recorded %+v, want %+v", tc.query, fx.reg.polls, want)
-		}
-	}
-	for _, v := range []string{"9223372036854775808", "18446744073709551615", "99999999999999999999"} {
-		fx.reg.polls = nil
-		if w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version="+v, nil); w.Code != http.StatusBadRequest {
-			t.Errorf("version=%s: status = %d, want 400", v, w.Code)
-		}
-		if len(fx.reg.polls) != 0 {
-			t.Errorf("version=%s: recorded %+v before refusing it", v, fx.reg.polls)
 		}
 	}
 }

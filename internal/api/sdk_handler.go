@@ -167,12 +167,12 @@ const maxPollWait = 60 * time.Second
 // @Produce      json
 // @Param        service        query   string  true   "service name"
 // @Param        instance_id    query   string  false  "SDK instance ID; selects the capability filter and records observed state"
-// @Param        version        query   integer false  "generation the instance currently holds (recorded as observed_generation; at most 9223372036854775807)"
+// @Param        version        query   integer false  "generation the instance currently holds, recorded as observed_generation; absent, unparseable or above 9223372036854775807 reads as 0"
 // @Param        wait           query   integer false  "long-poll hold in seconds (0-60, default 0)"
 // @Param        If-None-Match  header  string  false  "ETag of the last document the instance applied or confirmed"
 // @Success      200  {object}  api.RuleSyncWire  "desired state; headers ETag, X-Atropos-Generation"
 // @Success      304  "unchanged; headers ETag, X-Atropos-Generation"
-// @Failure      400  {object}  api.ErrorResponse  "service query parameter required, or version out of range"
+// @Failure      400  {object}  api.ErrorResponse  "service query parameter required"
 // @Failure      500  {object}  api.ErrorResponse  "desired state could not be materialized"
 // @Router       /sdk/rules [get]
 func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
@@ -182,13 +182,14 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "service query parameter required")
 		return
 	}
-	// Absent or garbage reads as 0. observed_generation is a BIGINT, so a
-	// larger value (ParseUint answers MaxUint64 for one that overflows) would
-	// fail the observed-state write: refuse it before touching the store.
-	observed, _ := strconv.ParseUint(q.Get("version"), 10, 64)
-	if observed > math.MaxInt64 {
-		writeError(w, http.StatusBadRequest, "version out of range")
-		return
+	// Absent, garbage or out of range reads as 0. observed_generation is a
+	// BIGINT, so a value above MaxInt64 would fail the observed-state write;
+	// an SDK still holding a pre-long-poll version can send one, and it must
+	// be served the document like any instance that holds nothing, not
+	// stranded on a 400.
+	observed, err := strconv.ParseUint(q.Get("version"), 10, 64)
+	if err != nil || observed > math.MaxInt64 {
+		observed = 0
 	}
 	wait := parseWait(q.Get("wait"))
 	instanceID := q.Get("instance_id")
