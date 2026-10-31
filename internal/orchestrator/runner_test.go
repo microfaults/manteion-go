@@ -240,6 +240,68 @@ func TestPhaseExit_BumpsGenerationPerTransition(t *testing.T) {
 	}
 }
 
+// TestPausePhase_BumpsEachServiceOnce pins the pause side: a paused phase is
+// not running, so its rules and its cache-box role leave the desired state of
+// every service it touches, and pause bumps each of those services exactly
+// once. Without the bump a held long-poll keeps the paused phase's faults (and
+// its frozen service replaying) until its wait runs out. A paused baseline
+// takes the record rule away from the services frozen elsewhere in the
+// experiment, so those are bumped too.
+func TestPausePhase_BumpsEachServiceOnce(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	// Services no other test touches, so an exact count cannot see a stray bump.
+	frozen, target, bystander := id.New("svc-pause-frozen"), id.New("svc-pause-target"), id.New("svc-pause-bystander")
+	base := mkRunningBaseline(t, exp.ID, 0)
+	iso := mkRunningIsolation(t, exp.ID, frozen, 1)
+	// The isolation phase also attaches a rule targeting a second service.
+	rule := &model.Rule{
+		ID: id.New("rule"), Name: "pause-target", Service: target, Enabled: true,
+		Action:    model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: "exact"}},
+		Mode:      "inline",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := testRuleRepo.Create(ctx, rule); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rule.ID) })
+	if err := testExpRepo.AttachPhaseRules(ctx, iso.ID, []string{rule.ID}); err != nil {
+		t.Fatalf("attach rule: %v", err)
+	}
+	gens := func() [3]uint64 {
+		return [3]uint64{generation(t, o, frozen), generation(t, o, target), generation(t, o, bystander)}
+	}
+
+	g0 := gens()
+	if err := o.PausePhase(ctx, iso.ID); err != nil {
+		t.Fatalf("pause isolation: %v", err)
+	}
+	if s := getPhase(t, iso.ID).Status; s != "paused" {
+		t.Fatalf("isolation status %q after pause, want paused", s)
+	}
+	if g, want := gens(), [3]uint64{g0[0] + 1, g0[1] + 1, g0[2]}; g != want {
+		t.Fatalf("isolation pause: generations (frozen, target, bystander) %v → %v, want %v", g0, g, want)
+	}
+
+	g1 := gens()
+	if err := o.PausePhase(ctx, base.ID); err != nil {
+		t.Fatalf("pause baseline: %v", err)
+	}
+	if g, want := gens(), [3]uint64{g1[0] + 1, g1[1], g1[2]}; g != want {
+		t.Fatalf("baseline pause: generations (frozen, target, bystander) %v → %v, want %v (the record rule leaves the frozen service)", g1, g, want)
+	}
+
+	// A pause that loses (the phase is no longer running) bumps nothing.
+	g2 := gens()
+	if err := o.PausePhase(ctx, iso.ID); err == nil {
+		t.Fatal("second pause of the isolation phase succeeded, want an invalid-state error")
+	}
+	if g := gens(); g != g2 {
+		t.Fatalf("refused pause bumped: %v → %v", g2, g)
+	}
+}
+
 // TestRecover_DrainingPhaseCompletes pins M2(a): a phase left 'draining' by a
 // crash mid-barrier must be recovered. Recover's switch had no 'draining' case,
 // so the phase wedged forever and advanceExperiment stalled on it. Recovery

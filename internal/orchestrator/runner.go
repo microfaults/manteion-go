@@ -66,9 +66,14 @@ func (o *Orchestrator) phaseStatus(ctx context.Context, phaseID string) string {
 	return p.Status
 }
 
-// PausePhase suspends a running phase: the poller and zeus attacks stop, but
-// rules and cache-box freezes stay applied so a resume continues the same
-// experimental condition. Resume via StartPhase.
+// PausePhase suspends a running phase: the poller, zeus attacks and k6 runs
+// stop. A paused phase is not running, so its rules and its cache-box role (an
+// isolation phase's replay rule, a baseline's record rule) leave the desired
+// state of every service it touches and stop applying on those instances' next
+// poll; pause bumps each service's generation so held long-polls take that
+// poll now. Pause does not thaw: the freeze pushed to the frozen services
+// stays, and resume re-asserts it. Resume via StartPhase, whose enter serves
+// the phase again and bumps the same services.
 func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 	paused, err := o.experiments.TransitionPhase(ctx, phaseID, "paused", "running")
 	if err != nil {
@@ -90,6 +95,15 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 	// (StartPhase fresh=false re-runs startPhaseRuns), matching attacks.
 	if pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID); err == nil {
 		o.stopPhaseRuns(ctx, pws)
+	}
+	// The phase left 'running' at the CAS above, so its rules and cache-box
+	// role are already out of the materialized documents; the bump wakes the
+	// held long-polls to fetch them. After the load stops, as in endPhase (M1).
+	if p, err := o.experiments.GetPhase(ctx, phaseID); err != nil {
+		o.logger.Warn("orchestrator: pause: load phase for the generation bump failed",
+			"phase_id", phaseID, "error", err)
+	} else {
+		o.bumpDesired(ctx, p)
 	}
 	o.logger.Info("orchestrator: phase paused", "phase_id", phaseID)
 	return nil
