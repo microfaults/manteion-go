@@ -248,13 +248,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/v1/policies/{id}/enable", s.handleEnablePolicy)
 	mux.HandleFunc("PATCH /api/v1/policies/{id}/disable", s.handleDisablePolicy)
 
-	// SDK registration & polling
+	// SDK registration, polling & status reports
 	mux.HandleFunc("POST /api/v1/sdk/register", s.handleRegister)
 	mux.HandleFunc("DELETE /api/v1/sdk/register/{id}", s.handleDeregister)
 	mux.HandleFunc("GET /api/v1/sdk/instances", s.handleListInstances)
 	mux.HandleFunc("GET /api/v1/sdk/instances/{id}", s.handleGetInstance)
 	mux.HandleFunc("POST /api/v1/sdk/instances/{id}/kill-switch", s.handleInstanceKillSwitch)
 	mux.HandleFunc("GET /api/v1/sdk/rules", s.handlePollRules)
+	mux.HandleFunc("POST /api/v1/sdk/status", s.handleSDKStatus)
 	mux.HandleFunc("GET /api/v1/sdk/init", s.handleInit)
 	mux.HandleFunc("GET /api/v1/sdk/events", s.handleSSEEvents)
 

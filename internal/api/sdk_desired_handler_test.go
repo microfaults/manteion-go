@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ type fakeRegistry struct {
 	mu    sync.Mutex
 	byID  map[string]*model.SDKInstance
 	polls []polled
-	err   error
+	err   error // injected store failure: Get, Register and RecordStatus return it
 }
 
 type polled struct {
@@ -96,6 +97,9 @@ func (f *fakeRegistry) RecordPoll(_ context.Context, id string, gen uint64) erro
 func (f *fakeRegistry) RecordStatus(_ context.Context, id string, st model.ObservedStatus) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
 	i, ok := f.byID[id]
 	if !ok {
 		return store.ErrNotFound
@@ -874,5 +878,279 @@ func TestHandlePollRules_GenerationStoreFailureMidHoldIs500(t *testing.T) {
 	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": etag})
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/sdk/status (desired-state protocol v1 §2)
+// ---------------------------------------------------------------------------
+
+func postStatus(t *testing.T, s *Server, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	return serveJSON(t, s, http.MethodPost, "/api/v1/sdk/status", body, nil)
+}
+
+func TestHandleSDKStatus(t *testing.T) {
+	ctx := context.Background()
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 3, Etag: "3-abc",
+		Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"rule x: decode: boom"},
+		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"}})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s, want 204", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("204 carried a body: %s", w.Body.String())
+	}
+	got, _ := fx.reg.Get(ctx, "cart-1")
+	if got.ObservedGeneration != 3 || got.ObservedEtag != "3-abc" || len(got.ObservedUnsupported) != 1 ||
+		len(got.ObservedErrors) != 1 || got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "committed" {
+		t.Errorf("stored = %+v", got)
+	}
+
+	// A report is a full snapshot: empty lists clear, and an absent replay_set
+	// means the instance holds none, which clears the stored id and state.
+	if w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 4}); w.Code != http.StatusNoContent {
+		t.Errorf("minimal report: status = %d", w.Code)
+	}
+	got, _ = fx.reg.Get(ctx, "cart-1")
+	if got.ObservedGeneration != 4 || got.ObservedEtag != "" || len(got.ObservedUnsupported) != 0 || len(got.ObservedErrors) != 0 ||
+		got.ReplaySetID != "" || got.ReplaySetState != "" {
+		t.Errorf("after minimal report: %+v (empty lists clear, absent replay_set clears the id and state)", got)
+	}
+
+	w = postStatus(t, s, StatusReport{InstanceID: "nope", Service: "cartservice"})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown instance: status = %d, want 404", w.Code)
+	}
+	assertErrorBody(t, w, "instance not found")
+}
+
+// Every refusal is decided before the store is touched, so the stored report
+// survives it. Each case changes one thing in a report the store would take,
+// and the report differs from the stored one in every column, so a 400 is that
+// thing's and a write would show.
+func TestHandleSDKStatus_Validation(t *testing.T) {
+	ctx := context.Background()
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	if w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 5, Etag: "5-abc",
+		Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"first"},
+		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}}); w.Code != http.StatusNoContent {
+		t.Fatalf("seed report: status = %d body = %s", w.Code, w.Body.String())
+	}
+	stored, _ := fx.reg.Get(ctx, "cart-1")
+
+	report := func(edit func(*StatusReport)) StatusReport {
+		r := StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 6, Etag: "6-def",
+			Unsupported: []model.UnsupportedRule{}, Errors: []string{"second"},
+			ReplaySet: &model.ReplaySetStatus{ID: "sha256:bb", State: "committed"}}
+		edit(&r)
+		return r
+	}
+	for _, tc := range []struct {
+		name string
+		body any
+		want string // the error message starts with it
+	}{
+		{"malformed JSON", strings.NewReader("{"), "invalid JSON: "},
+		{"negative applied_generation", strings.NewReader(`{"instance_id":"cart-1","service":"cartservice","applied_generation":-1}`), "invalid JSON: "},
+		{"applied_generation beyond uint64", strings.NewReader(`{"instance_id":"cart-1","service":"cartservice","applied_generation":99999999999999999999}`), "invalid JSON: "},
+		{"missing instance_id", report(func(r *StatusReport) { r.InstanceID = "" }), "instance_id required"},
+		{"missing service", report(func(r *StatusReport) { r.Service = "" }), "service required"},
+		// sdk_instances.observed_generation is a BIGINT: pgx cannot store more.
+		{"applied_generation above MaxInt64", report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 + 1 }), "applied_generation out of range"},
+		{"applied_generation MaxUint64", report(func(r *StatusReport) { r.AppliedGeneration = math.MaxUint64 }), "applied_generation out of range"},
+		{"replay_set.state outside the vocabulary", report(func(r *StatusReport) { r.ReplaySet.State = "done" }), "replay_set.state must be fetching, committed or failed"},
+		{"replay_set without a state", report(func(r *StatusReport) { r.ReplaySet = &model.ReplaySetStatus{ID: "sha256:bb"} }), "replay_set.state must be fetching, committed or failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postStatus(t, s, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body = %s, want 400", w.Code, w.Body.String())
+			}
+			var e ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil || !strings.HasPrefix(e.Error, tc.want) {
+				t.Errorf("body = %s, want an error starting %q", w.Body.String(), tc.want)
+			}
+			if got, _ := fx.reg.Get(ctx, "cart-1"); !reflect.DeepEqual(got, stored) {
+				t.Errorf("a refused report changed the stored one: %+v, was %+v", got, stored)
+			}
+		})
+	}
+
+	// The BIGINT's own maximum is stored.
+	if w := postStatus(t, s, report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 })); w.Code != http.StatusNoContent {
+		t.Fatalf("applied_generation MaxInt64: status = %d body = %s, want 204", w.Code, w.Body.String())
+	}
+	if got, _ := fx.reg.Get(ctx, "cart-1"); got.ObservedGeneration != math.MaxInt64 {
+		t.Errorf("stored generation = %d, want MaxInt64", got.ObservedGeneration)
+	}
+}
+
+// The SDK always sends both lists, but a body that leaves them out or sends
+// null is a report with nothing unsupported and no errors, and clears the
+// previous ones just the same.
+func TestHandleSDKStatus_AbsentListsClear(t *testing.T) {
+	ctx := context.Background()
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	const head = `{"instance_id":"cart-1","service":"cartservice","applied_generation":2,"etag":"2-x"`
+	for _, tc := range []struct{ name, body string }{
+		{"keys left out", head + `}`},
+		{"null", head + `,"unsupported":null,"errors":null}`},
+		{"empty lists", head + `,"unsupported":[],"errors":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1, Etag: "1-a",
+				Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"boom"}}); w.Code != http.StatusNoContent {
+				t.Fatalf("seed report: status = %d body = %s", w.Code, w.Body.String())
+			}
+			if w := postStatus(t, s, strings.NewReader(tc.body)); w.Code != http.StatusNoContent {
+				t.Fatalf("status = %d body = %s, want 204", w.Code, w.Body.String())
+			}
+			got, _ := fx.reg.Get(ctx, "cart-1")
+			if got.ObservedGeneration != 2 || got.ObservedEtag != "2-x" || len(got.ObservedUnsupported) != 0 || len(got.ObservedErrors) != 0 {
+				t.Errorf("stored = %+v, want generation 2 with both lists cleared", got)
+			}
+		})
+	}
+}
+
+// The body an SDK instance posts is its own StatusReport, encoded: the handler
+// must take exactly that, whatever the manteion-local type's tags say.
+func TestHandleSDKStatus_AcceptsTheSDKsReport(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	body, err := json.Marshal(atroposdk.StatusReport{
+		InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 7, Etag: "7-abc",
+		Unsupported: []atroposdk.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}},
+		Errors:      []string{"rule x: decode: boom"},
+		ReplaySet:   &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "fetching"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := postStatus(t, s, bytes.NewReader(body)); w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s, want 204 for %s", w.Code, w.Body.String(), body)
+	}
+	got, _ := fx.reg.Get(context.Background(), "cart-1")
+	if got.ObservedGeneration != 7 || got.ObservedEtag != "7-abc" ||
+		!slices.Equal(got.ObservedUnsupported, []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}) ||
+		!slices.Equal(got.ObservedErrors, []string{"rule x: decode: boom"}) ||
+		got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "fetching" {
+		t.Errorf("stored = %+v from %s", got, body)
+	}
+}
+
+// A store failure that is not a missing row is a 500 that keeps its cause out
+// of the response and in the log.
+func TestHandleSDKStatus_StoreFailureIs500(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	var logs bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	fx.reg.err = errors.New("db down")
+	w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body = %s, want 500", w.Code, w.Body.String())
+	}
+	assertErrorBody(t, w, "failed to record status")
+	if got := logs.String(); !strings.Contains(got, `level=ERROR msg="sdk status: record failed" instance_id=cart-1`) || !strings.Contains(got, "db down") {
+		t.Errorf("logs = %q, want the failure and its cause logged against the instance", got)
+	}
+}
+
+// Against Postgres (MANTEION_TEST_DB=1): reports go through the real store and
+// come back out of the instance detail, each replacing the previous one.
+func TestHandleSDKStatus_DB(t *testing.T) {
+	e := newGenEnv(t)
+	inst := &model.SDKInstance{ID: "inst-" + e.tag, Service: "cart-" + e.tag, Version: "1.0.0", Address: "10.0.0.1:9090", PollIntervalMs: 10000}
+	if err := e.s.sdk.Register(e.ctx, inst); err != nil {
+		t.Fatalf("register instance: %v", err)
+	}
+	t.Cleanup(func() { _ = e.s.sdk.Deregister(context.Background(), inst.ID) })
+
+	report := func(edit func(*StatusReport)) *httptest.ResponseRecorder {
+		t.Helper()
+		r := StatusReport{InstanceID: inst.ID, Service: inst.Service}
+		edit(&r)
+		return e.do(http.MethodPost, "/api/v1/sdk/status", r)
+	}
+	// detail reads the row back the way GET /sdk/instances/{id} serves it, with
+	// the JSON keys it serves the observed state under.
+	detail := func() (*model.SDKInstance, map[string]json.RawMessage) {
+		t.Helper()
+		w := e.do(http.MethodGet, "/api/v1/sdk/instances/"+inst.ID, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("instance detail: status = %d body = %s", w.Code, w.Body.String())
+		}
+		var d SDKInstanceDetail
+		if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+			t.Fatalf("decode instance detail: %v", err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("decode instance detail keys: %v", err)
+		}
+		return d.SDKInstance, raw
+	}
+	unsupported := []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}
+
+	if w := report(func(r *StatusReport) {
+		r.AppliedGeneration, r.Etag, r.Unsupported, r.Errors = 3, "3-abc", unsupported, []string{"rule x: decode: boom"}
+		r.ReplaySet = &model.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}
+	}); w.Code != http.StatusNoContent {
+		t.Fatalf("full report: status = %d body = %s, want 204", w.Code, w.Body.String())
+	}
+	got, keys := detail()
+	if got.ObservedGeneration != 3 || got.ObservedEtag != "3-abc" || !slices.Equal(got.ObservedUnsupported, unsupported) ||
+		!slices.Equal(got.ObservedErrors, []string{"rule x: decode: boom"}) ||
+		got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "fetching" || got.ObservedAt == nil {
+		t.Errorf("after the full report: %+v", got)
+	}
+	for _, key := range []string{"observed_generation", "observed_etag", "observed_unsupported", "observed_errors", "replay_set_id", "replay_set_state", "observed_at"} {
+		if _, ok := keys[key]; !ok {
+			t.Errorf("instance detail lacks %q", key)
+		}
+	}
+
+	// The replay set moves on: its state is overwritten, the rest repeated.
+	if w := report(func(r *StatusReport) {
+		r.AppliedGeneration, r.Etag, r.Unsupported, r.Errors = 3, "3-abc", unsupported, []string{}
+		r.ReplaySet = &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"}
+	}); w.Code != http.StatusNoContent {
+		t.Fatalf("committed report: status = %d body = %s", w.Code, w.Body.String())
+	}
+	if got, _ := detail(); got.ReplaySetState != "committed" || len(got.ObservedErrors) != 0 {
+		t.Errorf("after the committed report: %+v, want the state overwritten and the errors cleared", got)
+	}
+
+	// null lists and no replay_set: a snapshot of an instance holding nothing.
+	w := e.do(http.MethodPost, "/api/v1/sdk/status", json.RawMessage(
+		`{"instance_id":"`+inst.ID+`","service":"`+inst.Service+`","applied_generation":4,"etag":"4-def","unsupported":null,"errors":null}`))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("null-lists report: status = %d body = %s", w.Code, w.Body.String())
+	}
+	if got, _ := detail(); got.ObservedGeneration != 4 || got.ObservedEtag != "4-def" || len(got.ObservedUnsupported) != 0 ||
+		len(got.ObservedErrors) != 0 || got.ReplaySetID != "" || got.ReplaySetState != "" {
+		t.Errorf("after the null-lists report: %+v, want nothing observed but generation 4", got)
+	}
+
+	// The BIGINT's maximum is stored; one more is refused before pgx sees it.
+	if w := report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 }); w.Code != http.StatusNoContent {
+		t.Fatalf("MaxInt64 report: status = %d body = %s", w.Code, w.Body.String())
+	}
+	if w := report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 + 1 }); w.Code != http.StatusBadRequest {
+		t.Errorf("MaxInt64+1 report: status = %d body = %s, want 400", w.Code, w.Body.String())
+	}
+	if got, _ := detail(); got.ObservedGeneration != math.MaxInt64 {
+		t.Errorf("generation = %d, want MaxInt64 kept", got.ObservedGeneration)
+	}
+
+	// A row that is not there is the store's ErrNotFound.
+	if w := e.do(http.MethodPost, "/api/v1/sdk/status", StatusReport{InstanceID: "gone-" + e.tag, Service: inst.Service}); w.Code != http.StatusNotFound {
+		t.Errorf("unknown instance: status = %d body = %s, want 404", w.Code, w.Body.String())
 	}
 }
