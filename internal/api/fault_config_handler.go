@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -96,10 +97,10 @@ func (s *Server) handleFireFaultConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to fire fault config")
 		return
 	}
-	// Bump the desired-state version so the next poll returns 200 and the SDK
-	// reconciles the new fault into its active set, and nudge the service's SSE
-	// subscribers so they re-poll immediately instead of waiting for the tick.
-	s.bumpAndBroadcast(ctx, cfg.Service)
+	// Bump the service's generation so the next poll returns 200 and the SDK
+	// reconciles the new fault into its active set; Generations also wakes the
+	// service's parked polls and SSE subscribers so they re-poll immediately.
+	s.bumpGeneration(ctx, cfg.Service)
 	s.logger.Info("fault config fired", "id", id, "service", cfg.Service)
 
 	fired, err := s.faultConfigs.Get(ctx, id)
@@ -134,7 +135,16 @@ func (s *Server) handleCancelFaultConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to cancel fault config")
 		return
 	}
-	s.bumpAndBroadcast(ctx, cfg.Service)
+	s.bumpGeneration(ctx, cfg.Service)
 	s.logger.Info("fault config cancelled", "id", id, "service", cfg.Service)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": model.FaultConfigCancelled})
+}
+
+// bumpGeneration bumps a service's desired-state generation after an input
+// change made outside the rule repo (fault configs fire/cancel/expire). Pollers
+// wake and SSE subscribers are nudged by Generations itself. Best-effort.
+func (s *Server) bumpGeneration(ctx context.Context, service string) {
+	if _, err := s.generations.Bump(ctx, service); err != nil {
+		s.logger.Warn("bump generation failed", "service", service, "error", err)
+	}
 }

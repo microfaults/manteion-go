@@ -20,6 +20,7 @@ import (
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/db"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/policy"
 	"manteion-go/internal/promql"
@@ -60,8 +61,11 @@ func main() {
 	}
 	defer db.Close(database)
 
-	// Create repositories.
-	ruleRepo := store.NewRuleRepo(database)
+	// Create repositories. Generations is the desired-state change fabric: the
+	// rule repo bumps it in-transaction, the API bumps it for fault configs, and
+	// both wake the same long-polls and SSE subscribers.
+	gens := desired.NewGenerations(store.NewGenerationRepo(database), desired.NewBroker())
+	ruleRepo := store.NewRuleRepo(database, gens)
 	faultRepo := store.NewFaultRepo(database)
 	sdkRepo := store.NewSDKRepo(database)
 	experimentRepo := store.NewExperimentRepo(database)
@@ -123,7 +127,7 @@ func main() {
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
-		zeusClient, controller.IntentReader(), orch, cs, policyRepo,
+		zeusClient, controller.IntentReader(), gens, orch, cs, policyRepo,
 	)
 
 	httpServer := &http.Server{

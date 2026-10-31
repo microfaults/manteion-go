@@ -176,7 +176,6 @@ func (s *Server) handleInstanceKillSwitch(w http.ResponseWriter, r *http.Request
 	if len(disabled) > 0 {
 		s.logger.Info("kill-switch: rules disabled",
 			"instance_id", id, "service", inst.Service, "rule_ids", disabled)
-		s.broadcastRulesChanged(ctx, inst.Service)
 	}
 	if failed > 0 {
 		writeError(w, http.StatusInternalServerError,

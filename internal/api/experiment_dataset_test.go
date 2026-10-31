@@ -165,7 +165,7 @@ func TestPhaseWorkflowDatasets(t *testing.T) {
 	// runs its phases driver-less (auto-complete), which is all the start
 	// tests need — they pin that the preflight gates the orchestrator call.
 	orch := orchestrator.New(
-		expRepo, store.NewRuleRepo(database), store.NewFaultRepo(database),
+		expRepo, store.NewRuleRepo(database, nil), store.NewFaultRepo(database),
 		store.NewWorkloadRepo(database), wfRepo,
 		controller, nil, nil, cachestore.New(t.TempDir()),
 		store.NewPhaseFaultEventRepo(database), logger,

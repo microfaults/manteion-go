@@ -14,6 +14,7 @@ import (
 
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
@@ -52,6 +53,7 @@ type Server struct {
 	traces           *store.TraceRepo
 	zeus             *zeus.Client
 	intent           atrocontrol.IntentReader
+	generations      *desired.Generations
 	orch             *orchestrator.Orchestrator
 	cacheStore       *cachestore.Store
 	broker           *EventBroker
@@ -73,6 +75,7 @@ func NewServer(
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
 	intent atrocontrol.IntentReader,
+	gens *desired.Generations,
 	orch *orchestrator.Orchestrator,
 	cs *cachestore.Store,
 	policies *store.PolicyRepo,
@@ -99,9 +102,10 @@ func NewServer(
 		traces:           traces,
 		zeus:             zeusClient,
 		intent:           intent,
+		generations:      gens,
 		orch:             orch,
 		cacheStore:       cs,
-		broker:           NewEventBroker(),
+		broker:           gens.Broker(),
 	}
 }
 

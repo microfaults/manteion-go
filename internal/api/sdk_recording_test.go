@@ -38,7 +38,7 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	}
 	defer db.Close(database)
 
-	rules := store.NewRuleRepo(database)
+	rules := store.NewRuleRepo(database, nil)
 	exp := store.NewExperimentRepo(database)
 	s := &Server{
 		rules: rules, rulever: rules,

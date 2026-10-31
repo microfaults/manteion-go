@@ -91,7 +91,7 @@ func (e *editTestEnv) rule() string {
 		Action:    model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: "exact"}},
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
-	if err := store.NewRuleRepo(e.db).Create(e.ctx, r); err != nil {
+	if err := store.NewRuleRepo(e.db, nil).Create(e.ctx, r); err != nil {
 		e.t.Fatalf("create rule: %v", err)
 	}
 	e.t.Cleanup(func() {

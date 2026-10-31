@@ -78,7 +78,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testExpRepo = store.NewExperimentRepo(testDB)
-	testRuleRepo = store.NewRuleRepo(testDB)
+	testRuleRepo = store.NewRuleRepo(testDB, nil)
 	testFaultRepo = store.NewFaultRepo(testDB)
 	testWorkloadRepo = store.NewWorkloadRepo(testDB)
 	testWorkflowRepo = store.NewWorkflowRepo(testDB)

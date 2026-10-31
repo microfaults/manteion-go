@@ -35,7 +35,7 @@ func newTestOrch(t *testing.T, database *sql.DB, zeusURL string) *orchestrator.O
 		zc = zeus.NewClient(zeusURL)
 	}
 	orch := orchestrator.New(
-		store.NewExperimentRepo(database), store.NewRuleRepo(database), store.NewFaultRepo(database),
+		store.NewExperimentRepo(database), store.NewRuleRepo(database, nil), store.NewFaultRepo(database),
 		store.NewWorkloadRepo(database), store.NewWorkflowRepo(database),
 		controller, nil, zc, cachestore.New(t.TempDir()),
 		store.NewPhaseFaultEventRepo(database), logger,

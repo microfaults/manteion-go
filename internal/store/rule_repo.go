@@ -3,25 +3,56 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"manteion-go/internal/model"
 )
 
+// GenerationBumper is the slice of desired.Generations the rule repo drives: an
+// in-transaction bump and the post-commit wake-up. Nil disables bumping.
+type GenerationBumper interface {
+	BumpTx(ctx context.Context, tx *sql.Tx, service string) (uint64, error)
+	Notify(service string, generation uint64)
+}
+
 // RuleRepo provides CRUD operations for fault injection rules backed by PostgreSQL.
-// Every mutation bumps the rule_version counter in the same transaction so that
-// SDK polling can use version-based 304 responses.
+// Every mutation bumps the rule_version counter, and the generation of each
+// service it touches, in the same transaction; the service's pollers are woken
+// only after that transaction commits.
 type RuleRepo struct {
-	db *sql.DB
+	db   *sql.DB
+	gens GenerationBumper
 }
 
-// NewRuleRepo creates a new rule repository.
-func NewRuleRepo(db *sql.DB) *RuleRepo {
-	return &RuleRepo{db: db}
+// NewRuleRepo creates a new rule repository. An untyped nil gens disables
+// generation bumping (for tests that do not observe generations).
+func NewRuleRepo(db *sql.DB, gens GenerationBumper) *RuleRepo { return &RuleRepo{db: db, gens: gens} }
+
+// bumpGeneration bumps service inside tx; 0 when generations are disabled.
+func (r *RuleRepo) bumpGeneration(ctx context.Context, tx *sql.Tx, service string) (uint64, error) {
+	if r.gens == nil || service == "" {
+		return 0, nil
+	}
+	return r.gens.BumpTx(ctx, tx, service)
 }
 
-// Create inserts a new rule and bumps the rule version.
+// notify wakes a service's pollers after the transaction that bumped it committed.
+func (r *RuleRepo) notify(service string, generation uint64) {
+	if r.gens != nil && generation > 0 {
+		r.gens.Notify(service, generation)
+	}
+}
+
+// serviceGeneration is the generation a service reached in a bump.
+type serviceGeneration struct {
+	service    string
+	generation uint64
+}
+
+// Create inserts a new rule and bumps the rule version and the service's generation.
 func (r *RuleRepo) Create(ctx context.Context, rule *model.Rule) error {
 	if err := rule.Validate(); err != nil {
 		return err
@@ -32,7 +63,8 @@ func (r *RuleRepo) Create(ctx context.Context, rule *model.Rule) error {
 		return fmt.Errorf("marshal match_labels: %w", err)
 	}
 
-	return execTx(ctx, r.db, func(tx *sql.Tx) error {
+	var gen uint64
+	if err := execTx(ctx, r.db, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO rules (id, name, service, enabled, priority, injection_point,
 				match_labels, action_type, fault_spec_id, fault_composition_id,
@@ -49,8 +81,16 @@ func (r *RuleRepo) Create(ctx context.Context, rule *model.Rule) error {
 			return fmt.Errorf("insert rule: %w", err)
 		}
 
-		return r.bumpVersion(ctx, tx)
-	})
+		if err := r.bumpVersion(ctx, tx); err != nil {
+			return err
+		}
+		gen, err = r.bumpGeneration(ctx, tx, rule.Service)
+		return err
+	}); err != nil {
+		return err
+	}
+	r.notify(rule.Service, gen)
+	return nil
 }
 
 func nullCacheBoxMode(cb *model.CacheBoxRuleConfig) sql.NullString {
@@ -78,7 +118,8 @@ func (r *RuleRepo) Get(ctx context.Context, id string) (*model.Rule, error) {
 	return r.scanRule(row)
 }
 
-// Update replaces an existing rule and bumps the rule version.
+// Update replaces an existing rule and bumps the rule version and the generation
+// of the rule's service, and of its previous service when the update moves it.
 func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 	if err := rule.Validate(); err != nil {
 		return err
@@ -89,8 +130,19 @@ func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 		return fmt.Errorf("marshal match_labels: %w", err)
 	}
 
-	return execTx(ctx, r.db, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `
+	var bumped []serviceGeneration
+	if err := execTx(ctx, r.db, func(tx *sql.Tx) error {
+		// Lock the row and read the service it is leaving: a move bumps both.
+		var prev string
+		err := tx.QueryRowContext(ctx, `SELECT service FROM rules WHERE id = $1 FOR UPDATE`, rule.ID).Scan(&prev)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock rule: %w", err)
+		}
+
+		_, err = tx.ExecContext(ctx, `
 			UPDATE rules SET name=$2, service=$3, enabled=$4, priority=$5, injection_point=$6,
 				match_labels=$7, action_type=$8, fault_spec_id=$9, fault_composition_id=$10,
 				cachebox_mode=$11, cachebox_key_strategy=$12, mode=$13, start_policy=$14, updated_at=$15
@@ -105,25 +157,59 @@ func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 		if err != nil {
 			return fmt.Errorf("update rule: %w", err)
 		}
-		if err := affectedOrNotFound(res); err != nil {
+		if err := r.bumpVersion(ctx, tx); err != nil {
 			return err
 		}
-		return r.bumpVersion(ctx, tx)
-	})
+
+		// BumpTx holds the service_generations row lock until commit, so updates
+		// moving rules in opposite directions (A to B, B to A) must lock the two
+		// rows in the same order or Postgres aborts one with a deadlock (40P01):
+		// bump in sorted service order, once per distinct service.
+		services := []string{rule.Service}
+		if prev != rule.Service {
+			services = append(services, prev)
+			slices.Sort(services)
+		}
+		for _, svc := range services {
+			gen, err := r.bumpGeneration(ctx, tx, svc)
+			if err != nil {
+				return err
+			}
+			bumped = append(bumped, serviceGeneration{svc, gen})
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, b := range bumped {
+		r.notify(b.service, b.generation)
+	}
+	return nil
 }
 
-// Delete removes a rule by ID and bumps the rule version.
+// Delete removes a rule by ID and bumps the rule version and the generation of
+// the service the rule belonged to.
 func (r *RuleRepo) Delete(ctx context.Context, id string) error {
-	return execTx(ctx, r.db, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `DELETE FROM rules WHERE id = $1`, id)
+	var svc string
+	var gen uint64
+	if err := execTx(ctx, r.db, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `DELETE FROM rules WHERE id = $1 RETURNING service`, id).Scan(&svc)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
 		if err != nil {
 			return fmt.Errorf("delete rule: %w", err)
 		}
-		if err := affectedOrNotFound(res); err != nil {
+		if err := r.bumpVersion(ctx, tx); err != nil {
 			return err
 		}
-		return r.bumpVersion(ctx, tx)
-	})
+		gen, err = r.bumpGeneration(ctx, tx, svc)
+		return err
+	}); err != nil {
+		return err
+	}
+	r.notify(svc, gen)
+	return nil
 }
 
 // List returns all rules ordered by priority (desc) then creation time.
@@ -212,10 +298,10 @@ func (r *RuleRepo) Version(ctx context.Context) (uint64, error) {
 	return v, nil
 }
 
-// BumpVersion increments the rule store version out of band. Used when the
-// desired SDK state changes without a rule mutation — e.g. a long-running fault
-// config is fired, cancelled, or expires — so the next poll returns 200 and the
-// SDK reconciles its active_faults set instead of getting a 304.
+// BumpVersion increments the rule store version out of band. The orchestrator
+// uses it when a phase transition changes what the poll serves without a rule
+// mutation (cache-box phase start/stop, the drain barrier), so the next poll
+// returns 200 instead of a 304. Fault configs bump the service generation instead.
 func (r *RuleRepo) BumpVersion(ctx context.Context) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE rule_version SET version = version + 1 WHERE id = 1`)

@@ -502,7 +502,7 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	}
 	defer db.Close(database)
 
-	rules := store.NewRuleRepo(database)
+	rules := store.NewRuleRepo(database, nil)
 	faults := store.NewFaultRepo(database)
 	sdk := store.NewSDKRepo(database)
 	exp := store.NewExperimentRepo(database)

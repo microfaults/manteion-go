@@ -49,7 +49,7 @@ func TestHandleStopPhaseFlat_SurvivesClientDisconnect(t *testing.T) {
 		atrocontrol.WithDefaultTimeout(time.Second), atrocontrol.WithLogger(logger),
 	)
 	orch := orchestrator.New(
-		expRepo, store.NewRuleRepo(database), store.NewFaultRepo(database),
+		expRepo, store.NewRuleRepo(database, nil), store.NewFaultRepo(database),
 		store.NewWorkloadRepo(database), store.NewWorkflowRepo(database),
 		controller, nil, nil, cachestore.New(t.TempDir()),
 		store.NewPhaseFaultEventRepo(database), logger,
