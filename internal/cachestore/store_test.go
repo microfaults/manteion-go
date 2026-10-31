@@ -120,6 +120,60 @@ func TestIngest_EpochSeparatesRestarts(t *testing.T) {
 	}
 }
 
+// TestIngest_KeyIsInjective pins that the dedupe key keeps its fields apart:
+// batches that differ in any one of (instance, epoch, batch_seq) are different
+// batches, however their digits run together when written out. Without a
+// separator between two of the fields, epoch 1 / seq 23 and epoch 12 / seq 3
+// are both "123", and so are instance "i1" / epoch 2 and instance "i" / epoch
+// 12; the second batch of a pair would be swallowed as a retry of the first and
+// its entries lost, with no error anywhere.
+func TestIngest_KeyIsInjective(t *testing.T) {
+	type batch struct {
+		instance string
+		epoch    int64
+		seq      int
+	}
+	for _, tc := range []struct {
+		name string
+		a, b batch
+	}{
+		{"epoch and batch_seq", batch{"inst-a", 1, 23}, batch{"inst-a", 12, 3}},
+		{"instance and epoch", batch{"i1", 2, 3}, batch{"i", 12, 3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(t.TempDir())
+			ingest := func(b batch) IngestResult {
+				t.Helper()
+				r, err := s.Ingest("exp-1", "phase-1", "frontend", b.instance, b.epoch, b.seq,
+					[]atroposdk.CacheBoxWireEntry{{Key: "k"}})
+				if err != nil {
+					t.Fatalf("Ingest %+v: %v", b, err)
+				}
+				return r
+			}
+			for _, b := range []batch{tc.a, tc.b} {
+				if r := ingest(b); r.Duplicate || r.Accepted != 1 {
+					t.Fatalf("Ingest %+v = %+v, want accepted: it is not a retry of the batch before it", b, r)
+				}
+			}
+			// Each is still a duplicate of itself, so the two keys dedupe rather
+			// than merely differ.
+			for _, b := range []batch{tc.a, tc.b} {
+				if r := ingest(b); !r.Duplicate || r.Accepted != 0 {
+					t.Fatalf("Ingest %+v again = %+v, want a duplicate", b, r)
+				}
+			}
+			stored, err := s.Read("exp-1", "phase-1", "frontend")
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if len(stored) != 2 {
+				t.Fatalf("stored entries = %d, want 2 (one per batch, none lost, none doubled)", len(stored))
+			}
+		})
+	}
+}
+
 // TestIngest_CollisionStats pins MANT-3 ingest-side collision accounting (Q3):
 // a repeated key with a differing (status, response_body_sha256) is a
 // divergent collision; a repeated key matching the last-seen signature is an

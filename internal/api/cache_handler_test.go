@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
@@ -197,6 +198,57 @@ func TestIngest_EpochInDedupeKey(t *testing.T) {
 	expect("no epoch, seq 1 retried", postIngestBody(t, s, noEpoch), 0, true)
 	if got := s.cacheStore.ReceivedCount("exp-1", "phase-rec", "frontend", "i-old"); got != 1 {
 		t.Fatalf("i-old received = %d, want 1", got)
+	}
+}
+
+// TestIngest_MalformedEpochIs400 pins that epoch gets no leniency the other
+// fields lack: a value that is not a JSON integer is refused with 400 like a
+// malformed batch_seq, and nothing is recorded. The failure this guards against
+// is the silent kind: a decoder that took "7" (or dropped the field) would read
+// the batch as epoch 0, the old client's key, and a restarted instance's batches
+// would again be swallowed as retries of its previous process's. The bodies are
+// literal JSON, for the same reason as in TestIngest_EpochInDedupeKey.
+func TestIngest_MalformedEpochIs400(t *testing.T) {
+	reader := stubPhaseReader{phases: map[string]*model.ExperimentPhase{
+		"phase-rec": {ID: "phase-rec", ExperimentID: "exp-1", Status: "running", PersistCache: true},
+	}}
+	newServer := func() *Server {
+		return &Server{phaseReader: reader, cacheStore: cachestore.New(t.TempDir()), logger: discardLogger()}
+	}
+	body := func(batchSeq, epoch string) string {
+		return `{"service":"frontend","instance":"i1","experiment_id":"exp-1","phase_id":"phase-rec",` +
+			`"batch_seq":` + batchSeq + `,"epoch":` + epoch + `,"entries":[{"key":"k1"}]}`
+	}
+
+	// The well-formed twin is accepted, so a 400 below is the one field's doing.
+	if acc, dup := ingestOutcome(t, postIngestBody(t, newServer(), body("1", "7"))); acc != 1 || dup {
+		t.Fatalf("well-formed body = {accepted:%d duplicate:%v}, want {accepted:1 duplicate:false}", acc, dup)
+	}
+
+	for _, tc := range []struct{ name, batchSeq, epoch string }{
+		{"epoch as a string", "1", `"7"`},
+		{"epoch with a fraction", "1", `7.5`},
+		{"batch_seq as a string (the comparison)", `"1"`, `7`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newServer()
+			w := postIngestBody(t, s, body(tc.batchSeq, tc.epoch))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
+			}
+			var e struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
+				t.Fatalf("decode error body: %v", err)
+			}
+			if !strings.HasPrefix(e.Error, "invalid json") {
+				t.Fatalf("error=%q, want the invalid-json refusal", e.Error)
+			}
+			if got := s.cacheStore.ReceivedCount("exp-1", "phase-rec", "frontend", "i1"); got != 0 {
+				t.Fatalf("received = %d, want 0 (a refused body records nothing)", got)
+			}
+		})
 	}
 }
 
