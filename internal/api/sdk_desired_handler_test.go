@@ -1381,6 +1381,25 @@ func TestHandleSDKStatus_Validation(t *testing.T) {
 	}
 }
 
+// A replay set the instance could not fetch or commit is reported as "failed",
+// its reason in errors, and stored like any other state: plan 2's phase-entry
+// barrier fails the phase fast on it instead of waiting out its timeout.
+func TestHandleSDKStatus_StoresAFailedReplaySet(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	w := postStatus(t, s, strings.NewReader(`{"instance_id":"cart-1","service":"cartservice","applied_generation":3,`+
+		`"etag":"0123456789abcdef","unsupported":[],"errors":["replay set sha256:aa: digest mismatch"],`+
+		`"replay_set":{"id":"sha256:aa","state":"failed"}}`))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s, want 204", w.Code, w.Body.String())
+	}
+	got, _ := fx.reg.Get(context.Background(), "cart-1")
+	if got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "failed" || got.ObservedGeneration != 3 ||
+		!slices.Equal(got.ObservedErrors, []string{"replay set sha256:aa: digest mismatch"}) {
+		t.Errorf("stored = %+v, want the failed replay set, its reason and generation 3", got)
+	}
+}
+
 // The SDK always sends both lists, but a body that leaves them out or sends
 // null is a report with nothing unsupported and no errors, and clears the
 // previous ones just the same.
