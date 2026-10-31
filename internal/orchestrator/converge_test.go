@@ -52,9 +52,9 @@ func registerHost(t *testing.T, service string, caps []string) string {
 	return inst.ID
 }
 
-// The barrier compares observed_generation with >=: an instance that already
-// adopted a later generation has converged too (it can also lag one poll,
-// which is why the comparison is never ==).
+// The barrier compares observed_generation with >=, never ==: an instance
+// that already adopted a later generation (another bump landed) has converged
+// too.
 func TestWaitConverged_AliveInstancesAtOrPastTheTarget(t *testing.T) {
 	ctx := context.Background()
 	o := newOrch(t, "")
