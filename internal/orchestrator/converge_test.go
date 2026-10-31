@@ -66,7 +66,7 @@ func TestWaitConverged_AliveInstancesAtOrPastTheTarget(t *testing.T) {
 	if err := testSDKRepo.RecordPoll(ctx, ahead, target+2); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 5*time.Second); err != nil {
+	if err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 5*time.Second, nil); err != nil {
 		t.Fatalf("waitConverged = %v, want nil", err)
 	}
 }
@@ -87,7 +87,7 @@ func TestWaitConverged_SuspectInstanceIsNamedNotWaitedOn(t *testing.T) {
 	suspect := registerSDK(t, svc, "http://suspect.invalid")
 	markSuspect(t, suspect)
 
-	if err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 5*time.Second); err != nil {
+	if err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 5*time.Second, nil); err != nil {
 		t.Fatalf("waitConverged = %v, want nil: a suspect instance is not waited on", err)
 	}
 	if got := logs.String(); !strings.Contains(got, suspect) || !strings.Contains(got, "not waited on") {
@@ -97,7 +97,7 @@ func TestWaitConverged_SuspectInstanceIsNamedNotWaitedOn(t *testing.T) {
 	// An alive instance that never polls the target is waited on until the
 	// timeout, and the timeout error names it and the suspect one.
 	lagging := registerSDK(t, svc, "http://lagging.invalid")
-	err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 300*time.Millisecond)
+	err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 300*time.Millisecond, nil)
 	if err == nil {
 		t.Fatal("waitConverged = nil, want a timeout naming the lagging instance")
 	}
@@ -158,7 +158,7 @@ func TestWaitConverged_FatalAtOnce(t *testing.T) {
 			targets, wants := tc.setup(t, o, svc, bumpService(t, o, svc))
 			const timeout = 5 * time.Second
 			start := time.Now()
-			err := o.waitConverged(ctx, targets, map[string]string{svc: art}, timeout)
+			err := o.waitConverged(ctx, targets, map[string]string{svc: art}, timeout, nil)
 			if err == nil {
 				t.Fatal("waitConverged = nil, want a fatal error")
 			}
@@ -209,13 +209,13 @@ func TestWaitConverged_ReplaySetMustBeTheAssignedOneCommitted(t *testing.T) {
 		} else {
 			report(tc.id, tc.state)
 		}
-		err := o.waitConverged(ctx, targets, artifacts, 200*time.Millisecond)
+		err := o.waitConverged(ctx, targets, artifacts, 200*time.Millisecond, nil)
 		if err == nil || !strings.Contains(err.Error(), "still lagging") || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("replay set %q/%q: err = %v, want a lagging timeout with %q", tc.id, tc.state, err, tc.want)
 		}
 	}
 	report(art, "committed")
-	if err := o.waitConverged(ctx, targets, artifacts, 5*time.Second); err != nil {
+	if err := o.waitConverged(ctx, targets, artifacts, 5*time.Second, nil); err != nil {
 		t.Fatalf("committed: waitConverged = %v, want nil", err)
 	}
 }
@@ -688,5 +688,60 @@ func TestEnterPhase_PauseAndResumeDuringTheWait_OnlyTheNewEntryStartsLoad(t *tes
 	}
 	if n := fz.runCount(); n != 1 {
 		t.Fatalf("zeus started %d run(s), want 1: only the entry holding the phase's claim starts load", n)
+	}
+}
+
+// A stop that lands while an entry waits for its fleet ends the wait at the
+// barrier's next look: the phase is no longer running, so the entry gives up
+// at once with a refusal naming the status, instead of sitting out the whole
+// timeout before its failure turns out to be a no-op. It starts no load and
+// leaves the phase as the stop left it.
+func TestEnterPhase_StoppedWhileConvergingEndsTheWait(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	o.WithConvergeTimeout(5 * time.Second)
+	exp := mkExp(t)
+	svc := id.New("svc-stopped")
+	ph := mkRunningRulePhase(t, exp.ID, svc, 0)
+	attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1}) // a run would drive it
+	inst := registerSDK(t, svc, "http://acks-late.invalid")
+	g0 := generation(t, o, svc)
+
+	entry := make(chan error, 1)
+	go func() { entry <- o.enterPhase(ctx, ph, true) }()
+	if !waitGeneration(o, svc, g0) {
+		t.Fatal("the entry never bumped")
+	}
+	stopped := make(chan error, 1)
+	stopAt := time.Now()
+	go func() { stopped <- o.StopPhase(ctx, ph.ID, "skipped") }()
+
+	var err error
+	select {
+	case err = <-entry:
+	case <-time.After(4 * time.Second):
+		t.Fatal("the entry sat out its wait after the phase was stopped")
+	}
+	if elapsed := time.Since(stopAt); elapsed > 2*time.Second {
+		t.Errorf("the entry gave up %v after the stop, want within a few of the barrier's looks", elapsed)
+	}
+	var state *ErrInvalidState
+	if !errors.As(err, &state) || state.Current != "skipped" {
+		t.Fatalf("entry = %v, want an invalid-state refusal naming the skipped phase", err)
+	}
+
+	// The stop's own exit wait ends once the instance observes its bump.
+	if err := testSDKRepo.RecordPoll(ctx, inst, generation(t, o, svc)); err != nil {
+		t.Fatal(err)
+	}
+	if err := receive(t, "the stop", stopped); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "skipped" || got.FailureReason != "" {
+		t.Fatalf("phase = %s / %q, want skipped with no failure (the stop's)", got.Status, got.FailureReason)
+	}
+	if n := fz.runCount(); n != 0 {
+		t.Fatalf("zeus started %d run(s) for a stopped phase", n)
 	}
 }

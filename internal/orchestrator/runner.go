@@ -189,7 +189,11 @@ func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhas
 	// the document, so its frozen services were serving live.
 	targets, err := o.bumpDesired(ctx, p)
 	if err == nil {
-		err = o.waitConverged(ctx, targets, artifacts, o.convergeTimeout)
+		err = o.waitConverged(ctx, targets, artifacts, o.convergeTimeout,
+			func(ctx context.Context) error { return o.entryHolds(ctx, p.ID, claim) })
+	}
+	if errors.Is(err, errLeftRunning) {
+		return o.leftRunning(ctx, p) // a pause, a stop or a newer entry took the phase
 	}
 	if err != nil {
 		err = fmt.Errorf("orchestrator: converge gate: %w", err)

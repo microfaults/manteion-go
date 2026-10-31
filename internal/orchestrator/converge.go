@@ -44,10 +44,20 @@ const (
 // only: the SDK can fold a failed report into a later fetching one and retries
 // a failed pull on its own timer, so the timeout stays the guarantee. On
 // timeout the error lists every lagging instance.
-func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uint64, artifacts map[string]string, timeout time.Duration) error {
+//
+// holds, when non-nil, is asked before each look whether the wait still has a
+// reason: an entry's wait passes entryHolds, so a pause, a stop or a newer
+// entry that takes the phase ends the wait at the next look with
+// errLeftRunning instead of after the timeout. Exit and drain waits pass nil.
+func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uint64, artifacts map[string]string, timeout time.Duration, holds func(context.Context) error) error {
 	deadline := time.Now().Add(timeout)
 	logged := map[string]bool{} // suspect instances already named in the log
 	for {
+		if holds != nil {
+			if err := holds(ctx); err != nil {
+				return err
+			}
+		}
 		lagging, suspect, err := o.laggingInstances(ctx, targets, artifacts)
 		if err != nil {
 			return err
@@ -137,7 +147,7 @@ func (o *Orchestrator) laggingInstances(ctx context.Context, targets map[string]
 // recording instance reports only after its drain POST. A timeout is logged,
 // never a failure.
 func (o *Orchestrator) awaitConvergedNonFatal(ctx context.Context, p *model.ExperimentPhase, targets map[string]uint64) {
-	if err := o.waitConverged(ctx, targets, nil, o.convergeTimeout); err != nil {
+	if err := o.waitConverged(ctx, targets, nil, o.convergeTimeout, nil); err != nil {
 		o.logger.Warn("orchestrator: fleet did not converge at phase exit; next poll converges stragglers",
 			"phase_id", p.ID, "error", err)
 	}
