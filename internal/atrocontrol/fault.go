@@ -9,10 +9,7 @@ import (
 func (c *Controller) InjectFault(ctx context.Context, service string, req atroposdk.FaultRequest, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
 
-	c.intent.Set(service, ServiceIntent{
-		ActiveFault: &req,
-		RunID:       co.runID,
-	})
+	c.intent.SetActiveFault(service, &req) // keeps the rules and freeze config
 
 	targets, err := c.resolveTargets(ctx, service, co.filter)
 	if err != nil {
@@ -30,7 +27,7 @@ func (c *Controller) InjectFault(ctx context.Context, service string, req atropo
 
 func (c *Controller) ClearFault(ctx context.Context, service string, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
-	c.intent.Clear(service)
+	c.intent.SetActiveFault(service, nil)
 
 	targets, err := c.resolveTargets(ctx, service, co.filter)
 	if err != nil {

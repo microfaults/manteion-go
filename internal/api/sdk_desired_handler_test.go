@@ -21,6 +21,9 @@ import (
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
+	"manteion-go/internal/atrocontrol"
+	"manteion-go/internal/atropos"
+	"manteion-go/internal/atropostest"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
@@ -1081,6 +1084,101 @@ func TestServer_ShutdownAnswersHeldPollsAndEndsStreams(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("the SSE stream outlived Shutdown")
+	}
+}
+
+// oneInstanceResolver is an atrocontrol fleet with a single instance.
+type oneInstanceResolver struct{ inst *model.SDKInstance }
+
+func (r oneInstanceResolver) ForService(_ context.Context, service string) ([]*model.SDKInstance, error) {
+	if service != r.inst.Service {
+		return nil, nil
+	}
+	return []*model.SDKInstance{r.inst}, nil
+}
+
+func (r oneInstanceResolver) ForInstance(_ context.Context, id string) (*model.SDKInstance, error) {
+	if id != r.inst.ID {
+		return nil, store.ErrNotFound
+	}
+	return r.inst, nil
+}
+
+// Plan 1 serves freeze_cfg from the controller's intent tracker. enterPhase
+// freezes a frozen service and then pushes the phase's rules to it, and
+// endPhase pushes nil rules before it thaws. Neither rule push may disturb
+// the freeze config: the tracker keeps reporting it and the poll keeps serving
+// it to the service's cache-box instance until thaw clears it. (A rule push
+// that replaced the whole intent dropped it, and the SDK clears its delay
+// source on a document without freeze_cfg.)
+func TestHandlePollRules_RulePushKeepsTheFreezeConfig(t *testing.T) {
+	ctx := context.Background()
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice", Capabilities: []string{"inline", "cachebox"}})
+	sdk := &model.SDKInstance{ID: "cart-1", Service: "cartservice", Address: atropostest.NewServer(t).URL}
+	ctrl := atrocontrol.New(atropos.NewClient(), oneInstanceResolver{sdk},
+		atrocontrol.WithDefaultTimeout(5*time.Second), atrocontrol.WithLogger(discardLogger()))
+	fx.mat.Freeze = ctrl.IntentReader()
+	s := fx.server()
+
+	freeze := atroposdk.DelayRequest{Mu: 1.5, Sigma: 0.25, Seed: 7, Context: &atroposdk.CacheBoxContext{
+		ExperimentID: "exp-1", PhaseID: "phase-iso", KeyStrategy: "canonical_v2", StrategyVersion: 2}}
+	want, _ := json.Marshal(freeze)
+	rules := []atroposdk.CompiledRule{{Name: "phase-rule", InjectionPoint: "egress", Mode: "inline",
+		CacheBox: &atroposdk.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}}}
+	ok := func(step string, res atrocontrol.FanoutResult, err error) {
+		t.Helper()
+		if err != nil || !res.AllSucceeded() {
+			t.Fatalf("%s: err = %v, failed = %v", step, err, res.Failed)
+		}
+	}
+	// freezeCfgs reports the tracker's freeze config and the polled document's
+	// freeze_cfg, each as JSON ("null" when absent).
+	freezeCfgs := func(step string) (tracked, served string) {
+		t.Helper()
+		cfg, err := ctrl.IntentReader().FreezeConfigForService(ctx, "cartservice")
+		if err != nil {
+			t.Fatalf("%s: FreezeConfigForService: %v", step, err)
+		}
+		raw, _ := json.Marshal(cfg)
+		w := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: poll status = %d body = %s", step, w.Code, w.Body.String())
+		}
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("%s: decode: %v", step, err)
+		}
+		served = "null"
+		if fc, ok := doc["freeze_cfg"]; ok {
+			served = string(fc)
+		}
+		return string(raw), served
+	}
+
+	// enterPhase: freeze, then push the phase's rules.
+	res, err := ctrl.FreezeService(ctx, "cartservice", freeze)
+	ok("freeze", res, err)
+	res, err = ctrl.PushRules(ctx, "cartservice", rules)
+	ok("push the phase rules", res, err)
+	if tracked, served := freezeCfgs("after the rule push"); tracked != string(want) || served != string(want) {
+		t.Errorf("after the rule push: tracker %s, served %s; want both %s", tracked, served, want)
+	}
+	if intent, _ := ctrl.IntentReader().Get("cartservice"); intent == nil || len(intent.Rules) != 1 {
+		t.Errorf("the rule push itself was not recorded: %+v", intent)
+	}
+
+	// endPhase: the nil rule push before thaw keeps it as well.
+	res, err = ctrl.PushRules(ctx, "cartservice", nil)
+	ok("clear the rules", res, err)
+	if tracked, served := freezeCfgs("after the nil rule push"); tracked != string(want) || served != string(want) {
+		t.Errorf("after the nil rule push: tracker %s, served %s; want both %s", tracked, served, want)
+	}
+
+	// Thaw is what clears it.
+	res, err = ctrl.ClearService(ctx, "cartservice")
+	ok("thaw", res, err)
+	if tracked, served := freezeCfgs("after thaw"); tracked != "null" || served != "null" {
+		t.Errorf("after thaw: tracker %s, served %s; want neither", tracked, served)
 	}
 }
 

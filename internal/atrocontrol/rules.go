@@ -9,10 +9,7 @@ import (
 func (c *Controller) PushRules(ctx context.Context, service string, rules []ruleconv.CompiledRule, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
 
-	c.intent.Set(service, ServiceIntent{
-		Rules: rules,
-		RunID: co.runID,
-	})
+	c.intent.SetRules(service, rules, co.runID) // keeps the freeze config and active fault
 
 	targets, err := c.resolveTargets(ctx, service, co.filter)
 	if err != nil {
@@ -27,6 +24,8 @@ func (c *Controller) PushRules(ctx context.Context, service string, rules []rule
 	return result, nil
 }
 
+// PushRulesToInstance pushes rules to one instance. It records no intent (the
+// tracker is per service), so the service's freeze config is left alone.
 func (c *Controller) PushRulesToInstance(ctx context.Context, instanceID string, rules []ruleconv.CompiledRule, opts ...CallOption) error {
 	inst, err := c.resolveInstance(ctx, instanceID)
 	if err != nil {

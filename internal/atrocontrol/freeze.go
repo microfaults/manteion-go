@@ -9,11 +9,9 @@ import (
 func (c *Controller) FreezeService(ctx context.Context, service string, cfg atroposdk.DelayRequest, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
 
-	// Write intent before fan-out so late-joining registrations see target state.
-	c.intent.Set(service, ServiceIntent{
-		FreezeCfg: &cfg,
-		RunID:     co.runID,
-	})
+	// Write intent before fan-out so late-joining registrations see target
+	// state. Only the freeze config: the service's rules are kept.
+	c.intent.SetFreeze(service, &cfg)
 
 	targets, err := c.resolveTargets(ctx, service, co.filter)
 	if err != nil {
@@ -30,7 +28,7 @@ func (c *Controller) FreezeService(ctx context.Context, service string, cfg atro
 
 func (c *Controller) ClearService(ctx context.Context, service string, opts ...CallOption) (FanoutResult, error) {
 	co := c.resolveCallOpts(opts)
-	c.intent.Clear(service)
+	c.intent.SetFreeze(service, nil) // thaw clears the freeze config alone
 
 	targets, err := c.resolveTargets(ctx, service, co.filter)
 	if err != nil {

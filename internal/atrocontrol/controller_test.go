@@ -54,7 +54,7 @@ func setupAtroposServers(t *testing.T, n int) []string {
 	return urls
 }
 
-func newTestController(t *testing.T, urls []string) *Controller {
+func newTestController(t *testing.T, urls []string, opts ...ControllerOption) *Controller {
 	t.Helper()
 	instances := make([]*model.SDKInstance, len(urls))
 	for i, u := range urls {
@@ -72,10 +72,10 @@ func newTestController(t *testing.T, urls []string) *Controller {
 	}
 
 	tx := atropos.NewClient()
-	return New(tx, resolver,
-		WithDefaultTimeout(5*time.Second),
+	return New(tx, resolver, append([]ControllerOption{
+		WithDefaultTimeout(5 * time.Second),
 		WithDefaultConcurrency(4),
-	)
+	}, opts...)...)
 }
 
 func TestFreezeServiceFanout(t *testing.T) {
@@ -96,16 +96,14 @@ func TestFreezeServiceFanout(t *testing.T) {
 		t.Fatalf("expected 3 OK, got %d", len(result.OK))
 	}
 
-	// Intent should be set.
+	// Intent should be set: the freeze config as pushed. (The run id tags the
+	// fan-out log; in the intent it belongs to rule pushes.)
 	intent, ok := ctrl.IntentReader().Get("productcatalog")
 	if !ok {
 		t.Fatal("expected intent to be set")
 	}
-	if intent.FreezeCfg == nil {
-		t.Fatal("expected FreezeCfg in intent")
-	}
-	if intent.RunID != "run-1" {
-		t.Fatalf("expected run_id=run-1, got %s", intent.RunID)
+	if cfg := intent.FreezeCfg; cfg == nil || cfg.Mu != 1.0 || cfg.Sigma != 0.5 || cfg.Seed != 42 {
+		t.Fatalf("expected FreezeCfg mu=1 sigma=0.5 seed=42 in intent, got %+v", cfg)
 	}
 }
 
@@ -250,6 +248,68 @@ func TestPushRules(t *testing.T) {
 	intent, ok := ctrl.IntentReader().Get("productcatalog")
 	if !ok || len(intent.Rules) != 1 {
 		t.Fatal("expected rules intent to be set")
+	}
+}
+
+// The controller's service-wide writers each touch their own field of the
+// intent: PushRules the rules (nil clears them), FreezeService/ClearService
+// the freeze config, InjectFault/ClearFault the active fault. In enterPhase a
+// frozen service is frozen and then pushed its phase rules; the freeze config
+// must survive that (the materializer serves it as freeze_cfg), and survive
+// the nil push endPhase makes before it thaws.
+func TestControllerIntentWritesAreFieldScoped(t *testing.T) {
+	urls := setupAtroposServers(t, 2)
+	ctrl := newTestController(t, urls, WithLogger(slog.New(slog.DiscardHandler)))
+	ctx := context.Background()
+	const svc = "productcatalog"
+	ok := func(step string, res FanoutResult, err error) {
+		t.Helper()
+		if err != nil || !res.AllSucceeded() {
+			t.Fatalf("%s: err = %v, failed = %v", step, err, res.Failed)
+		}
+	}
+	intent := func() ServiceIntent {
+		t.Helper()
+		i, found := ctrl.IntentReader().Get(svc)
+		if !found {
+			t.Fatal("intent dropped")
+		}
+		return *i
+	}
+
+	res, err := ctrl.FreezeService(ctx, svc, atroposdk.DelayRequest{Mu: 1.0, Sigma: 0.5, Seed: 42})
+	ok("freeze", res, err)
+	res, err = ctrl.PushRules(ctx, svc, []ruleconv.CompiledRule{{Name: "phase-rule", InjectionPoint: "egress", Mode: "inline",
+		CacheBox: &ruleconv.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}}}, WithRunID("run-1"))
+	ok("push rules", res, err)
+	if i := intent(); i.FreezeCfg == nil || i.FreezeCfg.Mu != 1.0 || len(i.Rules) != 1 || i.RunID != "run-1" {
+		t.Fatalf("after freeze then rule push: %+v, want the freeze config kept and the rules recorded", i)
+	}
+	if cfg, _ := ctrl.IntentReader().FreezeConfigForService(ctx, svc); cfg == nil || cfg.Mu != 1.0 {
+		t.Fatalf("FreezeConfigForService after the rule push = %+v, want the freeze config", cfg)
+	}
+
+	res, err = ctrl.InjectFault(ctx, svc, atroposdk.FaultRequest{FaultType: "latency", Params: json.RawMessage(`{"delay":"200ms"}`)})
+	ok("inject fault", res, err)
+	res, err = ctrl.ClearFault(ctx, svc)
+	ok("clear fault", res, err)
+	if i := intent(); i.ActiveFault != nil || i.FreezeCfg == nil || len(i.Rules) != 1 {
+		t.Fatalf("after inject+clear fault: %+v, want only the active fault touched", i)
+	}
+
+	res, err = ctrl.PushRules(ctx, svc, nil)
+	ok("nil rule push", res, err)
+	if i := intent(); len(i.Rules) != 0 || i.FreezeCfg == nil {
+		t.Fatalf("after the nil rule push: %+v, want the rules cleared and the freeze config kept", i)
+	}
+
+	res, err = ctrl.PushRules(ctx, svc, []ruleconv.CompiledRule{{Name: "phase-rule", InjectionPoint: "egress", Mode: "inline",
+		CacheBox: &ruleconv.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}}})
+	ok("push rules again", res, err)
+	res, err = ctrl.ClearService(ctx, svc)
+	ok("thaw", res, err)
+	if i := intent(); i.FreezeCfg != nil || len(i.Rules) != 1 {
+		t.Fatalf("after thaw: %+v, want the freeze config cleared and the rules kept", i)
 	}
 }
 
