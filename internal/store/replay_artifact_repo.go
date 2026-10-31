@@ -39,9 +39,9 @@ func scanReplayArtifact(s interface{ Scan(...any) error }) (*model.ReplayArtifac
 // Upsert assigns the artifact to its (phase, service). The first call inserts
 // the row; a later call for the same pair replaces it (a rebuilt set, a new
 // id) and restamps created_at. created_at belongs to the database: the value
-// on a is not written and not read back.
+// on a is not written, and the row's is read back into a.CreatedAt.
 func (r *ReplayArtifactRepo) Upsert(ctx context.Context, a *model.ReplayArtifact) error {
-	_, err := r.db.ExecContext(ctx, `
+	err := r.db.QueryRowContext(ctx, `
 		INSERT INTO replay_artifacts (id, experiment_id, phase_id, service,
 			entry_count, w5_sha256, size_bytes, path)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -52,10 +52,11 @@ func (r *ReplayArtifactRepo) Upsert(ctx context.Context, a *model.ReplayArtifact
 			w5_sha256     = EXCLUDED.w5_sha256,
 			size_bytes    = EXCLUDED.size_bytes,
 			path          = EXCLUDED.path,
-			created_at    = now()`,
+			created_at    = now()
+		RETURNING created_at`,
 		a.ID, a.ExperimentID, a.PhaseID, a.Service,
 		a.EntryCount, a.W5SHA256, a.SizeBytes, a.Path,
-	)
+	).Scan(&a.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert replay_artifact (phase %q, service %q): %w", a.PhaseID, a.Service, err)
 	}
