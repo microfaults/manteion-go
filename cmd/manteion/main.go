@@ -123,8 +123,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The desired-state materializer: a pure function of the database that the
-	// SDK handlers serve per instance, filtered by its capabilities.
+	// The desired-state materializer: a function of the database (plus, until
+	// plan 2, the intent tracker's freeze config, which freeze/thaw change
+	// without a generation bump) that the SDK handlers serve per instance,
+	// filtered by its capabilities.
 	mat := &desired.Materializer{
 		Generations: gens, Rules: ruleRepo, FaultConfigs: faultConfigRepo,
 		CacheBox: experimentRepo, Specs: faultRepo,

@@ -22,9 +22,10 @@ probing.
   advertises `max(poll interval, hold)`, so the thresholds below are counted
   in holds: with a 30 s hold an idle instance is touched every ~30 s and stays
   `alive` (within 2 × 30 s), reads `stale` after a missed poll or two, and
-  `dead` only after 5 × 30 s = 150 s of silence. An SDK that advertised a
-  shorter interval than its hold would read `stale`, or with a 60 s hold
-  `dead`, while parked.
+  `dead` only after 5 × 30 s = 150 s of silence. An SDK that advertised its
+  poll interval alone, with the default 10 s interval, would read `stale`
+  while parked on a 30 s hold (beyond 2 × 10 s) and `dead` on a 60 s hold
+  (beyond 5 × 10 s).
 
 ## Status (computed at read time)
 

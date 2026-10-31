@@ -122,7 +122,8 @@ func NewServer(
 
 // BeginShutdown ends every held long-poll as if its wait had elapsed, so each
 // re-materializes and answers 304 or 200 at once, stops new polls from holding,
-// and ends every SSE stream (the SDK reconnects after its backoff).
+// and ends every SDK event stream (GET /api/v1/sdk/events; the SDK reconnects
+// after its backoff). The zeus run-events proxy is not affected.
 // http.Server.Shutdown waits for in-flight requests and its budget (10 s in
 // cmd/manteion) is shorter than a hold (up to 60 s); cmd/manteion registers
 // this with http.Server.RegisterOnShutdown. Idempotent.

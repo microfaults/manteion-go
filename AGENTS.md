@@ -35,7 +35,7 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 - REST API using stdlib `net/http` with Go 1.22+ method-path routing (`mux.HandleFunc("METHOD /path", handler)`)
 - PostgreSQL-backed persistence via pgx/v5 (`internal/db/` for connection management and migrations, `internal/store/` for domain repositories)
 - HTTP proxy to zeus-go Archer for workload/attack operations
-- Desired-state SDK polling (`internal/desired/`): a per-service generation bumped with every input change, a materialized document per instance with a content ETag, and a long-polling `GET /api/v1/sdk/rules` that answers 304 Not Modified when `If-None-Match` names the current ETag
+- Desired-state SDK polling (`internal/desired/`): a per-service generation bumped with every input change, a materialized document per instance with a content ETag, and a long-polling `GET /api/v1/sdk/rules` that answers 304 Not Modified when `If-None-Match` names the current ETag. Plan-1 exceptions move the ETag's content hash but not the generation (a non-held poll sees them at once, a held one when its wait elapses or the next bump arrives): the transitional `freeze_cfg`, which freeze/thaw push into the in-memory intent tracker without a bump until plan 2 derives it from the frozen phase; a fault config's time-based expiry, before the reaper's bump (`docs/long-running-faults.md`); and fault-spec edits
 - Docker-compose for local development (postgres:17-alpine)
 
 ### Storage

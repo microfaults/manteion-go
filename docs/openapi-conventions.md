@@ -47,9 +47,9 @@ Commit `docs/swagger.{yaml,json}` together with handler edits. CI fails if the s
 
 ## Known annotation gaps
 
-These are places where the generated spec is approximate because the underlying
-handler conflates error categories. They are tracked here so consumers know not
-to over-trust the 4xx/5xx breakdown until the handler is fixed.
+These are places where the generated spec is approximate, mostly because the
+underlying handler conflates error categories. They are tracked here so consumers
+know not to over-trust the 4xx/5xx breakdown until the handler is fixed.
 
 - `handleRegister` (`POST /sdk/register`) and `handleCreateRule` (`POST /rules`)
   collapse validation errors and infrastructure failures (DB unreachable, etc.)
@@ -59,3 +59,7 @@ to over-trust the 4xx/5xx breakdown until the handler is fixed.
   Note: `handleRegister` is *not* a 409 candidate — `store.SDKRepo.Register` is
   an `INSERT ... ON CONFLICT DO UPDATE` upsert with no "duplicate" semantic to
   surface.
+- `handleSSEEvents` (`GET /sdk/events`): swag applies an operation's single
+  `@Produce` to every response, so the 400 and 500 error responses render as
+  `text/event-stream` although the handler writes them as JSON
+  (`api.ErrorResponse`) before any stream starts.
