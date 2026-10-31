@@ -1936,7 +1936,7 @@
         },
         "/sdk/rules": {
             "get": {
-                "description": "Records the instance's observed generation (version) and poll time,\nmaterializes DesiredState(service, instance) and compares its ETag with\nIf-None-Match. With wait>0 (seconds, max 60) and a matching ETag the\nrequest is held until the service's generation changes, wait elapses or\nthe server begins shutting down, then re-materialized. 200 carries the\nRuleSync body (version = generation, etag, rules, active_faults,\nfreeze_cfg, replay_set) with ETag and X-Atropos-Generation headers; 304\ncarries the same headers and no body \u2014 the instance adopts\nX-Atropos-Generation without re-applying.",
+                "description": "Records the instance's observed generation (version) and poll time,\nmaterializes DesiredState(service, instance) and compares its ETag (the\ncontent hash alone; the generation is not part of it) with If-None-Match.\nWith wait>0 (seconds, max 60) the request is held only when version is\nthe current generation and the ETag matches, until the service's\ngeneration changes, wait elapses or the server begins shutting down, then\nre-materialized. A matching ETag with any other version (older, zero or\nabsent, or newer after a database reset) is answered 304 at once with\nthe current X-Atropos-Generation and ETag. 200 carries the RuleSync body\n(version = generation, etag, rules, active_faults, freeze_cfg,\nreplay_set) with ETag and X-Atropos-Generation headers; 304 carries the\nsame headers and no body \u2014 the instance adopts X-Atropos-Generation\nwithout re-applying.",
                 "parameters": [
                     {
                         "description": "service name",

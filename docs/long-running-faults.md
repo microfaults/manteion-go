@@ -27,12 +27,15 @@ any no longer present. Duration
 expiry and stale-fault reaping are handled SDK-side (server-side infinite-
 duration whitelist + fault watchdog); manteion only owns the desired state.
 
-The poll is keyed on the document's ETag (`"<generation>-<content hash>"`),
-which the SDK sends back in `If-None-Match`: a poll naming the current document
-gets a `304`, and the first poll after a change gets a `200` carrying the
-updated `active_faults` for the SDK to reconcile. Fire, cancel and delete bump
-the service's generation, which also wakes polls held with `wait`, so they
-answer at once instead of when their wait runs out.
+The poll is keyed on the document's ETag, the content hash alone (the
+generation travels in `X-Atropos-Generation` and the body's `version`), which
+the SDK sends back in `If-None-Match`: a poll naming the current document gets
+a `304`, and the first poll after a change gets a `200` carrying the updated
+`active_faults` for the SDK to reconcile. A poll with `wait` is held only when
+its `version` is the current generation and its ETag matches; a matching ETag
+with an older `version` is answered `304` at once with the current generation.
+Fire, cancel and delete bump the service's generation, which also wakes polls
+held with `wait`, so they answer at once instead of when their wait runs out.
 
 An expired fault leaves the document as soon as its duration elapses (the
 content hash moves). The fault config reaper (30s) then flips

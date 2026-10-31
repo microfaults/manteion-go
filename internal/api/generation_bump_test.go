@@ -478,8 +478,10 @@ func TestFaultConfigReaper_BumpsEachAffectedServiceOnce_DB(t *testing.T) {
 // service's fault configs (fire, cancel, delete, expiry) reaches an SDK that is
 // up to date: a poll naming the ETag it last applied gets a 200 at the bumped
 // generation carrying the new active faults, and a poll naming the new ETag
-// gets a 304. Every config polled here is open-ended or already expired, so no
-// document changes with the clock between two polls.
+// gets a 304. A bump that leaves the document unchanged (the sweep of a config
+// that expired unseen) is a 304 at the new generation. Every config polled
+// here is open-ended or already expired, so no document changes with the clock
+// between two polls.
 func TestFaultConfigChanges_ReachAnUpToDatePoll_DB(t *testing.T) {
 	e := newGenEnv(t)
 	svc := "svc-" + e.tag
@@ -550,17 +552,20 @@ func TestFaultConfigChanges_ReachAnUpToDatePoll_DB(t *testing.T) {
 
 	// Expiry: a config leaves the document by the clock, before the reaper
 	// completes it. This one is fired without a bump and polled only once
-	// expired, so it never shows: the document stays the same until the sweep,
-	// whose bump moves the generation (and with it the ETag).
+	// expired, so it never shows: the document, and with it the ETag (the
+	// content hash alone), stays the same through the sweep, whose bump moves
+	// only the generation. The poll after the sweep is a 304 at the new
+	// generation, which the SDK adopts without re-applying.
 	expiring := e.faultConfig(svc, 1)
 	if err := e.s.faultConfigs.MarkFired(e.ctx, expiring); err != nil {
 		t.Fatalf("fire %s: %v", expiring, err)
 	}
 	e.awaitExpired([]string{expiring})
 	poll("expired, before the sweep", etag, http.StatusNotModified)
+	beforeSweep := e.gen(svc)
 	e.s.reapExpiredFaultConfigs(e.ctx)
-	etag = poll("after the sweep", etag, http.StatusOK)
-	poll("after the sweep, up to date", etag, http.StatusNotModified)
+	e.wantGeneration(svc, beforeSweep+1)
+	poll("after the sweep", etag, http.StatusNotModified) // the helper checks the 304 carries the new generation
 }
 
 // TestKillSwitch_BumpsEachDisabledRulesServiceGeneration_DB pins that the

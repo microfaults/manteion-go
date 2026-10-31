@@ -158,14 +158,18 @@ const maxPollWait = 60 * time.Second
 //
 // @Summary      Poll for desired state (long-poll)
 // @Description  Records the instance's observed generation (version) and poll time,
-// @Description  materializes DesiredState(service, instance) and compares its ETag with
-// @Description  If-None-Match. With wait>0 (seconds, max 60) and a matching ETag the
-// @Description  request is held until the service's generation changes, wait elapses or
-// @Description  the server begins shutting down, then re-materialized. 200 carries the
-// @Description  RuleSync body (version = generation, etag, rules, active_faults,
-// @Description  freeze_cfg, replay_set) with ETag and X-Atropos-Generation headers; 304
-// @Description  carries the same headers and no body — the instance adopts
-// @Description  X-Atropos-Generation without re-applying.
+// @Description  materializes DesiredState(service, instance) and compares its ETag (the
+// @Description  content hash alone; the generation is not part of it) with If-None-Match.
+// @Description  With wait>0 (seconds, max 60) the request is held only when version is
+// @Description  the current generation and the ETag matches, until the service's
+// @Description  generation changes, wait elapses or the server begins shutting down, then
+// @Description  re-materialized. A matching ETag with any other version (older, zero or
+// @Description  absent, or newer after a database reset) is answered 304 at once with
+// @Description  the current X-Atropos-Generation and ETag. 200 carries the RuleSync body
+// @Description  (version = generation, etag, rules, active_faults, freeze_cfg,
+// @Description  replay_set) with ETag and X-Atropos-Generation headers; 304 carries the
+// @Description  same headers and no body — the instance adopts X-Atropos-Generation
+// @Description  without re-applying.
 // @Tags         sdk
 // @Produce      json
 // @Param        service        query   string  true   "service name"
@@ -220,7 +224,14 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ifNoneMatch := r.Header.Get("If-None-Match")
-	if wait > 0 && etagMatches(ifNoneMatch, doc.ETag) {
+	// Hold only an instance that already holds the current document at the
+	// current generation. The ETag is the content hash alone, so a matching
+	// ETag with another version means a bump left this instance's document
+	// unchanged: answer 304 at once with the generation to adopt. Held, it
+	// would wait out the hold with its observed generation behind. == rather
+	// than >=: an instance ahead of the database (after a reset) adopts the
+	// current generation at once too.
+	if wait > 0 && observed == doc.Generation && etagMatches(ifNoneMatch, doc.ETag) {
 		// Hold. The server's WriteTimeout (30s in cmd/manteion) would kill a
 		// longer hold, so push the deadline past it, as the SSE handler does.
 		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(wait + 15*time.Second)); err != nil {

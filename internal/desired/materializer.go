@@ -71,7 +71,7 @@ type Materializer struct {
 // responses carry, already filtered to what the instance's host can execute.
 type Document struct {
 	Generation   uint64
-	ETag         string
+	ETag         string                   // the body's content hash alone (see etag)
 	Rules        []atroposdk.CompiledRule // never nil
 	ActiveFaults []atroposdk.FaultRequest // never nil
 	FreezeCfg    *atroposdk.DelayRequest
@@ -128,18 +128,22 @@ func (m *Materializer) Materialize(ctx context.Context, service string, inst *mo
 			}
 		}
 	}
-	if doc.ETag, err = etag(gen, doc); err != nil {
+	if doc.ETag, err = etag(doc); err != nil {
 		return Document{}, err
 	}
 	return doc, nil
 }
 
-// etag is "<generation>-<sha256 hex[:16]>" over the canonical JSON of the
-// document body (encoding/json is deterministic for these types: struct
+// etag is the content hash alone, "<sha256 hex[:16]>" over the canonical JSON
+// of the document body (encoding/json is deterministic for these types: struct
 // fields in declaration order, map keys sorted, JSONB params as Postgres
-// normalized them). Slice order is content: equal-priority rules are
-// evaluated in the order delivered, so a reorder is a change.
-func etag(gen uint64, d Document) (string, error) {
+// normalized them). The generation is not an input: it travels in
+// X-Atropos-Generation and the body's version, so a bump that leaves an
+// instance's document unchanged keeps its ETag, and the instance is answered
+// 304 with the new generation instead of being sent the same document again.
+// Slice order is content: equal-priority rules are evaluated in the order
+// delivered, so a reorder is a change.
+func etag(d Document) (string, error) {
 	body, err := json.Marshal(struct {
 		Rules        []atroposdk.CompiledRule `json:"rules"`
 		ActiveFaults []atroposdk.FaultRequest `json:"active_faults"`
@@ -150,7 +154,7 @@ func etag(gen uint64, d Document) (string, error) {
 		return "", fmt.Errorf("canonical json: %w", err)
 	}
 	sum := sha256.Sum256(body)
-	return fmt.Sprintf("%d-%s", gen, hex.EncodeToString(sum[:])[:16]), nil
+	return hex.EncodeToString(sum[:])[:16], nil
 }
 
 // FaultRequestsOf maps active manual fault configs to their wire form.

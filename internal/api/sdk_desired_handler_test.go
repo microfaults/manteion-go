@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -239,6 +240,22 @@ func ruleNamesOf(t *testing.T, body []byte) []string {
 	return out
 }
 
+// isContentHash reports whether etag is a document's ETag: the content hash
+// alone, 16 lowercase hex digits with no generation prefix.
+func isContentHash(etag string) bool {
+	if len(etag) != 16 || strings.ToLower(etag) != etag {
+		return false
+	}
+	_, err := hex.DecodeString(etag)
+	return err == nil
+}
+
+// quotedContentHash reports whether an ETag header value is the quoted
+// content hash.
+func quotedContentHash(header string) bool {
+	return len(header) == 18 && header[0] == '"' && header[17] == '"' && isContentHash(header[1:17])
+}
+
 func TestHandleRegister_RespondsWithMaterializedDocument(t *testing.T) {
 	fx := newDesiredFixture()
 	s := fx.server()
@@ -252,8 +269,8 @@ func TestHandleRegister_RespondsWithMaterializedDocument(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Status != "registered" || resp.Version != 1 || !strings.HasPrefix(resp.Etag, "1-") {
-		t.Errorf("status/version/etag = %s/%d/%s", resp.Status, resp.Version, resp.Etag)
+	if resp.Status != "registered" || resp.Version != 1 || !isContentHash(resp.Etag) {
+		t.Errorf("status/version/etag = %s/%d/%s, want registered/1/<content hash>", resp.Status, resp.Version, resp.Etag)
 	}
 	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline,cachebox:replay:phase-iso" {
 		t.Errorf("rules = %v, want the inline rule and the cache-box rule only (network filtered)", got)
@@ -346,8 +363,8 @@ func TestHandleRegister_UnknownCapabilityCountsAsAChange(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Version != 2 || !strings.HasPrefix(resp.Etag, "2-") {
-		t.Errorf("version/etag = %d/%s, want the bumped generation 2", resp.Version, resp.Etag)
+	if resp.Version != 2 || !isContentHash(resp.Etag) {
+		t.Errorf("version/etag = %d/%s, want the bumped generation 2 and a content-hash ETag", resp.Version, resp.Etag)
 	}
 	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline" {
 		t.Errorf("rules = %v, want [r-inline] (netem unlocks no category)", got)
@@ -438,7 +455,7 @@ func TestSameCapabilities(t *testing.T) {
 func TestRegisterResponseWire_CarriesTheWholeDocument(t *testing.T) {
 	doc := desired.Document{
 		Generation:   7,
-		ETag:         "7-0123456789abcdef",
+		ETag:         "0123456789abcdef",
 		Rules:        []atroposdk.CompiledRule{{Name: "r-inline"}},
 		ActiveFaults: []atroposdk.FaultRequest{{ID: "fc-inline"}},
 		FreezeCfg:    &atroposdk.DelayRequest{Mu: 1.5, Sigma: 0.25},
@@ -452,7 +469,7 @@ func TestRegisterResponseWire_CarriesTheWholeDocument(t *testing.T) {
 	for key, want := range map[string]string{
 		"status":     `"registered"`,
 		"version":    `7`,
-		"etag":       `"7-0123456789abcdef"`,
+		"etag":       `"0123456789abcdef"`,
 		"replay_set": `{"id":"sha256:aa","experiment_id":"exp-1","phase_id":"phase-iso","key_strategy":"canonical_v2","count":3,"sha256":"bb","size_bytes":42,"url":"/api/v1/cache/artifacts/sha256:aa"}`,
 	} {
 		if string(raw[key]) != want {
@@ -471,7 +488,7 @@ func TestRegisterResponseWire_CarriesTheWholeDocument(t *testing.T) {
 		t.Errorf("rules/active_faults/freeze_cfg = %+v / %+v / %+v", rules, faults, freeze)
 	}
 
-	none := marshalRawJSON(t, ruleSyncFrom(desired.Document{Generation: 1, ETag: "1-0123456789abcdef",
+	none := marshalRawJSON(t, ruleSyncFrom(desired.Document{Generation: 1, ETag: "0123456789abcdef",
 		Rules: []atroposdk.CompiledRule{}, ActiveFaults: []atroposdk.FaultRequest{}}))
 	if got := slices.Sorted(maps.Keys(none)); !slices.Equal(got, []string{"active_faults", "etag", "rules", "version"}) {
 		t.Errorf("keys with no freeze config or replay set = %v, want both left out", got)
@@ -504,8 +521,8 @@ func TestHandlePollRules_200CarriesEtagAndGeneration(t *testing.T) {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
 	etag := w.Header().Get("ETag")
-	if !strings.HasPrefix(etag, `"1-`) || !strings.HasSuffix(etag, `"`) {
-		t.Errorf("ETag = %q, want a quoted 1-<hash>", etag)
+	if !quotedContentHash(etag) {
+		t.Errorf("ETag = %q, want the quoted content hash (no generation prefix)", etag)
 	}
 	if got := w.Header().Get("X-Atropos-Generation"); got != "1" {
 		t.Errorf("X-Atropos-Generation = %q, want 1", got)
@@ -564,8 +581,8 @@ func TestHandlePollRules_LongPollWakesOnBump(t *testing.T) {
 	if time.Since(start) > 5*time.Second {
 		t.Fatalf("long-poll took %v; it must return on the bump, not on wait", time.Since(start))
 	}
-	if w.Header().Get("X-Atropos-Generation") != "2" || !strings.HasPrefix(w.Header().Get("ETag"), `"2-`) {
-		t.Errorf("headers after bump = %v", w.Header())
+	if got := w.Header().Get("ETag"); w.Header().Get("X-Atropos-Generation") != "2" || got == etag || !quotedContentHash(got) {
+		t.Errorf("headers after bump = %v, want generation 2 and the new document's ETag (was %s)", w.Header(), etag)
 	}
 	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline,cachebox:replay:phase-iso" {
 		t.Errorf("rules = %v, want the post-bump set", got)
@@ -586,20 +603,72 @@ func TestHandlePollRules_LongPollTimesOutWith304(t *testing.T) {
 	}
 }
 
+// A generation move that leaves this instance's document unchanged keeps its
+// ETag, the content hash alone: another instance's capabilities changed, or a
+// bump landed between this instance's polls or while its document was being
+// materialized. Its next poll names the current ETag at a version behind the
+// generation and is answered at once: a 304 carrying the generation for the
+// instance to adopt. Held on the matching ETag alone, it would sit out the
+// whole wait with its observed generation stuck at the old one, which fails a
+// convergence barrier that waits no longer than the SDK's poll.
 func TestHandlePollRules_GenerationMovesButDocumentUnchanged(t *testing.T) {
-	// Another instance's capabilities changed: the generation moves, this
-	// instance's content does not — the ETag still differs (generation prefix),
-	// so it gets a 200 that it can recognise as same-content by the hash.
 	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
 	s := fx.server()
 	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
 	_, _ = fx.gens.Bump(context.Background(), "cartservice")
-	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=1", map[string]string{"If-None-Match": etag})
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (generation prefix changed)", w.Code)
+	start := time.Now()
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": etag})
+	if elapsed := time.Since(start); w.Code != http.StatusNotModified || elapsed > 5*time.Second {
+		t.Fatalf("status = %d after %v, want 304 at once (version 1 behind generation 2, document unchanged)", w.Code, elapsed)
 	}
-	if got := w.Header().Get("ETag"); got[len(`"2-`):] != etag[len(`"1-`):] {
-		t.Errorf("hash changed although the document did not: %s vs %s", got, etag)
+	if got := w.Header().Get("X-Atropos-Generation"); got != "2" {
+		t.Errorf("X-Atropos-Generation = %q, want 2 for the instance to adopt", got)
+	}
+	if got := w.Header().Get("ETag"); got != etag {
+		t.Errorf("ETag = %s, want %s: the bump left the document unchanged", got, etag)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("304 carried a body: %s", w.Body.String())
+	}
+}
+
+// The other side of the hold condition: a poll naming the current document at
+// the current generation is held. The next bump releases it (a 304 carrying
+// the bumped generation when the bump left the document unchanged), and so
+// does its wait elapsing (a 304 at the generation it holds).
+func TestHandlePollRules_CurrentVersionWithMatchingEtagIsHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		bumpAt  time.Duration // 0: nothing bumps
+		wait    string
+		heldFor time.Duration // the answer comes no sooner
+		wantGen string
+	}{
+		{name: "released by a bump", bumpAt: 300 * time.Millisecond, wait: "30", heldFor: 300 * time.Millisecond, wantGen: "2"},
+		{name: "released by the wait elapsing", wait: "1", heldFor: time.Second, wantGen: "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+			s := fx.server()
+			etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+			start := time.Now()
+			if tc.bumpAt > 0 {
+				go func() {
+					time.Sleep(tc.bumpAt)
+					_, _ = fx.gens.Bump(context.Background(), "cartservice") // the document does not change
+				}()
+			}
+			w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait="+tc.wait, map[string]string{"If-None-Match": etag})
+			if elapsed := time.Since(start); w.Code != http.StatusNotModified || elapsed < tc.heldFor || elapsed > 5*time.Second {
+				t.Fatalf("status = %d after %v, want 304 held for %v or more", w.Code, elapsed, tc.heldFor)
+			}
+			if got := w.Header().Get("X-Atropos-Generation"); got != tc.wantGen {
+				t.Errorf("X-Atropos-Generation = %q, want %s", got, tc.wantGen)
+			}
+			if got := w.Header().Get("ETag"); got != etag {
+				t.Errorf("ETag = %s, want %s (the document did not change)", got, etag)
+			}
+		})
 	}
 }
 
@@ -637,8 +706,10 @@ func TestHandlePollRules_Validation(t *testing.T) {
 }
 
 // Review Focus 1: cmd/manteion sets WriteTimeout=30s; a held poll longer than
-// that must extend its write deadline or the 200 is written into a dead
-// connection. A real server with a 200ms WriteTimeout and a 700ms hold proves it.
+// that must extend its write deadline or its answer is written into a dead
+// connection. A real server with a 200ms WriteTimeout and a 700ms hold proves it;
+// the bump that ends the hold leaves the document unchanged, so the answer is a
+// 304 carrying the bumped generation.
 // The client must not reuse connections: Go's transport silently retries a GET
 // that a reused connection dropped, and the retry, sent after the bump, would
 // be answered at once.
@@ -671,8 +742,8 @@ func TestHandlePollRules_HoldSurvivesServerWriteTimeout(t *testing.T) {
 		t.Fatalf("held poll failed (write deadline not extended?): %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Atropos-Generation") != "2" {
-		t.Fatalf("status = %d gen = %s, want 200 / 2", resp.StatusCode, resp.Header.Get("X-Atropos-Generation"))
+	if resp.StatusCode != http.StatusNotModified || resp.Header.Get("X-Atropos-Generation") != "2" {
+		t.Fatalf("status = %d gen = %s, want 304 / 2 (the bump left the document unchanged)", resp.StatusCode, resp.Header.Get("X-Atropos-Generation"))
 	}
 }
 
@@ -693,19 +764,22 @@ func TestParseWait(t *testing.T) {
 
 // Review Focus 3: If-None-Match names the document quoted, unquoted or weak
 // (W/), alone or in a list; anything else (a foreign or garbled value, the
-// wildcard, an empty header) is a mismatch, answered 200 and never held.
+// wildcard, an empty header, the generation-prefixed form ETags had before
+// the content hash alone was the ETag) is a mismatch, answered 200 and never
+// held.
 func TestEtagMatches(t *testing.T) {
-	const etag = "3-0123456789abcdef"
+	const etag = "0123456789abcdef"
 	for header, want := range map[string]bool{
-		`"3-0123456789abcdef"`:                         true,
-		`W/"3-0123456789abcdef"`:                       true,
-		`3-0123456789abcdef`:                           true,
-		`"2-0123456789abcdef", W/"3-0123456789abcdef"`: true,
-		`"2-0123456789abcdef"`:                         false,
-		`"3-0123456789abcdee"`:                         false, // same generation, other content
-		`"garbage"`:                                    false,
-		`*`:                                            false,
-		``:                                             false,
+		`"0123456789abcdef"`:                       true,
+		`W/"0123456789abcdef"`:                     true,
+		`0123456789abcdef`:                         true,
+		`"fedcba9876543210", W/"0123456789abcdef"`: true,
+		`"fedcba9876543210"`:                       false,
+		`"0123456789abcdee"`:                       false, // other content
+		`"3-0123456789abcdef"`:                     false, // generation-prefixed
+		`"garbage"`:                                false,
+		`*`:                                        false,
+		``:                                         false,
 	} {
 		if got := etagMatches(header, etag); got != want {
 			t.Errorf("etagMatches(%q) = %v, want %v", header, got, want)
@@ -813,19 +887,35 @@ func TestHandlePollRules_HeldPollRecordsFirstAndRereadsTheInstance(t *testing.T)
 	}
 }
 
-// Review Focus 3, the handler half: an If-None-Match that does not name the
-// current document is answered at once, whatever wait asks for: a foreign
-// value, or the instance's own ETag once the generation has moved.
+// Review Focus 3, the handler half: a poll is held only when it names the
+// current document at the current generation; anything else is answered at
+// once, whatever wait asks for. A foreign If-None-Match gets a 200, even at
+// the current version. The instance's own ETag at any other version gets a
+// 304 carrying the generation to adopt: behind the generation (a bump left its
+// document unchanged), ahead of it (the database was reset; == rather than >=
+// in the hold condition) or absent (read as 0).
 func TestHandlePollRules_MismatchIsNeverHeld(t *testing.T) {
 	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
 	s := fx.server()
 	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
 	_, _ = fx.gens.Bump(context.Background(), "cartservice")
-	for _, inm := range []string{`"garbage"`, etag} {
+	for _, tc := range []struct {
+		inm      string
+		version  string
+		wantCode int
+	}{
+		{`"garbage"`, "&version=2", http.StatusOK},
+		{etag, "&version=1", http.StatusNotModified},
+		{etag, "&version=7", http.StatusNotModified},
+		{etag, "", http.StatusNotModified},
+	} {
 		start := time.Now()
-		w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": inm})
-		if w.Code != http.StatusOK || time.Since(start) > 5*time.Second {
-			t.Errorf("If-None-Match %s: status = %d after %v, want 200 at once", inm, w.Code, time.Since(start))
+		w := pollWith(t, s, "service=cartservice&instance_id=cart-1&wait=30"+tc.version, map[string]string{"If-None-Match": tc.inm})
+		if w.Code != tc.wantCode || time.Since(start) > 5*time.Second {
+			t.Errorf("If-None-Match %s%s: status = %d after %v, want %d at once", tc.inm, tc.version, w.Code, time.Since(start), tc.wantCode)
+		}
+		if got := w.Header().Get("X-Atropos-Generation"); got != "2" {
+			t.Errorf("If-None-Match %s%s: X-Atropos-Generation = %q, want 2", tc.inm, tc.version, got)
 		}
 	}
 }
@@ -994,8 +1084,8 @@ func TestHandlePollRules_ShutdownEndsHoldLikeATimeout(t *testing.T) {
 			switch got := w.Header().Get("ETag"); {
 			case tc.wantCode == http.StatusNotModified && (got != etag || w.Body.Len() != 0):
 				t.Errorf("304: ETag = %s (want %s), body = %q (want none)", got, etag, w.Body.String())
-			case tc.wantCode == http.StatusOK && (got == etag || !strings.HasPrefix(got, `"1-`)):
-				t.Errorf("200: ETag = %s, want a new generation-1 ETag (was %s)", got, etag)
+			case tc.wantCode == http.StatusOK && (got == etag || !quotedContentHash(got)):
+				t.Errorf("200: ETag = %s, want the changed document's ETag (was %s)", got, etag)
 			}
 			if tc.wantCode == http.StatusOK {
 				if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline,cachebox:replay:phase-iso" {

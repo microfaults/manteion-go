@@ -13,10 +13,13 @@ probing.
 - The touch runs when the poll **arrives**: before the `If-None-Match` / `304
   Not Modified` decision and before any hold, so liveness stays accurate even
   when nothing changes.
-- The poll is a long-poll: when the instance's ETag is current, manteion holds
+- The poll is a long-poll: when the instance holds the current generation
+  (`version`) and its ETag (the content hash alone) is current, manteion holds
   the request until the service's generation moves or `wait` elapses (at most
-  60 s; the SDK asks for 30 s). The answer does not touch `last_poll_at` again,
-  so an idle instance's touches are one hold apart (plus its turnaround).
+  60 s; the SDK asks for 30 s). A current ETag with an older `version` is
+  answered `304` at once with the generation to adopt. The answer does not
+  touch `last_poll_at` again, so an idle instance's touches are one hold apart
+  (plus its turnaround).
 - The SDK reports its `poll_interval_ms` at registration; manteion stores it and
   derives status from it (no fixed global threshold). A long-polling SDK
   advertises `max(poll interval, hold)`, so the thresholds below are counted

@@ -2,6 +2,7 @@ package desired
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -118,6 +119,16 @@ func ruleNames(d Document) string {
 	return strings.Join(n, ",")
 }
 
+// isContentHash reports whether etag is the content hash alone: 16 lowercase
+// hex digits, with no generation prefix.
+func isContentHash(etag string) bool {
+	if len(etag) != 16 || strings.ToLower(etag) != etag {
+		return false
+	}
+	_, err := hex.DecodeString(etag)
+	return err == nil
+}
+
 func TestMaterialize_UnfilteredForNilInstance(t *testing.T) {
 	m, _ := newTestMaterializer(5)
 	d, err := m.Materialize(context.Background(), "cart", nil)
@@ -133,8 +144,8 @@ func TestMaterialize_UnfilteredForNilInstance(t *testing.T) {
 	if d.FreezeCfg == nil || d.FreezeCfg.Mu != 1.5 {
 		t.Errorf("freeze_cfg = %+v", d.FreezeCfg)
 	}
-	if d.Generation != 5 || !strings.HasPrefix(d.ETag, "5-") || len(d.ETag) != len("5-")+16 {
-		t.Errorf("generation/etag = %d/%q", d.Generation, d.ETag)
+	if d.Generation != 5 || !isContentHash(d.ETag) {
+		t.Errorf("generation/etag = %d/%q, want 5 and the content hash alone (16 hex digits)", d.Generation, d.ETag)
 	}
 }
 
@@ -165,6 +176,10 @@ func TestMaterialize_FiltersByCapabilities(t *testing.T) {
 	}
 }
 
+// The ETag is the content hash alone: the same document has the same ETag at
+// every generation, so a bump that leaves an instance's document unchanged is
+// answered 304 (with the new generation) rather than re-sent; only content
+// moves it.
 func TestMaterialize_ETagStableAndContentSensitive(t *testing.T) {
 	m, g := newTestMaterializer(5)
 	ctx := context.Background()
@@ -175,12 +190,12 @@ func TestMaterialize_ETagStableAndContentSensitive(t *testing.T) {
 	}
 	g.gen = 6 // another instance's capabilities changed: generation moves, document does not
 	c, _ := m.Materialize(ctx, "cart", inst("inline"))
-	if !strings.HasPrefix(c.ETag, "6-") || c.ETag[2:] != a.ETag[2:] {
-		t.Fatalf("hash must survive a generation move: %s vs %s", a.ETag, c.ETag)
+	if c.Generation != 6 || c.ETag != a.ETag {
+		t.Fatalf("generation 6 with the content of generation 5: ETag %s, want %s unchanged (generation %d)", c.ETag, a.ETag, c.Generation)
 	}
 	d, _ := m.Materialize(ctx, "cart", inst("inline", "network"))
-	if d.ETag[2:] == c.ETag[2:] {
-		t.Fatal("different content, same hash")
+	if d.ETag == c.ETag {
+		t.Fatal("different content, same ETag")
 	}
 }
 
@@ -297,20 +312,21 @@ func TestMaterialize_ETagCoversFreezeAndReplaySet(t *testing.T) {
 
 	m.ReplaySets = &fakeReplaySets{ref: &model.ReplaySetRef{ID: "sha256:ab12"}}
 	withSet, _ := m.Materialize(ctx, "cart", nil)
-	if withSet.ETag[2:] == base.ETag[2:] {
+	if withSet.ETag == base.ETag {
 		t.Error("installing a replay set did not change the ETag")
 	}
 
 	m.Freeze = &fakeFreeze{cfg: &atroposdk.DelayRequest{Mu: 2, Sigma: 0.4}}
 	retuned, _ := m.Materialize(ctx, "cart", nil)
-	if retuned.ETag[2:] == withSet.ETag[2:] {
+	if retuned.ETag == withSet.ETag {
 		t.Error("retuning the freeze delay did not change the ETag")
 	}
 }
 
 // A bump that lands while the inputs are being read must not be claimed by a
 // document that may predate it. The generation is read first, so the document
-// carries the older number and the instance's next poll picks up the newer one.
+// carries the older number and the instance's next poll picks up the newer one
+// (at once: a version behind the current generation is never held).
 func TestMaterialize_GenerationReadBeforeInputs(t *testing.T) {
 	m, g := newTestMaterializer(5)
 	m.Rules = &bumpingRules{g: g}
@@ -321,8 +337,8 @@ func TestMaterialize_GenerationReadBeforeInputs(t *testing.T) {
 	if g.gen != 6 {
 		t.Fatalf("generation = %d: the mid-read bump never happened, so this proves nothing", g.gen)
 	}
-	if d.Generation != 5 || !strings.HasPrefix(d.ETag, "5-") {
-		t.Errorf("document claims generation %d (ETag %q), want the 5 it was read at", d.Generation, d.ETag)
+	if d.Generation != 5 {
+		t.Errorf("document claims generation %d, want the 5 it was read at", d.Generation)
 	}
 }
 

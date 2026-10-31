@@ -30,7 +30,7 @@ numbers.
 | `internal/orchestrator/` | The experiment FSM. `enterPhase`: generation bump → preload gate → freeze gate → phase rules → workflow materialization → zeus runs + additive attacks → poller. `finishPhase`: the single terminal path — CAS `running→draining→completed` for recording phases (drain barrier), fidelity verdict *before* thaw, harvest exactly once, then experiment advance. Every transition (enter, pause, drain, finish) bumps the generation of each service the phase touches. Phase-level pause (experiment pause is derived; a paused phase's rules and cache-box role leave the desired state until resume); `Recover` reconciles crash state at startup. |
 | `internal/orchestrator/{drain,verdict,admission}.go` | Drain barrier + gap classification, per-phase verdict from W6 snapshots, refusal of overlapping concurrent experiments (the SDK is single-tenant). |
 | `internal/cachestore/` | NDJSON cache store: batch-seq dedup, per-key accounting, collision stats, drain-report ledger, W5 checksum. |
-| `internal/desired/` | Desired-state materializer (protocol v1): per-service generations (`service_generations`; a bump wakes held long-polls and SSE subscribers) and `Materializer`, which builds each `(service, instance)` document — phase-aware rules, active fault configs and the synthesized cache-box rule from the database, plus the transitional `freeze_cfg` from the in-memory intent tracker — filtered by the instance's capabilities, with ETag `"<generation>-<sha256[:16]>"`. Every input change bumps the generation except, in plan 1: `freeze_cfg`, which freeze/thaw push into the intent tracker without a bump (and a restart loses) until plan 2 derives it from the frozen phase; a fault config's time-based expiry, which changes the document before the reaper's bump (`docs/long-running-faults.md`); and a fault-spec edit (`PUT /api/v1/faults/specs/{id}`). Their content hash still moves: a non-held poll sees them at once, a held one when its wait elapses or the next bump arrives. |
+| `internal/desired/` | Desired-state materializer (protocol v1): per-service generations (`service_generations`; a bump wakes held long-polls and SSE subscribers) and `Materializer`, which builds each `(service, instance)` document — phase-aware rules, active fault configs and the synthesized cache-box rule from the database, plus the transitional `freeze_cfg` from the in-memory intent tracker — filtered by the instance's capabilities, with ETag `"<sha256[:16]>"`: the content hash alone (the generation rides `X-Atropos-Generation` and the body's `version`), so a bump that leaves an instance's document unchanged keeps its ETag. Every input change bumps the generation except, in plan 1: `freeze_cfg`, which freeze/thaw push into the intent tracker without a bump (and a restart loses) until plan 2 derives it from the frozen phase; a fault config's time-based expiry, which changes the document before the reaper's bump (`docs/long-running-faults.md`); and a fault-spec edit (`PUT /api/v1/faults/specs/{id}`). Their content hash still moves: a non-held poll sees them at once, a held one when its wait elapses or the next bump arrives. |
 | `internal/atrocontrol/` | SDK fanout controller: freeze/thaw, rule push, staged preload driver, fidelity pulls. Its in-memory intent tracker now only supplies the `freeze_cfg` the materializer serves, until plan 2 derives it from the frozen phase. Tracker writes are field-scoped: freeze and thaw are the only writers of `freeze_cfg` (rule pushes and fault injection no longer disturb it), they write it without a generation bump, and a restart loses it. The rest of the register and poll answers (rules, active faults) comes from the database. Liveness filter is `FilterLive` — `stale` (slow-polling) pods are live and owe drain records; only `dead` is excluded. |
 | `internal/atropos/` | HTTP client for individual SDK instances (delay, preload, fidelity, clear). |
 | `internal/zeus/` | HTTP client for zeus (workflows, runs, attacks, datasets). |
@@ -43,13 +43,15 @@ numbers.
 
 - **Poll** — `GET /api/v1/sdk/rules?service=&instance_id=&version=&wait=` with `If-None-Match`:
   records `version` (the generation the instance holds) as its `observed_generation`, then answers
-  200 with the **full desired state** — `version` is the per-service generation, `etag` is
-  `"<generation>-<content hash>"`, plus `rules`, `active_faults`, `freeze_cfg`, `replay_set` — or
-  304 when `If-None-Match` names the current ETag; both carry `ETag` and `X-Atropos-Generation`.
-  With `wait` (seconds, ≤ 60) a matching poll is held until the service's generation moves or the
-  wait elapses (a long-poll), then re-materialized. The document is filtered by the instance's
-  capabilities; an empty rule array is authoritative (clears SDK rules and triggers the drain
-  tracker).
+  200 with the **full desired state** — `version` is the per-service generation, `etag` is the
+  content hash alone (`"<sha256[:16]>"`, never the generation), plus `rules`, `active_faults`,
+  `freeze_cfg`, `replay_set` — or 304 when `If-None-Match` names the current ETag; both carry
+  `ETag` and `X-Atropos-Generation`. With `wait` (seconds, ≤ 60) the poll is held only when
+  `version` is the current generation and the ETag matches, until the service's generation moves
+  or the wait elapses (a long-poll), then re-materialized; a matching ETag with an older `version`
+  is answered 304 at once with the current generation, which the instance adopts without
+  re-applying. The document is filtered by the instance's capabilities; an empty rule array is
+  authoritative (clears SDK rules and triggers the drain tracker).
 - **Register** — `POST /api/v1/sdk/register`: instance identity, published routes, `host` and
   `capabilities`; the response is `status` plus the materialized desired state (the 200 poll body),
   filtered by the advertised capabilities. Re-registering with other capabilities bumps the
