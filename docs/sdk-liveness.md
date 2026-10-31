@@ -6,11 +6,25 @@ probing.
 
 ## Heartbeat
 
-- Every `GET /api/v1/sdk/rules` poll updates `last_poll_at` for the instance.
-- The touch runs **before** the `304 Not Modified` check, so liveness stays
-  accurate even when there are no rule changes.
+- Every `GET /api/v1/sdk/rules?service=&instance_id=&version=&wait=` poll
+  updates `last_poll_at` for the instance, together with `observed_generation`
+  (the generation the instance holds, from `version`). Registration sets
+  `last_poll_at` too.
+- The touch runs when the poll **arrives**: before the `If-None-Match` / `304
+  Not Modified` decision and before any hold, so liveness stays accurate even
+  when nothing changes.
+- The poll is a long-poll: when the instance's ETag is current, manteion holds
+  the request until the service's generation moves or `wait` elapses (at most
+  60 s; the SDK asks for 30 s). The answer does not touch `last_poll_at` again,
+  so an idle instance's touches are one hold apart (plus its turnaround).
 - The SDK reports its `poll_interval_ms` at registration; manteion stores it and
-  derives status from it (no fixed global threshold).
+  derives status from it (no fixed global threshold). A long-polling SDK
+  advertises `max(poll interval, hold)`, so the thresholds below are counted
+  in holds: with a 30 s hold an idle instance is touched every ~30 s and stays
+  `alive` (within 2 × 30 s), reads `stale` after a missed poll or two, and
+  `dead` only after 5 × 30 s = 150 s of silence. An SDK that advertised a
+  shorter interval than its hold would read `stale`, or with a 60 s hold
+  `dead`, while parked.
 
 ## Status (computed at read time)
 

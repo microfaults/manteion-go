@@ -16,6 +16,56 @@ components:
           type: array
           uniqueItems: false
       type: object
+    api.RegisterResponseWire:
+      properties:
+        active_faults:
+          description: null only on a degraded register (version 0, empty etag)
+          items:
+            $ref: '#/components/schemas/atropos.FaultRequest'
+          type: array
+          uniqueItems: false
+        etag:
+          type: string
+        freeze_cfg:
+          $ref: '#/components/schemas/atropos.DelayRequest'
+        replay_set:
+          $ref: '#/components/schemas/model.ReplaySetRef'
+        rules:
+          description: null only on a degraded register (version 0, empty etag)
+          items:
+            $ref: '#/components/schemas/atropos.CompiledRule'
+          type: array
+          uniqueItems: false
+        status:
+          type: string
+        version:
+          description: the generation, under the historical name
+          type: integer
+      type: object
+    api.RuleSyncWire:
+      properties:
+        active_faults:
+          description: null only on a degraded register (version 0, empty etag)
+          items:
+            $ref: '#/components/schemas/atropos.FaultRequest'
+          type: array
+          uniqueItems: false
+        etag:
+          type: string
+        freeze_cfg:
+          $ref: '#/components/schemas/atropos.DelayRequest'
+        replay_set:
+          $ref: '#/components/schemas/model.ReplaySetRef'
+        rules:
+          description: null only on a degraded register (version 0, empty etag)
+          items:
+            $ref: '#/components/schemas/atropos.CompiledRule'
+          type: array
+          uniqueItems: false
+        version:
+          description: the generation, under the historical name
+          type: integer
+      type: object
     api.SDKInstanceDetail:
       properties:
         active_rule_ids:
@@ -29,10 +79,45 @@ components:
           uniqueItems: false
         address:
           type: string
+        capabilities:
+          description: 'Capabilities lists the fault categories the host executes
+
+            (inline|network|resource|cachebox). Absent = all (the wire contract).'
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        host:
+          description: "Host names the instrument host that registered (\"in-process\"\
+            \ | \"sidecar\");\nstored as host_kind \u2014 \"host\" already means fault\
+            \ placement elsewhere."
+          type: string
         id:
           type: string
         last_poll_at:
           type: string
+        observed_at:
+          type: string
+        observed_errors:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        observed_etag:
+          type: string
+        observed_generation:
+          description: 'Observed state (desired-state protocol v1): what the instance
+            last told
+
+            us it holds. ObservedGeneration comes from the poll''s version param and
+
+            the status report; the rest only from POST /api/v1/sdk/status.'
+          type: integer
+        observed_unsupported:
+          items:
+            $ref: '#/components/schemas/model.UnsupportedRule'
+          type: array
+          uniqueItems: false
         poll_interval_ms:
           description: SDK's configured poll cadence
           type: integer
@@ -49,6 +134,11 @@ components:
           uniqueItems: false
         registered_at:
           type: string
+        replay_set_id:
+          type: string
+        replay_set_state:
+          description: fetching|committed|failed
+          type: string
         routes:
           description: "Routes is the HTTP route inventory the service published at\n\
             registration. Optional \u2014 services may register without routes\n(e.g.\
@@ -64,6 +154,198 @@ components:
           description: "\"alive\",\"stale\",\"dead\" \u2014 computed from poll staleness"
           type: string
         version:
+          type: string
+      type: object
+    api.StatusReport:
+      properties:
+        applied_generation:
+          type: integer
+        errors:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        etag:
+          type: string
+        instance_id:
+          type: string
+        replay_set:
+          $ref: '#/components/schemas/model.ReplaySetStatus'
+        service:
+          type: string
+        unsupported:
+          items:
+            $ref: '#/components/schemas/model.UnsupportedRule'
+          type: array
+          uniqueItems: false
+      type: object
+    atropos.CacheBoxContext:
+      properties:
+        experiment_id:
+          type: string
+        key_headers:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        key_strategy:
+          type: string
+        miss_status:
+          type: integer
+        phase_id:
+          type: string
+        strategy_version:
+          type: integer
+      type: object
+    atropos.CompiledCacheBox:
+      properties:
+        context:
+          $ref: '#/components/schemas/atropos.CacheBoxContext'
+        key_strategy:
+          description: '"exact" | "exact_with_host" | "exact_with_body"'
+          type: string
+        mode:
+          description: '"passthrough" | "replay" | "replay_with_delay"'
+          type: string
+      type: object
+    atropos.CompiledComposition:
+      properties:
+        duration_ms:
+          type: integer
+        execution_mode:
+          type: string
+        members:
+          items:
+            $ref: '#/components/schemas/atropos.CompiledCompositionMember'
+          type: array
+          uniqueItems: false
+        name:
+          type: string
+        ramp_down_ms:
+          type: integer
+        ramp_up_ms:
+          type: integer
+      type: object
+    atropos.CompiledCompositionMember:
+      properties:
+        composition:
+          $ref: '#/components/schemas/atropos.CompiledComposition'
+        direction:
+          type: string
+        fault:
+          $ref: '#/components/schemas/atropos.CompiledFault'
+      type: object
+    atropos.CompiledFault:
+      properties:
+        category:
+          description: '"inline" (default), "network", "resource"'
+          type: string
+        duration_ms:
+          type: integer
+        fault_type:
+          description: fault type within category
+          type: string
+        id:
+          description: slot identity (service+category:type); unused on compiled rules
+          type: string
+        network:
+          $ref: '#/components/schemas/atropos.NetworkEnvelope'
+        params:
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        ramp_down_ms:
+          type: integer
+        ramp_up_ms:
+          type: integer
+      type: object
+    atropos.CompiledRule:
+      properties:
+        cachebox:
+          $ref: '#/components/schemas/atropos.CompiledCacheBox'
+        composition:
+          $ref: '#/components/schemas/atropos.CompiledComposition'
+        fault:
+          $ref: '#/components/schemas/atropos.CompiledFault'
+        injection_point:
+          type: string
+        labels:
+          additionalProperties:
+            type: string
+          type: object
+        mode:
+          type: string
+        name:
+          type: string
+        priority:
+          type: integer
+        start_policy:
+          type: string
+      type: object
+    atropos.DelayRequest:
+      properties:
+        context:
+          $ref: '#/components/schemas/atropos.CacheBoxContext'
+        mu:
+          type: number
+        seed:
+          type: integer
+        sigma:
+          type: number
+      type: object
+    atropos.FaultRequest:
+      properties:
+        category:
+          description: '"inline" (default), "network", "resource"'
+          type: string
+        duration_ms:
+          type: integer
+        fault_type:
+          description: fault type within category
+          type: string
+        id:
+          description: slot identity (service+category:type); unused on compiled rules
+          type: string
+        network:
+          $ref: '#/components/schemas/atropos.NetworkEnvelope'
+        params:
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        ramp_down_ms:
+          type: integer
+        ramp_up_ms:
+          type: integer
+      type: object
+    atropos.NetworkEnvelope:
+      properties:
+        direction:
+          description: 'Direction selects which half of a proxied connection to apply
+            the
+
+            toxic to. Required when Host=="proxy". For Host=="inline" only
+
+            "downstream" (response body) is meaningful.'
+          type: string
+        host:
+          description: "Host selects where the toxic runs.\n  \"proxy\"  \u2192 TCP\
+            \ proxy sidecar (current behaviour; requires NetworkResolver)\n  \"inline\"\
+            \ \u2192 in-process RoundTripper wrapping response.Body (not yet supported)"
+          type: string
+        scope:
+          description: 'Scope is the fraction of connections (proxy) or requests (inline)
+
+            to which the toxic applies. Zero means 1.0 (all).'
+          type: number
+        target:
+          description: 'Target is the logical name of the upstream service, resolved
+            by
+
+            NetworkResolver into a (listen, upstream) address pair.
+
+            Required when Host=="proxy"; ignored when Host=="inline".'
           type: string
       type: object
     model.CacheBoxRuleConfig:
@@ -181,6 +463,33 @@ components:
         target:
           type: string
       type: object
+    model.ReplaySetRef:
+      properties:
+        count:
+          type: integer
+        experiment_id:
+          type: string
+        id:
+          type: string
+        key_strategy:
+          type: string
+        phase_id:
+          type: string
+        sha256:
+          type: string
+        size_bytes:
+          type: integer
+        url:
+          type: string
+      type: object
+    model.ReplaySetStatus:
+      properties:
+        id:
+          type: string
+        state:
+          description: fetching | committed | failed
+          type: string
+      type: object
     model.Rule:
       properties:
         action:
@@ -231,14 +540,54 @@ components:
       properties:
         address:
           type: string
+        capabilities:
+          description: 'Capabilities lists the fault categories the host executes
+
+            (inline|network|resource|cachebox). Absent = all (the wire contract).'
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        host:
+          description: "Host names the instrument host that registered (\"in-process\"\
+            \ | \"sidecar\");\nstored as host_kind \u2014 \"host\" already means fault\
+            \ placement elsewhere."
+          type: string
         id:
           type: string
         last_poll_at:
           type: string
+        observed_at:
+          type: string
+        observed_errors:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        observed_etag:
+          type: string
+        observed_generation:
+          description: 'Observed state (desired-state protocol v1): what the instance
+            last told
+
+            us it holds. ObservedGeneration comes from the poll''s version param and
+
+            the status report; the rest only from POST /api/v1/sdk/status.'
+          type: integer
+        observed_unsupported:
+          items:
+            $ref: '#/components/schemas/model.UnsupportedRule'
+          type: array
+          uniqueItems: false
         poll_interval_ms:
           description: SDK's configured poll cadence
           type: integer
         registered_at:
+          type: string
+        replay_set_id:
+          type: string
+        replay_set_state:
+          description: fetching|committed|failed
           type: string
         routes:
           description: "Routes is the HTTP route inventory the service published at\n\
@@ -269,6 +618,13 @@ components:
         method:
           type: string
         path:
+          type: string
+      type: object
+    model.UnsupportedRule:
+      properties:
+        category:
+          type: string
+        rule:
           type: string
       type: object
 info:
@@ -772,6 +1128,51 @@ paths:
       summary: Update rule
       tags:
       - rules
+  /sdk/events:
+    get:
+      description: 'Server-sent events for one service. Event type rules_changed,
+        with data
+
+        {"generation":G}, is emitted on every change of the service''s generation:
+
+        rule CRUD, fault-config fire/cancel/delete/expiry, kill switch, a capability
+
+        change on re-register, and orchestrator phase transitions (enter, pause,
+
+        drain, finish). A ": heartbeat" comment follows every 30 s. A nudge only:
+
+        the long-poll (GET /sdk/rules) is primary; an SDK polls at once on
+
+        rules_changed. The stream ends when the server shuts down.'
+      parameters:
+      - description: service name
+        in: query
+        name: service
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            text/event-stream:
+              schema:
+                type: string
+          description: 'event stream: rules_changed events and heartbeat comments'
+        '400':
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: service query param required
+        '500':
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: streaming not supported
+      summary: Rule-change nudges (SSE)
+      tags:
+      - sdk
   /sdk/init:
     get:
       description: 'Returns 200 with status="ready" when manteion is ready to
@@ -791,9 +1192,13 @@ paths:
       - sdk
   /sdk/instances:
     get:
-      description: 'Returns all currently registered SDK instances. Status is computed
+      description: 'Returns all currently registered SDK instances, including host,
 
-        (alive/stale/dead) from last-poll-at.'
+        capabilities and observed state (observed_generation, observed_etag,
+
+        observed_unsupported, observed_errors, replay_set_id/state, observed_at).
+
+        Status is computed (alive/stale/dead) from last-poll-at.'
       responses:
         '200':
           content:
@@ -852,9 +1257,9 @@ paths:
     post:
       description: "Disables every currently-enabled rule whose service matches the\n\
         instance's service, through the same full rule update as\nPUT /rules/{id}\
-        \ \u2014 the rule version bumps once per rule, so polling\nSDKs converge on\
-        \ their next poll (SSE subscribers are nudged too).\nIdempotent: a repeat\
-        \ call reports an empty disabled_rule_ids."
+        \ \u2014 the rule version and the service generation bump\nonce per rule,\
+        \ so polling SDKs converge on their next poll (held polls\nwake and SSE subscribers\
+        \ are nudged too).\nIdempotent: a repeat call reports an empty disabled_rule_ids."
       parameters:
       - description: Instance ID
         in: path
@@ -887,13 +1292,16 @@ paths:
       - sdk
   /sdk/register:
     post:
-      description: 'Registers an atropos-go SDK process. The 201 response carries
-
-        status="registered" and may include the initial desired state
-
-        (rules, active_faults, freeze_cfg) so the SDK converges before
-
-        its first poll.'
+      description: "Registers an atropos-go SDK process (in-process embed or atroposd\
+        \ sidecar)\nwith its host kind and fault capabilities. The 201 response carries\n\
+        status=\"registered\" plus the instance's materialized desired state \u2014\
+        \nthe same RuleSync shape a 200 poll serves (version = generation, etag,\n\
+        rules, active_faults, freeze_cfg, replay_set), already filtered by the\nadvertised\
+        \ capabilities \u2014 so the SDK converges before its first poll.\nRegistering\
+        \ with capabilities different from the stored ones bumps the\nservice generation.\
+        \ If the desired state cannot be materialized the\nregistration still succeeds\
+        \ with no document (version 0, empty etag,\nrules and active_faults null),\
+        \ which the SDK applies as nothing."
       requestBody:
         content:
           application/json:
@@ -901,18 +1309,19 @@ paths:
               oneOf:
               - type: object
               - $ref: '#/components/schemas/model.SDKInstance'
-                description: SDK instance metadata
+                description: SDK instance metadata (id, service, address, poll_interval_ms,
+                  routes, host, capabilities)
                 summary: instance
-        description: SDK instance metadata
+        description: SDK instance metadata (id, service, address, poll_interval_ms,
+          routes, host, capabilities)
         required: true
       responses:
         '201':
           content:
             application/json:
               schema:
-                additionalProperties: {}
-                type: object
-          description: registration ack with optional intent fields
+                $ref: '#/components/schemas/api.RegisterResponseWire'
+          description: Created
         '400':
           content:
             application/json:
@@ -951,18 +1360,14 @@ paths:
       - sdk
   /sdk/rules:
     get:
-      description: 'SDKs send their last-known rule version via the version query
-        param.
-
-        Returns 304 if unchanged, else 200 with the desired state the SDK
-
-        reconciles against: {"version": uint64, "rules": []CompiledRule,
-
-        "active_faults": []FaultRequest, "freeze_cfg": DelayRequest}.
-
-        Manual fault add/remove bumps the version so it rides this path.
-
-        Optional instance_id query param triggers a best-effort poll-timestamp touch.'
+      description: "Records the instance's observed generation (version) and poll\
+        \ time,\nmaterializes DesiredState(service, instance) and compares its ETag\
+        \ with\nIf-None-Match. With wait>0 (seconds, max 60) and a matching ETag the\n\
+        request is held until the service's generation changes, wait elapses or\n\
+        the server begins shutting down, then re-materialized. 200 carries the\nRuleSync\
+        \ body (version = generation, etag, rules, active_faults,\nfreeze_cfg, replay_set)\
+        \ with ETag and X-Atropos-Generation headers; 304\ncarries the same headers\
+        \ and no body \u2014 the instance adopts\nX-Atropos-Generation without re-applying."
       parameters:
       - description: service name
         in: query
@@ -970,14 +1375,26 @@ paths:
         required: true
         schema:
           type: string
-      - description: last known rule version (uint64); omit on first poll
+      - description: SDK instance ID; selects the capability filter and records observed
+          state
+        in: query
+        name: instance_id
+        schema:
+          type: string
+      - description: generation the instance currently holds, recorded as observed_generation;
+          absent, unparseable or above 9223372036854775807 reads as 0
         in: query
         name: version
         schema:
           type: integer
-      - description: SDK instance ID for poll-timestamp tracking
+      - description: long-poll hold in seconds (0-60, default 0)
         in: query
-        name: instance_id
+        name: wait
+        schema:
+          type: integer
+      - description: ETag of the last document the instance applied or confirmed
+        in: header
+        name: If-None-Match
         schema:
           type: string
       responses:
@@ -985,11 +1402,10 @@ paths:
           content:
             application/json:
               schema:
-                additionalProperties: {}
-                type: object
-          description: '{version, rules, active_faults, freeze_cfg}'
+                $ref: '#/components/schemas/api.RuleSyncWire'
+          description: desired state; headers ETag, X-Atropos-Generation
         '304':
-          description: no rule changes since requested version
+          description: unchanged; headers ETag, X-Atropos-Generation
         '400':
           content:
             application/json:
@@ -1001,8 +1417,59 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/api.ErrorResponse'
+          description: desired state could not be materialized
+      summary: Poll for desired state (long-poll)
+      tags:
+      - sdk
+  /sdk/status:
+    post:
+      description: 'Sent by an SDK instance after every apply and whenever its replay-set
+
+        state changes (fetching|committed|failed). The report is a full snapshot
+
+        of what the instance holds and replaces the previous one: it stores
+
+        applied_generation, etag, unsupported rules and errors (empty lists clear)
+
+        and the replay-set id and state (an absent replay_set means the instance
+
+        holds none and clears them) on the instance row, where GET /sdk/instances
+
+        exposes them and the orchestrator''s convergence barrier reads them.'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/api.StatusReport'
+                description: applied-state report
+                summary: report
+        description: applied-state report
+        required: true
+      responses:
+        '204':
+          description: stored
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: invalid JSON, missing instance_id or service, applied_generation
+            above 9223372036854775807, or unknown replay_set.state
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: unknown instance
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
           description: Internal Server Error
-      summary: Poll for rule updates
+      summary: Report applied desired state
       tags:
       - sdk
   /status:

@@ -177,6 +177,8 @@ func TestHandleGetInstance(t *testing.T) {
 		wantError  string
 		wantActive []string
 		wantRecent []string
+		wantRaw    map[string]string // body key → its exact JSON value
+		wantAbsent []string          // body keys that must not appear (beyond the always-absent two)
 	}{
 		{
 			name:       "unknown instance → 404",
@@ -196,6 +198,27 @@ func TestHandleGetInstance(t *testing.T) {
 			wantStatus: http.StatusOK,
 			wantActive: []string{"rule-cart-hi", "rule-cart-lo"},
 			wantRecent: []string{"phase-3", "phase-2", "phase-1"},
+		},
+		{
+			name: "host, capabilities and observed state ride along; zero observed_etag/observed_at stay absent",
+			id:   "cart-7f3a",
+			insts: func() *fakeSDKInstances {
+				f := sdkTestInstances()
+				inst := f.byID["cart-7f3a"]
+				inst.Host, inst.Capabilities = "sidecar", []string{"inline"}
+				inst.ObservedGeneration, inst.ReplaySetState = 7, "committed"
+				return f
+			}(),
+			rules:      &fakeServiceRules{},
+			phases:     &fakePhaseHistory{},
+			wantStatus: http.StatusOK,
+			wantActive: []string{},
+			wantRecent: []string{},
+			wantRaw: map[string]string{
+				"host": `"sidecar"`, "capabilities": `["inline"]`,
+				"observed_generation": `7`, "replay_set_state": `"committed"`,
+			},
+			wantAbsent: []string{"observed_etag", "observed_at"},
 		},
 		{
 			name:       "no rules, no phases → empty arrays, never null",
@@ -281,10 +304,16 @@ func TestHandleGetInstance(t *testing.T) {
 					t.Errorf("%s = %v, want %v", key, got, want)
 				}
 			}
-			// Nothing tracks these yet (no sdk_instances column; the poll's
-			// version param is not persisted) — they must stay absent, not
-			// zero-valued, so the UI's optional fields don't render garbage.
-			for _, key := range []string{"last_error", "last_rule_version_acked"} {
+			for key, want := range tc.wantRaw {
+				if got := string(raw[key]); got != want {
+					t.Errorf("%s = %s, want %s (body %s)", key, got, want, w.Body.String())
+				}
+			}
+			// Nothing tracks last_error or last_rule_version_acked under those
+			// names (observed_errors and observed_generation carry the observed
+			// state) — they must stay absent, not zero-valued, so the UI's
+			// optional fields don't render garbage.
+			for _, key := range append([]string{"last_error", "last_rule_version_acked"}, tc.wantAbsent...) {
 				if _, ok := raw[key]; ok {
 					t.Errorf("%s present in body, want absent: %s", key, w.Body.String())
 				}
@@ -529,7 +558,7 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	if err := faults.CreateSpec(ctx, spec); err != nil {
 		t.Fatalf("seed fault spec: %v", err)
 	}
-	t.Cleanup(func() { _ = faults.DeleteSpec(context.Background(), spec.ID) }) // runs last (LIFO)
+	t.Cleanup(func() { _ = faults.DeleteSpec(context.Background(), spec.ID) }) // runs after the rule deletes (LIFO)
 
 	mkRule := func(ruleID, service string, priority int, enabled bool) string {
 		t.Helper()

@@ -21,8 +21,9 @@ ready ──fire──▶ active ──┬── duration elapses ─▶ complet
 
 manteion does **not** push faults to instances. Instead, the SDK poll response
 (`GET /api/v1/sdk/rules`) carries an `active_faults` list, and the atropos-go SDK
-reconciles its applied faults against that list on every poll — applying new
-ones (keyed by a stable fault ID) and dropping any no longer present. Duration
+reconciles its applied faults against that list whenever a poll returns a new
+document (`200`) — applying new ones (keyed by a stable fault ID) and dropping
+any no longer present. Duration
 expiry and stale-fault reaping are handled SDK-side (server-side infinite-
 duration whitelist + fault watchdog); manteion only owns the desired state.
 

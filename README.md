@@ -27,23 +27,36 @@ numbers.
 | `internal/model/` | Domain types + `Validate()`; `enums.go` is the Go source of truth for the PG enum vocabularies. |
 | `internal/store/` | Postgres repositories (pgx). CAS phase/experiment transitions live here (`TransitionPhase` with explicit from-sets). |
 | `internal/db/` | Pool init + append-only migrations. **Schema epoch 2**: `Migrate` refuses a database whose history it doesn't recognize — resetting means dropping the database. |
-| `internal/orchestrator/` | The experiment FSM. `enterPhase`: version bump → preload gate → freeze gate → phase rules → workflow materialization → zeus runs + additive attacks → poller. `finishPhase`: the single terminal path — CAS `running→draining→completed` for recording phases (drain barrier), fidelity verdict *before* thaw, harvest exactly once, then experiment advance. Phase-level pause (experiment pause is derived); `Recover` reconciles crash state at startup. |
+| `internal/orchestrator/` | The experiment FSM. `enterPhase`: generation bump → preload gate → freeze gate → phase rules → workflow materialization → zeus runs + additive attacks → poller. `finishPhase`: the single terminal path — CAS `running→draining→completed` for recording phases (drain barrier), fidelity verdict *before* thaw, harvest exactly once, then experiment advance. Every transition (enter, pause, drain, finish) bumps the generation of each service the phase touches. Phase-level pause (experiment pause is derived; a paused phase's rules and cache-box role leave the desired state until resume); `Recover` reconciles crash state at startup. |
 | `internal/orchestrator/{drain,verdict,admission}.go` | Drain barrier + gap classification, per-phase verdict from W6 snapshots, refusal of overlapping concurrent experiments (the SDK is single-tenant). |
 | `internal/cachestore/` | NDJSON cache store: batch-seq dedup, per-key accounting, collision stats, drain-report ledger, W5 checksum. |
-| `internal/atrocontrol/` | SDK fanout controller: freeze/thaw, rule push, staged preload driver, fidelity pulls, intent tracker for late-joining instances. Liveness filter is `FilterLive` — `stale` (slow-polling) pods are live and owe drain records; only `dead` is excluded. |
+| `internal/desired/` | Desired-state materializer (protocol v1): per-service generations (`service_generations`, bumped with every input change; a bump wakes held long-polls and SSE subscribers) and `Materializer`, a pure function of the database per `(service, instance)` — phase-aware rules, active fault configs, the synthesized cache-box rule, freeze config — filtered by the instance's capabilities, with ETag `"<generation>-<sha256[:16]>"`. |
+| `internal/atrocontrol/` | SDK fanout controller: freeze/thaw, rule push, staged preload driver, fidelity pulls. Its in-memory intent tracker now only supplies the freeze config the materializer serves (until it is derived from the frozen phase); register and poll answers come from the database. Liveness filter is `FilterLive` — `stale` (slow-polling) pods are live and owe drain records; only `dead` is excluded. |
 | `internal/atropos/` | HTTP client for individual SDK instances (delay, preload, fidelity, clear). |
 | `internal/zeus/` | HTTP client for zeus (workflows, runs, attacks, datasets). |
-| `internal/ruleconv/` | Rule → wire compilation. Wire structs (`CompiledRule`, `FaultRequest`, `RuleSync`) are **imported from atropos-go** — one contract, two repos. Cache-box rules are **synthesized per running phase** (`SynthesizeCacheBoxRule`), never stored. |
+| `internal/ruleconv/` | Rule → wire compilation. Wire structs (`CompiledRule`, `FaultRequest`, `DelayRequest`) are **imported from atropos-go** — one contract, two repos; the poll/register body is a local mirror (`api.RuleSyncWire`) until atropos-go's `RuleSync` carries `etag` and `replay_set`. Cache-box rules are **synthesized per running phase** (`SynthesizeCacheBoxRule`), never stored. |
 | `internal/api/` | HTTP server; one handler file per domain group. Swagger covers a subset of routes — the code is authoritative. |
 | `internal/faultcatalog/` | Fault vocabulary + typed param validation backed by `atropos-go/faultparams`. |
 | `internal/policy/` | WIP-frozen behind `MANTEION_POLICY_ENGINE=off`. |
 
 ## Wire contracts (shared with atropos-go)
 
-- **Poll** — `GET /api/v1/sdk/rules?service=&version=`: 304 on version match, else the **full desired
-  state**; an empty rule array is authoritative (clears SDK rules and triggers the drain tracker).
-- **Register** — `POST /api/v1/sdk/register`: instance identity + published routes; the response
-  piggybacks current intent (rules, freeze config) for late joiners.
+- **Poll** — `GET /api/v1/sdk/rules?service=&instance_id=&version=&wait=` with `If-None-Match`:
+  records `version` (the generation the instance holds) as its `observed_generation`, then answers
+  200 with the **full desired state** — `version` is the per-service generation, `etag` is
+  `"<generation>-<content hash>"`, plus `rules`, `active_faults`, `freeze_cfg`, `replay_set` — or
+  304 when `If-None-Match` names the current ETag; both carry `ETag` and `X-Atropos-Generation`.
+  With `wait` (seconds, ≤ 60) a matching poll is held until the service's generation moves or the
+  wait elapses (a long-poll), then re-materialized. The document is filtered by the instance's
+  capabilities; an empty rule array is authoritative (clears SDK rules and triggers the drain
+  tracker).
+- **Register** — `POST /api/v1/sdk/register`: instance identity, published routes, `host` and
+  `capabilities`; the response is `status` plus the materialized desired state (the 200 poll body),
+  filtered by the advertised capabilities. Re-registering with other capabilities bumps the
+  generation.
+- **Status** — `POST /api/v1/sdk/status`: the instance's report after every apply and on each
+  replay-set state change (`applied_generation`, `etag`, unsupported rules, errors, replay-set
+  id/state), a full snapshot stored on the instance row (`observed_*`, `replay_set_*`).
 - **Ingest** — `POST /api/v1/cache/ingest`: recorded-entry batches, deduped by
   `(experiment, phase, instance, batch_seq)`; stays open while the phase drains.
 - **Drain** — `POST /api/v1/sdk/cachebox/drain`: per-`(experiment, phase)` instance report; the
@@ -51,12 +64,14 @@ numbers.
   fallback for lost reports.
 - **Preload** — SDK-side `POST /cachebox/preload/{begin,chunk,commit,abort}`; commit verifies the
   W5 checksum (implementation pinned to an identical cross-repo test vector in both repos).
-- **SSE** — `GET /api/v1/sdk/events` (`rules_changed`) nudges pollers between intervals.
+- **SSE** — `GET /api/v1/sdk/events?service=`: `rules_changed` with data `{"generation":G}` on every
+  generation change (orchestrator transitions included) nudges the instance to poll at once; the
+  long-poll is primary.
 
 ## HTTP surface (grouped)
 
 Health (`/healthz`, `/readyz`, `/api/v1/status`) · Rules CRUD · Fault specs / compositions CRUD ·
-Fault catalog · SDK (register / instances / rules / init / events) · Experiments
+Fault catalog · SDK (register / instances / rules / status / init / events) · Experiments
 (CRUD + start/pause/resume/cancel/stop + results, nested phases with the same verbs) · Phases
 run-details (`GET /api/v1/phases[/{id}[/faults]]`, `POST .../pause|resume|stop` — a "run" in the UI
 sense is a phase) · Cache (ingest, drain) · Zeus proxy (`/api/v1/zeus/*` — workflows, runs,

@@ -20,14 +20,16 @@ A faithful recording ⇒ baseline `recorded_entry_count > 0` **and** isolation
 ## How the pieces wire (manteion side)
 
 1. The orchestrator starts a **baseline** phase (`persist_cache=true`, no frozen
-   services). Starting it, draining it and finishing it each bump the
+   services). Starting, pausing, draining and finishing it each bump the
    generation of the services it records (those frozen anywhere in the
    experiment), which wakes their long-polls.
-2. The SDK poll/register response carries `recording_phase_id` =
-   `ExperimentRepo.RunningPersistCachePhaseID` (the running baseline). The
-   atropos SDK hands it to `ApplyTargets.PhaseIDSink` →
-   `CachePushClient.SetPhaseID`, so the service's cache pushes
-   (`POST /api/v1/cache/ingest`) are tagged with the baseline phase id.
+2. While the baseline runs, the desired state of each recorded service carries
+   a synthesized cache-box **record** rule (mode `passthrough`) whose `context`
+   names the baseline's `(experiment_id, phase_id)` and key strategy
+   (`ExperimentRepo.ActiveCacheBoxPhaseForService` →
+   `ruleconv.SynthesizeCacheBoxRule`). The SDK records under that context, so
+   the service's cache pushes (`POST /api/v1/cache/ingest`) are tagged with the
+   baseline's pair.
 3. manteion's `cachestore` persists entries under `{phase_id}/{service}.jsonl`.
    On baseline completion, `harvestCacheStats` writes `recorded_entry_count`
    per recording service (`cachestore.Services` + `Read`).
@@ -36,16 +38,16 @@ A faithful recording ⇒ baseline `recorded_entry_count > 0` **and** isolation
    live `Store.Hits/Misses` → `cache_hit_rate` + `request_count`, and carries
    the baseline coverage as `recorded_entry_count`.
 
-The `service-beds` services must wire `ApplyTargets.PhaseIDSink =
-cbPush.SetPhaseID` (their task) for step 2 to take effect.
+The record and replay rules are cache-box rules: an instance only receives
+them if it advertises the `cachebox` capability (or no capabilities, which
+means all).
 
 ## Prereqs
 
 - manteion (epoch-2, migrations ≥ 3) reachable at `$MANTEION_URL`.
 - zeus reachable by manteion (drives the per-workflow attacks).
 - An atropos-instrumented mesh slice that records cache and pushes to manteion
-  (`MANTEION_URL` set in the services; `PhaseIDSink` wired). See the service-beds
-  local-mesh task.
+  (`MANTEION_URL` set in the services). See the service-beds local-mesh task.
 - `curl` + `jq`.
 
 ## Run
@@ -68,9 +70,11 @@ fidelity thresholds. Exit 0 = PASS.
 ## Troubleshooting
 
 - **baseline `recorded_entry_count` = 0** → the SDK isn't ingesting. Check the
-  `recording_phase_id` reaches the service (poll response) and that
-  `PhaseIDSink → SetPhaseID` is wired; check `POST /api/v1/cache/ingest` is
-  reachable and `persist_cache=true` on the baseline.
+  service's poll response carries the record rule (a `cachebox` rule, mode
+  `passthrough`, whose `context` names the baseline) — an instance whose
+  advertised capabilities lack `cachebox` never gets it; check
+  `POST /api/v1/cache/ingest` is reachable and `persist_cache=true` on the
+  baseline.
 - **isolation `request_count` = 0** → no traffic hit the frozen service during
   replay; check the workflow `target_url`s actually route through `FREEZE_SVC`.
 - **low `cache_hit_rate`** → recording didn't cover the replayed request set

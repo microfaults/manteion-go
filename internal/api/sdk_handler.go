@@ -129,8 +129,10 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // handleListInstances returns all registered SDK instances.
 //
 // @Summary      List SDK instances
-// @Description  Returns all currently registered SDK instances. Status is computed
-// @Description  (alive/stale/dead) from last-poll-at.
+// @Description  Returns all currently registered SDK instances, including host,
+// @Description  capabilities and observed state (observed_generation, observed_etag,
+// @Description  observed_unsupported, observed_errors, replay_set_id/state, observed_at).
+// @Description  Status is computed (alive/stale/dead) from last-poll-at.
 // @Tags         sdk
 // @Produce      json
 // @Success      200  {array}   model.SDKInstance

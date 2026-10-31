@@ -6,9 +6,27 @@ import (
 	"time"
 )
 
-// handleSSEEvents streams rule-change notifications to SDK clients via SSE.
-// Clients connect with ?service=<name> and receive events until disconnected.
-// A heartbeat comment is sent every 30s to prevent proxy timeouts.
+// handleSSEEvents streams desired-state change nudges to SDK clients via SSE.
+// Clients connect with ?service=<name> and receive a rules_changed event, data
+// {"generation":G}, on every generation change of that service, until they
+// disconnect or the server begins shutting down. A heartbeat comment is sent
+// every 30s to prevent proxy timeouts.
+//
+// @Summary      Rule-change nudges (SSE)
+// @Description  Server-sent events for one service. Event type rules_changed, with data
+// @Description  {"generation":G}, is emitted on every change of the service's generation:
+// @Description  rule CRUD, fault-config fire/cancel/delete/expiry, kill switch, a capability
+// @Description  change on re-register, and orchestrator phase transitions (enter, pause,
+// @Description  drain, finish). A ": heartbeat" comment follows every 30 s. A nudge only:
+// @Description  the long-poll (GET /sdk/rules) is primary; an SDK polls at once on
+// @Description  rules_changed. The stream ends when the server shuts down.
+// @Tags         sdk
+// @Produce      text/event-stream
+// @Param        service  query     string  true  "service name"
+// @Success      200      {string}  string  "event stream: rules_changed events and heartbeat comments"
+// @Failure      400      {object}  api.ErrorResponse  "service query param required"
+// @Failure      500      {object}  api.ErrorResponse  "streaming not supported"
+// @Router       /sdk/events [get]
 func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 	service := r.URL.Query().Get("service")
 	if service == "" {

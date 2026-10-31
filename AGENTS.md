@@ -35,15 +35,15 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 - REST API using stdlib `net/http` with Go 1.22+ method-path routing (`mux.HandleFunc("METHOD /path", handler)`)
 - PostgreSQL-backed persistence via pgx/v5 (`internal/db/` for connection management and migrations, `internal/store/` for domain repositories)
 - HTTP proxy to zeus-go Archer for workload/attack operations
-- Version-based SDK polling (304 Not Modified on no-change) via `rule_version` counter bumped atomically on every rule mutation
+- Desired-state SDK polling (`internal/desired/`): a per-service generation bumped with every input change, a materialized document per instance with a content ETag, and a long-polling `GET /api/v1/sdk/rules` that answers 304 Not Modified when `If-None-Match` names the current ETag
 - Docker-compose for local development (postgres:17-alpine)
 
 ### Storage
 
 - PostgreSQL for all persistent state: rules, fault specs/compositions, experiments, results, workloads, trace anchors, policy rules
 - Schema managed by embedded migrations in `internal/db/migrations.go`
-- Rule version counter (`rule_version` single-row table) enables efficient 304 polling
-- TODO: in-memory caching layer for hot-path polling (rule version + compiled rules); SDK instances may move to in-memory store (ephemeral, high-frequency writes)
+- Per-service generation counters (`service_generations`) and the document's content ETag drive the 304/long-poll decision; the single-row `rule_version` counter only backs the SDK readiness probe (`/api/v1/sdk/init`)
+- TODO: in-memory caching layer for hot-path polling (materialized documents per generation); SDK instances may move to in-memory store (ephemeral, high-frequency writes)
 
 ## Key Domains
 

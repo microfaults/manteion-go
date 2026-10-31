@@ -53,9 +53,10 @@ const recentPhaseLimit = 5
 // context.
 //
 // Not emitted, deliberately: last_error and last_rule_version_acked. Nothing
-// tracks them — sdk_instances has no such columns and the poll's version
-// query param is not persisted — and the UI treats both as optional, so they
-// stay absent rather than zero-valued.
+// tracks them under those names (the poll's version is persisted as
+// observed_generation and the status report's errors as observed_errors, both
+// on the list row), and the UI treats both as optional, so they stay absent
+// rather than zero-valued.
 type SDKInstanceDetail struct {
 	*model.SDKInstance
 	// ActiveRuleIDs is every enabled rule targeting the instance's service,
