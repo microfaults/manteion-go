@@ -88,9 +88,12 @@ type Orchestrator struct {
 	// declares a data_schema.
 	zeusDatasetID string
 
-	mu       sync.Mutex
-	running  map[string]context.CancelFunc // phase ID → poller cancel
-	expLocks map[string]*sync.Mutex        // experiment ID → scheduler serializer
+	mu         sync.Mutex
+	running    map[string]context.CancelFunc // phase ID → poller cancel
+	expLocks   map[string]*sync.Mutex        // experiment ID → scheduler serializer
+	phaseLocks map[string]*sync.Mutex        // phase ID → status CAS + claim serializer (claims.go)
+	claims     map[string]claimToken         // phase ID → the current entry's claim (claims.go)
+	claimSeq   claimToken                    // the last claim token issued
 }
 
 // New constructs an Orchestrator.
@@ -133,6 +136,8 @@ func New(
 		convergePollInterval: defaultConvergePollInterval,
 		running:              make(map[string]context.CancelFunc),
 		expLocks:             make(map[string]*sync.Mutex),
+		phaseLocks:           make(map[string]*sync.Mutex),
+		claims:               make(map[string]claimToken),
 	}
 }
 

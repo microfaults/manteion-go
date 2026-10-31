@@ -44,7 +44,9 @@ func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 			fmt.Sprintf("orchestrator: phase %q not startable from status %q", phaseID, p.Status))
 	}
 
-	claimed, err := o.experiments.TransitionPhase(ctx, phaseID, "running", p.Status)
+	claim, claimed, err := o.claimRunning(phaseID, func() (bool, error) {
+		return o.experiments.TransitionPhase(ctx, phaseID, "running", p.Status)
+	})
 	if err != nil {
 		return fmt.Errorf("orchestrator: claim phase: %w", err)
 	}
@@ -54,7 +56,7 @@ func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 			fmt.Sprintf("orchestrator: phase %q is no longer %s", phaseID, p.Status))
 	}
 
-	return o.enterPhase(ctx, p, fresh)
+	return o.enterClaimed(ctx, p, fresh, claim)
 }
 
 // phaseStatus re-reads a phase's status after a lost CAS race, "" when the
@@ -77,7 +79,11 @@ func (o *Orchestrator) phaseStatus(ctx context.Context, phaseID string) string {
 // same services and waits for the fleet like a fresh start (a frozen service's
 // instances pull the phase's replay set again).
 func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
-	paused, err := o.experiments.TransitionPhase(ctx, phaseID, "paused", "running")
+	// The pause ends the claim of an entry still waiting for its fleet: from
+	// here on that entry leaves the phase alone (claims.go).
+	paused, err := o.endClaim(phaseID, 0, func() (bool, error) {
+		return o.experiments.TransitionPhase(ctx, phaseID, "paused", "running")
+	})
 	if err != nil {
 		return fmt.Errorf("orchestrator: pause phase: %w", err)
 	}
@@ -137,23 +143,21 @@ func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus strin
 	return nil
 }
 
-// enterPhase runs the phase enter sequence after the running claim. Data
-// errors (broken rules, unloadable workflows, zero startable attacks) and a
-// fleet that does not converge fail the phase via failPhase, recording the
-// error as the phase's failure reason — except a resume whose fleet does not
-// converge, which leaves the phase paused (leavePaused).
+// enterPhase runs the phase enter sequence for a phase that is already
+// running, under a claim of its own (claimPhase) instead of StartPhase's CAS.
 func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase, fresh bool) error {
-	// The converge gate can hold the caller for MANTEION_CONVERGE_TIMEOUT, and
-	// a caller that goes away meanwhile (an operator's client hanging up) must
-	// leave the phase failed with its reason, not wedged 'running' with no load
-	// driver and no poller: the failure is finalized on a context it cannot
-	// cancel.
-	fail := func(err error) error {
-		o.logger.Error("orchestrator: phase enter failed",
-			"phase_id", p.ID, "error", err)
-		o.failPhase(context.WithoutCancel(ctx), p.ID, failureReason(err), "running")
-		return err
-	}
+	return o.enterClaimed(ctx, p, fresh, o.claimPhase(p.ID))
+}
+
+// enterClaimed runs the phase enter sequence under claim, the claim the
+// running CAS gave this entry. Data errors (broken rules, unloadable
+// workflows, zero startable attacks) and a fleet that does not converge fail
+// the phase via failEntry, recording the error as the phase's failure reason —
+// except a resume whose fleet does not converge, which leaves the phase paused
+// (leavePaused). Once its claim has ended (a pause, a stop, or a newer entry
+// took the phase), the entry leaves the phase alone.
+func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhase, fresh bool, claim claimToken) error {
+	fail := func(err error) error { return o.failEntry(ctx, p, claim, err) }
 
 	exp, err := o.experiments.Get(ctx, p.ExperimentID)
 	if err != nil {
@@ -190,22 +194,19 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	if err != nil {
 		err = fmt.Errorf("orchestrator: converge gate: %w", err)
 		if !fresh {
-			return o.leavePaused(ctx, p, err)
+			return o.leavePaused(ctx, p, claim, err)
 		}
 		return fail(err)
 	}
 
-	// The wait can be long: a pause or stop that landed meanwhile owns the
-	// phase now, and no load may start for a phase that left 'running'.
-	cur, err := o.experiments.GetPhase(ctx, p.ID)
-	if err != nil {
+	// The wait can be long: a pause, a stop or a newer entry that took the
+	// phase meanwhile owns it now, and no load may start under an ended claim
+	// or for a phase that left 'running'.
+	if err := o.entryHolds(ctx, p.ID, claim); err != nil {
+		if errors.Is(err, errLeftRunning) {
+			return o.leftRunning(ctx, p)
+		}
 		return fail(fmt.Errorf("orchestrator: reload phase after the converge gate: %w", err))
-	}
-	if cur.Status != "running" {
-		o.logger.Warn("orchestrator: phase left running during the converge gate; no load started",
-			"phase_id", p.ID, "status", cur.Status)
-		return invalidState("phase", p.ID, cur.Status, "running",
-			fmt.Sprintf("orchestrator: phase %q left running while its fleet converged (now %s); no load started", p.ID, cur.Status))
 	}
 	o.logger.Info("orchestrator: fleet converged on phase entry",
 		"phase_id", p.ID, "services", len(targets), "frozen", len(artifacts), "fresh", fresh)
@@ -275,26 +276,83 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	return nil
 }
 
+// errLeftRunning is an entry finding that its phase is no longer its own: its
+// claim ended (a pause, a stop, a newer entry) or the phase left running.
+var errLeftRunning = errors.New("the phase left running while its fleet converged")
+
+// entryHolds reports whether the entry holding claim still owns phaseID: nil
+// while the claim is the phase's current one and the phase is running,
+// errLeftRunning once either stopped being true, and a read error as is.
+func (o *Orchestrator) entryHolds(ctx context.Context, phaseID string, claim claimToken) error {
+	if !o.holdsClaim(phaseID, claim) {
+		return errLeftRunning
+	}
+	cur, err := o.experiments.GetPhase(ctx, phaseID)
+	if err != nil {
+		return err
+	}
+	if cur.Status != "running" {
+		return errLeftRunning
+	}
+	return nil
+}
+
+// leftRunning is an entry's refusal once its phase is no longer its own: an
+// invalid-state error naming the status the phase is in now. Whoever took the
+// phase owns it; the entry starts no load and changes nothing.
+func (o *Orchestrator) leftRunning(ctx context.Context, p *model.ExperimentPhase) error {
+	status := o.phaseStatus(ctx, p.ID)
+	o.logger.Warn("orchestrator: phase left running during the converge gate; no load started",
+		"phase_id", p.ID, "status", status)
+	return invalidState("phase", p.ID, status, "running",
+		fmt.Sprintf("orchestrator: phase %q left running while its fleet converged (now %s); no load started", p.ID, status))
+}
+
+// failEntry fails the phase an entry holds, recording err as the reason, and
+// returns err. The converge gate can hold the caller for
+// MANTEION_CONVERGE_TIMEOUT, and a caller that goes away meanwhile (an
+// operator's client hanging up) must leave the phase failed with its reason,
+// not wedged 'running' with no load driver and no poller, so the failure is
+// finalized on a context the caller cannot cancel. An entry whose claim has
+// ended changes nothing: the phase belongs to whoever took it.
+func (o *Orchestrator) failEntry(ctx context.Context, p *model.ExperimentPhase, claim claimToken, err error) error {
+	if !o.holdsClaim(p.ID, claim) {
+		o.logger.Warn("orchestrator: phase enter failed after its claim ended; phase left to its owner",
+			"phase_id", p.ID, "error", err)
+		return err
+	}
+	o.logger.Error("orchestrator: phase enter failed",
+		"phase_id", p.ID, "error", err)
+	o.endPhaseClaimed(context.WithoutCancel(ctx), p.ID, "failed", failureReason(err), claim, "running")
+	return err
+}
+
 // leavePaused ends a resume whose fleet did not converge: the phase goes back
 // to paused, and the resume returns cause. Nothing is lost by waiting — load
 // has not started (the converge gate runs before any driver) — so a timed-out
 // resume does not fail the phase; the operator can resume again. The CAS back
 // to paused takes the phase's rules and freeze out of the documents its resume
 // claim had put them back in, so its services are bumped again, after it. It
-// runs on a context the caller cannot cancel, as fail does.
-func (o *Orchestrator) leavePaused(ctx context.Context, p *model.ExperimentPhase, cause error) error {
+// runs on a context the caller cannot cancel, as failEntry does, and only
+// while claim is still the phase's current one.
+func (o *Orchestrator) leavePaused(ctx context.Context, p *model.ExperimentPhase, claim claimToken, cause error) error {
 	ctx = context.WithoutCancel(ctx)
-	o.logger.Warn("orchestrator: resume did not converge; phase left paused",
-		"phase_id", p.ID, "error", cause)
-	repaused, err := o.experiments.TransitionPhase(ctx, p.ID, "paused", "running")
+	repaused, err := o.endClaim(p.ID, claim, func() (bool, error) {
+		return o.experiments.TransitionPhase(ctx, p.ID, "paused", "running")
+	})
 	switch {
 	case err != nil:
 		o.logger.Error("orchestrator: return an unconverged resume to paused failed",
 			"phase_id", p.ID, "error", err)
 	case repaused:
+		o.logger.Warn("orchestrator: resume did not converge; phase left paused",
+			"phase_id", p.ID, "error", cause)
 		_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service
+	default:
+		// The claim ended, or the phase moved on: whoever took it owns it now.
+		o.logger.Warn("orchestrator: resume did not converge after its claim ended; phase left to its owner",
+			"phase_id", p.ID, "error", cause)
 	}
-	// !repaused: a concurrent stop or pause moved the phase on and owns it now.
 	return cause
 }
 
@@ -325,9 +383,16 @@ func (o *Orchestrator) failPhase(ctx context.Context, phaseID, reason string, fr
 	return o.endPhase(ctx, phaseID, "failed", reason, from...)
 }
 
-// endPhase is the single race-safe terminal path for a phase. It
+// endPhase is endPhaseClaimed for a caller that holds no claim: an operator,
+// the poller, recovery, the scheduler. Its transition ends any entry's claim.
+func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason string, from ...string) bool {
+	return o.endPhaseClaimed(ctx, phaseID, status, reason, 0, from...)
+}
+
+// endPhaseClaimed is the single race-safe terminal path for a phase. It
 // atomically transitions phaseID to `status` only if the phase's current
-// status is one of `from` (for "failed", together with reason). Just before
+// status is one of `from` (for "failed", together with reason); the transition
+// ends any entry's claim on the phase (claims.go). Just before
 // that CAS it stops the poller and the zeus load and pulls the fidelity
 // snapshots of a completed frozen phase — idempotent or read-only steps that
 // must happen while the phase still holds its status. ONLY the caller that
@@ -342,7 +407,14 @@ func (o *Orchestrator) failPhase(ctx context.Context, phaseID, reason string, fr
 //
 // Callers on a context that the poller teardown is about to cancel (i.e. the
 // poller itself) must pass context.Background().
-func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason string, from ...string) bool {
+//
+// A non-zero claim is an entry ending its own phase (failEntry): nothing
+// happens unless the claim is still the phase's current one, checked before
+// any side effect and again, under the phase's transition lock, at the CAS.
+func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, reason string, claim claimToken, from ...string) bool {
+	if claim != 0 && !o.holdsClaim(phaseID, claim) {
+		return false // the entry's claim ended: the phase is someone else's
+	}
 	// Snapshot phase + workflows (frozen services, attack IDs) before the flip.
 	p, err := o.experiments.GetPhase(ctx, phaseID)
 	if err != nil {
@@ -366,7 +438,9 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 	// winner-only discipline holds across BOTH hops. A failed/cancelled/skipped
 	// recording phase skips the barrier (it never drains).
 	if status == "completed" && p.PersistCache {
-		won, err := o.experiments.TransitionPhase(ctx, phaseID, "draining", from...)
+		won, err := o.endClaim(phaseID, claim, func() (bool, error) {
+			return o.experiments.TransitionPhase(ctx, phaseID, "draining", from...)
+		})
 		if err != nil {
 			o.logger.Error("orchestrator: finish phase: transition to draining failed",
 				"phase_id", phaseID, "error", err)
@@ -377,6 +451,7 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 		}
 		o.runDrainBarrier(ctx, p, pws)
 		from = []string{"draining"} // now complete from draining
+		claim = 0                   // the draining CAS ended the claim; the drain winner completes
 	}
 
 	// Before the terminal transition, while the phase still holds its status —
@@ -402,12 +477,12 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 		pull = o.pullFidelity(ctx, p)
 	}
 
-	var transitioned bool
-	if status == "failed" {
-		transitioned, err = o.experiments.FailPhase(ctx, phaseID, reason, from...)
-	} else {
-		transitioned, err = o.experiments.TransitionPhase(ctx, phaseID, status, from...)
-	}
+	transitioned, err := o.endClaim(phaseID, claim, func() (bool, error) {
+		if status == "failed" {
+			return o.experiments.FailPhase(ctx, phaseID, reason, from...)
+		}
+		return o.experiments.TransitionPhase(ctx, phaseID, status, from...)
+	})
 	if err != nil {
 		o.logger.Error("orchestrator: finish phase: transition failed",
 			"phase_id", phaseID, "status", status, "error", err)

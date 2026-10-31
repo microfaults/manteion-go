@@ -244,6 +244,17 @@ func seedBaselineAt(t *testing.T, o *Orchestrator, expID, service string, pos, n
 // one enabled inline-latency rule targeting service (with its fault spec).
 func mkRunningRulePhase(t *testing.T, expID, service string, pos int) *model.ExperimentPhase {
 	t.Helper()
+	p := mkPendingRulePhase(t, expID, service, pos)
+	if err := testExpRepo.UpdatePhaseStatus(context.Background(), p.ID, "running"); err != nil {
+		t.Fatalf("run phase: %v", err)
+	}
+	p.Status = "running"
+	return p
+}
+
+// mkPendingRulePhase is mkRunningRulePhase left pending, for StartPhase.
+func mkPendingRulePhase(t *testing.T, expID, service string, pos int) *model.ExperimentPhase {
+	t.Helper()
 	ctx := context.Background()
 	tag := id.New("rulephase")
 	specID := "spec-" + tag
@@ -272,9 +283,6 @@ func mkRunningRulePhase(t *testing.T, expID, service string, pos int) *model.Exp
 	}
 	if err := testExpRepo.AttachPhaseRules(ctx, p.ID, []string{rule.ID}); err != nil {
 		t.Fatalf("attach phase rule: %v", err)
-	}
-	if err := testExpRepo.UpdatePhaseStatus(ctx, p.ID, "running"); err != nil {
-		t.Fatalf("run phase: %v", err)
 	}
 	return p
 }
@@ -614,5 +622,71 @@ func TestFinishPhase_VerdictPulledWhileThePhaseRuns(t *testing.T) {
 	case got := <-statusAtPull:
 		t.Fatalf("a losing finish pulled fidelity (phase %q)", got)
 	default:
+	}
+}
+
+// receive waits, bounded, for the result of an entry running on another
+// goroutine.
+func receive(t *testing.T, what string, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s never returned", what)
+		return nil
+	}
+}
+
+// The pause→resume race: the phase-level pause and resume take no experiment
+// lock, so while a first entry waits for its fleet an operator can pause the
+// phase and resume it, starting a second entry. The first entry's claim ended
+// at the pause: when the fleet converges only the second entry, which holds
+// the phase's current claim, starts load, and the first one leaves the phase
+// alone (no second run, no failure, no return to paused).
+func TestEnterPhase_PauseAndResumeDuringTheWait_OnlyTheNewEntryStartsLoad(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	o.WithConvergeTimeout(5 * time.Second)
+	exp := mkExp(t)
+	svc := id.New("svc-reclaim")
+	ph := mkPendingRulePhase(t, exp.ID, svc, 0)
+	attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1}) // a run drives it
+	t.Cleanup(func() { o.cancelPoller(ph.ID) })
+	inst := registerSDK(t, svc, "http://acks-late.invalid")
+	g0 := generation(t, o, svc)
+
+	first := make(chan error, 1)
+	go func() { first <- o.StartPhase(ctx, ph.ID) }()
+	if !waitGeneration(o, svc, g0) {
+		t.Fatal("the first entry never bumped")
+	}
+	if err := o.PausePhase(ctx, ph.ID); err != nil {
+		t.Fatalf("pause during the wait: %v", err)
+	}
+	g1 := generation(t, o, svc)
+	second := make(chan error, 1)
+	go func() { second <- o.StartPhase(ctx, ph.ID) }()
+	if !waitGeneration(o, svc, g1) {
+		t.Fatal("the resume never bumped")
+	}
+	// The fleet converges on every bump so far, which satisfies both waits.
+	if err := testSDKRepo.RecordPoll(ctx, inst, generation(t, o, svc)); err != nil {
+		t.Fatal(err)
+	}
+
+	var state *ErrInvalidState
+	if err := receive(t, "the first entry", first); !errors.As(err, &state) {
+		t.Fatalf("first entry = %v, want an invalid-state refusal: the resume took the phase", err)
+	}
+	if err := receive(t, "the second entry", second); err != nil {
+		t.Fatalf("second entry = %v, want nil", err)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "running" || got.FailureReason != "" {
+		t.Fatalf("phase = %s / %q, want running with no failure (the second entry's)", got.Status, got.FailureReason)
+	}
+	if n := fz.runCount(); n != 1 {
+		t.Fatalf("zeus started %d run(s), want 1: only the entry holding the phase's claim starts load", n)
 	}
 }
