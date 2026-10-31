@@ -355,6 +355,36 @@ func TestMaterialize_SourceErrorsAbort(t *testing.T) {
 	}
 }
 
+// Equal-priority rules are evaluated in the order delivered, so their order is
+// content: swapping two changes the ETag. That is why the rule store must hand
+// them back in a total order (RuleRepo.ForService breaks priority ties by age,
+// then id) -- the hash is a function of the database only if the order is.
+func TestMaterialize_ETagDependsOnEqualPriorityRuleOrder(t *testing.T) {
+	ctx := context.Background()
+	first := rule("r-first", "cart", "fault_spec", "spec-inline")
+	second := rule("r-second", "cart", "fault_spec", "spec-net")
+	if first.Priority != second.Priority {
+		t.Fatal("test setup: the rules must have equal priority")
+	}
+	m, _ := newTestMaterializer(5)
+	etagOf := func(rules ...*model.Rule) string {
+		t.Helper()
+		m.Rules = &fakeRules{rules: rules}
+		d, err := m.Materialize(ctx, "cart", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.ETag
+	}
+	ab, ba := etagOf(first, second), etagOf(second, first)
+	if ab == ba {
+		t.Errorf("swapping two equal-priority rules left the ETag at %s", ab)
+	}
+	if again := etagOf(first, second); again != ab {
+		t.Errorf("the same order hashed to %s, then %s", ab, again)
+	}
+}
+
 func TestFaultRequestsOf(t *testing.T) {
 	latency := json.RawMessage(`{"delay":"1s"}`)
 	errParams := json.RawMessage(`{"status_code":503}`)

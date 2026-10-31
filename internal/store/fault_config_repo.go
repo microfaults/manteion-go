@@ -93,13 +93,13 @@ func (r *FaultConfigRepo) Get(ctx context.Context, id string) (*model.FaultConfi
 }
 
 // List returns fault configs filtered by optional service and status (empty
-// string = no filter on that field), newest first.
+// string = no filter on that field), newest first, ties by id.
 func (r *FaultConfigRepo) List(ctx context.Context, service string, status model.FaultConfigStatus) ([]*model.FaultConfig, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+faultConfigColumns+` FROM fault_configs
 		WHERE ($1 = '' OR service = $1)
 		  AND ($2 = '' OR status::text = $2)
-		ORDER BY created_at DESC`,
+		ORDER BY created_at DESC, id`,
 		service, string(status),
 	)
 	if err != nil {
@@ -110,13 +110,14 @@ func (r *FaultConfigRepo) List(ctx context.Context, service string, status model
 
 // ListActiveForService returns the faults that should currently be applied to a
 // service: active and not past their duration. This is the poll-response set the
-// SDK reconciles against.
+// SDK reconciles against, oldest first, ties by id: the order is part of the
+// materialized document the ETag hashes, so it must not depend on the scan.
 func (r *FaultConfigRepo) ListActiveForService(ctx context.Context, service string) ([]*model.FaultConfig, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+faultConfigColumns+` FROM fault_configs
 		WHERE service = $1 AND status = 'active'
 		  AND (duration_ms = 0 OR fired_at + (duration_ms * INTERVAL '1 millisecond') > now())
-		ORDER BY created_at`,
+		ORDER BY created_at, id`,
 		service,
 	)
 	if err != nil {

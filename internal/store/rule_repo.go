@@ -212,13 +212,13 @@ func (r *RuleRepo) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// List returns all rules ordered by priority (desc) then creation time.
+// List returns all rules ordered by priority (desc), then creation time, then id.
 func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, name, service, enabled, priority, injection_point,
 			match_labels, action_type, fault_spec_id, fault_composition_id,
 			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
-		FROM rules ORDER BY priority DESC, created_at`)
+		FROM rules ORDER BY priority DESC, created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("list rules: %w", err)
 	}
@@ -228,13 +228,18 @@ func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 }
 
 // ForService returns the enabled rules a service's SDK should currently enforce,
-// ordered by priority. This is the authoritative poll set: the SDK reconciles to
-// EXACTLY this array, so the query is phase-aware (M4) — a rule is served iff it
-// is attached to NO experiment phase, OR attached to a phase that is currently
-// 'running'. A phase-scoped fault rule is therefore dark during the baseline
-// (its phase pending) and stops the instant the measurement window ends ('running'
-// only, deliberately NOT 'draining'), so it neither corrupts the baseline delta
-// nor gets resurrected after finishPhase clears it.
+// ordered by priority (desc), then creation time, then id. The order is total on
+// purpose: the SDK evaluates equal-priority rules in the order delivered and the
+// materialized document's ETag hashes that order, but a tie left to the scan
+// follows physical position, which every UPDATE and the choice of plan change.
+//
+// This is the authoritative poll set: the SDK reconciles to EXACTLY this array,
+// so the query is phase-aware (M4) — a rule is served iff it is attached to NO
+// experiment phase, OR attached to a phase that is currently 'running'. A
+// phase-scoped fault rule is therefore dark during the baseline (its phase
+// pending) and stops the instant the measurement window ends ('running' only,
+// deliberately NOT 'draining'), so it neither corrupts the baseline delta nor
+// gets resurrected after finishPhase clears it.
 func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT r.id, r.name, r.service, r.enabled, r.priority, r.injection_point,
@@ -246,7 +251,7 @@ func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rul
 		        OR EXISTS (SELECT 1 FROM phase_rules pr
 		                   JOIN experiment_phases p ON p.id = pr.phase_id
 		                   WHERE pr.rule_id = r.id AND p.status = 'running') )
-		ORDER BY r.priority DESC`, service)
+		ORDER BY r.priority DESC, r.created_at, r.id`, service)
 	if err != nil {
 		return nil, fmt.Errorf("rules for service: %w", err)
 	}
@@ -256,8 +261,8 @@ func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rul
 }
 
 // EnabledForService returns every enabled rule targeting service, ordered by
-// priority (desc) then creation time. This is the instance-scoped view the SDK
-// instance detail reports as active_rule_ids and the kill-switch disables.
+// priority (desc), then creation time, then id. This is the instance-scoped view
+// the SDK instance detail reports as active_rule_ids and the kill-switch disables.
 // Unlike ForService it is deliberately NOT phase-gated: a rule attached to a
 // pending phase is dark today but goes live the moment its phase starts, so a
 // kill-switch that skipped it would only be a pause.
@@ -268,7 +273,7 @@ func (r *RuleRepo) EnabledForService(ctx context.Context, service string) ([]*mo
 			cachebox_mode, cachebox_key_strategy, mode, start_policy, created_at, updated_at
 		FROM rules
 		WHERE service = $1 AND enabled = true
-		ORDER BY priority DESC, created_at`, service)
+		ORDER BY priority DESC, created_at, id`, service)
 	if err != nil {
 		return nil, fmt.Errorf("enabled rules for service: %w", err)
 	}

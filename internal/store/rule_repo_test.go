@@ -37,6 +37,14 @@ var (
 	testFaultRepo *FaultRepo
 )
 
+// testDSN is the database the store tests run against.
+func testDSN() string {
+	if dsn := os.Getenv("MANTEION_DATABASE_URL"); dsn != "" {
+		return dsn
+	}
+	return "postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable"
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv("MANTEION_TEST_DB") == "" {
 		fmt.Fprintln(os.Stderr,
@@ -44,10 +52,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
-	dsn := os.Getenv("MANTEION_DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable"
-	}
+	dsn := testDSN()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -242,6 +247,172 @@ func TestRuleRepo_ForService_PhaseGating(t *testing.T) {
 		if got[phaseID] != tc.wantPhaseIn {
 			t.Errorf("[phase=%s] phase-attached rule %s served=%v, want %v",
 				tc.status, phaseID, got[phaseID], tc.wantPhaseIn)
+		}
+	}
+}
+
+// seedLatencySpec persists a fault spec for rules to reference and removes it
+// at cleanup. Register the rules' own cleanups after calling it: cleanups run
+// last-in first-out, so the rules go before the spec their foreign key names.
+func seedLatencySpec(t *testing.T, tag string) string {
+	t.Helper()
+	spec := &model.FaultSpec{ID: "spec-" + tag, Name: "order-spec", Category: "inline", FaultType: "latency",
+		Host: "process", Params: json.RawMessage(`{"delay":"100ms"}`), CreatedAt: time.Now()}
+	if err := testFaultRepo.CreateSpec(context.Background(), spec); err != nil {
+		t.Fatalf("seed spec: %v", err)
+	}
+	t.Cleanup(func() { _ = testFaultRepo.DeleteSpec(context.Background(), spec.ID) })
+	return spec.ID
+}
+
+// createOrderedRule persists an enabled, phase-free rule with the given
+// priority and creation time, and removes it at cleanup.
+func createOrderedRule(t *testing.T, specID, svc, id string, priority int, createdAt time.Time) *model.Rule {
+	t.Helper()
+	rule := &model.Rule{ID: id, Name: id, Service: svc, Enabled: true, Priority: priority, Mode: "background",
+		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: specID}, CreatedAt: createdAt, UpdatedAt: createdAt}
+	if err := testRuleRepo.Create(context.Background(), rule); err != nil {
+		t.Fatalf("create rule %s: %v", id, err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), id) })
+	return rule
+}
+
+func ruleIDs(rules []*model.Rule) []string {
+	out := make([]string, len(rules))
+	for i, r := range rules {
+		out[i] = r.ID
+	}
+	return out
+}
+
+// planRepo returns a rule repo on its own single-connection pool whose session
+// has run the given SET statements, so a test can pin the plan a query uses.
+func planRepo(t *testing.T, sets ...string) *RuleRepo {
+	t.Helper()
+	conn, err := sql.Open("pgx", testDSN())
+	if err != nil {
+		t.Fatalf("open pinned pool: %v", err)
+	}
+	conn.SetMaxOpenConns(1) // one session, so the SETs below stay in force
+	t.Cleanup(func() { _ = conn.Close() })
+	for _, set := range sets {
+		if _, err := conn.Exec(set); err != nil {
+			t.Fatalf("%s: %v", set, err)
+		}
+	}
+	return NewRuleRepo(conn, nil)
+}
+
+// TestRuleRepo_ForService_EqualPriorityOrderSurvivesRewrites pins the poll set's
+// order as a function of the stored rules: priority first, then oldest first,
+// whatever plan the query gets and however often a rule is re-saved. A tie-break
+// left to the scan follows physical position, and every UPDATE writes a new row
+// version, even one that changes nothing: a sequential scan then returns the
+// re-saved rule behind its siblings, and so does an index scan once the update
+// has to move the row's index entry (here, a rule edited away and back). The
+// ETag of the materialized document would flip with no change in content, and so
+// would which of two equal-priority rules the SDK, which keeps delivery order
+// among equals, evaluates first.
+func TestRuleRepo_ForService_EqualPriorityOrderSurvivesRewrites(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("tieorder-%d", time.Now().UnixNano())
+	svc := "svc-" + tag
+	specID := seedLatencySpec(t, tag)
+	t0 := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
+
+	// Created in this order, one second apart. The ids are deliberately not in
+	// creation order, so age (not id) is what has to decide among equals; a
+	// lower- and a higher-priority rule bracket them, so the tie-breaks are
+	// shown to rank below priority.
+	low := createOrderedRule(t, specID, svc, "low-"+tag, 1, t0)
+	c := createOrderedRule(t, specID, svc, "c-"+tag, 5, t0.Add(1*time.Second))
+	a := createOrderedRule(t, specID, svc, "a-"+tag, 5, t0.Add(2*time.Second))
+	b := createOrderedRule(t, specID, svc, "b-"+tag, 5, t0.Add(3*time.Second))
+	high := createOrderedRule(t, specID, svc, "high-"+tag, 9, t0.Add(4*time.Second))
+	want := []string{high.ID, c.ID, a.ID, b.ID, low.ID}
+
+	// The default plan is an index scan on service here; the pinned session is
+	// forced to read the heap in physical order. The order must not depend on it.
+	repos := []struct {
+		plan string
+		repo *RuleRepo
+	}{
+		{"default plan", testRuleRepo},
+		{"sequential scan", planRepo(t, "SET enable_indexscan = off", "SET enable_bitmapscan = off")},
+	}
+	check := func(when string) {
+		t.Helper()
+		for _, r := range repos {
+			got, err := r.repo.ForService(ctx, svc)
+			if err != nil {
+				t.Fatalf("ForService (%s) %s: %v", r.plan, when, err)
+			}
+			if !slices.Equal(ruleIDs(got), want) {
+				t.Errorf("ForService (%s) %s = %v, want %v", r.plan, when, ruleIDs(got), want)
+			}
+		}
+	}
+	check("after creation")
+
+	// Re-save each equal-priority rule unchanged.
+	for _, r := range []*model.Rule{c, a, b} {
+		if err := testRuleRepo.Update(ctx, r); err != nil {
+			t.Fatalf("no-op update of %s: %v", r.ID, err)
+		}
+		check("after re-saving " + r.ID)
+	}
+
+	// Edit the middle rule away and back: the second write changes an indexed
+	// column, so the row's index entry moves as well.
+	away := *a
+	away.Service = "elsewhere-" + tag
+	if err := testRuleRepo.Update(ctx, &away); err != nil {
+		t.Fatalf("move %s away: %v", a.ID, err)
+	}
+	if err := testRuleRepo.Update(ctx, a); err != nil {
+		t.Fatalf("move %s back: %v", a.ID, err)
+	}
+	check("after editing " + a.ID + " away and back")
+}
+
+// TestRuleRepo_EqualPriorityAndAgeBreakByID covers rules created in the same
+// instant (the column is microsecond resolution and callers supply it): with
+// priority and creation time equal, id is the last word, in every listing that
+// orders rules.
+func TestRuleRepo_EqualPriorityAndAgeBreakByID(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("tieid-%d", time.Now().UnixNano())
+	svc := "svc-" + tag
+	specID := seedLatencySpec(t, tag)
+	at := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
+
+	// Inserted z first, so the scan order is the reverse of the id order.
+	createOrderedRule(t, specID, svc, "z-"+tag, 5, at)
+	createOrderedRule(t, specID, svc, "a-"+tag, 5, at)
+	want := []string{"a-" + tag, "z-" + tag}
+
+	forService, err := testRuleRepo.ForService(ctx, svc)
+	if err != nil {
+		t.Fatalf("ForService: %v", err)
+	}
+	enabled, err := testRuleRepo.EnabledForService(ctx, svc)
+	if err != nil {
+		t.Fatalf("EnabledForService: %v", err)
+	}
+	all, err := testRuleRepo.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var listed []*model.Rule
+	for _, r := range all { // List spans every service; keep this test's
+		if r.Service == svc {
+			listed = append(listed, r)
+		}
+	}
+	for name, got := range map[string][]*model.Rule{"ForService": forService, "EnabledForService": enabled, "List": listed} {
+		if !slices.Equal(ruleIDs(got), want) {
+			t.Errorf("%s = %v, want %v", name, ruleIDs(got), want)
 		}
 	}
 }
