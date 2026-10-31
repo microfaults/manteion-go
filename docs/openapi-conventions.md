@@ -36,7 +36,12 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 
 ## Regenerating the spec
 
-Run `make openapi` from the repo root.
+Run `make openapi` from the repo root. On a host whose Go is newer than swag rc5
+can parse (Go 1.27 fails with "method must have no type parameters" in the
+stdlib), run `make openapi-local` instead: it runs the same generation under the
+`go.mod` toolchain, through a scratch copy of `go.work` whose `go` line matches
+(see the Makefile). The output is identical; check it with
+`git diff --exit-code -- docs/swagger.yaml docs/swagger.json`.
 
 Commit `docs/swagger.{yaml,json}` together with handler edits. CI fails if the spec is stale.
 
