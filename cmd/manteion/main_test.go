@@ -37,11 +37,12 @@ func TestPositiveDurationEnv(t *testing.T) {
 	}
 }
 
-// Both barrier bounds are read through positiveDurationEnv. The drain bound
-// sizes the HTTP write timeout next to the converge bound, and a negative one
-// would shrink that deadline (far enough below zero, to none at all); zero
-// would end every drain before an instance could report. Startup refuses both,
-// naming the key.
+// Both barrier bounds are read through positiveDurationEnv, capped at
+// maxBarrierTimeout. The drain bound sizes the HTTP write timeout next to the
+// converge bound, and a negative one would shrink that deadline (far enough
+// below zero, to none at all); zero would end every drain before an instance
+// could report; and a huge value of either would overflow the deadline to a
+// negative duration. Startup refuses all of them, naming the key.
 func TestBarrierTimeouts(t *testing.T) {
 	for _, tc := range []struct {
 		name                    string
@@ -55,6 +56,9 @@ func TestBarrierTimeouts(t *testing.T) {
 		{name: "drain negative", drain: "-90s", wantErr: "MANTEION_DRAIN_TIMEOUT=\"-90s\" must be positive"},
 		{name: "drain zero", drain: "0s", wantErr: "MANTEION_DRAIN_TIMEOUT=\"0s\" must be positive"},
 		{name: "drain not a duration", drain: "soon", wantErr: "MANTEION_DRAIN_TIMEOUT=\"soon\" is not a duration"},
+		{name: "both at the bound", converge: "1h", drain: "60m", wantConverge: time.Hour, wantDrain: time.Hour},
+		{name: "converge above the bound", converge: "61m", wantErr: "MANTEION_CONVERGE_TIMEOUT=\"61m\" must be at most 1h0m0s"},
+		{name: "drain near the largest duration", drain: "2562047h", wantErr: "MANTEION_DRAIN_TIMEOUT=\"2562047h\" must be at most 1h0m0s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("MANTEION_CONVERGE_TIMEOUT", tc.converge)
@@ -81,6 +85,7 @@ func TestHTTPWriteTimeoutOutlastsAStop(t *testing.T) {
 		{30 * time.Second, 30 * time.Second},
 		{2 * time.Minute, 30 * time.Second},
 		{10 * time.Second, 5 * time.Minute},
+		{maxBarrierTimeout, maxBarrierTimeout}, // the largest values startup accepts
 	} {
 		got := httpWriteTimeout(tc.converge, tc.drain)
 		if stop := tc.converge + tc.drain + tc.converge; got <= stop {

@@ -52,7 +52,7 @@ func main() {
 	cacheDir := envOr("CACHE_DIR", "/var/cache/manteion")
 	// The convergence and drain barrier bounds (orchestrator setup below), which
 	// also size the HTTP write timeout: startup refuses a value that is not a
-	// positive duration (barrierTimeouts).
+	// positive duration of at most an hour (barrierTimeouts).
 	convergeTimeout, drainTimeout, err := barrierTimeouts()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
@@ -250,22 +250,41 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// maxBarrierTimeout caps MANTEION_CONVERGE_TIMEOUT and MANTEION_DRAIN_TIMEOUT.
+// At the cap httpWriteTimeout is about three hours; without one, a large value
+// of either would overflow it to a negative duration (no write deadline).
+const maxBarrierTimeout = time.Hour
+
 // barrierTimeouts reads the orchestrator's two barrier bounds:
 // MANTEION_CONVERGE_TIMEOUT (the convergence barrier) and
 // MANTEION_DRAIN_TIMEOUT (the drain barrier's report gate), 30 s each when
-// unset. Both must be positive durations: a zero or negative converge bound
-// would fail every phase entry at its first look, a zero drain bound would end
-// every drain before an instance could report, and both size httpWriteTimeout,
-// which a negative drain bound shrinks (far enough below zero, to no write
-// deadline at all). A typo would silently run on the default.
+// unset. Both must be positive durations of at most maxBarrierTimeout: a zero
+// or negative converge bound would fail every phase entry at its first look, a
+// zero drain bound would end every drain before an instance could report, and
+// both size httpWriteTimeout, which a negative drain bound shrinks (far enough
+// below zero, to no write deadline at all) and a huge one overflows. A typo
+// would silently run on the default.
 func barrierTimeouts() (converge, drain time.Duration, err error) {
-	if converge, err = positiveDurationEnv("MANTEION_CONVERGE_TIMEOUT", 30*time.Second); err != nil {
+	if converge, err = boundedDurationEnv("MANTEION_CONVERGE_TIMEOUT", 30*time.Second, maxBarrierTimeout); err != nil {
 		return 0, 0, err
 	}
-	if drain, err = positiveDurationEnv("MANTEION_DRAIN_TIMEOUT", 30*time.Second); err != nil {
+	if drain, err = boundedDurationEnv("MANTEION_DRAIN_TIMEOUT", 30*time.Second, maxBarrierTimeout); err != nil {
 		return 0, 0, err
 	}
 	return converge, drain, nil
+}
+
+// boundedDurationEnv is positiveDurationEnv with an upper limit: a value above
+// limit is an error naming key.
+func boundedDurationEnv(key string, fallback, limit time.Duration) (time.Duration, error) {
+	d, err := positiveDurationEnv(key, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if d > limit {
+		return 0, fmt.Errorf("%s=%q must be at most %s", key, os.Getenv(key), limit)
+	}
+	return d, nil
 }
 
 // positiveDurationEnv reads the environment variable key as a Go duration

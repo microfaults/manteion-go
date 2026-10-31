@@ -119,6 +119,6 @@ Typed errors wrap with `%w` and keep their historical log text; classify with `e
 | `MANTEION_ADDR` | `:8080` | Listen address |
 | `MANTEION_DATABASE_URL` | `postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable` | PostgreSQL DSN |
 | `MANTEION_POLICY_ENGINE` | `off` | Opt-in for the WIP-frozen policy evaluation loop (`on` to enable) |
-| `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier bound: fatal at phase entry and resume, logged at exit and drain. Must be a positive duration (startup refuses anything else); the HTTP write timeout is 2 × it + `MANTEION_DRAIN_TIMEOUT` + 30 s |
+| `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier bound: fatal at phase entry and resume, logged at exit and drain. Must be a positive duration of at most 1 h, as must `MANTEION_DRAIN_TIMEOUT` (startup refuses anything else); the HTTP write timeout is 2 × it + `MANTEION_DRAIN_TIMEOUT` + 30 s |
 | `ZEUS_URL` | `http://archer:8080` | Archer base URL |
 | `MANTEION_ZEUS_DATASET_ID` | (empty) | Fallback zeus dataset for phase workflow rows without a `dataset_id` of their own |
