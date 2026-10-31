@@ -141,6 +141,12 @@ func TestEnterPhase_BumpsGenerationOnEveryEnter(t *testing.T) {
 	if err := o.enterPhase(ctx, iso, false); err != nil {
 		t.Fatalf("enterPhase resume isolation: %v", err)
 	}
+	// The instance acks only after the barrier's first look (see
+	// TestEnterPhase_ConvergesWhenInstancesAck): a resume that waited looked
+	// at least twice.
+	if n := spy.looks.Load(); n < 2 {
+		t.Fatalf("the barrier looked %d time(s), want at least 2: the resume did not wait for its fleet", n)
+	}
 	if gen("frontend") != f1+1 {
 		t.Fatalf("resume of frozen phase did not bump frontend: %d → %d", f1, gen("frontend"))
 	}

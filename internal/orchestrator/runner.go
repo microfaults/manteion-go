@@ -155,7 +155,8 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 // the phase via failEntry, recording the error as the phase's failure reason —
 // except a resume whose fleet does not converge, which leaves the phase paused
 // (leavePaused). Once its claim has ended (a pause, a stop, or a newer entry
-// took the phase), the entry leaves the phase alone.
+// took the phase), the entry leaves the phase alone, stopping only the load it
+// had already started when it found out (abandonLoad).
 func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhase, fresh bool, claim claimToken) error {
 	fail := func(err error) error { return o.failEntry(ctx, p, claim, err) }
 
@@ -259,7 +260,14 @@ func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhas
 	}
 
 	if started > 0 {
-		o.spawnPoller(p.ID, maxDur)
+		// The zeus calls above take time too, and a pause or a stop can end the
+		// claim during them, after the post-gate check: its teardown may have
+		// read the phase's drivers before this entry recorded them. The poller
+		// is recorded only while the claim still holds, checked in the same step
+		// (spawnPollerClaimed); otherwise the entry stops what it started.
+		if !o.spawnPollerClaimed(p.ID, claim, maxDur) {
+			return o.abandonLoad(ctx, p, runs, atks)
+		}
 		o.logger.Info("orchestrator: phase started",
 			"phase_id", p.ID, "runs", runs.started, "attacks", atks.started, "fresh", fresh)
 		return nil
@@ -285,17 +293,19 @@ func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhas
 var errLeftRunning = errors.New("the phase left running while its fleet converged")
 
 // entryHolds reports whether the entry holding claim still owns phaseID: nil
-// while the claim is the phase's current one and the phase is running,
-// errLeftRunning once either stopped being true, and a read error as is.
+// while the phase is running and the claim is the phase's current one,
+// errLeftRunning once either stopped being true, and a read error as is. The
+// status is read first and the claim checked second: every transition out of
+// running ends the claim, so a claim still current after the read means no
+// pause, stop or newer entry took the phase before the read returned. In the
+// other order a pause and a resume landing inside the read's round trip would
+// leave the status running and pass both checks.
 func (o *Orchestrator) entryHolds(ctx context.Context, phaseID string, claim claimToken) error {
-	if !o.holdsClaim(phaseID, claim) {
-		return errLeftRunning
-	}
 	cur, err := o.experiments.GetPhase(ctx, phaseID)
 	if err != nil {
 		return err
 	}
-	if cur.Status != "running" {
+	if cur.Status != "running" || !o.holdsClaim(phaseID, claim) {
 		return errLeftRunning
 	}
 	return nil
@@ -310,6 +320,33 @@ func (o *Orchestrator) leftRunning(ctx context.Context, p *model.ExperimentPhase
 		"phase_id", p.ID, "status", status)
 	return invalidState("phase", p.ID, status, "running",
 		fmt.Sprintf("orchestrator: phase %q left running while its fleet converged (now %s); no load started", p.ID, status))
+}
+
+// abandonLoad ends an entry whose claim ended while it started load: a pause
+// or a stop took the phase after the post-gate check, and its teardown may
+// have read the phase's drivers before this entry recorded them. The entry
+// stops the runs and attacks it started, by the handles zeus knows them by,
+// on a context its caller cannot cancel, and refuses with the status the phase
+// is in now, like leftRunning. It recorded no poller (spawnPollerClaimed).
+func (o *Orchestrator) abandonLoad(ctx context.Context, p *model.ExperimentPhase, runs, atks driverStart) error {
+	ctx = context.WithoutCancel(ctx)
+	for _, runID := range runs.handles {
+		if err := o.zeusClient.StopRun(ctx, runID); err != nil {
+			o.logger.Warn("orchestrator: stop the run of an abandoned entry failed",
+				"phase_id", p.ID, "run_id", runID, "error", err)
+		}
+	}
+	for _, attackID := range atks.handles {
+		if err := o.zeusClient.StopAttack(ctx, attackID); err != nil {
+			o.logger.Warn("orchestrator: stop the attack of an abandoned entry failed",
+				"phase_id", p.ID, "attack_id", attackID, "error", err)
+		}
+	}
+	status := o.phaseStatus(ctx, p.ID)
+	o.logger.Warn("orchestrator: phase left running while its entry started load; that load was stopped",
+		"phase_id", p.ID, "status", status, "runs", len(runs.handles), "attacks", len(atks.handles))
+	return invalidState("phase", p.ID, status, "running",
+		fmt.Sprintf("orchestrator: phase %q left running while its entry started load (now %s); the load it started was stopped", p.ID, status))
 }
 
 // failEntry fails the phase an entry holds, recording err as the reason, and
@@ -541,11 +578,13 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 
 // driverStart is what starting one kind of load driver for a phase yielded:
 // how many workflow rows configured it, how many actually started, the
-// longest configured duration, and one operator-readable line per driver
-// that did not start — the phase's failure reason when none did.
+// longest configured duration, the handles zeus knows the started ones by,
+// and one operator-readable line per driver that did not start — the phase's
+// failure reason when none did.
 type driverStart struct {
 	started, configured int
 	maxDur              time.Duration
+	handles             []string
 	failures            []string
 }
 
@@ -685,6 +724,7 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 			ds.failures = append(ds.failures, driverStartFailure("attack", attackID, pw.WorkflowID, err))
 			continue
 		}
+		handle := attackID
 		if zeusID != "" && zeusID != attackID {
 			o.logger.Warn("orchestrator: zeus returned different attack id; using zeus id",
 				"phase_id", p.ID, "client_id", attackID, "zeus_id", zeusID)
@@ -692,9 +732,11 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 				o.logger.Error("orchestrator: persist zeus attack id failed",
 					"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
 			}
+			handle = zeusID
 		}
 
 		ds.started++
+		ds.handles = append(ds.handles, handle)
 		if d := time.Duration(pw.DurationSec) * time.Second; d > ds.maxDur {
 			ds.maxDur = d
 		}
@@ -762,6 +804,7 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 		}
 
 		ds.started++
+		ds.handles = append(ds.handles, zeusRunID)
 		if d := time.Duration(pw.DurationSec) * time.Second; d > ds.maxDur {
 			ds.maxDur = d
 		}
@@ -1133,13 +1176,35 @@ func (o *Orchestrator) ruleKind(ctx context.Context, r *model.Rule) string {
 // spawnPoller starts the zeus supervision goroutine for the phase and
 // records its cancel handle, replacing (and cancelling) any previous one.
 func (o *Orchestrator) spawnPoller(phaseID string, phaseDuration time.Duration) {
-	pollCtx, cancel := context.WithCancel(context.Background())
 	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.spawnPollerLocked(phaseID, phaseDuration)
+}
+
+// spawnPollerClaimed is spawnPoller for an entry: the poller starts only while
+// claim is still the phase's current one, checked under the lock that records
+// the poller and that every claim change takes, and the result reports whether
+// it started. An entry whose claim ended never records a poller, so it never
+// replaces (and cancels) the poller of the entry that holds the phase now; and
+// a pause after the poller is recorded finds it, since the pause cancels the
+// poller after its CAS.
+func (o *Orchestrator) spawnPollerClaimed(phaseID string, claim claimToken, phaseDuration time.Duration) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if cur, ok := o.claims[phaseID]; !ok || cur != claim {
+		return false
+	}
+	o.spawnPollerLocked(phaseID, phaseDuration)
+	return true
+}
+
+// spawnPollerLocked is spawnPoller's body; the caller holds o.mu.
+func (o *Orchestrator) spawnPollerLocked(phaseID string, phaseDuration time.Duration) {
+	pollCtx, cancel := context.WithCancel(context.Background())
 	if prev, ok := o.running[phaseID]; ok {
 		prev()
 	}
 	o.running[phaseID] = cancel
-	o.mu.Unlock()
 	go o.pollPhaseAttacks(pollCtx, phaseID, phaseDuration)
 }
 

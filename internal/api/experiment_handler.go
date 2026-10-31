@@ -387,7 +387,11 @@ func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleCancelExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.orch.CancelExperiment(r.Context(), id); err != nil {
+	// Detach from the request context, as the phase stop does: ending the
+	// experiment finishes every phase still in flight, each through its exit
+	// wait (up to MANTEION_CONVERGE_TIMEOUT), and a client hanging up meanwhile
+	// must not leave the phases after it unfinished.
+	if err := s.orch.CancelExperiment(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Error("cancel experiment failed", "experiment_id", id, "error", err)
 		writeErrorFor(w, err, "experiment", err.Error())
 		return
@@ -398,7 +402,8 @@ func (s *Server) handleCancelExperiment(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleStopExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	finalStatus := r.URL.Query().Get("status")
-	if err := s.orch.StopExperiment(r.Context(), id, finalStatus); err != nil {
+	// Detached from the request context, as cancel is.
+	if err := s.orch.StopExperiment(context.WithoutCancel(r.Context()), id, finalStatus); err != nil {
 		s.logger.Error("stop experiment failed", "error", err, "experiment_id", id)
 		writeErrorFor(w, err, "experiment", err.Error())
 		return

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -322,6 +323,12 @@ func TestEnterPhase_ConvergesWhenInstancesAck(t *testing.T) {
 
 	if err := o.enterPhase(ctx, iso, true); err != nil {
 		t.Fatalf("enterPhase: %v", err)
+	}
+	// The instance acks only after the barrier's first look has read the
+	// fleet, so a barrier that waited looked again; one that returned on its
+	// first look did not wait, however quickly the instance acked after it.
+	if n := spy.looks.Load(); n < 2 {
+		t.Fatalf("the barrier looked %d time(s), want at least 2: the entry did not wait for its fleet", n)
 	}
 	a, err := o.artifacts.ForPhaseService(ctx, iso.ID, "frontend")
 	if err != nil || a == nil || a.EntryCount != 2 || a.ExperimentID != exp.ID || !strings.HasPrefix(a.ID, "sha256:") {
@@ -763,6 +770,57 @@ func TestEnterPhase_StoppedWhileConvergingEndsTheWait(t *testing.T) {
 	if n := fz.runCount(); n != 0 {
 		t.Fatalf("zeus started %d run(s) for a stopped phase", n)
 	}
+}
+
+// A pause that lands while an entry calls zeus (after its post-gate check,
+// while its run is starting) ends the entry's claim but finds no load recorded
+// to stop. The entry then registers no poller and stops the run and the attack
+// it started itself, so nothing is left running on the paused phase.
+func TestEnterPhase_PausedWhileStartingLoad_StopsTheLoadItStarted(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	_, phases := mkExperiment(t, 1)
+	ph := phases[0]
+	attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 30, TargetURL: "http://target.invalid/"}) // a run and an attack
+	t.Cleanup(func() { o.cancelPoller(ph.ID) })
+	paused := make(chan error, 1)
+	var once sync.Once
+	fz.onRunStart(func() { once.Do(func() { paused <- o.PausePhase(ctx, ph.ID) }) })
+
+	err := o.StartPhase(ctx, ph.ID)
+	var state *ErrInvalidState
+	if !errors.As(err, &state) || state.Current != "paused" {
+		t.Fatalf("StartPhase = %v, want an invalid-state refusal naming the paused phase", err)
+	}
+	if err := receive(t, "the pause", paused); err != nil {
+		t.Fatalf("pause during the run start: %v", err)
+	}
+	runs, attacks := fz.driverStatuses()
+	if len(runs) != 1 || len(attacks) != 1 {
+		t.Fatalf("zeus knows runs %v and attacks %v, want one of each started", runs, attacks)
+	}
+	for kind, drivers := range map[string]map[string]string{"run": runs, "attack": attacks} {
+		for id, st := range drivers {
+			if st != "stopped" {
+				t.Errorf("%s %s is %s, want stopped: the entry left its load running on a paused phase", kind, id, st)
+			}
+		}
+	}
+	if pollerRunning(o, ph.ID) {
+		t.Error("a poller survives on the paused phase")
+	}
+	if got := getPhase(t, ph.ID); got.Status != "paused" || got.FailureReason != "" {
+		t.Errorf("phase = %s / %q, want paused with no failure (the pause's)", got.Status, got.FailureReason)
+	}
+}
+
+// pollerRunning reports whether the orchestrator holds a poller for phaseID.
+func pollerRunning(o *Orchestrator, phaseID string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, ok := o.running[phaseID]
+	return ok
 }
 
 // A zero poll interval must not turn the barrier into a busy loop: the option

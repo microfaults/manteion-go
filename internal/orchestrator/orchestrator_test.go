@@ -254,6 +254,9 @@ type fakeZeus struct {
 	runsReject *fakeReject
 	runsDrop   bool
 	runReasons map[string]string
+	// runStartHook, when set, runs inside POST .../runs before the run is
+	// accepted: something that lands while an entry is starting its load.
+	runStartHook func()
 }
 
 // fakeReject is a canned non-2xx answer for POST .../runs.
@@ -281,8 +284,11 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.mu.Lock()
-		reject, drop := f.runsReject, f.runsDrop
+		reject, drop, hook := f.runsReject, f.runsDrop, f.runStartHook
 		f.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		if drop {
 			panic(http.ErrAbortHandler) // close the connection without a response
 		}
@@ -466,6 +472,30 @@ func (f *fakeZeus) runDataset(runID string) (string, bool) {
 	defer f.mu.Unlock()
 	ds, ok := f.runDatasets[runID]
 	return ds, ok
+}
+
+// onRunStart makes fn run inside every POST .../runs before the run is
+// accepted (runStartHook).
+func (f *fakeZeus) onRunStart(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runStartHook = fn
+}
+
+// driverStatuses reports the status of every run and every attack the fake
+// knows, by id.
+func (f *fakeZeus) driverStatuses() (runs, attacks map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	runs = make(map[string]string, len(f.runs))
+	for id, st := range f.runs {
+		runs[id] = st
+	}
+	attacks = make(map[string]string, len(f.attacks))
+	for id, a := range f.attacks {
+		attacks[id] = a.status
+	}
+	return runs, attacks
 }
 
 // completeAllRuns marks every started workflow run completed so the poller

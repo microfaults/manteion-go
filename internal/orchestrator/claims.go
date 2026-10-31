@@ -12,8 +12,11 @@ import (
 // acts on the phase only while its claim is still the phase's current one: a
 // pause and a resume during the wait start a second entry, and the first one
 // must then leave the phase to it, starting no load, failing nothing and
-// re-pausing nothing. The phase-level pause and resume take no experiment
-// lock, so the claim is what orders them against an entry in flight.
+// re-pausing nothing. An entry whose claim ends while it starts the load, after
+// its last check, stops that load itself: it records the phase's poller only in
+// one step with a final check of the claim (spawnPollerClaimed). The
+// phase-level pause and resume take no experiment lock, so the claim is what
+// orders them against an entry in flight.
 //
 // Claims live in memory, which suffices for a single replica: a restart ends
 // every entry in flight along with its claim.

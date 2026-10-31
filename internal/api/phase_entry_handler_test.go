@@ -228,3 +228,50 @@ func TestEntryHandlers_NotConvergedIs504(t *testing.T) {
 		})
 	}
 }
+
+// The cancel and stop handlers run the orchestrator detached from the
+// request too: ending an experiment finishes each phase still in flight
+// through its exit wait (up to MANTEION_CONVERGE_TIMEOUT for the fleet), and a
+// client hanging up during one phase's wait must not leave the phases after it
+// unfinished under an experiment that is already cancelled.
+func TestTerminalExperimentHandlers_SurviveClientDisconnect(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		handler  func(s *Server) http.HandlerFunc
+		action   string
+		wantCode int
+	}{
+		{"cancel experiment", func(s *Server) http.HandlerFunc { return s.handleCancelExperiment }, "cancel", http.StatusOK},
+		{"stop experiment", func(s *Server) http.HandlerFunc { return s.handleStopExperiment }, "stop", http.StatusAccepted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEntryFixture(t, 5*time.Second)
+			exp := f.e.experiment("running")
+			running := f.rulePhase(t, exp, "running") // its exit bumps the fixture's service and waits for the instance
+			later := f.e.phase(exp, "later-"+id.New("p"), 1)
+			g0 := f.generation(t)
+			reqCtx, hangUp := context.WithCancel(context.Background())
+			defer hangUp()
+
+			url, pv := expAction(exp.ID, tc.action)
+			done := serveAsync(reqCtx, tc.handler(f.e.s), url, pv)
+			f.awaitBump(t, g0, done) // the running phase is ending and its exit waits for the fleet
+			hangUp()                 // the operator's client goes away during that wait
+			f.ack(t)                 // ...and the fleet converges after it left
+			w := await(t, done)
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d body = %s, want %d", w.Code, w.Body.String(), tc.wantCode)
+			}
+			if got, err := f.e.exp.Get(context.Background(), exp.ID); err != nil || got.Status != "cancelled" {
+				t.Fatalf("experiment = %+v, %v; want cancelled", got, err)
+			}
+			for _, ph := range []*model.ExperimentPhase{running, later} {
+				got, err := f.e.exp.GetPhase(context.Background(), ph.ID)
+				if err != nil || got.Status != "skipped" {
+					t.Errorf("phase %s = %+v, %v; want skipped: the experiment's end must not stop with its client", ph.Name, got, err)
+				}
+			}
+		})
+	}
+}

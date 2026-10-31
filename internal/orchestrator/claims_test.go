@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"manteion-go/internal/id"
 )
@@ -49,5 +50,52 @@ func TestEntryClaim_StaleClaimLeavesTheNewerEntryAlone(t *testing.T) {
 	}
 	if o.holdsClaim(ph.ID, current) {
 		t.Fatal("the claim outlived the phase's terminal transition")
+	}
+}
+
+// entryHolds reads the phase's status before it checks the claim. Every
+// transition out of running ends the claim, so a claim still current after
+// the read means nothing took the phase before the read returned. Checked the
+// other way round, a pause and a resume that land while the read is in flight
+// leave the status running and pass both checks, and the superseded entry
+// starts load next to the newer one. Here the read waits on a table lock
+// while a newer entry claims the phase (a pause and a resume, in memory: the
+// status ends where it started, running).
+func TestEntryHolds_ReadsTheStatusBeforeTheClaim(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	_, phases := mkExperiment(t, 1)
+	ph := phases[0]
+	if err := testExpRepo.UpdatePhaseStatus(ctx, ph.ID, "running"); err != nil {
+		t.Fatalf("run phase: %v", err)
+	}
+	claim := o.claimPhase(ph.ID)
+
+	// Every read of experiment_phases waits until this transaction ends.
+	tx, err := testDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `LOCK TABLE experiment_phases IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock experiment_phases: %v", err)
+	}
+
+	held := make(chan error, 1)
+	go func() { held <- o.entryHolds(ctx, ph.ID, claim) }()
+	waitFor(t, "the status read to wait on the lock", 5*time.Second, func() bool {
+		var n int
+		err := testDB.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
+			  AND query LIKE '%FROM experiment_phases WHERE id = %'`).Scan(&n)
+		return err == nil && n > 0
+	})
+	o.claimPhase(ph.ID) // a pause and a resume land while the read is in flight
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := receive(t, "entryHolds", held); !errors.Is(err, errLeftRunning) {
+		t.Fatalf("entryHolds = %v, want errLeftRunning: a newer entry claimed the phase while its status was read", err)
 	}
 }

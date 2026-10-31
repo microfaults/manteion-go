@@ -50,15 +50,14 @@ func main() {
 	zeusURL := envOr("ZEUS_URL", "http://archer:8080")
 	prometheusURL := envOr("PROMETHEUS_URL", "http://prometheus:9090")
 	cacheDir := envOr("CACHE_DIR", "/var/cache/manteion")
-	// MANTEION_CONVERGE_TIMEOUT bounds the convergence barrier (orchestrator
-	// setup below). Zero or less would fail every phase entry at its first
-	// look, and a typo would silently run on the default: startup refuses both.
-	convergeTimeout, err := positiveDurationEnv("MANTEION_CONVERGE_TIMEOUT", 30*time.Second)
+	// The convergence and drain barrier bounds (orchestrator setup below), which
+	// also size the HTTP write timeout: startup refuses a value that is not a
+	// positive duration (barrierTimeouts).
+	convergeTimeout, drainTimeout, err := barrierTimeouts()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	drainTimeout := envDurationOr("MANTEION_DRAIN_TIMEOUT", 30*time.Second)
 
 	// Connect to PostgreSQL and run migrations.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -249,6 +248,24 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// barrierTimeouts reads the orchestrator's two barrier bounds:
+// MANTEION_CONVERGE_TIMEOUT (the convergence barrier) and
+// MANTEION_DRAIN_TIMEOUT (the drain barrier's report gate), 30 s each when
+// unset. Both must be positive durations: a zero or negative converge bound
+// would fail every phase entry at its first look, a zero drain bound would end
+// every drain before an instance could report, and both size httpWriteTimeout,
+// which a negative drain bound shrinks (far enough below zero, to no write
+// deadline at all). A typo would silently run on the default.
+func barrierTimeouts() (converge, drain time.Duration, err error) {
+	if converge, err = positiveDurationEnv("MANTEION_CONVERGE_TIMEOUT", 30*time.Second); err != nil {
+		return 0, 0, err
+	}
+	if drain, err = positiveDurationEnv("MANTEION_DRAIN_TIMEOUT", 30*time.Second); err != nil {
+		return 0, 0, err
+	}
+	return converge, drain, nil
 }
 
 // positiveDurationEnv reads the environment variable key as a Go duration

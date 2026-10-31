@@ -53,8 +53,9 @@ func newFakeSDK(t *testing.T) *fakeSDK {
 }
 
 // lookSpy is the registry the convergence barrier reads (through the
-// atrocontrol controller): every look at service is counted and announced on
-// looked, without ever blocking.
+// atrocontrol controller): every look at service is counted and, once its
+// read has returned, announced on looked, without ever blocking. Anything
+// started on looked can change only what the later looks read.
 type lookSpy struct {
 	atrocontrol.InstanceResolver
 	service string
@@ -63,6 +64,7 @@ type lookSpy struct {
 }
 
 func (s *lookSpy) ForService(ctx context.Context, service string) ([]*model.SDKInstance, error) {
+	insts, err := s.InstanceResolver.ForService(ctx, service)
 	if service == s.service {
 		s.looks.Add(1)
 		select {
@@ -70,13 +72,14 @@ func (s *lookSpy) ForService(ctx context.Context, service string) ([]*model.SDKI
 		default:
 		}
 	}
-	return s.InstanceResolver.ForService(ctx, service)
+	return insts, err
 }
 
 // spyOnLooks points o's controller at a lookSpy for service. A simulated
-// instance started on its looked channel acks only once the barrier has
-// looked at it, so an entry that returned without waiting leaves the instance
-// behind, where its row shows it.
+// instance started on its looked channel acks only once the barrier's first
+// look has read it lagging, so a barrier that waited looks at least twice, and
+// an entry that returned without waiting leaves the instance behind, where its
+// row shows it.
 func spyOnLooks(o *Orchestrator, service string) *lookSpy {
 	spy := &lookSpy{InstanceResolver: &atrocontrol.RepoResolver{Repo: testSDKRepo}, service: service, looked: make(chan struct{}, 1)}
 	o.controller = newTestController(spy, o.logger)

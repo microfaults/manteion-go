@@ -37,6 +37,41 @@ func TestPositiveDurationEnv(t *testing.T) {
 	}
 }
 
+// Both barrier bounds are read through positiveDurationEnv. The drain bound
+// sizes the HTTP write timeout next to the converge bound, and a negative one
+// would shrink that deadline (far enough below zero, to none at all); zero
+// would end every drain before an instance could report. Startup refuses both,
+// naming the key.
+func TestBarrierTimeouts(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		converge, drain         string
+		wantConverge, wantDrain time.Duration
+		wantErr                 string
+	}{
+		{name: "unset: the defaults", wantConverge: 30 * time.Second, wantDrain: 30 * time.Second},
+		{name: "both set", converge: "45s", drain: "2m", wantConverge: 45 * time.Second, wantDrain: 2 * time.Minute},
+		{name: "converge zero", converge: "0s", wantErr: "MANTEION_CONVERGE_TIMEOUT"},
+		{name: "drain negative", drain: "-90s", wantErr: "MANTEION_DRAIN_TIMEOUT=\"-90s\" must be positive"},
+		{name: "drain zero", drain: "0s", wantErr: "MANTEION_DRAIN_TIMEOUT=\"0s\" must be positive"},
+		{name: "drain not a duration", drain: "soon", wantErr: "MANTEION_DRAIN_TIMEOUT=\"soon\" is not a duration"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MANTEION_CONVERGE_TIMEOUT", tc.converge)
+			t.Setenv("MANTEION_DRAIN_TIMEOUT", tc.drain)
+			converge, drain, err := barrierTimeouts()
+			switch {
+			case tc.wantErr != "":
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("err = %v, want one containing %q", err, tc.wantErr)
+				}
+			case err != nil || converge != tc.wantConverge || drain != tc.wantDrain:
+				t.Errorf("= %v, %v, %v; want %v, %v", converge, drain, err, tc.wantConverge, tc.wantDrain)
+			}
+		})
+	}
+}
+
 // The HTTP server's write deadline must outlast what a stop can wait out
 // before it answers: the drain barrier's convergence wait and report gate,
 // then the exit bump's convergence wait. Otherwise a stop that succeeded has
