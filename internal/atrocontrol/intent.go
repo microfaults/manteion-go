@@ -1,6 +1,7 @@
 package atrocontrol
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -14,11 +15,6 @@ type ServiceIntent struct {
 	FreezeCfg   *atroposdk.DelayRequest `json:"freeze_cfg,omitempty"`
 	AppliedAt   time.Time               `json:"applied_at"`
 	RunID       string                  `json:"run_id,omitempty"`
-}
-
-// IntentReader is the narrow read-only interface exposed to the register handler.
-type IntentReader interface {
-	Get(service string) (*ServiceIntent, bool)
 }
 
 type IntentTracker struct {
@@ -47,4 +43,14 @@ func (t *IntentTracker) Get(service string) (*ServiceIntent, bool) {
 	defer t.mu.RUnlock()
 	i, ok := t.state[service]
 	return i, ok
+}
+
+// FreezeConfigForService is the plan-1 desired.FreezeSource: the freeze
+// config the orchestrator last pushed for the service. Plan 2 replaces it
+// with the frozen phase's config and deletes the tracker.
+func (t *IntentTracker) FreezeConfigForService(_ context.Context, service string) (*atroposdk.DelayRequest, error) {
+	if i, ok := t.Get(service); ok {
+		return i.FreezeCfg, nil
+	}
+	return nil, nil
 }

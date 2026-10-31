@@ -146,7 +146,7 @@ func TestBumpGeneration(t *testing.T) {
 // object handed to NewServer reaches a connected subscriber.
 func TestNewServer_SSEStreamsGenerationBumps(t *testing.T) {
 	gens := desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker())
-	s := NewServer(discardLogger(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, gens, nil, nil, nil)
+	s := NewServer(discardLogger(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, gens, nil, nil, nil, nil)
 	srv := httptest.NewServer(http.HandlerFunc(s.handleSSEEvents))
 	defer srv.Close()
 
@@ -220,7 +220,7 @@ func newGenEnv(t *testing.T) *genEnv {
 	faults := store.NewFaultRepo(database)
 	s := NewServer(discardLogger(), database, store.NewRuleRepo(database, gens), faults, faults,
 		store.NewFaultConfigRepo(database), store.NewSDKRepo(database), store.NewExperimentRepo(database),
-		nil, nil, nil, nil, nil, nil, gens, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, gens, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	s.routes(mux)
 	return &genEnv{t: t, ctx: ctx, db: database, gens: gens, s: s, mux: mux, tag: id.New("g")}

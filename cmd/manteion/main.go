@@ -67,6 +67,7 @@ func main() {
 	gens := desired.NewGenerations(store.NewGenerationRepo(database), desired.NewBroker())
 	ruleRepo := store.NewRuleRepo(database, gens)
 	faultRepo := store.NewFaultRepo(database)
+	faultConfigRepo := store.NewFaultConfigRepo(database)
 	sdkRepo := store.NewSDKRepo(database)
 	experimentRepo := store.NewExperimentRepo(database)
 	workflowRepo := store.NewWorkflowRepo(database)
@@ -121,13 +122,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	faultConfigRepo := store.NewFaultConfigRepo(database)
+	// The desired-state materializer: a pure function of the database that the
+	// SDK handlers serve per instance, filtered by its capabilities.
+	mat := &desired.Materializer{
+		Generations: gens, Rules: ruleRepo, FaultConfigs: faultConfigRepo,
+		CacheBox: experimentRepo, Specs: faultRepo,
+		Freeze: controller.IntentReader(), // plan 2: the frozen phase's config
+	}
 
 	// Create the API server with all dependencies.
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
-		zeusClient, controller.IntentReader(), gens, orch, cs, policyRepo,
+		zeusClient, controller.IntentReader(), gens, mat, orch, cs, policyRepo,
 	)
 
 	httpServer := &http.Server{

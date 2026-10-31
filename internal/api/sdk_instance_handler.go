@@ -7,16 +7,33 @@ import (
 	"net/http"
 	"time"
 
+	"manteion-go/internal/desired"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
 )
 
-// Narrow views of the repos the SDK instance detail + kill-switch handlers
-// depend on, so handler tests can inject DB-free fakes (the phaseReader /
-// dbPing / rulever pattern). NewServer wires the real repos into them.
+// Narrow views of the repos the SDK instance detail, kill-switch and
+// desired-state (register) handlers depend on, so handler tests can inject
+// DB-free fakes (the phaseReader / dbPing / rulever pattern). NewServer wires
+// the real repos into them.
 
 type sdkInstanceReader interface {
 	Get(ctx context.Context, id string) (*model.SDKInstance, error)
+}
+
+// sdkRegistry is the sdk_instances table as the desired-state handlers use it:
+// registration plus the observed state the instances report.
+type sdkRegistry interface {
+	sdkInstanceReader
+	Register(ctx context.Context, inst *model.SDKInstance) error
+	RecordPoll(ctx context.Context, id string, observedGeneration uint64) error
+	RecordStatus(ctx context.Context, id string, st model.ObservedStatus) error
+}
+
+// desiredMaterializer builds an instance's desired-state document
+// (*desired.Materializer).
+type desiredMaterializer interface {
+	Materialize(ctx context.Context, service string, inst *model.SDKInstance) (desired.Document, error)
 }
 
 type serviceRuleStore interface {

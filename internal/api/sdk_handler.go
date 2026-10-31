@@ -62,18 +62,24 @@ func (s *Server) activeFaultsForService(ctx context.Context, service string) ([]
 	return faults, freeze
 }
 
-// handleRegister registers (or re-registers) an SDK instance.
+// handleRegister registers (or re-registers) an SDK instance and answers with
+// its materialized desired state (desired-state protocol v1 §2 Register).
 //
 // @Summary      Register SDK instance
-// @Description  Registers an atropos-go SDK process. The 201 response carries
-// @Description  status="registered" and may include the initial desired state
-// @Description  (rules, active_faults, freeze_cfg) so the SDK converges before
-// @Description  its first poll.
+// @Description  Registers an atropos-go SDK process (in-process embed or atroposd sidecar)
+// @Description  with its host kind and fault capabilities. The 201 response carries
+// @Description  status="registered" plus the instance's materialized desired state —
+// @Description  the same RuleSync shape a 200 poll serves (version = generation, etag,
+// @Description  rules, active_faults, freeze_cfg, replay_set), already filtered by the
+// @Description  advertised capabilities — so the SDK converges before its first poll.
+// @Description  Registering with capabilities different from the stored ones bumps the
+// @Description  service generation. If the desired state cannot be materialized the
+// @Description  registration still succeeds and rules is null ("no change").
 // @Tags         sdk
 // @Accept       json
 // @Produce      json
-// @Param        instance  body      model.SDKInstance  true  "SDK instance metadata"
-// @Success      201       {object}  map[string]any     "registration ack with optional intent fields"
+// @Param        instance  body      model.SDKInstance         true  "SDK instance metadata (id, service, address, poll_interval_ms, routes, host, capabilities)"
+// @Success      201       {object}  api.RegisterResponseWire
 // @Failure      400       {object}  api.ErrorResponse  "invalid JSON or registration error"
 // @Router       /sdk/register [post]
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -82,41 +88,62 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-
-	if err := s.sdk.Register(r.Context(), &inst); err != nil {
+	ctx := r.Context()
+	prev, err := s.registry.Get(ctx, inst.ID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logger.Warn("register: read previous registration failed", "id", inst.ID, "error", err)
+	}
+	if err := s.registry.Register(ctx, &inst); err != nil {
 		s.logger.Error("sdk register failed", "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.logger.Info("sdk registered", "id", inst.ID, "service", inst.Service, "host", inst.Host, "capabilities", inst.Capabilities)
 
-	s.logger.Info("sdk registered", "id", inst.ID, "service", inst.Service)
+	// A changed capability set changes this instance's document; bump so its
+	// long-poll (and anyone else's) re-materializes. A fresh registration
+	// changes nobody's document: the response below already carries it.
+	if prev != nil && !sameCapabilities(prev.Capabilities, inst.Capabilities) {
+		s.bumpGeneration(ctx, inst.Service)
+	}
 
-	// Typed wire struct shared with the SDK (atroposdk.RegisterResponse
-	// embeds RuleSync) — both ends marshal the same type, so the historical
-	// active_fault-vs-active_faults key drift cannot recur. Deliver the
-	// current desired state so a freshly-registered SDK converges before its
-	// first poll.
-	resp := atroposdk.RegisterResponse{Status: "registered"}
-	if s.intent != nil {
-		if intent, ok := s.intent.Get(inst.Service); ok && intent.Rules != nil {
-			resp.Rules = intent.Rules
+	resp := RegisterResponseWire{Status: "registered"}
+	doc, err := s.materializer.Materialize(ctx, inst.Service, &inst)
+	if err != nil {
+		// Never fail registration on a data error: the SDK would refuse to
+		// start. rules:null is the SDK's "no change"; the poll reports the
+		// error as a 500 until the rule is fixed.
+		s.logger.Error("register: materialize desired state failed", "service", inst.Service, "error", err)
+		resp.ActiveFaults = []atroposdk.FaultRequest{}
+		writeJSON(w, http.StatusCreated, resp)
+		return
+	}
+	resp.RuleSyncWire = ruleSyncFrom(doc)
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// sameCapabilities reports whether two advertised capability lists name the
+// same set: order and duplicates do not matter, and nil equals [] (both are
+// the wire's "absent = all"). Strings compare verbatim, so an unknown one the
+// filter ignores still counts as a change.
+func sameCapabilities(a, b []string) bool {
+	set := func(caps []string) map[string]bool {
+		m := make(map[string]bool, len(caps))
+		for _, c := range caps {
+			m[c] = true
+		}
+		return m
+	}
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for c := range sa {
+		if !sb[c] {
+			return false
 		}
 	}
-	faults, freeze := s.activeFaultsForService(r.Context(), inst.Service)
-	if faults == nil {
-		faults = []atroposdk.FaultRequest{}
-	}
-	resp.ActiveFaults = faults
-	resp.FreezeCfg = freeze
-	// A freshly-registered SDK converges before its first poll: hand it the
-	// service's active cache-box rule (record/replay) alongside the intent
-	// rules so recording/replay starts immediately (INV-5).
-	if cbctx, err := s.experiments.ActiveCacheBoxPhaseForService(r.Context(), inst.Service); err != nil {
-		s.logger.Warn("register: resolve cache-box context failed", "service", inst.Service, "error", err)
-	} else if cbctx != nil {
-		resp.Rules = append(resp.Rules, ruleconv.SynthesizeCacheBoxRule(*cbctx))
-	}
-	writeJSON(w, http.StatusCreated, resp)
+	return true
 }
 
 // handleDeregister removes an SDK instance.

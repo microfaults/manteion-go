@@ -52,7 +52,10 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 	return c
 }
 
-func (c *Controller) IntentReader() IntentReader { return c.intent }
+// IntentReader returns the controller's intent tracker, which the API and the
+// desired-state materializer (FreezeConfigForService) read until plan 2
+// deletes it.
+func (c *Controller) IntentReader() *IntentTracker { return c.intent }
 
 func (c *Controller) resolveCallOpts(opts []CallOption) callOpts {
 	cfg := callOpts{

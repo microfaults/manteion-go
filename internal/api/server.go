@@ -45,6 +45,7 @@ type Server struct {
 	configDeleter    faultConfigDeleter // same as faultConfigs; separate field so tests can inject a fake
 	sdk              *store.SDKRepo
 	sdkInstances     sdkInstanceReader // same as sdk; separate field so tests can inject a fake
+	registry         sdkRegistry       // same as sdk; separate field so tests can inject a fake
 	serviceRules     serviceRuleStore  // same as rules; separate field so tests can inject a fake
 	experiments      *store.ExperimentRepo
 	phaseHistory     recentPhaseLister // same as experiments; separate field so tests can inject a fake
@@ -55,8 +56,9 @@ type Server struct {
 	policies         *store.PolicyRepo
 	traces           *store.TraceRepo
 	zeus             *zeus.Client
-	intent           atrocontrol.IntentReader
+	intent           *atrocontrol.IntentTracker
 	generations      *desired.Generations
+	materializer     desiredMaterializer // the *desired.Materializer; separate field so tests can inject a fake
 	orch             *orchestrator.Orchestrator
 	cacheStore       *cachestore.Store
 	broker           *EventBroker
@@ -77,8 +79,9 @@ func NewServer(
 	workloads *store.WorkloadRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
-	intent atrocontrol.IntentReader,
+	intent *atrocontrol.IntentTracker,
 	gens *desired.Generations,
+	mat *desired.Materializer,
 	orch *orchestrator.Orchestrator,
 	cs *cachestore.Store,
 	policies *store.PolicyRepo,
@@ -95,6 +98,7 @@ func NewServer(
 		configDeleter:    faultConfigs,
 		sdk:              sdk,
 		sdkInstances:     sdk,
+		registry:         sdk,
 		serviceRules:     rules,
 		experiments:      experiments,
 		phaseHistory:     experiments,
@@ -107,6 +111,7 @@ func NewServer(
 		zeus:             zeusClient,
 		intent:           intent,
 		generations:      gens,
+		materializer:     mat,
 		orch:             orch,
 		cacheStore:       cs,
 		broker:           gens.Broker(),
