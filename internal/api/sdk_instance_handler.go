@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"manteion-go/internal/desired"
@@ -45,6 +46,15 @@ type recentPhaseLister interface {
 	RecentPhaseIDsForService(ctx context.Context, service string, limit int) ([]string, error)
 }
 
+// serviceFaultConfigStore is the slice of the fault-config repo the kill
+// switch uses. ListActiveForService is the set the materializer serves as a
+// poll's active_faults, so the kill switch cancels exactly the faults the
+// service's documents carry.
+type serviceFaultConfigStore interface {
+	ListActiveForService(ctx context.Context, service string) ([]*model.FaultConfig, error)
+	MarkCancelled(ctx context.Context, id string) error
+}
+
 // recentPhaseLimit caps recent_run_ids on the instance detail.
 const recentPhaseLimit = 5
 
@@ -70,10 +80,16 @@ type SDKInstanceDetail struct {
 	RecentRunIDs []string `json:"recent_run_ids"`
 }
 
-// KillSwitchResult is POST /api/v1/sdk/instances/{id}/kill-switch.
+// KillSwitchResult is POST /api/v1/sdk/instances/{id}/kill-switch: what the
+// call changed, both lists empty (never null) when there was nothing left to
+// change.
 type KillSwitchResult struct {
-	DisabledRuleIDs []string  `json:"disabled_rule_ids"`
-	At              time.Time `json:"at"`
+	// DisabledRuleIDs is every rule the call disabled, priority order.
+	DisabledRuleIDs []string `json:"disabled_rule_ids"`
+	// CancelledFaultConfigIDs is every active fault config for the service the
+	// call cancelled, oldest first.
+	CancelledFaultConfigIDs []string  `json:"cancelled_fault_config_ids"`
+	At                      time.Time `json:"at"`
 }
 
 // handleGetInstance returns one registered SDK instance with its rule and
@@ -133,21 +149,25 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleInstanceKillSwitch disables every enabled rule targeting the
-// instance's service.
+// instance's service and cancels every active fault config for it: the
+// service's desired state is left with no rules and no faults.
 //
-// @Summary      Kill-switch an SDK instance's rules
+// @Summary      Kill-switch an SDK instance's rules and faults
 // @Description  Disables every currently-enabled rule whose service matches the
 // @Description  instance's service, through the same full rule update as
-// @Description  PUT /rules/{id} — the rule version and the service generation bump
-// @Description  once per rule, so polling SDKs converge on their next poll (held polls
-// @Description  wake and SSE subscribers are nudged too).
-// @Description  Idempotent: a repeat call reports an empty disabled_rule_ids.
+// @Description  PUT /rules/{id} (the rule version and the service generation bump
+// @Description  once per rule), and cancels every active fault config for the service;
+// @Description  bumps the service generation once after the last write, so polling SDKs
+// @Description  converge on no rules and no faults on their next poll (held polls wake
+// @Description  and SSE subscribers are nudged too).
+// @Description  Idempotent: a repeat call reports empty disabled_rule_ids and
+// @Description  cancelled_fault_config_ids and bumps nothing.
 // @Tags         sdk
 // @Produce      json
 // @Param        id   path      string  true  "Instance ID"
 // @Success      200  {object}  api.KillSwitchResult
 // @Failure      404  {object}  api.ErrorResponse  "instance not found"
-// @Failure      500  {object}  api.ErrorResponse  "lookup failed, or some rules could not be disabled — retry; rules already disabled stay disabled"
+// @Failure      500  {object}  api.ErrorResponse  "lookup failed, or some rules could not be disabled or fault configs cancelled — retry; what was already disabled or cancelled stays so"
 // @Router       /sdk/instances/{id}/kill-switch [post]
 func (s *Server) handleInstanceKillSwitch(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -171,13 +191,13 @@ func (s *Server) handleInstanceKillSwitch(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// A kill-switch is maximally aggressive: every rule is attempted even if
-	// one fails, and each write is the full-rule update PUT /rules/{id}
-	// performs, so the version bump and SSE nudge are exactly what an
-	// operator disabling the rules one by one would produce.
+	// A kill-switch is maximally aggressive: every rule and every fault config
+	// is attempted even if one fails. Each rule write is the full-rule update
+	// PUT /rules/{id} performs, so the version bump and SSE nudge are exactly
+	// what an operator disabling the rules one by one would produce.
 	now := time.Now().UTC()
 	disabled := make([]string, 0, len(rules))
-	failed := 0
+	failedRules := 0
 	for _, rule := range rules {
 		rule.Enabled = false
 		rule.UpdatedAt = now
@@ -185,7 +205,7 @@ func (s *Server) handleInstanceKillSwitch(w http.ResponseWriter, r *http.Request
 		case errors.Is(err, store.ErrNotFound):
 			continue // deleted since we listed it — nothing left to disable
 		case err != nil:
-			failed++
+			failedRules++
 			s.logger.Error("kill-switch: disable rule failed",
 				"instance_id", id, "service", inst.Service, "rule_id", rule.ID, "error", err)
 			continue
@@ -196,11 +216,59 @@ func (s *Server) handleInstanceKillSwitch(w http.ResponseWriter, r *http.Request
 		s.logger.Info("kill-switch: rules disabled",
 			"instance_id", id, "service", inst.Service, "rule_ids", disabled)
 	}
-	if failed > 0 {
-		writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("kill-switch: %d of %d rules could not be disabled; retry", failed, len(rules)))
+
+	// Then the long-running faults: every fault config the service's polls
+	// serve as active, cancelled as POST /faults/configs/{id}/cancel does.
+	// A failed listing ends the call here, without the bump below: the rules
+	// it disabled have bumped on their own.
+	configs, err := s.serviceFaultConfigs.ListActiveForService(ctx, inst.Service)
+	if err != nil {
+		s.logger.Error("kill-switch: list active fault configs failed", "instance_id", id, "service", inst.Service, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list fault configs for instance")
+		return
+	}
+	cancelled := make([]string, 0, len(configs))
+	failedConfigs := 0
+	for _, cfg := range configs {
+		switch err := s.serviceFaultConfigs.MarkCancelled(ctx, cfg.ID); {
+		case errors.Is(err, store.ErrNotFound):
+			continue // deleted since we listed it — nothing left to cancel
+		case err != nil:
+			failedConfigs++
+			s.logger.Error("kill-switch: cancel fault config failed",
+				"instance_id", id, "service", inst.Service, "fault_config_id", cfg.ID, "error", err)
+			continue
+		}
+		cancelled = append(cancelled, cfg.ID)
+	}
+	if len(cancelled) > 0 {
+		s.logger.Info("kill-switch: fault configs cancelled",
+			"instance_id", id, "service", inst.Service, "fault_config_ids", cancelled)
+	}
+
+	// One bump after the last write, even when some writes failed: each rule
+	// update already bumped in its transaction, but a cancel does not, and this
+	// bump wakes the held polls and nudges the SSE subscribers once everything
+	// this call changed is in place. A call that changed nothing bumps nothing.
+	if len(disabled)+len(cancelled) > 0 {
+		s.bumpGeneration(ctx, inst.Service)
+	}
+	if failedRules+failedConfigs > 0 {
+		writeError(w, http.StatusInternalServerError, killSwitchFailure(failedRules, len(rules), failedConfigs, len(configs)))
 		return
 	}
 
-	writeJSON(w, http.StatusOK, KillSwitchResult{DisabledRuleIDs: disabled, At: now})
+	writeJSON(w, http.StatusOK, KillSwitchResult{DisabledRuleIDs: disabled, CancelledFaultConfigIDs: cancelled, At: now})
+}
+
+// killSwitchFailure words a kill switch that left some of its writes undone.
+func killSwitchFailure(failedRules, rules, failedConfigs, configs int) string {
+	var undone []string
+	if failedRules > 0 {
+		undone = append(undone, fmt.Sprintf("%d of %d rules could not be disabled", failedRules, rules))
+	}
+	if failedConfigs > 0 {
+		undone = append(undone, fmt.Sprintf("%d of %d fault configs could not be cancelled", failedConfigs, configs))
+	}
+	return "kill-switch: " + strings.Join(undone, ", ") + "; retry"
 }

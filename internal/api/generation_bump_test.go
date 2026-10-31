@@ -571,14 +571,21 @@ func TestFaultConfigChanges_ReachAnUpToDatePoll_DB(t *testing.T) {
 }
 
 // TestKillSwitch_BumpsEachDisabledRulesServiceGeneration_DB pins that the
-// kill-switch's per-rule updates go through the rule repo's bump-and-notify:
-// one generation per disabled rule, each announced, and none on a repeat.
+// kill-switch's per-rule updates go through the rule repo's bump-and-notify,
+// one generation per disabled rule, each announced; that the kill switch then
+// bumps and announces once more after its last write, the cancel of the
+// service's active fault config, which does not bump on its own; and that a
+// repeat bumps nothing.
 func TestKillSwitch_BumpsEachDisabledRulesServiceGeneration_DB(t *testing.T) {
 	e := newGenEnv(t)
 	svc := "svc-" + e.tag
 	specID := e.faultSpec()
 	e.rule("hi", svc, specID)
 	e.rule("lo", svc, specID)
+	fault := e.faultConfig(svc, 0)
+	if err := e.s.faultConfigs.MarkFired(e.ctx, fault); err != nil {
+		t.Fatalf("fire %s: %v", fault, err)
+	}
 	inst := &model.SDKInstance{ID: "inst-" + e.tag, Service: svc, Version: "1.0.0", Address: "10.0.0.1:9090", PollIntervalMs: 10000}
 	if err := e.s.sdk.Register(e.ctx, inst); err != nil {
 		t.Fatalf("register instance: %v", err)
@@ -589,15 +596,16 @@ func TestKillSwitch_BumpsEachDisabledRulesServiceGeneration_DB(t *testing.T) {
 
 	path := "/api/v1/sdk/instances/" + inst.ID + "/kill-switch"
 	w := e.do(http.MethodPost, path, nil)
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), `"disabled_rule_ids":[]`) {
-		t.Fatalf("kill-switch: status = %d, body = %s; want 200 with the disabled rules", w.Code, w.Body.String())
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), `"disabled_rule_ids":[]`) ||
+		!strings.Contains(w.Body.String(), `"cancelled_fault_config_ids":["`+fault+`"]`) {
+		t.Fatalf("kill-switch: status = %d, body = %s; want 200 with the disabled rules and %s cancelled", w.Code, w.Body.String(), fault)
 	}
-	e.wantGeneration(svc, g0+2)
-	e.wantEvents(ev, g0+1, g0+2)
+	e.wantGeneration(svc, g0+3)
+	e.wantEvents(ev, g0+1, g0+2, g0+3)
 
 	if w := e.do(http.MethodPost, path, nil); w.Code != http.StatusOK {
 		t.Fatalf("second kill-switch: status = %d, body = %s", w.Code, w.Body.String())
 	}
-	e.wantGeneration(svc, g0+2)
+	e.wantGeneration(svc, g0+3)
 	e.wantEvents(ev)
 }

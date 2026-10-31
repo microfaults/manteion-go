@@ -103,6 +103,43 @@ func (f *fakePhaseHistory) RecentPhaseIDsForService(_ context.Context, service s
 	return f.byService[service], nil
 }
 
+// fakeServiceFaultConfigs is an in-memory fault_configs table as the kill
+// switch sees it: the active configs, of which ListActiveForService serves a
+// service's that are not cancelled yet, oldest first, as the poll does.
+type fakeServiceFaultConfigs struct {
+	active    []*model.FaultConfig
+	cancelled []string         // every successful MarkCancelled, in call order
+	cancelErr map[string]error // per-config MarkCancelled failure injection
+	listErr   error
+}
+
+func (f *fakeServiceFaultConfigs) ListActiveForService(_ context.Context, service string) ([]*model.FaultConfig, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := []*model.FaultConfig{}
+	for _, c := range f.active {
+		if c.Service == service && !slices.Contains(f.cancelled, c.ID) {
+			cp := *c
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeServiceFaultConfigs) MarkCancelled(_ context.Context, id string) error {
+	if err := f.cancelErr[id]; err != nil {
+		return err
+	}
+	for _, c := range f.active {
+		if c.ID == id {
+			f.cancelled = append(f.cancelled, id)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -141,8 +178,38 @@ func sdkTestRules() []*model.Rule {
 	}
 }
 
-func newSDKInstanceServer(insts *fakeSDKInstances, rules *fakeServiceRules, phases *fakePhaseHistory) *Server {
-	return &Server{sdkInstances: insts, serviceRules: rules, phaseHistory: phases, logger: discardLogger()}
+func sdkTestFaultConfig(configID, service string) *model.FaultConfig {
+	return &model.FaultConfig{
+		ID: configID, Name: "fault " + configID, Service: service, Category: "inline", FaultType: "latency",
+		Params: json.RawMessage(`{"delay":"100ms"}`), Status: model.FaultConfigActive, CreatedAt: sdkTestTime,
+	}
+}
+
+// cartservice: two active fault configs; checkoutservice: one.
+func sdkTestFaultConfigs() *fakeServiceFaultConfigs {
+	return &fakeServiceFaultConfigs{active: []*model.FaultConfig{
+		sdkTestFaultConfig("fc-cart-1", "cartservice"),
+		sdkTestFaultConfig("fc-cart-2", "cartservice"),
+		sdkTestFaultConfig("fc-checkout", "checkoutservice"),
+	}}
+}
+
+func newSDKInstanceServer(insts *fakeSDKInstances, rules *fakeServiceRules, phases *fakePhaseHistory, configs *fakeServiceFaultConfigs) *Server {
+	return &Server{
+		sdkInstances: insts, serviceRules: rules, phaseHistory: phases, serviceFaultConfigs: configs,
+		generations: desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker()),
+		logger:      discardLogger(),
+	}
+}
+
+// generationOf reads a service's generation from the server's store.
+func generationOf(t *testing.T, s *Server, service string) uint64 {
+	t.Helper()
+	g, err := s.generations.Get(context.Background(), service)
+	if err != nil {
+		t.Fatalf("read the generation of %s: %v", service, err)
+	}
+	return g
 }
 
 // serveSDKInstance drives a request through the real route table so the
@@ -160,8 +227,9 @@ func serveSDKInstance(t *testing.T, s *Server, method, path string) *httptest.Re
 // killSwitchWire mirrors the kill-switch envelope with `at` kept raw so the
 // test can pin its wire format.
 type killSwitchWire struct {
-	DisabledRuleIDs []string `json:"disabled_rule_ids"`
-	At              string   `json:"at"`
+	DisabledRuleIDs         []string `json:"disabled_rule_ids"`
+	CancelledFaultConfigIDs []string `json:"cancelled_fault_config_ids"`
+	At                      string   `json:"at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +327,7 @@ func TestHandleGetInstance(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newSDKInstanceServer(tc.insts, tc.rules, tc.phases)
+			s := newSDKInstanceServer(tc.insts, tc.rules, tc.phases, &fakeServiceFaultConfigs{})
 			w := serveSDKInstance(t, s, http.MethodGet, "/api/v1/sdk/instances/"+tc.id)
 			if w.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d, body = %s", w.Code, tc.wantStatus, w.Body.String())
@@ -333,74 +401,163 @@ func TestHandleGetInstance(t *testing.T) {
 
 func TestHandleInstanceKillSwitch(t *testing.T) {
 	tests := []struct {
-		name         string
-		id           string
-		insts        *fakeSDKInstances
-		rules        *fakeServiceRules
-		wantStatus   int
-		wantError    string   // substring of the error envelope
-		wantDisabled []string // disabled_rule_ids in the response
-		wantOff      []string // rules that must be persisted disabled afterwards
-		wantOn       []string // rules that must still be enabled afterwards
+		name          string
+		id            string
+		insts         *fakeSDKInstances
+		rules         *fakeServiceRules
+		configs       *fakeServiceFaultConfigs // nil: none active
+		wantStatus    int
+		wantError     string            // substring of the error envelope
+		wantDisabled  []string          // disabled_rule_ids in the response
+		wantOff       []string          // rules that must be persisted disabled afterwards
+		wantOn        []string          // rules that must still be enabled afterwards
+		wantCancelled []string          // fault configs persisted cancelled, in order; also cancelled_fault_config_ids on a 200
+		wantGens      map[string]uint64 // service generations afterwards (1: never bumped)
 	}{
 		{
 			name:       "unknown instance → 404, nothing touched",
 			id:         "nope",
 			insts:      sdkTestInstances(),
 			rules:      &fakeServiceRules{rules: sdkTestRules()},
+			configs:    sdkTestFaultConfigs(),
 			wantStatus: http.StatusNotFound,
 			wantError:  "instance not found",
 			wantOn:     []string{"rule-cart-hi", "rule-cart-lo", "rule-checkout"},
+			wantGens:   map[string]uint64{"cartservice": 1, "checkoutservice": 1},
 		},
 		{
-			name:         "disables every enabled rule for the service, other services untouched",
-			id:           "cart-7f3a",
-			insts:        sdkTestInstances(),
-			rules:        &fakeServiceRules{rules: sdkTestRules()},
-			wantStatus:   http.StatusOK,
-			wantDisabled: []string{"rule-cart-hi", "rule-cart-lo"},
-			wantOff:      []string{"rule-cart-hi", "rule-cart-lo", "rule-cart-off"},
-			wantOn:       []string{"rule-checkout"},
+			name:          "disables every enabled rule for the service, other services untouched",
+			id:            "cart-7f3a",
+			insts:         sdkTestInstances(),
+			rules:         &fakeServiceRules{rules: sdkTestRules()},
+			wantStatus:    http.StatusOK,
+			wantDisabled:  []string{"rule-cart-hi", "rule-cart-lo"},
+			wantOff:       []string{"rule-cart-hi", "rule-cart-lo", "rule-cart-off"},
+			wantOn:        []string{"rule-checkout"},
+			wantCancelled: []string{},
+			wantGens:      map[string]uint64{"cartservice": 2, "checkoutservice": 1},
 		},
 		{
-			name:         "no enabled rules → 200 with an empty list",
-			id:           "cart-7f3a",
-			insts:        sdkTestInstances(),
-			rules:        &fakeServiceRules{rules: []*model.Rule{sdkTestRule("rule-cart-off", "cartservice", 30, false)}},
-			wantStatus:   http.StatusOK,
-			wantDisabled: []string{},
-			wantOff:      []string{"rule-cart-off"},
+			name:          "cancels active fault configs for the service and bumps once",
+			id:            "cart-7f3a",
+			insts:         sdkTestInstances(),
+			rules:         &fakeServiceRules{rules: sdkTestRules()},
+			configs:       sdkTestFaultConfigs(),
+			wantStatus:    http.StatusOK,
+			wantDisabled:  []string{"rule-cart-hi", "rule-cart-lo"},
+			wantOff:       []string{"rule-cart-hi", "rule-cart-lo"},
+			wantOn:        []string{"rule-checkout"},
+			wantCancelled: []string{"fc-cart-1", "fc-cart-2"},
+			wantGens:      map[string]uint64{"cartservice": 2, "checkoutservice": 1},
 		},
 		{
-			name:         "rule deleted between list and update is skipped",
-			id:           "cart-7f3a",
-			insts:        sdkTestInstances(),
-			rules:        &fakeServiceRules{rules: sdkTestRules(), updateErr: map[string]error{"rule-cart-lo": store.ErrNotFound}},
-			wantStatus:   http.StatusOK,
-			wantDisabled: []string{"rule-cart-hi"},
-			wantOff:      []string{"rule-cart-hi"},
+			name:          "fault configs alone: cancelled, bumped once",
+			id:            "cart-7f3a",
+			insts:         sdkTestInstances(),
+			rules:         &fakeServiceRules{rules: []*model.Rule{sdkTestRule("rule-cart-off", "cartservice", 30, false)}},
+			configs:       sdkTestFaultConfigs(),
+			wantStatus:    http.StatusOK,
+			wantDisabled:  []string{},
+			wantCancelled: []string{"fc-cart-1", "fc-cart-2"},
+			wantGens:      map[string]uint64{"cartservice": 2, "checkoutservice": 1},
 		},
 		{
-			name:       "update failure → 500, the remaining rules are still disabled",
-			id:         "cart-7f3a",
-			insts:      sdkTestInstances(),
-			rules:      &fakeServiceRules{rules: sdkTestRules(), updateErr: map[string]error{"rule-cart-hi": errors.New("boom")}},
-			wantStatus: http.StatusInternalServerError,
-			wantError:  "1 of 2",
-			wantOff:    []string{"rule-cart-lo"},
-			wantOn:     []string{"rule-cart-hi", "rule-checkout"},
+			name:          "no enabled rules, no active fault configs → 200 with empty lists, no bump",
+			id:            "cart-7f3a",
+			insts:         sdkTestInstances(),
+			rules:         &fakeServiceRules{rules: []*model.Rule{sdkTestRule("rule-cart-off", "cartservice", 30, false)}},
+			wantStatus:    http.StatusOK,
+			wantDisabled:  []string{},
+			wantOff:       []string{"rule-cart-off"},
+			wantCancelled: []string{},
+			wantGens:      map[string]uint64{"cartservice": 1},
+		},
+		{
+			name:          "rule deleted between list and update is skipped",
+			id:            "cart-7f3a",
+			insts:         sdkTestInstances(),
+			rules:         &fakeServiceRules{rules: sdkTestRules(), updateErr: map[string]error{"rule-cart-lo": store.ErrNotFound}},
+			wantStatus:    http.StatusOK,
+			wantDisabled:  []string{"rule-cart-hi"},
+			wantOff:       []string{"rule-cart-hi"},
+			wantCancelled: []string{},
+		},
+		{
+			name:  "fault config gone between list and cancel is skipped",
+			id:    "cart-7f3a",
+			insts: sdkTestInstances(),
+			rules: &fakeServiceRules{},
+			configs: func() *fakeServiceFaultConfigs {
+				f := sdkTestFaultConfigs()
+				f.cancelErr = map[string]error{"fc-cart-1": store.ErrNotFound}
+				return f
+			}(),
+			wantStatus:    http.StatusOK,
+			wantDisabled:  []string{},
+			wantCancelled: []string{"fc-cart-2"},
+			wantGens:      map[string]uint64{"cartservice": 2},
+		},
+		{
+			name:          "update failure → 500, the remaining rules are still disabled and the fault configs cancelled",
+			id:            "cart-7f3a",
+			insts:         sdkTestInstances(),
+			rules:         &fakeServiceRules{rules: sdkTestRules(), updateErr: map[string]error{"rule-cart-hi": errors.New("boom")}},
+			configs:       sdkTestFaultConfigs(),
+			wantStatus:    http.StatusInternalServerError,
+			wantError:     "1 of 2 rules could not be disabled",
+			wantOff:       []string{"rule-cart-lo"},
+			wantOn:        []string{"rule-cart-hi", "rule-checkout"},
+			wantCancelled: []string{"fc-cart-1", "fc-cart-2"},
+			wantGens:      map[string]uint64{"cartservice": 2},
+		},
+		{
+			name:  "cancel failure → 500, rules still disabled",
+			id:    "cart-7f3a",
+			insts: sdkTestInstances(),
+			rules: &fakeServiceRules{rules: sdkTestRules()},
+			configs: func() *fakeServiceFaultConfigs {
+				f := sdkTestFaultConfigs()
+				f.cancelErr = map[string]error{"fc-cart-1": errors.New("boom")}
+				return f
+			}(),
+			wantStatus:    http.StatusInternalServerError,
+			wantError:     "1 of 2 fault configs could not be cancelled",
+			wantOff:       []string{"rule-cart-hi", "rule-cart-lo"},
+			wantOn:        []string{"rule-checkout"},
+			wantCancelled: []string{"fc-cart-2"},
+			wantGens:      map[string]uint64{"cartservice": 2, "checkoutservice": 1},
 		},
 		{
 			name:       "rule lookup failure → 500",
 			id:         "cart-7f3a",
 			insts:      sdkTestInstances(),
 			rules:      &fakeServiceRules{listErr: errors.New("db down")},
+			configs:    sdkTestFaultConfigs(),
 			wantStatus: http.StatusInternalServerError,
+			wantGens:   map[string]uint64{"cartservice": 1},
+		},
+		{
+			name:  "fault config lookup failure → 500, rules still disabled",
+			id:    "cart-7f3a",
+			insts: sdkTestInstances(),
+			rules: &fakeServiceRules{rules: sdkTestRules()},
+			configs: func() *fakeServiceFaultConfigs {
+				f := sdkTestFaultConfigs()
+				f.listErr = errors.New("db down")
+				return f
+			}(),
+			wantStatus: http.StatusInternalServerError,
+			wantError:  "failed to list fault configs",
+			wantOff:    []string{"rule-cart-hi", "rule-cart-lo"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newSDKInstanceServer(tc.insts, tc.rules, &fakePhaseHistory{})
+			configs := tc.configs
+			if configs == nil {
+				configs = &fakeServiceFaultConfigs{}
+			}
+			s := newSDKInstanceServer(tc.insts, tc.rules, &fakePhaseHistory{}, configs)
 			before := time.Now().UTC()
 			w := serveSDKInstance(t, s, http.MethodPost, "/api/v1/sdk/instances/"+tc.id+"/kill-switch")
 			after := time.Now().UTC()
@@ -431,6 +588,17 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 					t.Errorf("update for %s is not a full rule: %+v", upd.ID, upd)
 				}
 			}
+			if !slices.Equal(configs.cancelled, tc.wantCancelled) {
+				t.Errorf("fault configs cancelled = %v, want %v", configs.cancelled, tc.wantCancelled)
+			}
+			// One bump per kill switch that changed anything, after its last
+			// write: each rule update bumps on its own in the real repo, never in
+			// the fake, so the fake's count is the handler's alone.
+			for svc, want := range tc.wantGens {
+				if got := generationOf(t, s, svc); got != want {
+					t.Errorf("generation of %s = %d, want %d", svc, got, want)
+				}
+			}
 
 			if tc.wantStatus != http.StatusOK {
 				var er ErrorResponse
@@ -447,8 +615,10 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 			if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
 				t.Fatalf("decode raw: %v", err)
 			}
-			if string(raw["disabled_rule_ids"]) == "null" {
-				t.Errorf("disabled_rule_ids = null, want a JSON array")
+			for _, key := range []string{"disabled_rule_ids", "cancelled_fault_config_ids"} {
+				if msg, ok := raw[key]; !ok || string(msg) == "null" {
+					t.Errorf("%s = %s, want a JSON array (body %s)", key, msg, w.Body.String())
+				}
 			}
 			var got killSwitchWire
 			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
@@ -456,6 +626,9 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 			}
 			if !slices.Equal(got.DisabledRuleIDs, tc.wantDisabled) {
 				t.Errorf("disabled_rule_ids = %v, want %v", got.DisabledRuleIDs, tc.wantDisabled)
+			}
+			if !slices.Equal(got.CancelledFaultConfigIDs, tc.wantCancelled) {
+				t.Errorf("cancelled_fault_config_ids = %v, want %v", got.CancelledFaultConfigIDs, tc.wantCancelled)
 			}
 			at, err := time.Parse(time.RFC3339Nano, got.At)
 			if err != nil {
@@ -472,11 +645,13 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 }
 
 // TestHandleInstanceKillSwitch_Idempotent pins the second-call contract: once
-// the service's rules are disabled a repeat returns an empty list, persists
-// nothing, and the detail endpoint reports no active rules.
+// the service's rules are disabled and its fault configs cancelled, a repeat
+// returns empty lists, persists nothing, does not bump the generation again,
+// and the detail endpoint reports no active rules.
 func TestHandleInstanceKillSwitch_Idempotent(t *testing.T) {
 	rules := &fakeServiceRules{rules: sdkTestRules()}
-	s := newSDKInstanceServer(sdkTestInstances(), rules, &fakePhaseHistory{})
+	configs := sdkTestFaultConfigs()
+	s := newSDKInstanceServer(sdkTestInstances(), rules, &fakePhaseHistory{}, configs)
 	path := "/api/v1/sdk/instances/cart-7f3a/kill-switch"
 
 	first := serveSDKInstance(t, s, http.MethodPost, path)
@@ -490,16 +665,30 @@ func TestHandleInstanceKillSwitch_Idempotent(t *testing.T) {
 	if want := []string{"rule-cart-hi", "rule-cart-lo"}; !slices.Equal(got.DisabledRuleIDs, want) {
 		t.Fatalf("first disabled_rule_ids = %v, want %v", got.DisabledRuleIDs, want)
 	}
+	if want := []string{"fc-cart-1", "fc-cart-2"}; !slices.Equal(got.CancelledFaultConfigIDs, want) {
+		t.Fatalf("first cancelled_fault_config_ids = %v, want %v", got.CancelledFaultConfigIDs, want)
+	}
+	if g := generationOf(t, s, "cartservice"); g != 2 {
+		t.Fatalf("generation after the first call = %d, want 2 (one bump)", g)
+	}
 
 	second := serveSDKInstance(t, s, http.MethodPost, path)
 	if second.Code != http.StatusOK {
 		t.Fatalf("second: status = %d, body = %s", second.Code, second.Body.String())
 	}
-	if !strings.Contains(second.Body.String(), `"disabled_rule_ids":[]`) {
-		t.Errorf("second body = %s, want an empty disabled_rule_ids array", second.Body.String())
+	for _, want := range []string{`"disabled_rule_ids":[]`, `"cancelled_fault_config_ids":[]`} {
+		if !strings.Contains(second.Body.String(), want) {
+			t.Errorf("second body = %s, want %s", second.Body.String(), want)
+		}
 	}
 	if len(rules.updates) != 2 {
 		t.Errorf("updates after second call = %d, want 2 (no re-writes)", len(rules.updates))
+	}
+	if len(configs.cancelled) != 2 {
+		t.Errorf("cancels after second call = %v, want the first call's two (no re-writes)", configs.cancelled)
+	}
+	if g := generationOf(t, s, "cartservice"); g != 2 {
+		t.Errorf("generation after the second call = %d, want 2: a kill switch that changed nothing must not bump", g)
 	}
 
 	detail := serveSDKInstance(t, s, http.MethodGet, "/api/v1/sdk/instances/cart-7f3a")
@@ -541,7 +730,7 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	s := &Server{
 		rules: rules, rulever: rules, faults: faults, sdk: sdk, experiments: exp,
 		sdkInstances: sdk, registry: sdk, serviceRules: rules, phaseHistory: exp,
-		generations: gens, broker: gens.Broker(),
+		serviceFaultConfigs: faultConfigs, generations: gens, broker: gens.Broker(),
 		materializer: &desired.Materializer{Generations: gens, Rules: rules, FaultConfigs: faultConfigs, CacheBox: exp, Specs: faults},
 		logger:       discardLogger(),
 	}
@@ -608,6 +797,32 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 		if err := exp.UpdatePhaseStatus(ctx, phaseA.ID, status); err != nil {
 			t.Fatalf("phase A → %s: %v", status, err)
 		}
+	}
+
+	// A long-running fault fired on each service: the kill switch cancels svc's.
+	fireFault := func(service string) string {
+		t.Helper()
+		fc := &model.FaultConfig{
+			ID: id.New("fc"), Name: "ks-fault", Service: service, Category: "inline", FaultType: "latency",
+			Params: json.RawMessage(`{"delay":"100ms"}`), Status: model.FaultConfigReady,
+		}
+		if err := faultConfigs.Create(ctx, fc); err != nil {
+			t.Fatalf("create fault config: %v", err)
+		}
+		t.Cleanup(func() { _ = faultConfigs.Delete(context.Background(), fc.ID) })
+		if err := faultConfigs.MarkFired(ctx, fc.ID); err != nil {
+			t.Fatalf("fire fault config: %v", err)
+		}
+		return fc.ID
+	}
+	fault, otherFault := fireFault(svc), fireFault(other)
+	faultStatus := func(configID string) model.FaultConfigStatus {
+		t.Helper()
+		fc, err := faultConfigs.Get(ctx, configID)
+		if err != nil {
+			t.Fatalf("get fault config %s: %v", configID, err)
+		}
+		return fc.Status
 	}
 
 	inst := &model.SDKInstance{ID: "inst-" + tag, Service: svc, Version: "1.0.0", Address: "10.0.0.1:9090", PollIntervalMs: 10000}
@@ -685,8 +900,8 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	}
 
 	// Before: the poll serves only the unattached rule (lo is gated behind its
-	// pending phase) — "active" is broader than "served", by design. A poll
-	// naming the document it was served gets a 304.
+	// pending phase) — "active" is broader than "served", by design — and the
+	// fired fault. A poll naming the document it was served gets a 304.
 	var pollsFrom time.Time // last_poll_at is written with the database's clock
 	if err := database.QueryRowContext(ctx, `SELECT now()`).Scan(&pollsFrom); err != nil {
 		t.Fatalf("read the database clock: %v", err)
@@ -696,13 +911,17 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	if w0.Code != http.StatusOK || len(sync0.Rules) != 1 || sync0.Rules[0].Name != hi || sync0.Version != g0 {
 		t.Fatalf("poll before kill-switch: code=%d rules=%+v version=%d, want 200 [%s] generation %d", w0.Code, sync0.Rules, sync0.Version, hi, g0)
 	}
+	if len(sync0.ActiveFaults) != 1 {
+		t.Fatalf("poll before kill-switch: active_faults=%+v, want the fault fired on %s", sync0.ActiveFaults, svc)
+	}
 	etag0 := w0.Header().Get("ETag")
 	if w, _ := poll(g0, etag0); w.Code != http.StatusNotModified {
 		t.Fatalf("poll(same etag) = %d, want 304", w.Code)
 	}
 
 	// Kill-switch: one rule_version bump and one generation bump per rule,
-	// exactly as PUT /rules/{id}.
+	// exactly as PUT /rules/{id}, then the service's active fault configs
+	// cancelled and one more generation bump after the last write.
 	w := do(http.MethodPost, "/api/v1/sdk/instances/"+inst.ID+"/kill-switch")
 	if w.Code != http.StatusOK {
 		t.Fatalf("kill-switch: status = %d, body = %s", w.Code, w.Body.String())
@@ -714,11 +933,20 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	if want := []string{hi, lo}; !slices.Equal(ks.DisabledRuleIDs, want) {
 		t.Errorf("disabled_rule_ids = %v, want %v", ks.DisabledRuleIDs, want)
 	}
+	if want := []string{fault}; !slices.Equal(ks.CancelledFaultConfigIDs, want) {
+		t.Errorf("cancelled_fault_config_ids = %v, want %v", ks.CancelledFaultConfigIDs, want)
+	}
 	if v := ruleVersion(); v != v0+2 {
 		t.Errorf("rule_version %d → %d, want +2 (one bump per disabled rule)", v0, v)
 	}
-	if g := gen(); g != g0+2 {
-		t.Errorf("generation %d → %d, want +2 (one bump per disabled rule)", g0, g)
+	if g := gen(); g != g0+3 {
+		t.Errorf("generation %d → %d, want +3 (one bump per disabled rule, then the kill switch's own)", g0, g)
+	}
+	if st := faultStatus(fault); st != model.FaultConfigCancelled {
+		t.Errorf("fault config %s is %s after the kill switch, want cancelled", fault, st)
+	}
+	if st := faultStatus(otherFault); st != model.FaultConfigActive {
+		t.Errorf("other service's fault config %s is %s, want still active", otherFault, st)
 	}
 	for _, rid := range []string{hi, lo, off} {
 		if r, err := rules.Get(ctx, rid); err != nil || r.Enabled {
@@ -730,30 +958,32 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	}
 
 	// Poll pickup: the ETag the instance holds no longer matches, so it gets a
-	// 200 with an empty set (the reconciler clears on []) at the new
+	// 200 with no rules and no faults (the reconciler clears on []) at the new
 	// generation; the new ETag gets a 304. Each poll records the generation
 	// the instance holds, and its time.
 	w1, sync1 := poll(g0, etag0)
-	if w1.Code != http.StatusOK || len(sync1.Rules) != 0 || sync1.Version != g0+2 {
-		t.Errorf("poll(old etag) = %d version=%d rules=%d, want 200 at generation %d with no rules", w1.Code, sync1.Version, len(sync1.Rules), g0+2)
+	if w1.Code != http.StatusOK || len(sync1.Rules) != 0 || len(sync1.ActiveFaults) != 0 || sync1.Version != g0+3 {
+		t.Errorf("poll(old etag) = %d version=%d rules=%d active_faults=%d, want 200 at generation %d with no rules and no faults",
+			w1.Code, sync1.Version, len(sync1.Rules), len(sync1.ActiveFaults), g0+3)
 	}
-	if w, _ := poll(g0+2, w1.Header().Get("ETag")); w.Code != http.StatusNotModified {
+	if w, _ := poll(g0+3, w1.Header().Get("ETag")); w.Code != http.StatusNotModified {
 		t.Errorf("poll(new etag) = %d, want 304", w.Code)
 	}
-	if d := detail(); d.ObservedGeneration != g0+2 || d.LastPollAt.Before(pollsFrom) {
-		t.Errorf("detail after polls: observed_generation=%d last_poll_at=%v, want %d and a poll time from %v on", d.ObservedGeneration, d.LastPollAt, g0+2, pollsFrom)
+	if d := detail(); d.ObservedGeneration != g0+3 || d.LastPollAt.Before(pollsFrom) {
+		t.Errorf("detail after polls: observed_generation=%d last_poll_at=%v, want %d and a poll time from %v on", d.ObservedGeneration, d.LastPollAt, g0+3, pollsFrom)
 	}
 
-	// Idempotent: nothing left to disable, no version or generation churn.
+	// Idempotent: nothing left to disable or cancel, no version or generation churn.
 	w = do(http.MethodPost, "/api/v1/sdk/instances/"+inst.ID+"/kill-switch")
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"disabled_rule_ids":[]`) {
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"disabled_rule_ids":[]`) ||
+		!strings.Contains(w.Body.String(), `"cancelled_fault_config_ids":[]`) {
 		t.Errorf("second kill-switch: status = %d, body = %s", w.Code, w.Body.String())
 	}
 	if v := ruleVersion(); v != v0+2 {
 		t.Errorf("second kill-switch bumped rule_version %d → %d", v0+2, v)
 	}
-	if g := gen(); g != g0+2 {
-		t.Errorf("second kill-switch bumped the generation %d → %d", g0+2, g)
+	if g := gen(); g != g0+3 {
+		t.Errorf("second kill-switch bumped the generation %d → %d", g0+3, g)
 	}
 	if d := detail(); len(d.ActiveRuleIDs) != 0 {
 		t.Errorf("active_rule_ids after kill-switch = %v, want none", d.ActiveRuleIDs)

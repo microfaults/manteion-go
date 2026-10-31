@@ -32,34 +32,35 @@ type ruleVersioner interface {
 
 // Server holds all dependencies for the manteion API.
 type Server struct {
-	logger           *slog.Logger
-	db               *sql.DB
-	dbPing           dbPinger // same as db; separate field so tests can inject a fake
-	rules            *store.RuleRepo
-	rulever          ruleVersioner // same as rules; separate field so tests can inject a fake
-	faults           *store.FaultRepo
-	faultStore       FaultStore
-	faultConfigs     *store.FaultConfigRepo
-	configDeleter    faultConfigDeleter // same as faultConfigs; separate field so tests can inject a fake
-	sdk              *store.SDKRepo
-	sdkInstances     sdkInstanceReader // same as sdk; separate field so tests can inject a fake
-	registry         sdkRegistry       // same as sdk; separate field so tests can inject a fake
-	serviceRules     serviceRuleStore  // same as rules; separate field so tests can inject a fake
-	experiments      *store.ExperimentRepo
-	phaseHistory     recentPhaseLister // same as experiments; separate field so tests can inject a fake
-	phaseReader      phaseReader       // same as experiments; separate field so ingest tests can inject a fake
-	phaseFaultEvents *store.PhaseFaultEventRepo
-	workflows        *store.WorkflowRepo
-	workloads        *store.WorkloadRepo
-	policies         *store.PolicyRepo
-	traces           *store.TraceRepo
-	zeus             *zeus.Client
-	generations      *desired.Generations
-	materializer     desiredMaterializer // the *desired.Materializer; separate field so tests can inject a fake
-	orch             *orchestrator.Orchestrator
-	cacheStore       *cachestore.Store
-	artifacts        artifactReader // the *store.ReplayArtifactRepo; an interface so tests can inject a fake
-	broker           *EventBroker
+	logger              *slog.Logger
+	db                  *sql.DB
+	dbPing              dbPinger // same as db; separate field so tests can inject a fake
+	rules               *store.RuleRepo
+	rulever             ruleVersioner // same as rules; separate field so tests can inject a fake
+	faults              *store.FaultRepo
+	faultStore          FaultStore
+	faultConfigs        *store.FaultConfigRepo
+	configDeleter       faultConfigDeleter // same as faultConfigs; separate field so tests can inject a fake
+	sdk                 *store.SDKRepo
+	sdkInstances        sdkInstanceReader       // same as sdk; separate field so tests can inject a fake
+	registry            sdkRegistry             // same as sdk; separate field so tests can inject a fake
+	serviceRules        serviceRuleStore        // same as rules; separate field so tests can inject a fake
+	serviceFaultConfigs serviceFaultConfigStore // same as faultConfigs; separate field so tests can inject a fake
+	experiments         *store.ExperimentRepo
+	phaseHistory        recentPhaseLister // same as experiments; separate field so tests can inject a fake
+	phaseReader         phaseReader       // same as experiments; separate field so ingest tests can inject a fake
+	phaseFaultEvents    *store.PhaseFaultEventRepo
+	workflows           *store.WorkflowRepo
+	workloads           *store.WorkloadRepo
+	policies            *store.PolicyRepo
+	traces              *store.TraceRepo
+	zeus                *zeus.Client
+	generations         *desired.Generations
+	materializer        desiredMaterializer // the *desired.Materializer; separate field so tests can inject a fake
+	orch                *orchestrator.Orchestrator
+	cacheStore          *cachestore.Store
+	artifacts           artifactReader // the *store.ReplayArtifactRepo; an interface so tests can inject a fake
+	broker              *EventBroker
 
 	// shutdown is done once the HTTP server begins shutting down
 	// (BeginShutdown). Created on first use, so a Server literal (as the
@@ -92,34 +93,35 @@ func NewServer(
 	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
-		logger:           logger,
-		db:               db,
-		dbPing:           db,
-		rules:            rules,
-		rulever:          rules,
-		faults:           faults,
-		faultStore:       faultStore,
-		faultConfigs:     faultConfigs,
-		configDeleter:    faultConfigs,
-		sdk:              sdk,
-		sdkInstances:     sdk,
-		registry:         sdk,
-		serviceRules:     rules,
-		experiments:      experiments,
-		phaseHistory:     experiments,
-		phaseReader:      experiments,
-		phaseFaultEvents: phaseFaultEvents,
-		workflows:        workflows,
-		workloads:        workloads,
-		policies:         policies,
-		traces:           traces,
-		zeus:             zeusClient,
-		generations:      gens,
-		materializer:     mat,
-		orch:             orch,
-		cacheStore:       cs,
-		artifacts:        artifacts,
-		broker:           gens.Broker(),
+		logger:              logger,
+		db:                  db,
+		dbPing:              db,
+		rules:               rules,
+		rulever:             rules,
+		faults:              faults,
+		faultStore:          faultStore,
+		faultConfigs:        faultConfigs,
+		configDeleter:       faultConfigs,
+		sdk:                 sdk,
+		sdkInstances:        sdk,
+		registry:            sdk,
+		serviceRules:        rules,
+		serviceFaultConfigs: faultConfigs,
+		experiments:         experiments,
+		phaseHistory:        experiments,
+		phaseReader:         experiments,
+		phaseFaultEvents:    phaseFaultEvents,
+		workflows:           workflows,
+		workloads:           workloads,
+		policies:            policies,
+		traces:              traces,
+		zeus:                zeusClient,
+		generations:         gens,
+		materializer:        mat,
+		orch:                orch,
+		cacheStore:          cs,
+		artifacts:           artifacts,
+		broker:              gens.Broker(),
 	}
 }
 
