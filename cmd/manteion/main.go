@@ -74,6 +74,7 @@ func main() {
 	workflowRepo := store.NewWorkflowRepo(database)
 	workloadRepo := store.NewWorkloadRepo(database)
 	traceRepo := store.NewTraceRepo(database)
+	artifactRepo := store.NewReplayArtifactRepo(database)
 
 	// Create zeus client.
 	zeusClient := zeus.NewClient(zeusURL)
@@ -137,7 +138,7 @@ func main() {
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
-		zeusClient, gens, mat, orch, cs, policyRepo,
+		zeusClient, gens, mat, orch, cs, artifactRepo, policyRepo,
 	)
 
 	httpServer := &http.Server{

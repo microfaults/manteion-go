@@ -58,6 +58,7 @@ type Server struct {
 	materializer     desiredMaterializer // the *desired.Materializer; separate field so tests can inject a fake
 	orch             *orchestrator.Orchestrator
 	cacheStore       *cachestore.Store
+	artifacts        artifactReader // the *store.ReplayArtifactRepo; an interface so tests can inject a fake
 	broker           *EventBroker
 
 	// shutdown is done once the HTTP server begins shutting down
@@ -87,6 +88,7 @@ func NewServer(
 	mat *desired.Materializer,
 	orch *orchestrator.Orchestrator,
 	cs *cachestore.Store,
+	artifacts *store.ReplayArtifactRepo,
 	policies *store.PolicyRepo,
 ) *Server {
 	return &Server{
@@ -116,6 +118,7 @@ func NewServer(
 		materializer:     mat,
 		orch:             orch,
 		cacheStore:       cs,
+		artifacts:        artifacts,
 		broker:           gens.Broker(),
 	}
 }
@@ -290,6 +293,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Cache ingest + serve
 	mux.HandleFunc("POST /api/v1/cache/ingest", s.handleCacheIngest)
 	mux.HandleFunc("GET /api/v1/cache/entries", s.handleCacheEntries)
+	mux.HandleFunc("GET /api/v1/cache/artifacts/{id}", s.handleCacheArtifact) // GET also serves HEAD
 	mux.HandleFunc("POST /api/v1/sdk/cachebox/drain", s.handleCacheDrain)
 
 	// Zeus proxy — workflow lifecycle (register, validate, trigger runs, view status).

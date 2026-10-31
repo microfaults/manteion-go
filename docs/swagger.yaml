@@ -635,6 +635,62 @@ info:
   version: '1.0'
 openapi: 3.1.0
 paths:
+  /cache/artifacts/{id}:
+    get:
+      description: "Immutable NDJSON replay set (one CacheBoxWireEntry per line) named\
+        \ by\nRuleSync.replay_set.id (\"sha256:<hex>\" of the file bytes). Supports\n\
+        HEAD (Content-Length, ETag) and Range (206); the instance fetches it in\n\u2264\
+        4 MiB ranges and commits when count and the W5 digest match."
+      parameters:
+      - description: artifact id (sha256:<hex>)
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: bytes=a-b; answered 206, or 416 past the end
+        in: header
+        name: Range
+        schema:
+          type: string
+      - description: the artifact's ETag; a match answers 304
+        in: header
+        name: If-None-Match
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+          description: the artifact; headers ETag, Content-Length
+        '206':
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+          description: the requested byte range; headers ETag, Content-Range
+        '304':
+          description: unchanged; the artifact is immutable
+        '404':
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: 'unknown artifact (an id that is not sha256: and 64 lowercase
+            hex digits is unknown too)'
+        '416':
+          description: range not satisfiable
+        '500':
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: artifact lookup failed, or its file is unavailable
+      summary: Fetch a replay-set artifact
+      tags:
+      - cache
   /faults/catalog:
     get:
       description: 'Lists every supported (category, fault_type) pair with its
