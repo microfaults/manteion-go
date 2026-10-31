@@ -104,7 +104,13 @@ func main() {
 		os.Exit(1)
 	}
 	phaseFaultEventRepo := store.NewPhaseFaultEventRepo(database)
-	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, gens, logger)
+	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, artifactRepo, gens, logger)
+	// Convergence barrier (desired-state contract §4): a phase entry or resume
+	// bumps its services and waits up to MANTEION_CONVERGE_TIMEOUT for every
+	// alive instance to observe the bump (and, on a frozen service, to hold the
+	// replay set committed), failing the phase on timeout; an exit or drain
+	// waits as long and only logs.
+	orch.WithConvergeTimeout(envDurationOr("MANTEION_CONVERGE_TIMEOUT", 30*time.Second))
 	// Drain barrier (MANT-2): MANTEION_DRAIN_TIMEOUT must be ≥ 3× the SDK poll
 	// interval + flush time (default 30s); MANTEION_ALLOW_DEGRADED_BASELINE lets
 	// isolation phases start from a degraded recording.

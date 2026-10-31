@@ -169,7 +169,7 @@ func TestPhaseWorkflowDatasets(t *testing.T) {
 		expRepo, store.NewRuleRepo(database, nil), store.NewFaultRepo(database),
 		store.NewWorkloadRepo(database), wfRepo,
 		controller, nil, nil, cachestore.New(t.TempDir()),
-		store.NewPhaseFaultEventRepo(database),
+		store.NewPhaseFaultEventRepo(database), store.NewReplayArtifactRepo(database),
 		desired.NewGenerations(store.NewGenerationRepo(database), desired.NewBroker()), logger,
 	)
 	orch.WithPollInterval(20 * time.Millisecond)

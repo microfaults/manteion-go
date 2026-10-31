@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
@@ -106,13 +107,44 @@ func writeTestJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// registerSDK registers one live instance of service at addr and deregisters it
-// on cleanup. Register stamps last_poll_at=now(), so the instance is "alive".
-func registerSDK(t *testing.T, service, addr string) {
+// registerSDK registers one live instance of service at addr, deregisters it
+// on cleanup, and returns its id. Register stamps last_poll_at=now(), so the
+// instance is "alive".
+func registerSDK(t *testing.T, service, addr string) string {
 	t.Helper()
 	inst := &model.SDKInstance{ID: id.New("sdk"), Service: service, Version: "test", Address: addr}
 	if err := testSDKRepo.Register(context.Background(), inst); err != nil {
 		t.Fatalf("register sdk: %v", err)
 	}
 	t.Cleanup(func() { _ = testSDKRepo.Deregister(context.Background(), inst.ID) })
+	return inst.ID
+}
+
+// ackGenerations simulates a converging instance: every 20ms it records the
+// service's current generation as observed and, when artifact != "", reports
+// the replay set committed under it. Stops at test cleanup.
+func ackGenerations(t *testing.T, o *Orchestrator, instanceID, service, artifact string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				gen, err := o.generations.Get(ctx, service)
+				if err != nil {
+					continue
+				}
+				_ = testSDKRepo.RecordPoll(ctx, instanceID, gen)
+				if artifact != "" {
+					_ = testSDKRepo.RecordStatus(ctx, instanceID, model.ObservedStatus{AppliedGeneration: gen,
+						ReplaySet: &model.ReplaySetStatus{ID: artifact, State: "committed"}})
+				}
+			}
+		}
+	}()
 }

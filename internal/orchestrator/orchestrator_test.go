@@ -109,13 +109,18 @@ func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 	}
 	gens := desired.NewGenerations(store.NewGenerationRepo(testDB), desired.NewBroker())
 	o := New(testExpRepo, testRuleRepo, testFaultRepo, testWorkloadRepo, testWorkflowRepo,
-		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB), gens, logger)
+		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB),
+		store.NewReplayArtifactRepo(testDB), gens, logger)
 	o.WithPollInterval(50 * time.Millisecond)
 	o.WithMaxPollDuration(15 * time.Second)
 	// Keep the drain barrier fast so tests never wait the 30s production bound;
 	// tests that exercise the gate directly override these.
 	o.WithDrainTimeout(500 * time.Millisecond)
 	o.WithDrainPollInterval(20 * time.Millisecond)
+	// Likewise the convergence barrier: an instance that never acks costs a
+	// test 300ms at an exit. Tests that wait for convergence raise the bound.
+	o.WithConvergeTimeout(300 * time.Millisecond)
+	o.WithConvergePollInterval(20 * time.Millisecond)
 	return o
 }
 

@@ -37,8 +37,10 @@ import (
 )
 
 // Orchestrator drives experiment execution: starting/stopping phases,
-// pushing rules, freezing cache-box services, supervising zeus attacks,
-// harvesting results, and updating phase status as the experiment progresses.
+// writing the desired state they imply (replay-set artifacts, generation
+// bumps) and waiting for the SDK fleet to converge on it, supervising zeus
+// attacks, harvesting results, and updating phase status as the experiment
+// progresses.
 type Orchestrator struct {
 	experiments *store.ExperimentRepo
 	rules       *store.RuleRepo
@@ -50,7 +52,8 @@ type Orchestrator struct {
 	zeusClient  *zeus.Client
 	cacheStore  *cachestore.Store
 	faultEvents *store.PhaseFaultEventRepo
-	generations *desired.Generations // per-service desired-state generations, bumped on phase transitions
+	artifacts   *store.ReplayArtifactRepo // replay sets assigned to frozen (phase, service) pairs
+	generations *desired.Generations      // per-service desired-state generations, bumped on phase transitions
 	logger      *slog.Logger
 
 	maxPollDuration time.Duration
@@ -65,6 +68,13 @@ type Orchestrator struct {
 	drainTimeout          time.Duration
 	drainPollInterval     time.Duration
 	allowDegradedBaseline bool
+
+	// Convergence barrier (contract §4). convergeTimeout bounds how long a
+	// phase entry waits for the fleet to observe its bump (fatal) and an exit
+	// or drain waits (logged); convergePollInterval is how often the barrier
+	// re-reads the observed state.
+	convergeTimeout      time.Duration
+	convergePollInterval time.Duration
 
 	// zeusDatasetID is the dataset a workflow run binds to when its
 	// phase_workflows row carries no dataset_id of its own
@@ -92,30 +102,34 @@ func New(
 	zeusClient *zeus.Client,
 	cs *cachestore.Store,
 	faultEvents *store.PhaseFaultEventRepo,
+	artifacts *store.ReplayArtifactRepo,
 	gens *desired.Generations,
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
-		experiments:       experiments,
-		rules:             rules,
-		faults:            faults,
-		workloads:         workloads,
-		workflows:         workflows,
-		controller:        controller,
-		prom:              prom,
-		zeusClient:        zeusClient,
-		cacheStore:        cs,
-		faultEvents:       faultEvents,
-		generations:       gens,
-		logger:            logger,
-		maxPollDuration:   defaultMaxPollDuration,
-		pollInterval:      defaultZeusPollInterval,
-		pollGrace:         defaultPollGrace,
-		autoComplete:      true,
-		drainTimeout:      30 * time.Second,
-		drainPollInterval: 200 * time.Millisecond,
-		running:           make(map[string]context.CancelFunc),
-		expLocks:          make(map[string]*sync.Mutex),
+		experiments:          experiments,
+		rules:                rules,
+		faults:               faults,
+		workloads:            workloads,
+		workflows:            workflows,
+		controller:           controller,
+		prom:                 prom,
+		zeusClient:           zeusClient,
+		cacheStore:           cs,
+		faultEvents:          faultEvents,
+		artifacts:            artifacts,
+		generations:          gens,
+		logger:               logger,
+		maxPollDuration:      defaultMaxPollDuration,
+		pollInterval:         defaultZeusPollInterval,
+		pollGrace:            defaultPollGrace,
+		autoComplete:         true,
+		drainTimeout:         30 * time.Second,
+		drainPollInterval:    200 * time.Millisecond,
+		convergeTimeout:      defaultConvergeTimeout,
+		convergePollInterval: defaultConvergePollInterval,
+		running:              make(map[string]context.CancelFunc),
+		expLocks:             make(map[string]*sync.Mutex),
 	}
 }
 
@@ -125,6 +139,15 @@ func (o *Orchestrator) WithDrainTimeout(d time.Duration) { o.drainTimeout = d }
 
 // WithDrainPollInterval overrides how often the drain gate re-checks (test seam).
 func (o *Orchestrator) WithDrainPollInterval(d time.Duration) { o.drainPollInterval = d }
+
+// WithConvergeTimeout overrides how long a phase transition waits for the
+// fleet to converge on its bump (MANTEION_CONVERGE_TIMEOUT, default 30s): fatal
+// at entry and resume, logged at exit and drain.
+func (o *Orchestrator) WithConvergeTimeout(d time.Duration) { o.convergeTimeout = d }
+
+// WithConvergePollInterval overrides how often the convergence barrier
+// re-reads the fleet's observed state (test seam; default 500ms).
+func (o *Orchestrator) WithConvergePollInterval(d time.Duration) { o.convergePollInterval = d }
 
 // WithAllowDegradedBaseline lets isolation phases start from a degraded
 // recording (MANTEION_ALLOW_DEGRADED_BASELINE).
