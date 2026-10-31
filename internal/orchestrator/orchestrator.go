@@ -305,8 +305,11 @@ func (o *Orchestrator) PauseExperiment(ctx context.Context, experimentID string)
 }
 
 // ResumeExperiment resumes a paused experiment: every paused phase is
-// restarted (rules re-pushed, attacks re-launched, poller respawned), then
-// the scheduler re-walks in case the experiment stalled between phases.
+// restarted (its services bumped back onto the phase's desired state and the
+// fleet waited on, attacks re-launched, poller respawned), then the scheduler
+// re-walks in case the experiment stalled between phases. When no phase
+// resumes, the first resume failure is returned (a phase whose fleet did not
+// converge stays paused).
 func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string) error {
 	lk := o.experimentLock(experimentID)
 	lk.Lock()
@@ -327,6 +330,7 @@ func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string
 		return fmt.Errorf("orchestrator: list phases: %w", err)
 	}
 	resumed := 0
+	var resumeErr error // the first phase resume that failed
 	for _, p := range phases {
 		if p.Status != "paused" {
 			continue
@@ -334,12 +338,18 @@ func (o *Orchestrator) ResumeExperiment(ctx context.Context, experimentID string
 		if err := o.StartPhase(ctx, p.ID); err != nil {
 			o.logger.Warn("orchestrator: resume experiment: resume phase failed",
 				"phase_id", p.ID, "error", err)
+			if resumeErr == nil {
+				resumeErr = err
+			}
 			continue
 		}
 		resumed++
 	}
 	if resumed == 0 {
 		lk.Unlock()
+		if resumeErr != nil {
+			return resumeErr
+		}
 		return invalidState("experiment", experimentID, exp.Status, "paused phase",
 			fmt.Sprintf("orchestrator: experiment %q has no paused phase to resume", experimentID))
 	}

@@ -21,13 +21,16 @@ type drainTarget struct {
 // no new records are generated; bumps the generation of every service the phase
 // records — no longer 'running', the phase has dropped their record rule from
 // the materialized desired state, and the bump wakes their held long-polls so
-// the SDK's drain tracker sees the rule go and flushes + reports; waits
-// (bounded) for every expected instance; and persists the outcome.
+// the SDK's drain tracker sees the rule go and flushes + reports — and waits,
+// bounded and non-fatally, for the fleet to observe the bump (the drain report
+// stays the real acknowledgement); waits (bounded) for every expected
+// instance's report; and persists the outcome.
 func (o *Orchestrator) runDrainBarrier(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow) {
 	o.cancelPoller(p.ID)
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
-	_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service
+	targets, _ := o.bumpDesired(ctx, p) // a failed bump is logged per service
+	o.awaitConvergedNonFatal(ctx, p, targets)
 
 	result := o.awaitDrain(ctx, p)
 	if err := o.experiments.UpsertPhaseDrain(ctx, p.ID, result); err != nil {

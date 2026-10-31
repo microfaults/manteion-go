@@ -20,9 +20,11 @@ import (
 )
 
 // StartPhase claims a phase (pending → running for a fresh start, paused →
-// running for a resume) and runs the enter sequence: cache preload (fresh
-// non-baseline only) → freeze frozen_services → push phase rules →
-// materialize workflows into zeus → start attacks → spawn the poller.
+// running for a resume) and runs the enter sequence: replay-set artifacts for
+// the frozen services (built on a fresh start, re-read on a resume) → one
+// generation bump per service → wait for the fleet to converge on it →
+// materialize workflows into zeus → start runs and attacks → spawn the
+// poller.
 //
 // Deliberately permissive about ordering: the scheduler always starts phases
 // in position order, but an operator may start any pending phase directly
@@ -68,13 +70,14 @@ func (o *Orchestrator) phaseStatus(ctx context.Context, phaseID string) string {
 }
 
 // PausePhase suspends a running phase: the poller, zeus attacks and k6 runs
-// stop. A paused phase is not running, so its rules and its cache-box role (an
-// isolation phase's replay rule, a baseline's record rule) leave the desired
-// state of every service it touches and stop applying on those instances' next
-// poll; pause bumps each service's generation so held long-polls take that
-// poll now. Pause does not thaw: the freeze pushed to the frozen services
-// stays, and resume re-asserts it. Resume via StartPhase, whose enter serves
-// the phase again and bumps the same services.
+// stop. A paused phase is not running, so its rules, its cache-box role (an
+// isolation phase's replay rule, a baseline's record rule) and a frozen
+// service's freeze_cfg and replay_set all leave the desired state of every
+// service it touches and stop applying on those instances' next poll; pause
+// bumps each service's generation so held long-polls take that poll now. Pause
+// thaws. Resume via StartPhase, whose enter serves the phase again, bumps the
+// same services and waits for the fleet like a fresh start (a frozen service's
+// instances pull the phase's replay set again).
 func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 	paused, err := o.experiments.TransitionPhase(ctx, phaseID, "paused", "running")
 	if err != nil {
@@ -139,7 +142,8 @@ func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus strin
 // enterPhase runs the phase enter sequence after the running claim. Data
 // errors (broken rules, unloadable workflows, zero startable attacks) and a
 // fleet that does not converge fail the phase via failPhase, recording the
-// error as the phase's failure reason.
+// error as the phase's failure reason — except a resume whose fleet does not
+// converge, which leaves the phase paused (leavePaused).
 func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase, fresh bool) error {
 	// The converge gate can hold the caller for MANTEION_CONVERGE_TIMEOUT, and
 	// a caller that goes away meanwhile (an operator's client hanging up) must
@@ -186,7 +190,11 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		err = o.waitConverged(ctx, targets, artifacts, o.convergeTimeout)
 	}
 	if err != nil {
-		return fail(fmt.Errorf("orchestrator: converge gate: %w", err))
+		err = fmt.Errorf("orchestrator: converge gate: %w", err)
+		if !fresh {
+			return o.leavePaused(ctx, p, err)
+		}
+		return fail(err)
 	}
 
 	// The wait can be long: a pause or stop that landed meanwhile owns the
@@ -269,6 +277,29 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 	return nil
 }
 
+// leavePaused ends a resume whose fleet did not converge: the phase goes back
+// to paused, and the resume returns cause. Nothing is lost by waiting — load
+// has not started (the converge gate runs before any driver) — so a timed-out
+// resume does not fail the phase; the operator can resume again. The CAS back
+// to paused takes the phase's rules and freeze out of the documents its resume
+// claim had put them back in, so its services are bumped again, after it. It
+// runs on a context the caller cannot cancel, as fail does.
+func (o *Orchestrator) leavePaused(ctx context.Context, p *model.ExperimentPhase, cause error) error {
+	ctx = context.WithoutCancel(ctx)
+	o.logger.Warn("orchestrator: resume did not converge; phase left paused",
+		"phase_id", p.ID, "error", cause)
+	repaused, err := o.experiments.TransitionPhase(ctx, p.ID, "paused", "running")
+	switch {
+	case err != nil:
+		o.logger.Error("orchestrator: return an unconverged resume to paused failed",
+			"phase_id", p.ID, "error", err)
+	case repaused:
+		_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service
+	}
+	// !repaused: a concurrent stop or pause moved the phase on and owns it now.
+	return cause
+}
+
 // failureReason renders an enter-sequence error as the phase's failure
 // reason: the error text without the "orchestrator: " log prefix.
 func failureReason(err error) string {
@@ -300,7 +331,9 @@ func (o *Orchestrator) failPhase(ctx context.Context, phaseID, reason string, fr
 // atomically transitions phaseID to `status` only if the phase's current
 // status is one of `from` (for "failed", together with reason); ONLY the
 // caller that wins that transition runs the side effects: tear down the
-// poller, clear injected rules, thaw frozen services, stop zeus attacks,
+// poller, stop zeus attacks and runs, pull the fidelity verdict (a completed
+// frozen phase), bump the phase's services off its desired state (their rules
+// and freeze leave every document) and wait non-fatally for the fleet,
 // harvest once for "completed", recompute the experiment rollup, and re-walk
 // the scheduler. Losers are a no-op, which is what makes auto-complete, the
 // poller, StopPhase, and cancellation safe to race. Returns whether this
@@ -359,43 +392,39 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 
 	o.cancelPoller(phaseID)
 
-	// M1: stop load BEFORE clearing rules and thawing the frozen service. On an
-	// operator StopPhase of a still-firing phase, tail traffic must not hit the
-	// service after it is un-frozen / its replay rule is cleared, or that traffic
-	// is harvested as frozen data (silent, plausible numbers). Both stops are
-	// idempotent — the recording-phase drain barrier already called them; this is
-	// the non-draining operator-stop path, which reaches teardown directly.
+	// M1: stop load BEFORE the exit bump. On an operator StopPhase of a
+	// still-firing phase, tail traffic must not reach the service once its
+	// instances drop the phase's rules, replay rule and replay set, or that
+	// traffic is harvested as frozen data (silent, plausible numbers). Both
+	// stops are idempotent — the recording-phase drain barrier already called
+	// them; this is the non-draining operator-stop path, which reaches teardown
+	// directly.
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
 
-	// The phase is terminal: its rules are no longer served and its cache-box
-	// rule no longer synthesized, so the desired state of every service it
-	// touched changes. Bump each one's generation so their held long-polls wake
-	// and the SDKs stop recording/replaying and drop the phase's rules now. A
-	// completed recording (persist_cache) phase already lost its record rule at
-	// running → draining, where the drain barrier bumped — that removal is what
-	// the SDK's drain tracker keys off (MANT-2); for a recording phase that
-	// failed or was skipped without draining, this bump is the removal signal.
-	_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service
-
-	svcs, _ := o.phaseServices(ctx, p) // an unreadable rule was logged by the bump above
-	for _, svc := range svcs {
-		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
-			o.logger.Warn("orchestrator: clear rules failed on finish",
-				"phase_id", phaseID, "service", svc, "error", err)
-		}
-	}
-
-	// Fidelity verdict BEFORE thaw (INV-6): pull each frozen instance's W6
-	// snapshot while its counters are intact, compute + persist the verdict, and
-	// carry the per-service replay aggregates (hits/misses/age) into harvest —
-	// the same snapshots the verdict trusted, not the SDK's store counters.
+	// Fidelity verdict BEFORE the exit bump (INV-6): pull each frozen
+	// instance's W6 snapshot while it still holds the replay set — once the
+	// bump wakes it, the instance applies a document without replay_set and
+	// clears the set, and a later pull would read Preload.Committed=false —
+	// compute + persist the verdict, and carry the per-service replay
+	// aggregates (hits/misses/age) into harvest: the same snapshots the verdict
+	// trusted, not the SDK's store counters.
 	var fidelity map[string]replayFidelity
 	if status == "completed" && len(p.FrozenServices) > 0 {
 		fidelity = o.collectFidelityVerdict(ctx, p)
 	}
 
-	o.thawServices(ctx, p)
+	// The phase is terminal: its rules are no longer served, its cache-box rule
+	// no longer synthesized, and a frozen service's freeze_cfg and replay_set
+	// have left its document. Bump each service once — this bump is the rule
+	// clear and the thaw — and wait, bounded and non-fatally, for the fleet to
+	// observe it. A completed recording (persist_cache) phase already lost its
+	// record rule at running → draining, where the drain barrier bumped — that
+	// removal is what the SDK's drain tracker keys off (MANT-2); for a
+	// recording phase that failed or was skipped without draining, this bump is
+	// the removal signal.
+	targets, _ := o.bumpDesired(ctx, p) // a failed bump is logged per service
+	o.awaitConvergedNonFatal(ctx, p, targets)
 
 	if o.faultEvents != nil {
 		if err := o.faultEvents.EndOpenForPhase(ctx, phaseID, time.Now()); err != nil {

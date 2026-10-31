@@ -30,6 +30,10 @@ type fakeSDK struct {
 	// fidelity, when set, is served at GET /cachebox/fidelity; nil ⇒ 503 (used
 	// to simulate a missing-telemetry instance).
 	fidelity *atroposdk.FidelitySnapshot
+	// onFidelity, when set, runs in the fidelity handler before it answers;
+	// genAtPull is where a test's onFidelity records the generation it saw.
+	onFidelity func()
+	genAtPull  atomic.Uint64
 
 	// mu guards pushed, the compiled rule names POSTed to /admin/rules — lets
 	// tests assert the push channel is a strict projection of the poll
@@ -89,6 +93,9 @@ func newFakeSDK(t *testing.T) *fakeSDK {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /cachebox/fidelity", func(w http.ResponseWriter, _ *http.Request) {
+		if f.onFidelity != nil {
+			f.onFidelity()
+		}
 		if f.fidelity == nil {
 			http.Error(w, "no snapshot", http.StatusServiceUnavailable)
 			return

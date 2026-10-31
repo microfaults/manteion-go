@@ -5,63 +5,64 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 )
 
-// TestFinishPhase_StopsLoadBeforeThawAndClear pins M1: on an operator StopPhase
-// of a still-firing isolation phase (no drain barrier — persist_cache is false),
-// the zeus attacks and runs MUST be stopped BEFORE the frozen service is thawed
-// and its replay rule is cleared. In the buggy order the service was un-frozen
-// and its rule cleared while tail traffic was still arriving, so that traffic hit
-// the service un-frozen and was harvested as frozen data — silent, plausible
-// numbers that invalidate the isolation delta.
-func TestFinishPhase_StopsLoadBeforeThawAndClear(t *testing.T) {
+// TestFinishPhase_StopsLoadBeforeBump pins M1 under desired state: on an
+// operator stop of a still-firing isolation phase (no drain barrier, since
+// persist_cache is false), the zeus attacks and runs MUST stop BEFORE the exit
+// bump that takes the frozen service's replay rule and replay set out of its
+// instances' documents. In the other order, tail traffic still arriving would
+// hit the service un-frozen and be harvested as frozen data — silent,
+// plausible numbers that invalidate the isolation delta.
+func TestFinishPhase_StopsLoadBeforeBump(t *testing.T) {
 	ctx := context.Background()
 
-	var mu sync.Mutex
-	var order []string
-	rec := func(ev string) { mu.Lock(); order = append(order, ev); mu.Unlock() }
-
-	// One recording server standing in for BOTH zeus (/api/v1/*) and the frozen
-	// service's SDK (/admin/*, /cachebox/*) — the path namespaces are disjoint.
+	// A zeus that, at each stop, checks whether the frozen service's
+	// rules_changed broadcast (the bump) has already gone out.
+	var (
+		mu          sync.Mutex
+		stops       []string
+		bumpedFirst bool
+		events      chan desired.Event
+	)
+	stop := func(kind string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			stops = append(stops, kind)
+			select {
+			case <-events:
+				bumpedFirst = true
+			default:
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /admin/rules", func(w http.ResponseWriter, _ *http.Request) {
-		rec("clear_rules")
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("DELETE /admin/cachebox", func(w http.ResponseWriter, _ *http.Request) {
-		rec("thaw")
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("GET /cachebox/fidelity", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("{}"))
-	})
-	mux.HandleFunc("DELETE /api/v1/attacks/{id}", func(w http.ResponseWriter, _ *http.Request) {
-		rec("stop_attack")
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("DELETE /api/v1/runs/{run_id}", func(w http.ResponseWriter, _ *http.Request) {
-		rec("stop_run")
-		w.WriteHeader(http.StatusNoContent)
+	mux.HandleFunc("DELETE /api/v1/attacks/{id}", stop("stop_attack"))
+	mux.HandleFunc("DELETE /api/v1/runs/{run_id}", stop("stop_run"))
+	mux.HandleFunc("GET /api/v1/attacks/{id}/result", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("{}")) // a final (empty) result: harvest does not back off
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	o := newOrch(t, srv.URL)
+	events = o.generations.Broker().Subscribe("frontend")
+	t.Cleanup(func() { o.generations.Broker().Unsubscribe("frontend", events) })
 
 	exp := mkExp(t)
 	iso := mkRunningIsolation(t, exp.ID, "frontend", 0) // frozen, NOT persist_cache → no drain barrier
-	registerSDK(t, "frontend", srv.URL)
-
 	// A phase workflow carrying live attack + run handles so teardown has load to
-	// stop; both DELETEs land on the recording server.
+	// stop; both DELETEs land on the fake zeus.
 	_ = attachAttackWorkflow(t, iso.ID, model.PhaseWorkflow{
 		VUs: 1, DurationSec: 1,
 		ZeusAttackID: "atk-" + iso.ID, ZeusRunID: "run-" + iso.ID,
@@ -73,29 +74,19 @@ func TestFinishPhase_StopsLoadBeforeThawAndClear(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	idx := func(ev string) int {
-		for i, e := range order {
-			if e == ev {
-				return i
-			}
-		}
-		return -1
+	if !slices.Contains(stops, "stop_attack") || !slices.Contains(stops, "stop_run") {
+		t.Fatalf("teardown stopped %v, want the attack and the run", stops)
 	}
-	for _, ev := range []string{"stop_attack", "stop_run", "thaw", "clear_rules"} {
-		if idx(ev) < 0 {
-			t.Fatalf("teardown event %q never happened; order=%v", ev, order)
-		}
+	if bumpedFirst {
+		t.Fatalf("the exit bump went out before the load stopped (stops: %v); load must stop first", stops)
 	}
-	// The whole point: load stops before the service is thawed and its rule cleared.
-	for _, load := range []string{"stop_attack", "stop_run"} {
-		if idx(load) > idx("thaw") {
-			t.Errorf("%s (%d) happened AFTER thaw (%d); load must stop first. order=%v",
-				load, idx(load), idx("thaw"), order)
+	select {
+	case ev := <-events:
+		if ev.Type != "rules_changed" {
+			t.Fatalf("event %+v, want rules_changed", ev)
 		}
-		if idx(load) > idx("clear_rules") {
-			t.Errorf("%s (%d) happened AFTER clear_rules (%d); load must stop first. order=%v",
-				load, idx(load), idx("clear_rules"), order)
-		}
+	default:
+		t.Fatal("the phase exit never bumped frontend")
 	}
 }
 

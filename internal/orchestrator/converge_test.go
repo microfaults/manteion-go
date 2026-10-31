@@ -480,3 +480,86 @@ func TestEnterPhase_FailedBumpFailsThePhase(t *testing.T) {
 		t.Fatalf("phase = %s / %q, want failed with the bump error", got.Status, got.FailureReason)
 	}
 }
+
+func TestFinishPhase_VerdictBeforeBump(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	mkCompletedBaseline(t, exp.ID, 0)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	g0, _ := o.generations.Get(ctx, "frontend")
+
+	sdk := newFakeSDK(t)
+	sdk.fidelity = cleanSnapshot()
+	// The fake records the service generation at the moment of the fidelity pull.
+	sdk.onFidelity = func() { g, _ := o.generations.Get(context.Background(), "frontend"); sdk.genAtPull.Store(g) }
+	registerSDK(t, "frontend", sdk.server.URL)
+
+	if !o.finishPhase(ctx, iso.ID, "completed", "running") {
+		t.Fatal("finishPhase returned false")
+	}
+	if got := sdk.genAtPull.Load(); got != g0 {
+		t.Fatalf("fidelity pulled at generation %d, want %d (before the thaw bump)", got, g0)
+	}
+	if g1, _ := o.generations.Get(ctx, "frontend"); g1 <= g0 {
+		t.Fatalf("phase exit did not bump: %d → %d", g0, g1)
+	}
+	v, err := testExpRepo.GetPhaseVerdict(ctx, iso.ID)
+	if err != nil || v == nil || v.Verdict != "VALID" {
+		t.Fatalf("verdict = %+v, %v", v, err)
+	}
+}
+
+// Pause thaws under desired state (a paused phase leaves every service's
+// document), so a resume is an entry: bump and wait with the convergence
+// timeout. A resume whose fleet does not converge fails and leaves the phase
+// paused, through the phase resume and the experiment resume alike (which
+// reports that failure, not "no paused phase"); once the fleet converges, the
+// resume goes through.
+func TestResume_UnconvergedFleetLeavesThePhasePaused(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.autoComplete = false
+	exp := mkExp(t)
+	if err := testExpRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	svc := id.New("svc-resume")
+	ph := mkRunningRulePhase(t, exp.ID, svc, 0)
+	if err := o.PausePhase(ctx, ph.ID); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	inst := registerSDK(t, svc, "http://late.invalid") // alive, not acking yet
+
+	g0 := generation(t, o, svc)
+	err := o.StartPhase(ctx, ph.ID)
+	if err == nil || !strings.Contains(err.Error(), "converge gate") || !strings.Contains(err.Error(), inst) {
+		t.Fatalf("resume err = %v, want a converge-gate failure naming %s", err, inst)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "paused" || got.FailureReason != "" {
+		t.Fatalf("phase = %s / %q after an unconverged resume, want paused with no failure reason", got.Status, got.FailureReason)
+	}
+	// The resume bumped; the return to paused took the phase out of the
+	// document again, and bumped once more to say so.
+	if g := generation(t, o, svc); g != g0+2 {
+		t.Fatalf("generation %d → %d, want +2 (the resume, then back to paused)", g0, g)
+	}
+
+	err = o.ResumeExperiment(ctx, exp.ID)
+	var state *ErrInvalidState
+	if err == nil || errors.As(err, &state) || !strings.Contains(err.Error(), "converge gate") {
+		t.Fatalf("ResumeExperiment err = %v, want the phase's converge-gate failure, not an invalid-state refusal", err)
+	}
+	if got := getPhase(t, ph.ID).Status; got != "paused" {
+		t.Fatalf("phase status = %q, want still paused", got)
+	}
+
+	ackGenerations(t, o, inst, svc, "")
+	o.WithConvergeTimeout(5 * time.Second) // returns once the instance acks
+	if err := o.ResumeExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("ResumeExperiment with a converging fleet: %v", err)
+	}
+	if got := getPhase(t, ph.ID).Status; got != "running" {
+		t.Fatalf("phase status = %q, want running", got)
+	}
+}
