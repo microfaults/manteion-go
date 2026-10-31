@@ -149,17 +149,22 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleInstanceKillSwitch disables every enabled rule targeting the
-// instance's service and cancels every active fault config for it: the
-// service's desired state is left with no rules and no faults.
+// instance's service and cancels every active fault config for it, so the
+// service's desired state loses its rules and its long-running faults. It ends
+// no experiment phase: what a running phase itself puts in the service's
+// document (a synthesized cache-box rule, freeze_cfg, replay_set) stays until
+// that phase stops.
 //
 // @Summary      Kill-switch an SDK instance's rules and faults
 // @Description  Disables every currently-enabled rule whose service matches the
 // @Description  instance's service, through the same full rule update as
 // @Description  PUT /rules/{id} (the rule version and the service generation bump
 // @Description  once per rule), and cancels every active fault config for the service;
-// @Description  bumps the service generation once after the last write, so polling SDKs
-// @Description  converge on no rules and no faults on their next poll (held polls wake
-// @Description  and SSE subscribers are nudged too).
+// @Description  when anything changed, bumps the service generation once after the last
+// @Description  write, so polling SDKs drop those rules and faults on their next poll (held
+// @Description  polls wake and SSE subscribers are nudged too). It ends no experiment
+// @Description  phase: a running phase's synthesized cache-box rule, freeze_cfg and
+// @Description  replay_set stay in the service's document until that phase stops.
 // @Description  Idempotent: a repeat call reports empty disabled_rule_ids and
 // @Description  cancelled_fault_config_ids and bumps nothing.
 // @Tags         sdk

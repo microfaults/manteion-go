@@ -1373,11 +1373,15 @@ paths:
 
         once per rule), and cancels every active fault config for the service;
 
-        bumps the service generation once after the last write, so polling SDKs
+        when anything changed, bumps the service generation once after the last
 
-        converge on no rules and no faults on their next poll (held polls wake
+        write, so polling SDKs drop those rules and faults on their next poll (held
 
-        and SSE subscribers are nudged too).
+        polls wake and SSE subscribers are nudged too). It ends no experiment
+
+        phase: a running phase''s synthesized cache-box rule, freeze_cfg and
+
+        replay_set stay in the service''s document until that phase stops.
 
         Idempotent: a repeat call reports empty disabled_rule_ids and
 
