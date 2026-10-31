@@ -40,6 +40,7 @@ type Server struct {
 	faults           *store.FaultRepo
 	faultStore       FaultStore
 	faultConfigs     *store.FaultConfigRepo
+	configDeleter    faultConfigDeleter // same as faultConfigs; separate field so tests can inject a fake
 	sdk              *store.SDKRepo
 	sdkInstances     sdkInstanceReader // same as sdk; separate field so tests can inject a fake
 	serviceRules     serviceRuleStore  // same as rules; separate field so tests can inject a fake
@@ -89,6 +90,7 @@ func NewServer(
 		faults:           faults,
 		faultStore:       faultStore,
 		faultConfigs:     faultConfigs,
+		configDeleter:    faultConfigs,
 		sdk:              sdk,
 		sdkInstances:     sdk,
 		serviceRules:     rules,

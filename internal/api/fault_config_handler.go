@@ -9,6 +9,14 @@ import (
 	"manteion-go/internal/store"
 )
 
+// faultConfigDeleter is the slice of the fault-config repo the delete handler
+// depends on, so its test can inject a DB-free fake (the sdkInstances /
+// serviceRules pattern). NewServer wires the real repo into it.
+type faultConfigDeleter interface {
+	Get(ctx context.Context, id string) (*model.FaultConfig, error)
+	Delete(ctx context.Context, id string) error
+}
+
 // handleCreateFaultConfig registers a long-running fault in the "ready" state.
 // It is not applied to any instance until fired.
 func (s *Server) handleCreateFaultConfig(w http.ResponseWriter, r *http.Request) {
@@ -52,10 +60,24 @@ func (s *Server) handleListFaultConfigs(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleDeleteFaultConfig removes a fault config. Deleting an active config
-// stops it: the next poll omits it and the SDK reconciles it away.
+// stops it: the service's generation is bumped, so the next poll omits it and
+// the SDK reconciles it away.
 func (s *Server) handleDeleteFaultConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.faultConfigs.Delete(r.Context(), id); err != nil {
+	ctx := r.Context()
+
+	// Read the config first: its service is the generation to bump once it is gone.
+	cfg, err := s.configDeleter.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "fault config not found")
+			return
+		}
+		s.logger.Error("read fault config for delete failed", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to delete fault config")
+		return
+	}
+	if err := s.configDeleter.Delete(ctx, id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "fault config not found")
 			return
@@ -64,6 +86,7 @@ func (s *Server) handleDeleteFaultConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to delete fault config")
 		return
 	}
+	s.bumpGeneration(ctx, cfg.Service)
 	w.WriteHeader(http.StatusNoContent)
 }
 

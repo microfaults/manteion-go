@@ -185,20 +185,27 @@ func (e *genEnv) watch(service string) chan desired.Event {
 	return ch
 }
 
-// wantEvents asserts, and drains, the events announced on ch so far. Every
-// announcement is made on the writer's goroutine before its call returns, so
-// after a handler has answered they are all already queued.
-func (e *genEnv) wantEvents(ch chan desired.Event, generations ...uint64) {
-	e.t.Helper()
-	var got, want []string
-	for drained := false; !drained; {
+// drainEvents returns, and consumes, the events announced on ch so far as
+// "type data" strings. Every announcement is made on the writer's goroutine
+// before its call returns, so once a handler has answered they are all already
+// queued.
+func drainEvents(ch chan desired.Event) []string {
+	var got []string
+	for {
 		select {
 		case ev := <-ch:
 			got = append(got, ev.Type+" "+ev.Data)
 		default:
-			drained = true
+			return got
 		}
 	}
+}
+
+// wantEvents asserts, and drains, the events announced on ch so far.
+func (e *genEnv) wantEvents(ch chan desired.Event, generations ...uint64) {
+	e.t.Helper()
+	got := drainEvents(ch)
+	var want []string
 	for _, g := range generations {
 		want = append(want, fmt.Sprintf(`rules_changed {"generation":%d}`, g))
 	}
@@ -301,8 +308,9 @@ func TestRuleHandlers_BumpAndAnnounceTheServiceGeneration_DB(t *testing.T) {
 }
 
 // TestFaultConfigHandlers_BumpAndAnnounceTheServiceGeneration_DB pins that
-// firing and cancelling a fault config each bump the config's service and
-// announce it, and that a refused fire/cancel does neither.
+// firing, cancelling and deleting a fault config each bump the config's service
+// and announce it, and that a refused fire/cancel or a delete of nothing does
+// neither.
 func TestFaultConfigHandlers_BumpAndAnnounceTheServiceGeneration_DB(t *testing.T) {
 	e := newGenEnv(t)
 	svc, other := "svc-"+e.tag, "other-"+e.tag
@@ -335,6 +343,27 @@ func TestFaultConfigHandlers_BumpAndAnnounceTheServiceGeneration_DB(t *testing.T
 		t.Fatalf("second cancel: status = %d, want 409", w.Code)
 	}
 	e.wantGeneration(svc, g0+2)
+	e.wantEvents(ev)
+
+	// Deleting an active config stops it, so the delete bumps too; deleting what
+	// is already gone bumps nothing.
+	activeID := e.faultConfig(svc, 0)
+	if w := e.do(http.MethodPost, "/api/v1/faults/configs/"+activeID+"/fire", nil); w.Code != http.StatusOK {
+		t.Fatalf("fire second config: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	e.wantGeneration(svc, g0+3)
+	e.wantEvents(ev, g0+3)
+
+	if w := e.do(http.MethodDelete, "/api/v1/faults/configs/"+activeID, nil); w.Code != http.StatusNoContent {
+		t.Fatalf("delete: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	e.wantGeneration(svc, g0+4)
+	e.wantEvents(ev, g0+4)
+
+	if w := e.do(http.MethodDelete, "/api/v1/faults/configs/"+activeID, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("second delete: status = %d, want 404", w.Code)
+	}
+	e.wantGeneration(svc, g0+4)
 	e.wantEvents(ev)
 
 	e.wantGeneration(other, o0) // another service is never bumped
