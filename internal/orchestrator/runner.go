@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -326,15 +327,18 @@ func (o *Orchestrator) failPhase(ctx context.Context, phaseID, reason string, fr
 
 // endPhase is the single race-safe terminal path for a phase. It
 // atomically transitions phaseID to `status` only if the phase's current
-// status is one of `from` (for "failed", together with reason); ONLY the
-// caller that wins that transition runs the side effects: tear down the
-// poller, stop zeus attacks and runs, pull the fidelity verdict (a completed
-// frozen phase), bump the phase's services off its desired state (their rules
-// and freeze leave every document) and wait non-fatally for the fleet,
-// harvest once for "completed", recompute the experiment rollup, and re-walk
-// the scheduler. Losers are a no-op, which is what makes auto-complete, the
-// poller, StopPhase, and cancellation safe to race. Returns whether this
-// call performed the transition.
+// status is one of `from` (for "failed", together with reason). Just before
+// that CAS it stops the poller and the zeus load and pulls the fidelity
+// snapshots of a completed frozen phase — idempotent or read-only steps that
+// must happen while the phase still holds its status. ONLY the caller that
+// wins the transition runs the side effects that must happen once: record the
+// verdict, bump the phase's services off its desired state (their rules and
+// freeze leave every document) and wait non-fatally for the fleet, harvest
+// once for "completed", recompute the experiment rollup, and re-walk the
+// scheduler. A phase outside `from` is left untouched, and a loser changes
+// nothing, which is what makes auto-complete, the poller, StopPhase, and
+// cancellation safe to race. Returns whether this call performed the
+// transition.
 //
 // Callers on a context that the poller teardown is about to cancel (i.e. the
 // poller itself) must pass context.Background().
@@ -351,6 +355,9 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 		o.logger.Error("orchestrator: finish phase: list workflows failed",
 			"phase_id", phaseID, "error", err)
 		return false
+	}
+	if !slices.Contains(from, p.Status) {
+		return false // not in an allowed source state: nothing to end, nothing touched
 	}
 
 	// A recording (persist_cache) phase completes through the drain barrier
@@ -372,6 +379,29 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 		from = []string{"draining"} // now complete from draining
 	}
 
+	// Before the terminal transition, while the phase still holds its status —
+	// an isolation phase still 'running', so its frozen services' documents
+	// still carry the replay set — stop the poller and the load, then pull the
+	// fidelity snapshots the verdict reads. M1: on an operator StopPhase of a
+	// still-firing phase, tail traffic must not reach the service once its
+	// instances drop the phase's rules, replay rule and replay set, or that
+	// traffic is harvested as frozen data (silent, plausible numbers); the
+	// poller goes first, or it would read the stopped load as a natural end and
+	// race this finish. INV-6: from the CAS on the phase is out of the
+	// documents, and an instance whose held poll re-materializes in that window
+	// (its wait elapsing) drops the replay set and reports
+	// Preload.Committed=false. All of this is idempotent or read-only — the
+	// recording-phase drain barrier already stopped the load — so a caller that
+	// then loses the CAS has changed nothing; only the winner records the
+	// verdict.
+	o.cancelPoller(phaseID)
+	o.stopZeusAttacks(ctx, pws)
+	o.stopPhaseRuns(ctx, pws)
+	var pull *fidelityPull
+	if status == "completed" && len(p.FrozenServices) > 0 {
+		pull = o.pullFidelity(ctx, p)
+	}
+
 	var transitioned bool
 	if status == "failed" {
 		transitioned, err = o.experiments.FailPhase(ctx, phaseID, reason, from...)
@@ -384,31 +414,15 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 		return false
 	}
 	if !transitioned {
-		return false // lost the race / not in an allowed source state
+		return false // lost the race
 	}
 
-	o.cancelPoller(phaseID)
-
-	// M1: stop load BEFORE the exit bump. On an operator StopPhase of a
-	// still-firing phase, tail traffic must not reach the service once its
-	// instances drop the phase's rules, replay rule and replay set, or that
-	// traffic is harvested as frozen data (silent, plausible numbers). Both
-	// stops are idempotent — the recording-phase drain barrier already called
-	// them; this is the non-draining operator-stop path, which reaches teardown
-	// directly.
-	o.stopZeusAttacks(ctx, pws)
-	o.stopPhaseRuns(ctx, pws)
-
-	// Fidelity verdict BEFORE the exit bump (INV-6): pull each frozen
-	// instance's W6 snapshot while it still holds the replay set — once the
-	// bump wakes it, the instance applies a document without replay_set and
-	// clears the set, and a later pull would read Preload.Committed=false —
-	// compute + persist the verdict, and carry the per-service replay
-	// aggregates (hits/misses/age) into harvest: the same snapshots the verdict
-	// trusted, not the SDK's store counters.
+	// The verdict (INV-6), from the snapshots pulled above; harvest carries the
+	// per-service replay aggregates (hits/misses/age) it trusted, not the SDK's
+	// store counters.
 	var fidelity map[string]replayFidelity
-	if status == "completed" && len(p.FrozenServices) > 0 {
-		fidelity = o.collectFidelityVerdict(ctx, p)
+	if pull != nil {
+		fidelity = o.recordVerdict(ctx, p, pull)
 	}
 
 	// The phase is terminal: its rules are no longer served, its cache-box rule

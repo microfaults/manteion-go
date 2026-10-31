@@ -563,3 +563,56 @@ func TestResume_UnconvergedFleetLeavesThePhasePaused(t *testing.T) {
 		t.Fatalf("phase status = %q, want running", got)
 	}
 }
+
+// The verdict's snapshots are pulled before the terminal transition, while the
+// phase still runs: from the CAS on, the phase is out of its frozen services'
+// documents, and an instance whose held poll re-materializes in that window
+// (its wait elapsing) would drop the replay set before the pull. Only the CAS
+// winner records the verdict.
+func TestFinishPhase_VerdictPulledWhileThePhaseRuns(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	mkCompletedBaseline(t, exp.ID, 0)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+
+	sdk := newFakeSDK(t)
+	sdk.fidelity = cleanSnapshot()
+	statusAtPull := make(chan string, 1)
+	sdk.onFidelity = func() {
+		p, err := testExpRepo.GetPhase(context.Background(), iso.ID)
+		if err == nil {
+			select {
+			case statusAtPull <- p.Status:
+			default:
+			}
+		}
+	}
+	registerSDK(t, "frontend", sdk.server.URL)
+
+	if !o.finishPhase(ctx, iso.ID, "completed", "running") {
+		t.Fatal("finishPhase returned false")
+	}
+	select {
+	case got := <-statusAtPull:
+		if got != "running" {
+			t.Fatalf("fidelity pulled with the phase %q, want running (before the terminal transition)", got)
+		}
+	default:
+		t.Fatal("the verdict never pulled the instance's fidelity")
+	}
+	if v, err := testExpRepo.GetPhaseVerdict(ctx, iso.ID); err != nil || v == nil || v.Verdict != "VALID" {
+		t.Fatalf("verdict = %+v, %v", v, err)
+	}
+
+	// A finish that cannot win (the phase is already completed) pulls nothing
+	// and records nothing.
+	if o.finishPhase(ctx, iso.ID, "completed", "running") {
+		t.Fatal("second finishPhase returned true")
+	}
+	select {
+	case got := <-statusAtPull:
+		t.Fatalf("a losing finish pulled fidelity (phase %q)", got)
+	default:
+	}
+}

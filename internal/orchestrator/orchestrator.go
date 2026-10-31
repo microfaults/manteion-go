@@ -10,7 +10,10 @@
 //  2. a per-experiment lock serializing the phase scheduler
 //     (advanceExperiment) so concurrent phase completions can't double-start;
 //  3. a single terminal path (finishPhase, runner.go) whose CAS winner runs
-//     all side effects — teardown, harvest, rollup — exactly once.
+//     the side effects that must happen once — verdict, generation bump,
+//     harvest, rollup — exactly once; the idempotent teardown (poller, zeus
+//     load) and the read-only fidelity pull run just before the CAS, while the
+//     phase still holds its status.
 //
 // Experiment-level pause is DERIVED state: the experiment_status enum has no
 // 'paused' label (phase_status does, deliberately). PauseExperiment pauses

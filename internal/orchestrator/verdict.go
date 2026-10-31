@@ -27,17 +27,22 @@ type replayFidelity struct {
 	AgeMeanMs    float64 // mean replay age across instances (ms)
 }
 
-// collectFidelityVerdict pulls every frozen instance's W6 fidelity snapshot
-// (before thaw, while counters are intact), computes the phase's first-class
-// verdict (INV-6), and persists it. Returns the per-service replay aggregates
-// (hits, misses, mean replay age) — the authoritative source harvest writes
-// into phase_service_cache.
-//
-// Verdict: INVALID if any instance shows a replay miss, an uncommitted preload,
-// a degraded source recording, or missing telemetry (a failed pull); else
-// VALID_WITH_WARNINGS if the recording's divergent-collision rate exceeds 1%;
-// else VALID.
-func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.ExperimentPhase) map[string]replayFidelity {
+// fidelityPull is what a frozen phase's instances reported for its verdict:
+// the W6 snapshots pulled, the per-service replay aggregates, and the findings
+// the verdict reasons over.
+type fidelityPull struct {
+	snapshots                                    []atroposdk.FidelitySnapshot
+	fidelity                                     map[string]replayFidelity
+	anyMiss, preloadIncomplete, telemetryMissing bool
+	ageMaxMs, ageSumMs, ageCount                 int64
+}
+
+// pullFidelity pulls every frozen instance's W6 fidelity snapshot for the
+// phase. endPhase calls it before the terminal transition, while the phase
+// still runs: its instances still hold the replay set (one that applied a
+// document without it would report Preload.Committed=false) and their counters
+// are intact. It only reads; recordVerdict turns the pull into the verdict.
+func (o *Orchestrator) pullFidelity(ctx context.Context, p *model.ExperimentPhase) *fidelityPull {
 	fidelity := map[string]replayFidelity{}
 	var snapshots []atroposdk.FidelitySnapshot
 	anyMiss, preloadIncomplete, telemetryMissing := false, false, false
@@ -101,6 +106,27 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 		}
 	}
 
+	return &fidelityPull{
+		snapshots: snapshots, fidelity: fidelity,
+		anyMiss: anyMiss, preloadIncomplete: preloadIncomplete, telemetryMissing: telemetryMissing,
+		ageMaxMs: ageMaxMs, ageSumMs: ageSumMs, ageCount: ageCount,
+	}
+}
+
+// recordVerdict computes the phase's first-class verdict (INV-6) from the
+// pull and the quality of its baseline recording, persists it, and returns the
+// per-service replay aggregates (hits, misses, mean replay age) — the
+// authoritative source harvest writes into phase_service_cache. endPhase calls
+// it once, as the terminal transition's winner.
+//
+// Verdict: INVALID if any instance shows a replay miss, an uncommitted preload,
+// a degraded source recording, or missing telemetry (a failed pull); else
+// VALID_WITH_WARNINGS if the recording's divergent-collision rate exceeds 1%;
+// else VALID.
+func (o *Orchestrator) recordVerdict(ctx context.Context, p *model.ExperimentPhase, pull *fidelityPull) map[string]replayFidelity {
+	anyMiss, preloadIncomplete, telemetryMissing := pull.anyMiss, pull.preloadIncomplete, pull.telemetryMissing
+	ageMaxMs, ageSumMs, ageCount := pull.ageMaxMs, pull.ageSumMs, pull.ageCount
+
 	// Source recording quality: degraded drain (INVALID) and divergent-collision
 	// rate (warning). Both come from the experiment's baseline recording.
 	// Collision tallies are per-recorded-service (exp6 finding 7: a phase-wide
@@ -156,7 +182,7 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 	if ageCount > 0 {
 		ageMeanMs = ageSumMs / ageCount
 	}
-	rawSnaps, _ := json.Marshal(snapshots)
+	rawSnaps, _ := json.Marshal(pull.snapshots)
 	pv := &model.PhaseVerdict{
 		Verdict:         verdict,
 		Reasons:         reasons,
@@ -170,5 +196,5 @@ func (o *Orchestrator) collectFidelityVerdict(ctx context.Context, p *model.Expe
 	}
 	o.logger.Info("orchestrator: phase verdict",
 		"phase_id", p.ID, "verdict", verdict, "reasons", reasons, "collision_rate", collisionRate)
-	return fidelity
+	return pull.fidelity
 }
