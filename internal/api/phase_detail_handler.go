@@ -106,7 +106,8 @@ func (s *Server) handleGetPhaseFaults(w http.ResponseWriter, r *http.Request) {
 // /experiments/{id}/phases/{phaseId}/... routes: 404 not_found for an
 // unknown phase, 409 invalid_state (with "status") for a phase the
 // transition does not accept, 422 validation for an unknown final status,
-// 502 zeus_unreachable when a resume cannot reach zeus.
+// 502 zeus_unreachable when a resume cannot reach zeus, 504 not_converged
+// (with "lagging" and "suspect") when a resume's fleet does not converge.
 
 func (s *Server) handlePausePhaseFlat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
@@ -124,7 +125,10 @@ func (s *Server) handlePausePhaseFlat(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleResumePhaseFlat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
 	// StartPhase resumes a paused phase (and would start a pending one).
-	if err := s.orch.StartPhase(r.Context(), id); err != nil {
+	// Detached from the request context, as pause and stop are: the resume
+	// waits up to MANTEION_CONVERGE_TIMEOUT for its fleet, and a client
+	// hanging up meanwhile must not abort it.
+	if err := s.orch.StartPhase(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Error("resume phase failed", "error", err, "phase_id", id)
 		writeErrorFor(w, err, "phase", err.Error())
 		return

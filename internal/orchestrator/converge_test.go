@@ -106,6 +106,13 @@ func TestWaitConverged_SuspectInstanceIsNamedNotWaitedOn(t *testing.T) {
 			t.Errorf("timeout error = %q, want it to contain %q", err, want)
 		}
 	}
+	// The timeout is typed: the API answers it 504 with both lists.
+	var nc *ErrNotConverged
+	if !errors.As(err, &nc) || nc.Timeout != 300*time.Millisecond ||
+		len(nc.Lagging) != 1 || !strings.HasPrefix(nc.Lagging[0], lagging+"(") ||
+		len(nc.Suspect) != 1 || !strings.HasPrefix(nc.Suspect[0], suspect+"(") {
+		t.Errorf("timeout error = %#v, want an *ErrNotConverged listing %s as lagging and %s as suspect", err, lagging, suspect)
+	}
 	if strings.Contains(err.Error(), acking) {
 		t.Errorf("timeout error = %q names the converged instance %s", err, acking)
 	}

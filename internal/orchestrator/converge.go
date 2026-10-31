@@ -79,11 +79,7 @@ func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uin
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			msg := fmt.Sprintf("%d instance(s) still lagging after %s: %s", len(lagging), timeout, strings.Join(lagging, "; "))
-			if len(suspect) > 0 {
-				msg += "; not waited on, suspect (missed polls): " + describeSuspects(suspect, targets)
-			}
-			return errors.New(msg)
+			return &ErrNotConverged{Timeout: timeout, Lagging: lagging, Suspect: suspectLines(suspect, targets)}
 		}
 		select {
 		case <-ctx.Done():
@@ -136,7 +132,7 @@ func (o *Orchestrator) laggingInstances(ctx context.Context, targets map[string]
 		if frozen && alive == 0 {
 			msg := fmt.Sprintf("%s: no live instances to hold the replay set", svc)
 			if len(svcSuspect) > 0 {
-				msg += " (suspect, missed polls: " + describeSuspects(svcSuspect, targets) + ")"
+				msg += " (suspect, missed polls: " + strings.Join(suspectLines(svcSuspect, targets), "; ") + ")"
 			}
 			return nil, nil, errors.New(msg)
 		}
@@ -157,15 +153,15 @@ func (o *Orchestrator) awaitConvergedNonFatal(ctx context.Context, p *model.Expe
 	}
 }
 
-// describeSuspects words the suspect instances for an error: id(service), the
-// last poll, and how far behind the target each one is.
-func describeSuspects(suspect []*model.SDKInstance, targets map[string]uint64) string {
-	parts := make([]string, 0, len(suspect))
+// suspectLines words the suspect instances for an error, one line each:
+// id(service), the last poll, and how far behind the target each one is.
+func suspectLines(suspect []*model.SDKInstance, targets map[string]uint64) []string {
+	lines := make([]string, 0, len(suspect))
 	for _, inst := range suspect {
-		parts = append(parts, fmt.Sprintf("%s(%s): last poll %s, observed=%d target=%d",
+		lines = append(lines, fmt.Sprintf("%s(%s): last poll %s, observed=%d target=%d",
 			inst.ID, inst.Service, inst.LastPollAt.UTC().Format(time.RFC3339), inst.ObservedGeneration, targets[inst.Service]))
 	}
-	return strings.Join(parts, "; ")
+	return lines
 }
 
 // withErrors appends to a lagging line the errors the instance last reported,

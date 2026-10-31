@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"manteion-go/internal/model"
 	"manteion-go/internal/orchestrator"
@@ -105,6 +106,12 @@ func TestErrorEnvelope(t *testing.T) {
 			Op: "Post", URL: "http://127.0.0.1:1/api/v1/workflows", Err: errors.New("connection refused"),
 		}),
 	}
+	notConverged := &orchestrator.ErrNotConverged{
+		Timeout: 30 * time.Second,
+		Lagging: []string{"sdk-1(cartservice): observed=3 target=4"},
+	}
+	// A wait the caller cancelled is not the fleet's fault: no 504.
+	callerGone := fmt.Errorf("orchestrator: converge gate: %w", fmt.Errorf("%w while 1 instance(s) lagged: x", context.Canceled))
 	// Real producers of the validation-tagged errors, reached without a DB:
 	// both refuse before touching a repository.
 	badFinal := noDBServer().orch.StopExperiment(ctx, "exp-1", "bogus")
@@ -128,6 +135,9 @@ func TestErrorEnvelope(t *testing.T) {
 		{"store validation", storeInvalid, http.StatusUnprocessableEntity, "validation", nil},
 		{"orchestrator validation", badFinal, http.StatusUnprocessableEntity, "validation", nil},
 		{"zeus unreachable", fmt.Errorf("orchestrator: materialize workflows: %w", zeusDown), http.StatusBadGateway, "zeus_unreachable", nil},
+		{"not converged", fmt.Errorf("orchestrator: converge gate: %w", notConverged), http.StatusGatewayTimeout, "not_converged",
+			map[string]any{"lagging": []string{"sdk-1(cartservice): observed=3 target=4"}, "suspect": []string{}}},
+		{"caller gone mid-wait", callerGone, http.StatusInternalServerError, "internal", nil},
 		{"unclassified", errors.New("boom"), http.StatusInternalServerError, "internal", nil},
 	}
 	for _, c := range cases {

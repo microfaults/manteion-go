@@ -337,12 +337,16 @@ func (s *Server) handleStartExperiment(w http.ResponseWriter, r *http.Request) {
 	if !s.preflightExperimentDatasets(w, r, id) {
 		return
 	}
-	if err := s.orch.StartExperiment(r.Context(), id); err != nil {
+	// Detach from the request context, as pause and stop do: starting the
+	// first phase waits up to MANTEION_CONVERGE_TIMEOUT for its fleet, and a
+	// client hanging up meanwhile must not abort that entry.
+	ctx := context.WithoutCancel(r.Context())
+	if err := s.orch.StartExperiment(ctx, id); err != nil {
 		s.logger.Error("start experiment failed", "error", err, "experiment_id", id)
 		writeErrorFor(w, err, "experiment", err.Error())
 		return
 	}
-	resp, err := s.composeExperimentDetail(r.Context(), id)
+	resp, err := s.composeExperimentDetail(ctx, id)
 	if err != nil {
 		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "experiment started but detail unavailable", nil)
 		return
@@ -369,7 +373,11 @@ func (s *Server) handlePauseExperiment(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResumeExperiment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.orch.ResumeExperiment(r.Context(), id); err != nil {
+	// Detach from the request context: a resume waits up to
+	// MANTEION_CONVERGE_TIMEOUT for its fleet, and a client hanging up
+	// meanwhile must not abort it (504 not_converged when the fleet does not
+	// converge; the phase stays paused).
+	if err := s.orch.ResumeExperiment(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Error("resume experiment failed", "experiment_id", id, "error", err)
 		writeErrorFor(w, err, "experiment", err.Error())
 		return
@@ -588,7 +596,11 @@ func (s *Server) handleStartPhase(w http.ResponseWriter, r *http.Request) {
 	if !s.preflightPhaseDatasets(w, r, id) {
 		return
 	}
-	if err := s.orch.StartPhase(r.Context(), id); err != nil {
+	// Detach from the request context: the entry waits up to
+	// MANTEION_CONVERGE_TIMEOUT for its fleet, and a client hanging up
+	// meanwhile must not abort it (504 not_converged when the fleet does not
+	// converge).
+	if err := s.orch.StartPhase(context.WithoutCancel(r.Context()), id); err != nil {
 		s.logger.Error("start phase failed", "error", err, "phase_id", id)
 		writeErrorFor(w, err, "phase", err.Error())
 		return

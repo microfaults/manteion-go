@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
+	"time"
 )
 
 // Typed refusals. The API maps these onto its error envelope (see
@@ -68,6 +70,28 @@ func zeusError(op string, err error) error {
 		return &ErrZeusUnreachable{Op: op, Err: err}
 	}
 	return fmt.Errorf("%s: %w", op, err)
+}
+
+// ErrNotConverged is a convergence barrier that timed out (desired-state
+// contract §4): the fleet did not observe a phase entry's or resume's bump
+// within Timeout (MANTEION_CONVERGE_TIMEOUT). Lagging names each alive
+// instance still behind and on what ("id(service): observed=3 target=4",
+// "id(service): replay_set=none target=<id>/committed", with the instance's
+// reported errors); Suspect names the instances the barrier did not wait on
+// (missed polls). A fresh phase is failed with it as the reason, a resumed one
+// is left paused. The API maps it to 504 not_converged carrying both lists.
+type ErrNotConverged struct {
+	Timeout time.Duration
+	Lagging []string
+	Suspect []string
+}
+
+func (e *ErrNotConverged) Error() string {
+	msg := fmt.Sprintf("%d instance(s) still lagging after %s: %s", len(e.Lagging), e.Timeout, strings.Join(e.Lagging, "; "))
+	if len(e.Suspect) > 0 {
+		msg += "; not waited on, suspect (missed polls): " + strings.Join(e.Suspect, "; ")
+	}
+	return msg
 }
 
 // ErrValidation tags a refusal caused by the request or the plan itself — an

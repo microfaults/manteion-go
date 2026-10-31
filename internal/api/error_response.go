@@ -35,6 +35,7 @@ const (
 	codeInvalidState    = "invalid_state"    // 409: lifecycle refusal; "status" carries the current status
 	codeServiceOverlap  = "service_overlap"  // 409: admission control; "running_experiment_id", "services"
 	codeZeusUnreachable = "zeus_unreachable" // 502: transport failure talking to zeus during a start
+	codeNotConverged    = "not_converged"    // 504: a start or resume whose fleet did not converge; "lagging", "suspect"
 	codeInternal        = "internal"         // 500
 )
 
@@ -58,6 +59,7 @@ func errorEnvelope(err error) (status int, code string, extra map[string]any) {
 	var overlap *orchestrator.ErrServiceOverlap
 	var state *orchestrator.ErrInvalidState
 	var zeusDown *orchestrator.ErrZeusUnreachable
+	var notConverged *orchestrator.ErrNotConverged
 	switch {
 	case errors.As(err, &overlap):
 		return http.StatusConflict, codeServiceOverlap, map[string]any{
@@ -68,6 +70,11 @@ func errorEnvelope(err error) (status int, code string, extra map[string]any) {
 		return http.StatusConflict, codeInvalidState, map[string]any{"status": state.Current}
 	case errors.As(err, &zeusDown):
 		return http.StatusBadGateway, codeZeusUnreachable, nil
+	case errors.As(err, &notConverged):
+		return http.StatusGatewayTimeout, codeNotConverged, map[string]any{
+			"lagging": nilToEmpty(notConverged.Lagging),
+			"suspect": nilToEmpty(notConverged.Suspect),
+		}
 	case errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound, codeNotFound, nil
 	case errors.Is(err, store.ErrConflict):

@@ -107,6 +107,7 @@ manteion-go (Controller)
 | 409 | `service_overlap` | admission control (INV-5): the footprint overlaps a running experiment (`orchestrator.ErrServiceOverlap`) | `running_experiment_id`, `services` (sorted) |
 | 422 | `validation` | well-formed but rejected: empty name, vus/duration ≤ 0, cache-box strategy disagreement, unknown workflow/rule id, mutation_policy, no phases, unknown `?status=` (`store.ErrValidation`, `orchestrator.ErrValidation`) | — |
 | 502 | `zeus_unreachable` | transport failure talking to zeus while starting/resuming a phase (`orchestrator.ErrZeusUnreachable`); the phase is finalized `failed` | — |
+| 504 | `not_converged` | a phase start or resume whose fleet did not observe its bump within `MANTEION_CONVERGE_TIMEOUT` (`orchestrator.ErrNotConverged`); a started phase is finalized `failed`, a resumed one stays `paused`. An experiment start reports its first phase's entry on the phase, as it does every entry failure. The start and resume handlers run the orchestrator detached from the request, so a client hanging up does not abort the wait | `lagging`, `suspect` (one line per instance) |
 | 500 | `internal` | anything unclassified | — |
 
 Typed errors wrap with `%w` and keep their historical log text; classify with `errors.As` / `errors.Is`, never by parsing `error`.
