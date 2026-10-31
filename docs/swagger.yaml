@@ -322,17 +322,20 @@ components:
     atropos.NetworkEnvelope:
       properties:
         direction:
-          description: 'Direction selects which half of a proxied connection to apply
-            the
-
-            toxic to. Required when Host=="proxy". For Host=="inline" only
-
-            "downstream" (response body) is meaningful.'
+          description: "Direction selects which half of a proxied connection to apply\
+            \ the\ntoxic to: \"upstream\" (client \u2192 server, request bytes) or\
+            \ \"downstream\"\n(server \u2192 client, response bytes). It defaults\
+            \ to \"upstream\" with\nHost==\"proxy\" and to \"downstream\" with Host==\"\
+            inline\"."
           type: string
         host:
           description: "Host selects where the toxic runs.\n  \"proxy\"  \u2192 TCP\
-            \ proxy sidecar (current behaviour; requires NetworkResolver)\n  \"inline\"\
-            \ \u2192 in-process RoundTripper wrapping response.Body (not yet supported)"
+            \ proxy (requires a NetworkResolver; the in-process default)\n  \"inline\"\
+            \ \u2192 armed policy on the atroposd sidecar's proxied upstream calls\n\
+            The in-process host has no proxied connection to shape: it skips a rule\n\
+            with Host==\"inline\" (reported as unsupported) and rejects a single\n\
+            /admin/fault slot with 400. An empty Host means \"inline\" on a host that\n\
+            owns the proxied connections (the sidecar) and \"proxy\" in-process."
           type: string
         scope:
           description: 'Scope is the fraction of connections (proxy) or requests (inline)
@@ -340,12 +343,16 @@ components:
             to which the toxic applies. Zero means 1.0 (all).'
           type: number
         target:
-          description: 'Target is the logical name of the upstream service, resolved
-            by
+          description: 'Target is the logical name of the upstream service. Required
+            for both
 
-            NetworkResolver into a (listen, upstream) address pair.
+            hosts. With Host=="proxy" a NetworkResolver turns it into a
 
-            Required when Host=="proxy"; ignored when Host=="inline".'
+            (listen, upstream) address pair; with Host=="inline" it is the
+
+            upstream''s host or host:port, matched against the outbound request''s
+
+            host (a target without a port matches any port).'
           type: string
       type: object
     model.CacheBoxRuleConfig:

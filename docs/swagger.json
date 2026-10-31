@@ -439,11 +439,11 @@
             "atropos.NetworkEnvelope": {
                 "properties": {
                     "direction": {
-                        "description": "Direction selects which half of a proxied connection to apply the\ntoxic to. Required when Host==\"proxy\". For Host==\"inline\" only\n\"downstream\" (response body) is meaningful.",
+                        "description": "Direction selects which half of a proxied connection to apply the\ntoxic to: \"upstream\" (client \u2192 server, request bytes) or \"downstream\"\n(server \u2192 client, response bytes). It defaults to \"upstream\" with\nHost==\"proxy\" and to \"downstream\" with Host==\"inline\".",
                         "type": "string"
                     },
                     "host": {
-                        "description": "Host selects where the toxic runs.\n  \"proxy\"  \u2192 TCP proxy sidecar (current behaviour; requires NetworkResolver)\n  \"inline\" \u2192 in-process RoundTripper wrapping response.Body (not yet supported)",
+                        "description": "Host selects where the toxic runs.\n  \"proxy\"  \u2192 TCP proxy (requires a NetworkResolver; the in-process default)\n  \"inline\" \u2192 armed policy on the atroposd sidecar's proxied upstream calls\nThe in-process host has no proxied connection to shape: it skips a rule\nwith Host==\"inline\" (reported as unsupported) and rejects a single\n/admin/fault slot with 400. An empty Host means \"inline\" on a host that\nowns the proxied connections (the sidecar) and \"proxy\" in-process.",
                         "type": "string"
                     },
                     "scope": {
@@ -451,7 +451,7 @@
                         "type": "number"
                     },
                     "target": {
-                        "description": "Target is the logical name of the upstream service, resolved by\nNetworkResolver into a (listen, upstream) address pair.\nRequired when Host==\"proxy\"; ignored when Host==\"inline\".",
+                        "description": "Target is the logical name of the upstream service. Required for both\nhosts. With Host==\"proxy\" a NetworkResolver turns it into a\n(listen, upstream) address pair; with Host==\"inline\" it is the\nupstream's host or host:port, matched against the outbound request's\nhost (a target without a port matches any port).",
                         "type": "string"
                     }
                 },
