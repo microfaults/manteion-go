@@ -3,64 +3,15 @@ package api
 import (
 	"context"
 	"errors"
-	"hash/fnv"
+	"math"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 	"manteion-go/internal/model"
-	"manteion-go/internal/ruleconv"
 	"manteion-go/internal/store"
 )
-
-// activeFaultsForService returns the faults a service should currently apply,
-// plus its freeze config — the desired-state set the SDK reconciles against on
-// each poll. It unions manual long-running fault configs with any experiment-
-// driven intent fault. Each entry carries a stable unique ID so the SDK keys
-// its slots correctly.
-func (s *Server) activeFaultsForService(ctx context.Context, service string) ([]atroposdk.FaultRequest, *atroposdk.DelayRequest) {
-	var faults []atroposdk.FaultRequest
-
-	if s.faultConfigs != nil {
-		configs, err := s.faultConfigs.ListActiveForService(ctx, service)
-		if err != nil {
-			s.logger.Error("active faults: list manual failed", "service", service, "error", err)
-		}
-		for _, c := range configs {
-			if len(c.Params) == 0 {
-				continue // composition configs aren't deliverable yet
-			}
-			req := atroposdk.FaultRequest{
-				ID:         c.ID,
-				Category:   c.Category,
-				FaultType:  c.FaultType,
-				DurationMs: c.DurationMs,
-				RampUpMs:   c.RampUpMs,
-				RampDownMs: c.RampDownMs,
-				Params:     c.Params,
-			}
-			if c.Network != nil {
-				req.Network = &atroposdk.NetworkEnvelope{
-					Target:    c.Network.Target,
-					Direction: c.Network.Direction,
-					Scope:     c.Network.Scope,
-				}
-			}
-			faults = append(faults, req)
-		}
-	}
-
-	var freeze *atroposdk.DelayRequest
-	if s.intent != nil {
-		if intent, ok := s.intent.Get(service); ok {
-			if intent.ActiveFault != nil {
-				faults = append(faults, *intent.ActiveFault)
-			}
-			freeze = intent.FreezeCfg
-		}
-	}
-	return faults, freeze
-}
 
 // handleRegister registers (or re-registers) an SDK instance and answers with
 // its materialized desired state (desired-state protocol v1 §2 Register).
@@ -198,157 +149,155 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, instances)
 }
 
-// handlePollRules is the SDK polling endpoint.
-// Query params: ?service=X&version=N
-// Returns 304 if store version == requested version, otherwise 200 with rules.
+// maxPollWait caps the long-poll hold (contract §2: wait ≤ 60 s).
+const maxPollWait = 60 * time.Second
+
+// handlePollRules serves an instance's desired state (desired-state protocol v1).
 //
-// @Summary      Poll for rule updates
-// @Description  SDKs send their last-known rule version via the version query param.
-// @Description  Returns 304 if unchanged, else 200 with the desired state the SDK
-// @Description  reconciles against: {"version": uint64, "rules": []CompiledRule,
-// @Description  "active_faults": []FaultRequest, "freeze_cfg": DelayRequest}.
-// @Description  Manual fault add/remove bumps the version so it rides this path.
-// @Description  Optional instance_id query param triggers a best-effort poll-timestamp touch.
+// @Summary      Poll for desired state (long-poll)
+// @Description  Records the instance's observed generation (version) and poll time,
+// @Description  materializes DesiredState(service, instance) and compares its ETag with
+// @Description  If-None-Match. With wait>0 (seconds, max 60) and a matching ETag the
+// @Description  request is held until the service's generation changes or wait elapses,
+// @Description  then re-materialized. 200 carries the RuleSync body (version = generation,
+// @Description  etag, rules, active_faults, freeze_cfg, replay_set) with ETag and
+// @Description  X-Atropos-Generation headers; 304 carries the same headers and no body —
+// @Description  the instance adopts X-Atropos-Generation without re-applying.
 // @Tags         sdk
 // @Produce      json
-// @Param        service      query     string  true   "service name"
-// @Param        version      query     integer false  "last known rule version (uint64); omit on first poll"
-// @Param        instance_id  query     string  false  "SDK instance ID for poll-timestamp tracking"
-// @Success      200          {object}  map[string]any  "{version, rules, active_faults, freeze_cfg}"
-// @Success      304          "no rule changes since requested version"
-// @Failure      400          {object}  api.ErrorResponse  "service query parameter required"
-// @Failure      500          {object}  api.ErrorResponse
+// @Param        service        query   string  true   "service name"
+// @Param        instance_id    query   string  false  "SDK instance ID; selects the capability filter and records observed state"
+// @Param        version        query   integer false  "generation the instance currently holds (recorded as observed_generation; at most 9223372036854775807)"
+// @Param        wait           query   integer false  "long-poll hold in seconds (0-60, default 0)"
+// @Param        If-None-Match  header  string  false  "ETag of the last document the instance applied or confirmed"
+// @Success      200  {object}  api.RuleSyncWire  "desired state; headers ETag, X-Atropos-Generation"
+// @Success      304  "unchanged; headers ETag, X-Atropos-Generation"
+// @Failure      400  {object}  api.ErrorResponse  "service query parameter required, or version out of range"
+// @Failure      500  {object}  api.ErrorResponse  "desired state could not be materialized"
 // @Router       /sdk/rules [get]
 func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
-	service := r.URL.Query().Get("service")
+	q := r.URL.Query()
+	service := q.Get("service")
 	if service == "" {
 		writeError(w, http.StatusBadRequest, "service query parameter required")
 		return
 	}
-
-	versionStr := r.URL.Query().Get("version")
-	requestedVersion, _ := strconv.ParseUint(versionStr, 10, 64)
-
+	// Absent or garbage reads as 0. observed_generation is a BIGINT, so a
+	// larger value (ParseUint answers MaxUint64 for one that overflows) would
+	// fail the observed-state write: refuse it before touching the store.
+	observed, _ := strconv.ParseUint(q.Get("version"), 10, 64)
+	if observed > math.MaxInt64 {
+		writeError(w, http.StatusBadRequest, "version out of range")
+		return
+	}
+	wait := parseWait(q.Get("wait"))
+	instanceID := q.Get("instance_id")
 	ctx := r.Context()
 
-	// Record the poll for the instance: timestamp and the version it holds
-	// (best-effort, don't fail the poll). Must run BEFORE the 304 check — most
-	// polls are no-change, and last_poll_at drives the computed liveness status.
-	if instanceID := r.URL.Query().Get("instance_id"); instanceID != "" {
-		if recErr := s.sdk.RecordPoll(ctx, instanceID, requestedVersion); recErr != nil {
-			s.logger.Warn("record poll failed", "instance_id", instanceID, "error", recErr)
+	// Observed state first (contract §2): the generation the instance holds and
+	// its poll time, before any 304 decision. Best-effort — a purged row must
+	// not break polling.
+	if instanceID != "" {
+		if err := s.registry.RecordPoll(ctx, instanceID, observed); err != nil {
+			s.logger.Warn("record poll failed", "instance_id", instanceID, "error", err)
+		}
+	}
+	inst, err := s.pollInstance(ctx, instanceID)
+	if err != nil {
+		s.pollFailed(ctx, w, "read instance", service, err)
+		return
+	}
+	doc, err := s.materializer.Materialize(ctx, service, inst)
+	if err != nil {
+		// Never fall back to a partial document: a 500 makes the SDK keep its
+		// stale state and log degraded, its designed failure mode.
+		s.pollFailed(ctx, w, "materialize desired state", service, err)
+		return
+	}
+
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if wait > 0 && etagMatches(ifNoneMatch, doc.ETag) {
+		// Hold. The server's WriteTimeout (30s in cmd/manteion) would kill a
+		// longer hold, so push the deadline past it, as the SSE handler does.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(wait + 15*time.Second)); err != nil {
+			s.logger.Debug("poll: extend write deadline failed", "error", err) // httptest.ResponseRecorder: unsupported
+		}
+		if _, err := s.generations.Wait(ctx, service, doc.Generation, wait); err != nil {
+			s.pollFailed(ctx, w, "wait for a generation change", service, err)
+			return
+		}
+		// Re-read the instance: it may have re-registered with other
+		// capabilities while parked (the change that bumped).
+		if inst, err = s.pollInstance(ctx, instanceID); err != nil {
+			s.pollFailed(ctx, w, "re-read instance after the hold", service, err)
+			return
+		}
+		if doc, err = s.materializer.Materialize(ctx, service, inst); err != nil {
+			s.pollFailed(ctx, w, "re-materialize after the hold", service, err)
+			return
 		}
 	}
 
-	// Check current rule version.
-	currentVersion, err := s.rules.Version(ctx)
-	if err != nil {
-		s.logger.Error("read rule version failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to read rule version")
-		return
-	}
-
-	// Resolve the service's cache-box role BEFORE the 304 fast path. The
-	// cache-box rule is SYNTHESIZED per-service at poll time (MANT-4), not
-	// stored, so starting or ending a phase never bumps rule_version. Folding
-	// the role into the version the client compares against is what makes a
-	// phase transition visible to a polling SDK — without it the SDK sits on
-	// 304 forever, its evaluator never receives the record/replay rule, and a
-	// baseline drains zero entries while every push-side counter reads clean.
-	cbctx, err := s.experiments.ActiveCacheBoxPhaseForService(ctx, service)
-	if err != nil {
-		// Best-effort, matching the synthesis path below: a resolve failure
-		// must not fail the poll, it just leaves the rule set unchanged.
-		s.logger.Warn("poll: resolve cache-box context failed", "service", service, "error", err)
-		cbctx = nil
-	}
-	effectiveVersion := cacheBoxEffectiveVersion(currentVersion, cbctx)
-
-	// 304 Not Modified — client already has the latest desired state. Fault
-	// config changes bump the rule version, so add/remove of manual faults is
-	// delivered through this same fast-path (a 200 follows the bump).
-	if requestedVersion == effectiveVersion {
+	w.Header().Set("ETag", `"`+doc.ETag+`"`)
+	w.Header().Set("X-Atropos-Generation", strconv.FormatUint(doc.Generation, 10))
+	if etagMatches(ifNoneMatch, doc.ETag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-
-	// Desired fault set for this service (manual long-running + experiment) and
-	// freeze config — the SDK reconciles its applied faults against this list.
-	activeFaults, freezeCfg := s.activeFaultsForService(ctx, service)
-	if activeFaults == nil {
-		activeFaults = []atroposdk.FaultRequest{}
-	}
-
-	// Fetch rules for this service.
-	rules, err := s.rules.ForService(ctx, service)
-	if err != nil {
-		s.logger.Error("fetch rules for service failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to fetch rules")
-		return
-	}
-
-	if rules == nil {
-		rules = []*model.Rule{}
-	}
-
-	specResolver := &ruleconv.FuncResolver{Fn: s.faults.SpecResolver(ctx)}
-	compResolver := &ruleconv.FuncCompositionResolver{Fn: s.faults.CompositionResolver(ctx)}
-	compiled, err := ruleconv.CompileRules(rules, specResolver, compResolver)
-	if err != nil {
-		// Do NOT fall back to raw model rules — that's a wire shape the SDK
-		// can't decode. A 500 makes the SDK keep its stale rules and log
-		// degraded, which is its designed failure mode.
-		s.logger.Error("compile rules failed", "service", service, "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to compile rules")
-		return
-	}
-
-	// Synthesize the service's active cache-box rule (record on a baseline,
-	// replay on an isolation freeze) and append it to the desired rule set.
-	// Recording/replay provenance rides on this rule's CacheBoxContext (INV-5),
-	// replacing the removed global RecordingPhaseID signal. Best-effort: an
-	// error leaves the set unchanged (SDK won't record), never fails the poll.
-	if cbctx != nil {
-		compiled = append(compiled, ruleconv.SynthesizeCacheBoxRule(*cbctx))
-	}
-
-	// The poll is the reconciler, so rules must never serialize as null:
-	// [] is the authoritative "no rules" the SDK clears on (its Apply
-	// treats nil as "no change" but honors an explicit empty list). This
-	// is also what delivers the drain trigger for a baseline-recorded
-	// service, whose set is empty once its recording rule drops out.
-	if compiled == nil {
-		compiled = []atroposdk.CompiledRule{}
-	}
-
-	writeJSON(w, http.StatusOK, atroposdk.RuleSync{
-		Version:      effectiveVersion,
-		Rules:        compiled,
-		ActiveFaults: activeFaults,
-		FreezeCfg:    freezeCfg,
-	})
+	writeJSON(w, http.StatusOK, ruleSyncFrom(doc))
 }
 
-// cacheBoxEffectiveVersion folds a service's active cache-box role into the
-// polled rule version. rule_version counts stored-rule mutations only, while
-// the cache-box rule is synthesized per-service at poll time — so a phase
-// start/stop is otherwise invisible behind the 304 fast path.
-//
-// It returns currentVersion unchanged when the service has no cache-box role,
-// so the wire value is identical for every service outside a running phase.
-// When a role IS active the mixed-in value is guaranteed to differ (the hash
-// is forced odd, and x^odd != x), so each of no-role → record → replay →
-// no-role transitions delivers exactly one 200. The final transition back to
-// no-role is what hands the SDK the empty rule set that triggers its drain.
-func cacheBoxEffectiveVersion(currentVersion uint64, cb *model.CacheBoxRuleContext) uint64 {
-	if cb == nil {
-		return currentVersion
+// pollInstance reads the polling instance's registration, which selects its
+// capability filter. No instance_id, or one whose row is gone (a replaced or
+// purged pod still polling), means no registration: the unfiltered document.
+func (s *Server) pollInstance(ctx context.Context, id string) (*model.SDKInstance, error) {
+	if id == "" {
+		return nil, nil
 	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(cb.Mode))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(cb.PhaseID))
-	return currentVersion ^ (h.Sum64() | 1)
+	inst, err := s.registry.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	return inst, err
+}
+
+// pollFailed answers a poll whose step failed: with nothing when the client
+// has gone, since a failure is then likely its cancellation (Wait returns
+// ctx.Err(), and SpecResolver reports a cancelled read as a missing spec);
+// otherwise with a 500.
+func (s *Server) pollFailed(ctx context.Context, w http.ResponseWriter, step, service string, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	s.logger.Error("poll: "+step+" failed", "service", service, "error", err)
+	writeError(w, http.StatusInternalServerError, "failed to materialize desired state")
+}
+
+// parseWait parses the wait query param: seconds, clamped to [0, maxPollWait]
+// before conversion (a huge value must not overflow time.Duration); absent,
+// negative or unparseable → 0.
+func parseWait(s string) time.Duration {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n >= int(maxPollWait/time.Second) {
+		return maxPollWait
+	}
+	return time.Duration(n) * time.Second
+}
+
+// etagMatches reports whether the If-None-Match header names etag: weak
+// validators (W/) and quotes are stripped, a comma-separated list is matched
+// element-wise, anything else is a mismatch.
+func etagMatches(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "W/"))
+		if strings.Trim(part, `"`) == etag && etag != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // handleInit is the startup readiness check for SDK initialization.

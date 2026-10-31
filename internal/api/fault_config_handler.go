@@ -120,9 +120,10 @@ func (s *Server) handleFireFaultConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to fire fault config")
 		return
 	}
-	// Bump the service's generation so the next poll returns 200 and the SDK
-	// reconciles the new fault into its active set; Generations also wakes the
-	// service's parked polls and SSE subscribers so they re-poll immediately.
+	// The fault changes the service's document, so a poll naming the previous
+	// ETag gets a 200 and the SDK reconciles the fault into its active set. The
+	// generation bump wakes the service's held polls, which answer now instead
+	// of when their wait runs out, and nudges SSE subscribers.
 	s.bumpGeneration(ctx, cfg.Service)
 	s.logger.Info("fault config fired", "id", id, "service", cfg.Service)
 
@@ -165,22 +166,12 @@ func (s *Server) handleCancelFaultConfig(w http.ResponseWriter, r *http.Request)
 
 // bumpGeneration bumps a service's desired-state generation after an input
 // change made outside the rule repo (fault configs fire/cancel/delete/expire).
-// Pollers wake and SSE subscribers are nudged by Generations itself.
+// Held polls wake and SSE subscribers are nudged by Generations itself.
 // Best-effort: the write that made the bump necessary has already committed, so
-// both bumps run on a context a client hang-up cannot cancel, and a failure is
+// the bump runs on a context a client hang-up cannot cancel, and a failure is
 // only logged.
 func (s *Server) bumpGeneration(ctx context.Context, service string) {
-	ctx = context.WithoutCancel(ctx)
-
-	// TODO(desired-state Task 6): remove once the poll is keyed on generations/ETag
-	// The poll still compares rule_version, so an up-to-date SDK would answer 304
-	// to this change. Bump it first: the announcement made by Generations.Bump
-	// below wakes pollers that re-poll at once, and they must find the new version.
-	if err := s.rulever.BumpVersion(ctx); err != nil {
-		s.logger.Warn("bump rule_version failed", "service", service, "error", err)
-	}
-
-	if _, err := s.generations.Bump(ctx, service); err != nil {
+	if _, err := s.generations.Bump(context.WithoutCancel(ctx), service); err != nil {
 		s.logger.Warn("bump generation failed", "service", service, "error", err)
 	}
 }

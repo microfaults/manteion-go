@@ -137,8 +137,9 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 // @Summary      Kill-switch an SDK instance's rules
 // @Description  Disables every currently-enabled rule whose service matches the
 // @Description  instance's service, through the same full rule update as
-// @Description  PUT /rules/{id} — the rule version bumps once per rule, so polling
-// @Description  SDKs converge on their next poll (SSE subscribers are nudged too).
+// @Description  PUT /rules/{id} — the rule version and the service generation bump
+// @Description  once per rule, so polling SDKs converge on their next poll (held polls
+// @Description  wake and SSE subscribers are nudged too).
 // @Description  Idempotent: a repeat call reports an empty disabled_rule_ids.
 // @Tags         sdk
 // @Produce      json

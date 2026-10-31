@@ -48,10 +48,9 @@ func (f *fakeFaultConfigs) Delete(_ context.Context, id string) error {
 
 // TestHandleDeleteFaultConfig_BumpsTheConfigsServiceGeneration pins that a
 // delete that lands is an input change to its service's desired state (an
-// active config drops out of the document): it bumps that service once (the
-// rule_version the poll still compares, then the generation) and announces it,
-// whatever the config's status. A delete that does not happen bumps nothing, and
-// a failed bump does not fail the delete.
+// active config drops out of the document): it bumps that service's generation
+// exactly once and announces it, whatever the config's status. A delete that
+// does not happen bumps nothing, and a failed bump does not fail the delete.
 func TestHandleDeleteFaultConfig_BumpsTheConfigsServiceGeneration(t *testing.T) {
 	has := func(status model.FaultConfigStatus) map[string]*model.FaultConfig {
 		return map[string]*model.FaultConfig{"fc-1": {ID: "fc-1", Name: "latency", Service: "cart", Status: status}}
@@ -94,7 +93,7 @@ func TestHandleDeleteFaultConfig_BumpsTheConfigsServiceGeneration(t *testing.T) 
 			defer broker.Unsubscribe("cart", cart)
 			defer broker.Unsubscribe("checkout", checkout)
 
-			s := &Server{configDeleter: tc.fake, rulever: &spyRuleVersion{log: &log}, generations: gens, logger: discardLogger()}
+			s := &Server{configDeleter: tc.fake, generations: gens, logger: discardLogger()}
 			mux := http.NewServeMux()
 			s.routes(mux)
 			w := httptest.NewRecorder()
@@ -107,11 +106,8 @@ func TestHandleDeleteFaultConfig_BumpsTheConfigsServiceGeneration(t *testing.T) 
 				t.Errorf("deleted = %q, want fc-1 deleted: %v", tc.fake.deleted, tc.wantGone)
 			}
 			var wantEvents, wantBumps []string
-			switch {
-			case tc.failBump:
-				wantBumps = []string{"rule_version"} // the generation store is the one that is down
-			case tc.wantBumped:
-				wantBumps = []string{"rule_version", "generation cart"}
+			if tc.wantBumped {
+				wantBumps = []string{"generation cart"}
 				wantEvents = []string{`rules_changed {"generation":2}`} // absent = 1, one bump = 2
 			}
 			if !slices.Equal(log.calls, wantBumps) {

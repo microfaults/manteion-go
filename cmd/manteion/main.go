@@ -134,7 +134,7 @@ func main() {
 	srv := api.NewServer(logger, database,
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
-		zeusClient, controller.IntentReader(), gens, mat, orch, cs, policyRepo,
+		zeusClient, gens, mat, orch, cs, policyRepo,
 	)
 
 	httpServer := &http.Server{
@@ -155,7 +155,7 @@ func main() {
 	}
 
 	// Complete expired long-running fault configs (status bookkeeping +
-	// version bump; the SDK reconciles them away).
+	// generation bump; the SDK reconciles them away).
 	srv.StartFaultConfigReaper(ctx, 30*time.Second)
 
 	// Start SDK reaper — purges instances dead for > 10 minutes. Opt-in via

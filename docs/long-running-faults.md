@@ -26,25 +26,30 @@ ones (keyed by a stable fault ID) and dropping any no longer present. Duration
 expiry and stale-fault reaping are handled SDK-side (server-side infinite-
 duration whitelist + fault watchdog); manteion only owns the desired state.
 
-Fire/cancel/expiry bump the rule version, so the change rides the existing
-version-based poll fast-path: an unchanged poll still gets a `304`, and the next
-`200` after a bump carries the updated `active_faults` for the SDK to reconcile.
+The poll is keyed on the document's ETag (`"<generation>-<content hash>"`),
+which the SDK sends back in `If-None-Match`: a poll naming the current document
+gets a `304`, and the first poll after a change gets a `200` carrying the
+updated `active_faults` for the SDK to reconcile. Fire, cancel and delete bump
+the service's generation, which also wakes polls held with `wait`, so they
+answer at once instead of when their wait runs out.
 
-The fault config reaper (30s) only flips `active → completed` in the DB once a
-finite duration elapses; the SDK drops the fault on its next poll.
+An expired fault leaves the document as soon as its duration elapses (the
+content hash moves). The fault config reaper (30s) then flips
+`active → completed` in the DB and bumps the generation, waking the polls held
+meanwhile.
 
 ## NOTE — behavioral change to the SDK poll contract
 
 Before this feature, `GET /api/v1/sdk/rules` returned only `{version, rules}`.
-It now **always** returns `active_faults` and `freeze_cfg` on a `200`, and the
-SDK reconciles against them. Two consequences worth knowing:
+It now **always** returns `active_faults` on a `200` (and `freeze_cfg` when one
+is desired), and the SDK reconciles against them. Two consequences worth knowing:
 
-- This is also the delivery path for **experiment-driven** faults: the poll set
-  is the union of manual fault configs and the in-memory experiment intent. The
-  register response likewise now emits `active_faults` (plural) instead of the
-  legacy singular `active_fault`, which the current SDK ignored.
-- The experiment intent tracker is **in-memory**. If manteion restarts while an
-  experiment is mid-flight, the next `200` will not include that experiment's
-  in-flight faults, so the SDK will reconcile them away (the SDK watchdog would
-  reap them within its grace period regardless). Durable experiment-fault
-  delivery across restarts would require persisting intent — tracked separately.
+- The poll and the register response serve the same materialized document:
+  `active_faults` are the service's active fault configs, filtered by the
+  instance's capabilities. The register response emits `active_faults`
+  (plural) instead of the legacy singular `active_fault`, which the old SDK
+  ignored. Experiment faults held in the in-memory intent tracker are no longer
+  served.
+- `freeze_cfg` is still read from the **in-memory** intent tracker until it is
+  derived from the frozen phase. If manteion restarts while a service is
+  frozen, the next `200` carries no `freeze_cfg`.

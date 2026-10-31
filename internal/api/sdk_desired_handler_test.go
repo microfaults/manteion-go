@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
@@ -109,9 +112,14 @@ func (f *fakeRegistry) RecordStatus(_ context.Context, id string, st model.Obser
 // Desired-state fixtures for "cartservice": an inline rule, a network rule, an
 // active inline fault config, an active resource fault config, and a running
 // replay phase (synthesized cache-box rule).
-type fakeDesiredRules struct{ rules []*model.Rule }
+type fakeDesiredRules struct {
+	mu    sync.Mutex // a test may change the rules while a held poll reads them
+	rules []*model.Rule
+}
 
 func (f *fakeDesiredRules) ForService(_ context.Context, svc string) ([]*model.Rule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*model.Rule
 	for _, r := range f.rules {
 		if r.Service == svc {
@@ -119,6 +127,13 @@ func (f *fakeDesiredRules) ForService(_ context.Context, svc string) ([]*model.R
 		}
 	}
 	return out, nil
+}
+
+// keep deletes every rule but the first n.
+func (f *fakeDesiredRules) keep(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules = f.rules[:n]
 }
 
 type fakeDesiredConfigs struct{ configs []*model.FaultConfig }
@@ -173,10 +188,7 @@ func newDesiredFixture(insts ...*model.SDKInstance) *desiredFixture {
 
 func (fx *desiredFixture) server() *Server {
 	return &Server{registry: fx.reg, sdkInstances: fx.reg, generations: fx.gens, materializer: fx.mat,
-		broker: fx.gens.Broker(), logger: discardLogger(),
-		// bumpGeneration still moves rule_version for the poll keyed on it
-		// (TODO(desired-state Task 6)); the spy keeps that off a database.
-		rulever: &spyRuleVersion{log: &bumpLog{}}}
+		broker: fx.gens.Broker(), logger: discardLogger()}
 }
 
 // serveJSON drives a request through the real route table. body is sent as
@@ -469,4 +481,398 @@ func marshalRawJSON(t *testing.T, v any) map[string]json.RawMessage {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func pollWith(t *testing.T, s *Server, query string, hdr map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	return serveJSON(t, s, http.MethodGet, "/api/v1/sdk/rules?"+query, nil, hdr)
+}
+
+func TestHandlePollRules_200CarriesEtagAndGeneration(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice", Capabilities: []string{"inline"}})
+	s := fx.server()
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=0", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	etag := w.Header().Get("ETag")
+	if !strings.HasPrefix(etag, `"1-`) || !strings.HasSuffix(etag, `"`) {
+		t.Errorf("ETag = %q, want a quoted 1-<hash>", etag)
+	}
+	if got := w.Header().Get("X-Atropos-Generation"); got != "1" {
+		t.Errorf("X-Atropos-Generation = %q, want 1", got)
+	}
+	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline" {
+		t.Errorf("rules = %v, want [r-inline] (network and cache-box filtered for an inline-only host)", got)
+	}
+	var sync RuleSyncWire
+	_ = json.Unmarshal(w.Body.Bytes(), &sync)
+	if `"`+sync.Etag+`"` != etag || sync.Version != 1 {
+		t.Errorf("body etag/version = %s/%d, header = %s", sync.Etag, sync.Version, etag)
+	}
+	if len(fx.reg.polls) != 1 || fx.reg.polls[0] != (polled{"cart-1", 0}) {
+		t.Errorf("observed generation not recorded before answering: %+v", fx.reg.polls)
+	}
+}
+
+func TestHandlePollRules_304OnMatchingEtag(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	first := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil)
+	etag := first.Header().Get("ETag")
+	for _, inm := range []string{etag, "W/" + etag, strings.Trim(etag, `"`)} {
+		w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1", map[string]string{"If-None-Match": inm})
+		if w.Code != http.StatusNotModified {
+			t.Errorf("If-None-Match %s: status = %d, want 304", inm, w.Code)
+		}
+		if w.Header().Get("ETag") != etag || w.Header().Get("X-Atropos-Generation") != "1" {
+			t.Errorf("304 headers = %v", w.Header())
+		}
+		if w.Body.Len() != 0 {
+			t.Errorf("304 carried a body: %s", w.Body.String())
+		}
+	}
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1", map[string]string{"If-None-Match": `"garbage"`})
+	if w.Code != http.StatusOK {
+		t.Errorf("foreign ETag: status = %d, want 200", w.Code)
+	}
+}
+
+func TestHandlePollRules_LongPollWakesOnBump(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		fx.rules.keep(1)                                         // the network rule is deleted...
+		_, _ = fx.gens.Bump(context.Background(), "cartservice") // ...and the repo bumped
+	}()
+	start := time.Now()
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": etag})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after the bump; body = %s", w.Code, w.Body.String())
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("long-poll took %v; it must return on the bump, not on wait", time.Since(start))
+	}
+	if w.Header().Get("X-Atropos-Generation") != "2" || !strings.HasPrefix(w.Header().Get("ETag"), `"2-`) {
+		t.Errorf("headers after bump = %v", w.Header())
+	}
+	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline,cachebox:replay:phase-iso" {
+		t.Errorf("rules = %v, want the post-bump set", got)
+	}
+}
+
+func TestHandlePollRules_LongPollTimesOutWith304(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+	start := time.Now()
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=1", map[string]string{"If-None-Match": etag})
+	if w.Code != http.StatusNotModified || time.Since(start) < time.Second {
+		t.Fatalf("status = %d after %v, want 304 after ~1s", w.Code, time.Since(start))
+	}
+	if w.Header().Get("X-Atropos-Generation") != "1" {
+		t.Errorf("X-Atropos-Generation = %q", w.Header().Get("X-Atropos-Generation"))
+	}
+}
+
+func TestHandlePollRules_GenerationMovesButDocumentUnchanged(t *testing.T) {
+	// Another instance's capabilities changed: the generation moves, this
+	// instance's content does not — the ETag still differs (generation prefix),
+	// so it gets a 200 that it can recognise as same-content by the hash.
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+	_, _ = fx.gens.Bump(context.Background(), "cartservice")
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=1", map[string]string{"If-None-Match": etag})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (generation prefix changed)", w.Code)
+	}
+	if got := w.Header().Get("ETag"); got[len(`"2-`):] != etag[len(`"1-`):] {
+		t.Errorf("hash changed although the document did not: %s vs %s", got, etag)
+	}
+}
+
+func TestHandlePollRules_UnknownInstanceStillServed(t *testing.T) {
+	fx := newDesiredFixture()
+	s := fx.server()
+	w := pollWith(t, s, "service=cartservice&instance_id=gone-1&version=0", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for an unknown instance (unfiltered document)", w.Code)
+	}
+	if got := ruleNamesOf(t, w.Body.Bytes()); len(got) != 3 {
+		t.Errorf("rules = %v, want all 3 (no capability filter without a registration)", got)
+	}
+}
+
+func TestHandlePollRules_Validation(t *testing.T) {
+	fx := newDesiredFixture()
+	s := fx.server()
+	if w := pollWith(t, s, "instance_id=cart-1", nil); w.Code != http.StatusBadRequest {
+		t.Errorf("missing service: status = %d, want 400", w.Code)
+	}
+	if got := parseWait("61"); got != maxPollWait {
+		t.Errorf("parseWait(61) = %v, want clamp to %v", got, maxPollWait)
+	}
+	if got := parseWait("-3"); got != 0 {
+		t.Errorf("parseWait(-3) = %v, want 0", got)
+	}
+	if got := parseWait("abc"); got != 0 {
+		t.Errorf("parseWait(abc) = %v, want 0", got)
+	}
+	s.materializer = failingMaterializer{}
+	if w := pollWith(t, s, "service=cartservice", nil); w.Code != http.StatusInternalServerError {
+		t.Errorf("materialize failure: status = %d, want 500", w.Code)
+	}
+}
+
+// Review Focus 1: cmd/manteion sets WriteTimeout=30s; a held poll longer than
+// that must extend its write deadline or the 200 is written into a dead
+// connection. A real server with a 200ms WriteTimeout and a 700ms hold proves it.
+// The client must not reuse connections: Go's transport silently retries a GET
+// that a reused connection dropped, and the retry, sent after the bump, would
+// be answered at once.
+func TestHandlePollRules_HoldSurvivesServerWriteTimeout(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	mux := http.NewServeMux()
+	s.routes(mux)
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.WriteTimeout = 200 * time.Millisecond
+	srv.Start()
+	t.Cleanup(srv.Close)
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
+	first, err := client.Get(srv.URL + "/api/v1/sdk/rules?service=cartservice&instance_id=cart-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	etag := first.Header.Get("ETag")
+
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		_, _ = fx.gens.Bump(context.Background(), "cartservice")
+	}()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/sdk/rules?service=cartservice&instance_id=cart-1&version=1&wait=5", nil)
+	req.Header.Set("If-None-Match", etag)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("held poll failed (write deadline not extended?): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Atropos-Generation") != "2" {
+		t.Fatalf("status = %d gen = %s, want 200 / 2", resp.StatusCode, resp.Header.Get("X-Atropos-Generation"))
+	}
+}
+
+// wait is whole seconds clamped to [0, maxPollWait], the clamp applied before
+// the conversion so a huge value cannot overflow into a negative or short
+// hold; anything unparseable is no hold at all.
+func TestParseWait(t *testing.T) {
+	for in, want := range map[string]time.Duration{
+		"": 0, "0": 0, "-3": 0, "abc": 0, "1.5": 0,
+		"1": time.Second, "30": 30 * time.Second, "60": maxPollWait, "61": maxPollWait,
+		"9999999999": maxPollWait, // 9999999999 s overflows time.Duration
+	} {
+		if got := parseWait(in); got != want {
+			t.Errorf("parseWait(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// Review Focus 3: If-None-Match names the document quoted, unquoted or weak
+// (W/), alone or in a list; anything else (a foreign or garbled value, the
+// wildcard, an empty header) is a mismatch, answered 200 and never held.
+func TestEtagMatches(t *testing.T) {
+	const etag = "3-0123456789abcdef"
+	for header, want := range map[string]bool{
+		`"3-0123456789abcdef"`:                         true,
+		`W/"3-0123456789abcdef"`:                       true,
+		`3-0123456789abcdef`:                           true,
+		`"2-0123456789abcdef", W/"3-0123456789abcdef"`: true,
+		`"2-0123456789abcdef"`:                         false,
+		`"3-0123456789abcdee"`:                         false, // same generation, other content
+		`"garbage"`:                                    false,
+		`*`:                                            false,
+		``:                                             false,
+	} {
+		if got := etagMatches(header, etag); got != want {
+			t.Errorf("etagMatches(%q) = %v, want %v", header, got, want)
+		}
+	}
+	if etagMatches(`""`, "") {
+		t.Error("an empty ETag matched")
+	}
+}
+
+// version is the generation the instance holds, recorded with the poll. Absent
+// or unparseable reads as 0 and is still recorded (a bad version never costs
+// the poll its last_poll_at); a value sdk_instances' BIGINT cannot hold is
+// refused with 400 before the store is touched, where the write would fail.
+func TestHandlePollRules_ObservedVersion(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	for _, tc := range []struct {
+		query string
+		want  uint64
+	}{
+		{"", 0},
+		{"&version=", 0},
+		{"&version=abc", 0},
+		{"&version=-1", 0},
+		{"&version=7", 7},
+		{"&version=9223372036854775807", math.MaxInt64},
+	} {
+		fx.reg.polls = nil
+		if w := pollWith(t, s, "service=cartservice&instance_id=cart-1"+tc.query, nil); w.Code != http.StatusOK {
+			t.Errorf("%q: status = %d, want 200", tc.query, w.Code)
+		}
+		if want := []polled{{"cart-1", tc.want}}; !slices.Equal(fx.reg.polls, want) {
+			t.Errorf("%q: recorded %+v, want %+v", tc.query, fx.reg.polls, want)
+		}
+	}
+	for _, v := range []string{"9223372036854775808", "18446744073709551615", "99999999999999999999"} {
+		fx.reg.polls = nil
+		if w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version="+v, nil); w.Code != http.StatusBadRequest {
+			t.Errorf("version=%s: status = %d, want 400", v, w.Code)
+		}
+		if len(fx.reg.polls) != 0 {
+			t.Errorf("version=%s: recorded %+v before refusing it", v, fx.reg.polls)
+		}
+	}
+}
+
+// Review Focus 2, the log half: the observed-state write a purged registration
+// fails is only a warning. A registry that cannot be read is another matter:
+// the instance's capability filter is unknown, so the poll answers 500 rather
+// than a document that is not the instance's.
+func TestHandlePollRules_RegistryFailures(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice", Capabilities: []string{"inline"}})
+	s := fx.server()
+	var logs bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	if w := pollWith(t, s, "service=cartservice&instance_id=gone-1&version=4", nil); w.Code != http.StatusOK {
+		t.Fatalf("unknown instance: status = %d, want 200", w.Code)
+	}
+	if want := []polled{{"gone-1", 4}}; !slices.Equal(fx.reg.polls, want) {
+		t.Errorf("recorded %+v, want the attempt %+v", fx.reg.polls, want)
+	}
+	if got := logs.String(); !strings.Contains(got, `level=WARN msg="record poll failed" instance_id=gone-1`) || strings.Contains(got, "level=ERROR") {
+		t.Errorf("logs = %q, want only the record-poll warning", got)
+	}
+
+	fx.reg.err = errors.New("db down")
+	if w := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil); w.Code != http.StatusInternalServerError {
+		t.Errorf("registry read failure: status = %d, want 500", w.Code)
+	}
+}
+
+// A held poll records the generation the instance holds before it parks (the
+// orchestrator observes convergence from it while the poll is held), and
+// re-reads the registration once the generation moves: the instance may have
+// re-registered with other capabilities while parked (the change that bumped),
+// and its document must be filtered by them.
+func TestHandlePollRules_HeldPollRecordsFirstAndRereadsTheInstance(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice", Capabilities: []string{"inline"}})
+	s := fx.server()
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+	recordedWhileHeld := make(chan bool, 1)
+	go func() {
+		recorded := false // the poll cannot be answered before the bump below
+		for deadline := time.Now().Add(5 * time.Second); !recorded && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			fx.reg.mu.Lock()
+			recorded = slices.Contains(fx.reg.polls, polled{"cart-1", 1})
+			fx.reg.mu.Unlock()
+		}
+		recordedWhileHeld <- recorded
+		time.Sleep(100 * time.Millisecond) // let it park
+		fx.reg.mu.Lock()
+		fx.reg.byID["cart-1"].Capabilities = nil // every category now...
+		fx.reg.mu.Unlock()
+		_, _ = fx.gens.Bump(context.Background(), "cartservice") // ...and the change bumped
+	}()
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": etag})
+	if !<-recordedWhileHeld {
+		t.Error("the held poll's observed generation was not recorded before the hold")
+	}
+	if w.Code != http.StatusOK || w.Header().Get("X-Atropos-Generation") != "2" {
+		t.Fatalf("status = %d gen = %s, want 200 / 2", w.Code, w.Header().Get("X-Atropos-Generation"))
+	}
+	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline,r-net,cachebox:replay:phase-iso" {
+		t.Errorf("rules = %v, want the unfiltered set of the re-read registration", got)
+	}
+}
+
+// Review Focus 3, the handler half: an If-None-Match that does not name the
+// current document is answered at once, whatever wait asks for: a foreign
+// value, or the instance's own ETag once the generation has moved.
+func TestHandlePollRules_MismatchIsNeverHeld(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+	_, _ = fx.gens.Bump(context.Background(), "cartservice")
+	for _, inm := range []string{`"garbage"`, etag} {
+		start := time.Now()
+		w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": inm})
+		if w.Code != http.StatusOK || time.Since(start) > 5*time.Second {
+			t.Errorf("If-None-Match %s: status = %d after %v, want 200 at once", inm, w.Code, time.Since(start))
+		}
+	}
+}
+
+// A poll whose client has gone (its context is done) writes nothing: not when
+// its hold ends that way, and not when a step fails because of it either
+// (SpecResolver reports a cancelled read as a missing spec, so the error alone
+// says nothing).
+func TestHandlePollRules_ClientGoneWritesNothing(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	var logs bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+
+	gone, cancel := context.WithCancel(context.Background())
+	cancel() // the client hung up
+	pollGone := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequestWithContext(gone, http.MethodGet, "/api/v1/sdk/rules?service=cartservice&instance_id=cart-1&version=1&wait=30", nil)
+		req.Header.Set("If-None-Match", etag)
+		mux := http.NewServeMux()
+		s.routes(mux)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	start := time.Now()
+	if w := pollGone(); w.Body.Len() != 0 || len(w.Header()) != 0 {
+		t.Errorf("hold ended by the client: wrote headers %v body %q, want nothing", w.Header(), w.Body.String())
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("hold outlived its client: %v", time.Since(start))
+	}
+	s.materializer = failingMaterializer{}
+	if w := pollGone(); w.Body.Len() != 0 || len(w.Header()) != 0 {
+		t.Errorf("materialize failure after the client left: wrote headers %v body %q, want nothing", w.Header(), w.Body.String())
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("a client hang-up was logged as an error: %q", logs.String())
+	}
+}
+
+// Generations.Wait fails on store errors as well as on the client leaving; a
+// store failure mid-hold is a 500, not silence.
+func TestHandlePollRules_GenerationStoreFailureMidHoldIs500(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+	s.generations = desired.NewGenerations(failingGenerationStore{}, desired.NewBroker()) // the materializer still reads fx.gens
+	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": etag})
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", w.Code)
+	}
 }

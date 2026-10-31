@@ -304,9 +304,11 @@ func (r *RuleRepo) Version(ctx context.Context) (uint64, error) {
 }
 
 // BumpVersion increments the rule store version out of band. The orchestrator
-// uses it when a phase transition changes what the poll serves without a rule
-// mutation (cache-box phase start/stop, the drain barrier), so the next poll
-// returns 200 instead of a 304. Fault configs bump the service generation instead.
+// still calls it on phase transitions (cache-box phase start/stop, the drain
+// barrier), but no poll reads rule_version any more: the poll is keyed on the
+// service generation and the document's ETag, whose hash moves with the
+// synthesized cache-box rule. Until phase transitions bump generations, a held
+// poll learns of one only when its wait runs out.
 func (r *RuleRepo) BumpVersion(ctx context.Context) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE rule_version SET version = version + 1 WHERE id = 1`)

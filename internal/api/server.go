@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 
-	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/orchestrator"
@@ -25,11 +24,9 @@ type dbPinger interface {
 	PingContext(ctx context.Context) error
 }
 
-// ruleVersioner abstracts rule-version reads (health checks) and bumps (see
-// bumpGeneration) for testing.
+// ruleVersioner abstracts rule-version reads for health checks and testing.
 type ruleVersioner interface {
 	Version(ctx context.Context) (uint64, error)
-	BumpVersion(ctx context.Context) error
 }
 
 // Server holds all dependencies for the manteion API.
@@ -56,7 +53,6 @@ type Server struct {
 	policies         *store.PolicyRepo
 	traces           *store.TraceRepo
 	zeus             *zeus.Client
-	intent           *atrocontrol.IntentTracker
 	generations      *desired.Generations
 	materializer     desiredMaterializer // the *desired.Materializer; separate field so tests can inject a fake
 	orch             *orchestrator.Orchestrator
@@ -79,7 +75,6 @@ func NewServer(
 	workloads *store.WorkloadRepo,
 	traces *store.TraceRepo,
 	zeusClient *zeus.Client,
-	intent *atrocontrol.IntentTracker,
 	gens *desired.Generations,
 	mat *desired.Materializer,
 	orch *orchestrator.Orchestrator,
@@ -109,7 +104,6 @@ func NewServer(
 		policies:         policies,
 		traces:           traces,
 		zeus:             zeusClient,
-		intent:           intent,
 		generations:      gens,
 		materializer:     mat,
 		orch:             orch,

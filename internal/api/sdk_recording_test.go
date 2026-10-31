@@ -12,6 +12,7 @@ import (
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
 	"manteion-go/internal/db"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
@@ -38,13 +39,15 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 	}
 	defer db.Close(database)
 
-	rules := store.NewRuleRepo(database, nil)
 	exp := store.NewExperimentRepo(database)
+	faults := store.NewFaultRepo(database)
+	// In-memory generations do here: the test asserts rule content, not generations.
+	gens := desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker())
 	s := &Server{
-		rules: rules, rulever: rules,
-		faults:      store.NewFaultRepo(database),
-		experiments: exp,
-		logger:      discardLogger(),
+		generations: gens,
+		materializer: &desired.Materializer{Generations: gens, Rules: store.NewRuleRepo(database, nil),
+			FaultConfigs: store.NewFaultConfigRepo(database), CacheBox: exp, Specs: faults},
+		logger: discardLogger(),
 	}
 
 	poll := func(service string) atroposdk.RuleSync {

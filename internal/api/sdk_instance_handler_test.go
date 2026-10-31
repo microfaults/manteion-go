@@ -12,9 +12,8 @@ import (
 	"testing"
 	"time"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
-
 	"manteion-go/internal/db"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
@@ -482,8 +481,8 @@ func TestHandleInstanceKillSwitch_Idempotent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Against Postgres (MANTEION_TEST_DB=1): the real predicates + version bump
-// + poll pickup, end to end.
+// Against Postgres (MANTEION_TEST_DB=1): the real predicates + version and
+// generation bumps + poll pickup, end to end.
 // ---------------------------------------------------------------------------
 
 func TestSDKInstanceHandlers_DB(t *testing.T) {
@@ -502,19 +501,26 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	}
 	defer db.Close(database)
 
-	rules := store.NewRuleRepo(database, nil)
+	gens := desired.NewGenerations(store.NewGenerationRepo(database), desired.NewBroker())
+	rules := store.NewRuleRepo(database, gens)
 	faults := store.NewFaultRepo(database)
+	faultConfigs := store.NewFaultConfigRepo(database)
 	sdk := store.NewSDKRepo(database)
 	exp := store.NewExperimentRepo(database)
 	s := &Server{
 		rules: rules, rulever: rules, faults: faults, sdk: sdk, experiments: exp,
-		sdkInstances: sdk, serviceRules: rules, phaseHistory: exp,
-		logger: discardLogger(),
+		sdkInstances: sdk, registry: sdk, serviceRules: rules, phaseHistory: exp,
+		generations: gens, broker: gens.Broker(),
+		materializer: &desired.Materializer{Generations: gens, Rules: rules, FaultConfigs: faultConfigs, CacheBox: exp, Specs: faults},
+		logger:       discardLogger(),
 	}
 
 	// Per-run-unique names so reruns and leftovers from sibling tests can't collide.
 	tag := id.New("t")
 	svc, other := "cart-"+tag, "checkout-"+tag
+	t.Cleanup(func() { // runs last (LIFO): the rule deletes below bump these rows
+		_, _ = database.Exec(`DELETE FROM service_generations WHERE service IN ($1, $2)`, svc, other)
+	})
 
 	spec := &model.FaultSpec{
 		ID: "spec-" + tag, Name: "ks-spec", Category: "inline", FaultType: "latency",
@@ -599,16 +605,39 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 		}
 		return d
 	}
-	poll := func(version uint64) (int, atroposdk.RuleSync) {
+	// poll polls as the instance holding generation version and, when not
+	// empty, the document ifNoneMatch names.
+	poll := func(version uint64, ifNoneMatch string) (*httptest.ResponseRecorder, RuleSyncWire) {
 		t.Helper()
-		w := do(http.MethodGet, "/api/v1/sdk/rules?service="+svc+"&version="+jsonNumber(version))
-		var sync atroposdk.RuleSync
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/sdk/rules?service="+svc+"&instance_id="+inst.ID+"&version="+jsonNumber(version), nil)
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		var sync RuleSyncWire
 		if w.Code == http.StatusOK {
 			if err := json.Unmarshal(w.Body.Bytes(), &sync); err != nil {
-				t.Fatalf("decode RuleSync: %v", err)
+				t.Fatalf("decode RuleSyncWire: %v", err)
 			}
 		}
-		return w.Code, sync
+		return w, sync
+	}
+	gen := func() uint64 {
+		t.Helper()
+		g, err := gens.Get(ctx, svc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	ruleVersion := func() uint64 {
+		t.Helper()
+		v, err := rules.Version(ctx)
+		if err != nil {
+			t.Fatalf("version: %v", err)
+		}
+		return v
 	}
 
 	// Detail: every enabled rule for the service (priority order), regardless
@@ -625,16 +654,24 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	}
 
 	// Before: the poll serves only the unattached rule (lo is gated behind its
-	// pending phase) — "active" is broader than "served", by design.
-	before, err := rules.Version(ctx)
-	if err != nil {
-		t.Fatalf("version: %v", err)
+	// pending phase) — "active" is broader than "served", by design. A poll
+	// naming the document it was served gets a 304.
+	var pollsFrom time.Time // last_poll_at is written with the database's clock
+	if err := database.QueryRowContext(ctx, `SELECT now()`).Scan(&pollsFrom); err != nil {
+		t.Fatalf("read the database clock: %v", err)
 	}
-	if code, sync := poll(0); code != http.StatusOK || len(sync.Rules) != 1 || sync.Rules[0].Name != hi {
-		t.Fatalf("poll before kill-switch: code=%d rules=%+v, want 200 with [%s]", code, sync.Rules, hi)
+	g0, v0 := gen(), ruleVersion()
+	w0, sync0 := poll(0, "")
+	if w0.Code != http.StatusOK || len(sync0.Rules) != 1 || sync0.Rules[0].Name != hi || sync0.Version != g0 {
+		t.Fatalf("poll before kill-switch: code=%d rules=%+v version=%d, want 200 [%s] generation %d", w0.Code, sync0.Rules, sync0.Version, hi, g0)
+	}
+	etag0 := w0.Header().Get("ETag")
+	if w, _ := poll(g0, etag0); w.Code != http.StatusNotModified {
+		t.Fatalf("poll(same etag) = %d, want 304", w.Code)
 	}
 
-	// Kill-switch: one version bump per rule, exactly as PUT /rules/{id}.
+	// Kill-switch: one rule_version bump and one generation bump per rule,
+	// exactly as PUT /rules/{id}.
 	w := do(http.MethodPost, "/api/v1/sdk/instances/"+inst.ID+"/kill-switch")
 	if w.Code != http.StatusOK {
 		t.Fatalf("kill-switch: status = %d, body = %s", w.Code, w.Body.String())
@@ -646,12 +683,11 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	if want := []string{hi, lo}; !slices.Equal(ks.DisabledRuleIDs, want) {
 		t.Errorf("disabled_rule_ids = %v, want %v", ks.DisabledRuleIDs, want)
 	}
-	after, err := rules.Version(ctx)
-	if err != nil {
-		t.Fatalf("version: %v", err)
+	if v := ruleVersion(); v != v0+2 {
+		t.Errorf("rule_version %d → %d, want +2 (one bump per disabled rule)", v0, v)
 	}
-	if after != before+2 {
-		t.Errorf("rule_version %d → %d, want +2 (one bump per disabled rule)", before, after)
+	if g := gen(); g != g0+2 {
+		t.Errorf("generation %d → %d, want +2 (one bump per disabled rule)", g0, g)
 	}
 	for _, rid := range []string{hi, lo, off} {
 		if r, err := rules.Get(ctx, rid); err != nil || r.Enabled {
@@ -662,22 +698,31 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 		t.Errorf("other service's rule touched: enabled=%v err=%v", r != nil && r.Enabled, err)
 	}
 
-	// Poll pickup: an SDK holding the old version gets a 200 with an empty
-	// set (the reconciler clears on []); one at the new version gets 304.
-	if code, sync := poll(before); code != http.StatusOK || len(sync.Rules) != 0 || sync.Version != after {
-		t.Errorf("poll(old) = %d version=%d rules=%d, want 200 version=%d rules=0", code, sync.Version, len(sync.Rules), after)
+	// Poll pickup: the ETag the instance holds no longer matches, so it gets a
+	// 200 with an empty set (the reconciler clears on []) at the new
+	// generation; the new ETag gets a 304. Each poll records the generation
+	// the instance holds, and its time.
+	w1, sync1 := poll(g0, etag0)
+	if w1.Code != http.StatusOK || len(sync1.Rules) != 0 || sync1.Version != g0+2 {
+		t.Errorf("poll(old etag) = %d version=%d rules=%d, want 200 at generation %d with no rules", w1.Code, sync1.Version, len(sync1.Rules), g0+2)
 	}
-	if code, _ := poll(after); code != http.StatusNotModified {
-		t.Errorf("poll(new) = %d, want 304", code)
+	if w, _ := poll(g0+2, w1.Header().Get("ETag")); w.Code != http.StatusNotModified {
+		t.Errorf("poll(new etag) = %d, want 304", w.Code)
+	}
+	if d := detail(); d.ObservedGeneration != g0+2 || d.LastPollAt.Before(pollsFrom) {
+		t.Errorf("detail after polls: observed_generation=%d last_poll_at=%v, want %d and a poll time from %v on", d.ObservedGeneration, d.LastPollAt, g0+2, pollsFrom)
 	}
 
-	// Idempotent: nothing left to disable, no version churn.
+	// Idempotent: nothing left to disable, no version or generation churn.
 	w = do(http.MethodPost, "/api/v1/sdk/instances/"+inst.ID+"/kill-switch")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"disabled_rule_ids":[]`) {
 		t.Errorf("second kill-switch: status = %d, body = %s", w.Code, w.Body.String())
 	}
-	if v, _ := rules.Version(ctx); v != after {
-		t.Errorf("second kill-switch bumped rule_version %d → %d", after, v)
+	if v := ruleVersion(); v != v0+2 {
+		t.Errorf("second kill-switch bumped rule_version %d → %d", v0+2, v)
+	}
+	if g := gen(); g != g0+2 {
+		t.Errorf("second kill-switch bumped the generation %d → %d", g0+2, g)
 	}
 	if d := detail(); len(d.ActiveRuleIDs) != 0 {
 		t.Errorf("active_rule_ids after kill-switch = %v, want none", d.ActiveRuleIDs)

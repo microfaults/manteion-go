@@ -7,9 +7,11 @@ import (
 
 // StartFaultConfigReaper completes long-running faults whose finite duration has
 // elapsed. It only flips DB status and bumps the affected services' desired-state
-// generations — there is no push to instances. The SDK drops an expired fault
-// when the poll's active_faults list no longer includes it (ListActiveForService
-// already excludes expired ones), with the SDK watchdog as a backstop.
+// generations — there is no push to instances. An expired fault leaves the
+// service's document when its duration elapses (ListActiveForService excludes
+// it), so a poll naming the earlier ETag already gets a 200 without it; the bump
+// wakes the polls held meanwhile, which would otherwise learn of it only when
+// their wait runs out. The SDK watchdog is the backstop.
 func (s *Server) StartFaultConfigReaper(ctx context.Context, interval time.Duration) {
 	s.logger.Info("starting fault config reaper", "interval", interval)
 	go func() {
