@@ -227,9 +227,9 @@ func serveJSON(t *testing.T, s *Server, method, path string, body any, hdr map[s
 
 func ruleNamesOf(t *testing.T, body []byte) []string {
 	t.Helper()
-	var sync RuleSyncWire
+	var sync atroposdk.RuleSync
 	if err := json.Unmarshal(body, &sync); err != nil {
-		t.Fatalf("decode RuleSyncWire: %v (%s)", err, body)
+		t.Fatalf("decode RuleSync: %v (%s)", err, body)
 	}
 	out := []string{}
 	for _, r := range sync.Rules {
@@ -263,7 +263,7 @@ func TestHandleRegister_RespondsWithMaterializedDocument(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
-	var resp RegisterResponseWire
+	var resp atroposdk.RegisterResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestHandleRegister_UnknownCapabilityCountsAsAChange(t *testing.T) {
 	if gen, _ := fx.gens.Get(ctx, "cartservice"); gen != 2 {
 		t.Fatalf("generation = %d, want 2 (an added unknown string is a change)", gen)
 	}
-	var resp RegisterResponseWire
+	var resp atroposdk.RegisterResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +450,7 @@ func TestSameCapabilities(t *testing.T) {
 // field reaches the wire under its contract name, replay_set carries the
 // (experiment_id, phase_id) pair it is installed under, and freeze_cfg and
 // replay_set are left out when none is desired.
-func TestRegisterResponseWire_CarriesTheWholeDocument(t *testing.T) {
+func TestRegisterResponse_CarriesTheWholeDocument(t *testing.T) {
 	doc := desired.Document{
 		Generation:   7,
 		ETag:         "0123456789abcdef",
@@ -460,7 +460,11 @@ func TestRegisterResponseWire_CarriesTheWholeDocument(t *testing.T) {
 		ReplaySet: &model.ReplaySetRef{ID: "sha256:aa", ExperimentID: "exp-1", PhaseID: "phase-iso", KeyStrategy: "canonical_v2",
 			Count: 3, SHA256: "bb", SizeBytes: 42, URL: "/api/v1/cache/artifacts/sha256:aa"},
 	}
-	raw := marshalRawJSON(t, RegisterResponseWire{Status: "registered", RuleSyncWire: ruleSyncFrom(doc)})
+	sync, err := ruleSyncFrom(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := marshalRawJSON(t, atroposdk.RegisterResponse{Status: "registered", RuleSync: sync})
 	if got := slices.Sorted(maps.Keys(raw)); !slices.Equal(got, []string{"active_faults", "etag", "freeze_cfg", "replay_set", "rules", "status", "version"}) {
 		t.Errorf("keys = %v", got)
 	}
@@ -486,8 +490,12 @@ func TestRegisterResponseWire_CarriesTheWholeDocument(t *testing.T) {
 		t.Errorf("rules/active_faults/freeze_cfg = %+v / %+v / %+v", rules, faults, freeze)
 	}
 
-	none := marshalRawJSON(t, ruleSyncFrom(desired.Document{Generation: 1, ETag: "0123456789abcdef",
-		Rules: []atroposdk.CompiledRule{}, ActiveFaults: []atroposdk.FaultRequest{}}))
+	bare, err := ruleSyncFrom(desired.Document{Generation: 1, ETag: "0123456789abcdef",
+		Rules: []atroposdk.CompiledRule{}, ActiveFaults: []atroposdk.FaultRequest{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	none := marshalRawJSON(t, bare)
 	if got := slices.Sorted(maps.Keys(none)); !slices.Equal(got, []string{"active_faults", "etag", "rules", "version"}) {
 		t.Errorf("keys with no freeze config or replay set = %v, want both left out", got)
 	}
@@ -528,7 +536,7 @@ func TestHandlePollRules_200CarriesEtagAndGeneration(t *testing.T) {
 	if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline" {
 		t.Errorf("rules = %v, want [r-inline] (network and cache-box filtered for an inline-only host)", got)
 	}
-	var sync RuleSyncWire
+	var sync atroposdk.RuleSync
 	_ = json.Unmarshal(w.Body.Bytes(), &sync)
 	if `"`+sync.Etag+`"` != etag || sync.Version != 1 {
 		t.Errorf("body etag/version = %s/%d, header = %s", sync.Etag, sync.Version, etag)
@@ -1301,9 +1309,9 @@ func TestHandleSDKStatus(t *testing.T) {
 	ctx := context.Background()
 	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
 	s := fx.server()
-	w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 3, Etag: "3-abc",
-		Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"rule x: decode: boom"},
-		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"}})
+	w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 3, Etag: "3-abc",
+		Unsupported: []atroposdk.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"rule x: decode: boom"},
+		ReplaySet: &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "committed"}})
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d body = %s, want 204", w.Code, w.Body.String())
 	}
@@ -1318,7 +1326,7 @@ func TestHandleSDKStatus(t *testing.T) {
 
 	// A report is a full snapshot: empty lists clear, and an absent replay_set
 	// means the instance holds none, which clears the stored id and state.
-	if w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 4}); w.Code != http.StatusNoContent {
+	if w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 4}); w.Code != http.StatusNoContent {
 		t.Errorf("minimal report: status = %d", w.Code)
 	}
 	got, _ = fx.reg.Get(ctx, "cart-1")
@@ -1327,7 +1335,7 @@ func TestHandleSDKStatus(t *testing.T) {
 		t.Errorf("after minimal report: %+v (empty lists clear, absent replay_set clears the id and state)", got)
 	}
 
-	w = postStatus(t, s, StatusReport{InstanceID: "nope", Service: "cartservice"})
+	w = postStatus(t, s, atroposdk.StatusReport{InstanceID: "nope", Service: "cartservice"})
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unknown instance: status = %d, want 404", w.Code)
 	}
@@ -1342,17 +1350,17 @@ func TestHandleSDKStatus_Validation(t *testing.T) {
 	ctx := context.Background()
 	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
 	s := fx.server()
-	if w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 5, Etag: "5-abc",
-		Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"first"},
-		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}}); w.Code != http.StatusNoContent {
+	if w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 5, Etag: "5-abc",
+		Unsupported: []atroposdk.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"first"},
+		ReplaySet: &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}}); w.Code != http.StatusNoContent {
 		t.Fatalf("seed report: status = %d body = %s", w.Code, w.Body.String())
 	}
 	stored, _ := fx.reg.Get(ctx, "cart-1")
 
-	report := func(edit func(*StatusReport)) StatusReport {
-		r := StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 6, Etag: "6-def",
-			Unsupported: []model.UnsupportedRule{}, Errors: []string{"second"},
-			ReplaySet: &model.ReplaySetStatus{ID: "sha256:bb", State: "committed"}}
+	report := func(edit func(*atroposdk.StatusReport)) atroposdk.StatusReport {
+		r := atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 6, Etag: "6-def",
+			Unsupported: []atroposdk.UnsupportedRule{}, Errors: []string{"second"},
+			ReplaySet: &atroposdk.ReplaySetStatus{ID: "sha256:bb", State: "committed"}}
 		edit(&r)
 		return r
 	}
@@ -1364,13 +1372,13 @@ func TestHandleSDKStatus_Validation(t *testing.T) {
 		{"malformed JSON", strings.NewReader("{"), "invalid JSON: "},
 		{"negative applied_generation", strings.NewReader(`{"instance_id":"cart-1","service":"cartservice","applied_generation":-1}`), "invalid JSON: "},
 		{"applied_generation beyond uint64", strings.NewReader(`{"instance_id":"cart-1","service":"cartservice","applied_generation":99999999999999999999}`), "invalid JSON: "},
-		{"missing instance_id", report(func(r *StatusReport) { r.InstanceID = "" }), "instance_id required"},
-		{"missing service", report(func(r *StatusReport) { r.Service = "" }), "service required"},
+		{"missing instance_id", report(func(r *atroposdk.StatusReport) { r.InstanceID = "" }), "instance_id required"},
+		{"missing service", report(func(r *atroposdk.StatusReport) { r.Service = "" }), "service required"},
 		// sdk_instances.observed_generation is a BIGINT: pgx cannot store more.
-		{"applied_generation above MaxInt64", report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 + 1 }), "applied_generation out of range"},
-		{"applied_generation MaxUint64", report(func(r *StatusReport) { r.AppliedGeneration = math.MaxUint64 }), "applied_generation out of range"},
-		{"replay_set.state outside the vocabulary", report(func(r *StatusReport) { r.ReplaySet.State = "done" }), "replay_set.state must be fetching, committed or failed"},
-		{"replay_set without a state", report(func(r *StatusReport) { r.ReplaySet = &model.ReplaySetStatus{ID: "sha256:bb"} }), "replay_set.state must be fetching, committed or failed"},
+		{"applied_generation above MaxInt64", report(func(r *atroposdk.StatusReport) { r.AppliedGeneration = math.MaxInt64 + 1 }), "applied_generation out of range"},
+		{"applied_generation MaxUint64", report(func(r *atroposdk.StatusReport) { r.AppliedGeneration = math.MaxUint64 }), "applied_generation out of range"},
+		{"replay_set.state outside the vocabulary", report(func(r *atroposdk.StatusReport) { r.ReplaySet.State = "done" }), "replay_set.state must be fetching, committed or failed"},
+		{"replay_set without a state", report(func(r *atroposdk.StatusReport) { r.ReplaySet = &atroposdk.ReplaySetStatus{ID: "sha256:bb"} }), "replay_set.state must be fetching, committed or failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := postStatus(t, s, tc.body)
@@ -1388,7 +1396,7 @@ func TestHandleSDKStatus_Validation(t *testing.T) {
 	}
 
 	// The BIGINT's own maximum is stored.
-	if w := postStatus(t, s, report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 })); w.Code != http.StatusNoContent {
+	if w := postStatus(t, s, report(func(r *atroposdk.StatusReport) { r.AppliedGeneration = math.MaxInt64 })); w.Code != http.StatusNoContent {
 		t.Fatalf("applied_generation MaxInt64: status = %d body = %s, want 204", w.Code, w.Body.String())
 	}
 	if got, _ := fx.reg.Get(ctx, "cart-1"); got.ObservedGeneration != math.MaxInt64 {
@@ -1429,8 +1437,8 @@ func TestHandleSDKStatus_AbsentListsClear(t *testing.T) {
 		{"empty lists", head + `,"unsupported":[],"errors":[]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1, Etag: "1-a",
-				Unsupported: []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"boom"}}); w.Code != http.StatusNoContent {
+			if w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1, Etag: "1-a",
+				Unsupported: []atroposdk.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"boom"}}); w.Code != http.StatusNoContent {
 				t.Fatalf("seed report: status = %d body = %s", w.Code, w.Body.String())
 			}
 			if w := postStatus(t, s, strings.NewReader(tc.body)); w.Code != http.StatusNoContent {
@@ -1445,7 +1453,7 @@ func TestHandleSDKStatus_AbsentListsClear(t *testing.T) {
 }
 
 // The body an SDK instance posts is its own StatusReport, encoded: the handler
-// must take exactly that, whatever the manteion-local type's tags say.
+// must take exactly that.
 func TestHandleSDKStatus_AcceptsTheSDKsReport(t *testing.T) {
 	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
 	s := fx.server()
@@ -1478,7 +1486,7 @@ func TestHandleSDKStatus_StoreFailureIs500(t *testing.T) {
 	var logs bytes.Buffer
 	s.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	fx.reg.err = errors.New("db down")
-	w := postStatus(t, s, StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1})
+	w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1})
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d body = %s, want 500", w.Code, w.Body.String())
 	}
@@ -1498,9 +1506,9 @@ func TestHandleSDKStatus_DB(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = e.s.sdk.Deregister(context.Background(), inst.ID) })
 
-	report := func(edit func(*StatusReport)) *httptest.ResponseRecorder {
+	report := func(edit func(*atroposdk.StatusReport)) *httptest.ResponseRecorder {
 		t.Helper()
-		r := StatusReport{InstanceID: inst.ID, Service: inst.Service}
+		r := atroposdk.StatusReport{InstanceID: inst.ID, Service: inst.Service}
 		edit(&r)
 		return e.do(http.MethodPost, "/api/v1/sdk/status", r)
 	}
@@ -1522,16 +1530,17 @@ func TestHandleSDKStatus_DB(t *testing.T) {
 		}
 		return d.SDKInstance, raw
 	}
-	unsupported := []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}
+	unsupported := []atroposdk.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}   // as the instance reports them
+	storedUnsupported := []model.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}} // as the row holds them
 
-	if w := report(func(r *StatusReport) {
+	if w := report(func(r *atroposdk.StatusReport) {
 		r.AppliedGeneration, r.Etag, r.Unsupported, r.Errors = 3, "3-abc", unsupported, []string{"rule x: decode: boom"}
-		r.ReplaySet = &model.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}
+		r.ReplaySet = &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}
 	}); w.Code != http.StatusNoContent {
 		t.Fatalf("full report: status = %d body = %s, want 204", w.Code, w.Body.String())
 	}
 	got, keys := detail()
-	if got.ObservedGeneration != 3 || got.ObservedEtag != "3-abc" || !slices.Equal(got.ObservedUnsupported, unsupported) ||
+	if got.ObservedGeneration != 3 || got.ObservedEtag != "3-abc" || !slices.Equal(got.ObservedUnsupported, storedUnsupported) ||
 		!slices.Equal(got.ObservedErrors, []string{"rule x: decode: boom"}) ||
 		got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "fetching" || got.ObservedAt == nil {
 		t.Errorf("after the full report: %+v", got)
@@ -1543,9 +1552,9 @@ func TestHandleSDKStatus_DB(t *testing.T) {
 	}
 
 	// The replay set moves on: its state is overwritten, the rest repeated.
-	if w := report(func(r *StatusReport) {
+	if w := report(func(r *atroposdk.StatusReport) {
 		r.AppliedGeneration, r.Etag, r.Unsupported, r.Errors = 3, "3-abc", unsupported, []string{}
-		r.ReplaySet = &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"}
+		r.ReplaySet = &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "committed"}
 	}); w.Code != http.StatusNoContent {
 		t.Fatalf("committed report: status = %d body = %s", w.Code, w.Body.String())
 	}
@@ -1565,10 +1574,10 @@ func TestHandleSDKStatus_DB(t *testing.T) {
 	}
 
 	// The BIGINT's maximum is stored; one more is refused before pgx sees it.
-	if w := report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 }); w.Code != http.StatusNoContent {
+	if w := report(func(r *atroposdk.StatusReport) { r.AppliedGeneration = math.MaxInt64 }); w.Code != http.StatusNoContent {
 		t.Fatalf("MaxInt64 report: status = %d body = %s", w.Code, w.Body.String())
 	}
-	if w := report(func(r *StatusReport) { r.AppliedGeneration = math.MaxInt64 + 1 }); w.Code != http.StatusBadRequest {
+	if w := report(func(r *atroposdk.StatusReport) { r.AppliedGeneration = math.MaxInt64 + 1 }); w.Code != http.StatusBadRequest {
 		t.Errorf("MaxInt64+1 report: status = %d body = %s, want 400", w.Code, w.Body.String())
 	}
 	if got, _ := detail(); got.ObservedGeneration != math.MaxInt64 {
@@ -1576,7 +1585,7 @@ func TestHandleSDKStatus_DB(t *testing.T) {
 	}
 
 	// A row that is not there is the store's ErrNotFound.
-	if w := e.do(http.MethodPost, "/api/v1/sdk/status", StatusReport{InstanceID: "gone-" + e.tag, Service: inst.Service}); w.Code != http.StatusNotFound {
+	if w := e.do(http.MethodPost, "/api/v1/sdk/status", atroposdk.StatusReport{InstanceID: "gone-" + e.tag, Service: inst.Service}); w.Code != http.StatusNotFound {
 		t.Errorf("unknown instance: status = %d body = %s, want 404", w.Code, w.Body.String())
 	}
 }

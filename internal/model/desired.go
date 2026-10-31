@@ -1,8 +1,12 @@
 package model
 
 // Desired-state protocol v1 (docs/plans/2026-10-30-desired-state-protocol.md).
-// TODO(desired-state): swap ReplaySetRef and the status shapes for the
-// atropos-go wire aliases once the sibling SDK plan lands them.
+// The wire shapes are the SDK's own (atropos-go's RuleSync, ReplaySetRef,
+// StatusReport, ...); the types here are what manteion stores and serves, and
+// internal/api/sdk_wire.go converts at the wire boundary. UnsupportedRule and
+// ReplaySetStatus match the SDK's field for field and convert by Go type
+// conversion, so a drift fails the build; ReplaySetRef's count is the column's
+// int64 where the SDK's is an int, so it converts with a bounds check.
 
 // UnsupportedRule is one rule an instance skipped because its host cannot
 // execute the fault category.

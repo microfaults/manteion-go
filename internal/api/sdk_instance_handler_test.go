@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/db"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
@@ -636,7 +638,7 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 	}
 	// poll polls as the instance holding generation version and, when not
 	// empty, the document ifNoneMatch names.
-	poll := func(version uint64, ifNoneMatch string) (*httptest.ResponseRecorder, RuleSyncWire) {
+	poll := func(version uint64, ifNoneMatch string) (*httptest.ResponseRecorder, atroposdk.RuleSync) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/sdk/rules?service="+svc+"&instance_id="+inst.ID+"&version="+jsonNumber(version), nil)
 		if ifNoneMatch != "" {
@@ -644,10 +646,10 @@ func TestSDKInstanceHandlers_DB(t *testing.T) {
 		}
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
-		var sync RuleSyncWire
+		var sync atroposdk.RuleSync
 		if w.Code == http.StatusOK {
 			if err := json.Unmarshal(w.Body.Bytes(), &sync); err != nil {
-				t.Fatalf("decode RuleSyncWire: %v", err)
+				t.Fatalf("decode RuleSync: %v", err)
 			}
 		}
 		return w, sync

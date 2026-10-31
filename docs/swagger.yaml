@@ -16,56 +16,6 @@ components:
           type: array
           uniqueItems: false
       type: object
-    api.RegisterResponseWire:
-      properties:
-        active_faults:
-          description: null only on a degraded register (version 0, empty etag)
-          items:
-            $ref: '#/components/schemas/atropos.FaultRequest'
-          type: array
-          uniqueItems: false
-        etag:
-          type: string
-        freeze_cfg:
-          $ref: '#/components/schemas/atropos.DelayRequest'
-        replay_set:
-          $ref: '#/components/schemas/model.ReplaySetRef'
-        rules:
-          description: null only on a degraded register (version 0, empty etag)
-          items:
-            $ref: '#/components/schemas/atropos.CompiledRule'
-          type: array
-          uniqueItems: false
-        status:
-          type: string
-        version:
-          description: the generation, under the historical name
-          type: integer
-      type: object
-    api.RuleSyncWire:
-      properties:
-        active_faults:
-          description: null only on a degraded register (version 0, empty etag)
-          items:
-            $ref: '#/components/schemas/atropos.FaultRequest'
-          type: array
-          uniqueItems: false
-        etag:
-          type: string
-        freeze_cfg:
-          $ref: '#/components/schemas/atropos.DelayRequest'
-        replay_set:
-          $ref: '#/components/schemas/model.ReplaySetRef'
-        rules:
-          description: null only on a degraded register (version 0, empty etag)
-          items:
-            $ref: '#/components/schemas/atropos.CompiledRule'
-          type: array
-          uniqueItems: false
-        version:
-          description: the generation, under the historical name
-          type: integer
-      type: object
     api.SDKInstanceDetail:
       properties:
         active_rule_ids:
@@ -155,29 +105,6 @@ components:
           type: string
         version:
           type: string
-      type: object
-    api.StatusReport:
-      properties:
-        applied_generation:
-          type: integer
-        errors:
-          items:
-            type: string
-          type: array
-          uniqueItems: false
-        etag:
-          type: string
-        instance_id:
-          type: string
-        replay_set:
-          $ref: '#/components/schemas/model.ReplaySetStatus'
-        service:
-          type: string
-        unsupported:
-          items:
-            $ref: '#/components/schemas/model.UnsupportedRule'
-          type: array
-          uniqueItems: false
       type: object
     atropos.CacheBoxContext:
       properties:
@@ -355,6 +282,143 @@ components:
             host (a target without a port matches any port).'
           type: string
       type: object
+    atropos.RegisterResponse:
+      properties:
+        active_faults:
+          items:
+            $ref: '#/components/schemas/atropos.FaultRequest'
+          type: array
+          uniqueItems: false
+        etag:
+          description: 'Etag is the ETag of this materialized document: a hash of
+            its content
+
+            alone, never the generation (that travels in Version and in the
+
+            X-Atropos-Generation header), so an unchanged document keeps its ETag
+
+            while the generation moves. The instance treats it as opaque and sends
+
+            it back as `If-None-Match`.'
+          type: string
+        freeze_cfg:
+          $ref: '#/components/schemas/atropos.DelayRequest'
+        replay_set:
+          $ref: '#/components/schemas/atropos.ReplaySetRef'
+        rules:
+          items:
+            $ref: '#/components/schemas/atropos.CompiledRule'
+          type: array
+          uniqueItems: false
+        status:
+          type: string
+        version:
+          description: the generation, kept under the old name
+          type: integer
+      type: object
+    atropos.ReplaySetRef:
+      description: 'ReplaySet is the replay set desired on this instance: absent means
+        no replay
+
+        set is desired, so the instance clears one it holds. Present, it names the
+
+        set to pull: ExperimentID and PhaseID are the (experiment, phase) pair it
+
+        is installed under (the cache-box serves it only to the rule whose context
+
+        matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from
+
+        URL, and SHA256 is the W5 digest over its entries.'
+      properties:
+        count:
+          type: integer
+        experiment_id:
+          type: string
+        id:
+          type: string
+        key_strategy:
+          type: string
+        phase_id:
+          type: string
+        sha256:
+          description: W5 digest over entries (cachebox.SetChecksum)
+          type: string
+        size_bytes:
+          type: integer
+        url:
+          description: relative to the manteion base URL
+          type: string
+      type: object
+    atropos.ReplaySetStatus:
+      properties:
+        id:
+          type: string
+        state:
+          description: fetching | committed | failed
+          type: string
+      type: object
+    atropos.RuleSync:
+      properties:
+        active_faults:
+          items:
+            $ref: '#/components/schemas/atropos.FaultRequest'
+          type: array
+          uniqueItems: false
+        etag:
+          description: 'Etag is the ETag of this materialized document: a hash of
+            its content
+
+            alone, never the generation (that travels in Version and in the
+
+            X-Atropos-Generation header), so an unchanged document keeps its ETag
+
+            while the generation moves. The instance treats it as opaque and sends
+
+            it back as `If-None-Match`.'
+          type: string
+        freeze_cfg:
+          $ref: '#/components/schemas/atropos.DelayRequest'
+        replay_set:
+          $ref: '#/components/schemas/atropos.ReplaySetRef'
+        rules:
+          items:
+            $ref: '#/components/schemas/atropos.CompiledRule'
+          type: array
+          uniqueItems: false
+        version:
+          description: the generation, kept under the old name
+          type: integer
+      type: object
+    atropos.StatusReport:
+      properties:
+        applied_generation:
+          type: integer
+        errors:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        etag:
+          type: string
+        instance_id:
+          type: string
+        replay_set:
+          $ref: '#/components/schemas/atropos.ReplaySetStatus'
+        service:
+          type: string
+        unsupported:
+          items:
+            $ref: '#/components/schemas/atropos.UnsupportedRule'
+          type: array
+          uniqueItems: false
+      type: object
+    atropos.UnsupportedRule:
+      properties:
+        category:
+          type: string
+        rule:
+          type: string
+      type: object
     model.CacheBoxRuleConfig:
       description: when type=cachebox
       properties:
@@ -468,33 +532,6 @@ components:
         scope:
           type: number
         target:
-          type: string
-      type: object
-    model.ReplaySetRef:
-      properties:
-        count:
-          type: integer
-        experiment_id:
-          type: string
-        id:
-          type: string
-        key_strategy:
-          type: string
-        phase_id:
-          type: string
-        sha256:
-          type: string
-        size_bytes:
-          type: integer
-        url:
-          type: string
-      type: object
-    model.ReplaySetStatus:
-      properties:
-        id:
-          type: string
-        state:
-          description: fetching | committed | failed
           type: string
       type: object
     model.Rule:
@@ -1383,7 +1420,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/api.RegisterResponseWire'
+                $ref: '#/components/schemas/atropos.RegisterResponse'
           description: Created
         '400':
           content:
@@ -1469,7 +1506,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/api.RuleSyncWire'
+                $ref: '#/components/schemas/atropos.RuleSync'
           description: desired state; headers ETag, X-Atropos-Generation
         '304':
           description: unchanged; headers ETag, X-Atropos-Generation
@@ -1513,7 +1550,7 @@ paths:
             schema:
               oneOf:
               - type: object
-              - $ref: '#/components/schemas/api.StatusReport'
+              - $ref: '#/components/schemas/atropos.StatusReport'
                 description: applied-state report
                 summary: report
         description: applied-state report

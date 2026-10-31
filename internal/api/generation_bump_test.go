@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/db"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
@@ -510,9 +512,9 @@ func TestFaultConfigChanges_ReachAnUpToDatePoll_DB(t *testing.T) {
 		}
 		lastGen = gen
 		if wantCode == http.StatusOK {
-			var sync RuleSyncWire
+			var sync atroposdk.RuleSync
 			if err := json.Unmarshal(w.Body.Bytes(), &sync); err != nil {
-				t.Fatalf("%s: decode RuleSyncWire: %v", step, err)
+				t.Fatalf("%s: decode RuleSync: %v", step, err)
 			}
 			faults := []string{}
 			for _, f := range sync.ActiveFaults {

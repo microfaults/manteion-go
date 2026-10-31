@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
 )
@@ -31,7 +33,7 @@ import (
 // @Accept       json
 // @Produce      json
 // @Param        instance  body      model.SDKInstance         true  "SDK instance metadata (id, service, address, poll_interval_ms, routes, host, capabilities)"
-// @Success      201       {object}  api.RegisterResponseWire
+// @Success      201       {object}  atroposdk.RegisterResponse
 // @Failure      400       {object}  api.ErrorResponse  "invalid JSON or registration error"
 // @Router       /sdk/register [post]
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -59,21 +61,25 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.bumpGeneration(ctx, inst.Service)
 	}
 
-	resp := RegisterResponseWire{Status: "registered"}
 	doc, err := s.materializer.Materialize(ctx, inst.Service, &inst)
+	var body atroposdk.RuleSync
+	if err == nil {
+		body, err = ruleSyncFrom(doc)
+	}
 	if err != nil {
 		// Never fail registration on a data error: the SDK would refuse to
 		// start. Answer with no document instead — version 0, an empty etag,
 		// null rules and active_faults, no freeze_cfg or replay_set — which
 		// the SDK applies as nothing, so an instance re-registering while its
 		// polls fail keeps what it has armed ([] would clear it). The poll
-		// reports the error as a 500 until the data is fixed.
+		// reports the error as a 500 until the data is fixed. A document that
+		// cannot go on the wire (a replay-set count the SDK's int cannot hold)
+		// is such an error too.
 		s.logger.Error("register: materialize desired state failed", "service", inst.Service, "error", err)
-		writeJSON(w, http.StatusCreated, resp)
+		writeJSON(w, http.StatusCreated, noDocumentRegister{Status: "registered"})
 		return
 	}
-	resp.RuleSyncWire = ruleSyncFrom(doc)
-	writeJSON(w, http.StatusCreated, resp)
+	writeJSON(w, http.StatusCreated, atroposdk.RegisterResponse{Status: "registered", RuleSync: body})
 }
 
 // sameCapabilities reports whether two advertised capability lists name the
@@ -177,7 +183,7 @@ const maxPollWait = 60 * time.Second
 // @Param        version        query   integer false  "generation the instance currently holds, recorded as observed_generation; absent, unparseable or above 9223372036854775807 reads as 0"
 // @Param        wait           query   integer false  "long-poll hold in seconds (0-60, default 0)"
 // @Param        If-None-Match  header  string  false  "ETag of the last document the instance applied or confirmed"
-// @Success      200  {object}  api.RuleSyncWire  "desired state; headers ETag, X-Atropos-Generation"
+// @Success      200  {object}  atroposdk.RuleSync  "desired state; headers ETag, X-Atropos-Generation"
 // @Success      304  "unchanged; headers ETag, X-Atropos-Generation"
 // @Failure      400  {object}  api.ErrorResponse  "service query parameter required"
 // @Failure      500  {object}  api.ErrorResponse  "desired state could not be materialized"
@@ -253,13 +259,22 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	notModified := etagMatches(ifNoneMatch, doc.ETag)
+	var body atroposdk.RuleSync
+	if !notModified {
+		// A document that cannot go on the wire is never sent in part.
+		if body, err = ruleSyncFrom(doc); err != nil {
+			s.pollFailed(ctx, w, "put desired state on the wire", service, err)
+			return
+		}
+	}
 	w.Header().Set("ETag", `"`+doc.ETag+`"`)
 	w.Header().Set("X-Atropos-Generation", strconv.FormatUint(doc.Generation, 10))
-	if etagMatches(ifNoneMatch, doc.ETag) {
+	if notModified {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	writeJSON(w, http.StatusOK, ruleSyncFrom(doc))
+	writeJSON(w, http.StatusOK, body)
 }
 
 // hold parks a poll until the service's generation passes after, wait

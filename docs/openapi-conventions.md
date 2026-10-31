@@ -22,6 +22,10 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 ## Body and response types
 
 - Use Go model types directly: `{object} model.Rule`, `{array} model.Workflow`
+- Wire shapes atropos-go exports (`RuleSync`, `RegisterResponse`, `StatusReport`,
+  ...) are the bodies of the SDK-facing routes; reference them by the file's
+  import alias, `{object} atroposdk.RuleSync`. The spec names them by the SDK's
+  own `@name`, so they appear as `atropos.RuleSync`, next to `atropos.FaultRequest`
 - Use `api.ErrorResponse` for all 4xx/5xx responses. The experiment and phase
   handlers additionally emit a machine-readable `code` (and code-specific
   fields) on top of `error` — see the error-envelope table in `CLAUDE.md`;
