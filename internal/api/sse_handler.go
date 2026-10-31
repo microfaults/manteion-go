@@ -37,6 +37,7 @@ func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 
 	ch := s.broker.Subscribe(service)
 	defer s.broker.Unsubscribe(service, ch)
+	shutdown := s.shutdownContext()
 
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
@@ -59,6 +60,8 @@ func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-shutdown.Done():
+			return // the server is shutting down; the SDK reconnects after its backoff
 		case event, ok := <-ch:
 			if !ok {
 				return

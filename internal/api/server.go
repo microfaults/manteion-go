@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/desired"
@@ -58,6 +59,13 @@ type Server struct {
 	orch             *orchestrator.Orchestrator
 	cacheStore       *cachestore.Store
 	broker           *EventBroker
+
+	// shutdown is done once the HTTP server begins shutting down
+	// (BeginShutdown). Created on first use, so a Server literal (as the
+	// handler tests build) works too.
+	shutdownOnce  sync.Once
+	shutdown      context.Context
+	beginShutdown context.CancelFunc
 }
 
 // NewServer creates a new API server with all repository and client dependencies.
@@ -110,6 +118,25 @@ func NewServer(
 		cacheStore:       cs,
 		broker:           gens.Broker(),
 	}
+}
+
+// BeginShutdown ends every held long-poll as if its wait had elapsed, so each
+// re-materializes and answers 304 or 200 at once, stops new polls from holding,
+// and ends every SSE stream (the SDK reconnects after its backoff).
+// http.Server.Shutdown waits for in-flight requests and its budget (10 s in
+// cmd/manteion) is shorter than a hold (up to 60 s); cmd/manteion registers
+// this with http.Server.RegisterOnShutdown. Idempotent.
+func (s *Server) BeginShutdown() {
+	s.shutdownContext()
+	s.beginShutdown()
+}
+
+// shutdownContext is done once BeginShutdown has been called.
+func (s *Server) shutdownContext() context.Context {
+	s.shutdownOnce.Do(func() {
+		s.shutdown, s.beginShutdown = context.WithCancel(context.Background())
+	})
+	return s.shutdown
 }
 
 // Handler returns an http.Handler with all routes registered.

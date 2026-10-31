@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -876,6 +877,210 @@ func TestHandlePollRules_GenerationStoreFailureMidHoldIs500(t *testing.T) {
 	w := pollWith(t, s, "service=cartservice&instance_id=cart-1&version=1&wait=30", map[string]string{"If-None-Match": etag})
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// shutdownSpyStore is a held poll's generation store in the shutdown tests.
+// Every Get announces itself on read (the poll's Wait has subscribed and is
+// about to park) and, like a database driver, fails on a cancelled context.
+// With block set, Get parks inside the read until its context is cancelled: a
+// store read the shutdown cuts short.
+type shutdownSpyStore struct {
+	desired.Store
+	read  chan struct{}
+	block bool
+}
+
+func (s shutdownSpyStore) Get(ctx context.Context, service string) (uint64, error) {
+	select {
+	case s.read <- struct{}{}:
+	default:
+	}
+	if s.block {
+		<-ctx.Done()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("read generation: %w", err)
+	}
+	return s.Store.Get(ctx, service)
+}
+
+// The server's shutdown budget (10 s in cmd/manteion) is shorter than a hold
+// (up to 60 s). Once the server begins shutting down, a held poll ends as if
+// its wait had elapsed: it re-materializes and answers 304 when the document
+// is unchanged or 200 with the new one, never through pollFailed (a 500, or
+// nothing at all), even when the shutdown cut a store read short. A poll that
+// arrives after shutdown began is answered without holding, unless its client
+// has gone: that is still pollFailed's silence.
+func TestHandlePollRules_ShutdownEndsHoldLikeATimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		block         bool // the hold is inside a store read when shutdown begins
+		change        bool // the document changes, without a bump, during the hold
+		shutdownFirst bool // shutdown began before the poll arrived
+		clientGone    bool // ...and the poll's client hung up
+		wantCode      int  // 0: nothing written
+	}{
+		{name: "held, document unchanged: 304", wantCode: http.StatusNotModified},
+		{name: "held, document changed without a bump: 200", change: true, wantCode: http.StatusOK},
+		{name: "store read cut short: 304, not 500", block: true, wantCode: http.StatusNotModified},
+		{name: "arriving after shutdown began: answered at once", shutdownFirst: true, wantCode: http.StatusNotModified},
+		{name: "client gone during shutdown: nothing written", shutdownFirst: true, clientGone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+			s := fx.server()
+			var logs bytes.Buffer
+			s.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			etag := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil).Header().Get("ETag")
+			// The hold waits on its own generations (the materializer keeps
+			// fx.gens); both stores read generation 1.
+			read := make(chan struct{}, 1)
+			s.generations = desired.NewGenerations(shutdownSpyStore{Store: desired.NewMemoryStore(), read: read, block: tc.block}, desired.NewBroker())
+			if tc.shutdownFirst {
+				s.BeginShutdown()
+			}
+
+			reqCtx, hangUp := context.WithCancel(context.Background())
+			defer hangUp()
+			if tc.clientGone {
+				hangUp()
+			}
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				req := httptest.NewRequestWithContext(reqCtx, http.MethodGet, "/api/v1/sdk/rules?service=cartservice&instance_id=cart-1&version=1&wait=30", nil)
+				req.Header.Set("If-None-Match", etag)
+				mux := http.NewServeMux()
+				s.routes(mux)
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+				done <- w
+			}()
+			if !tc.shutdownFirst {
+				select {
+				case <-read: // the poll's Wait has subscribed: parked, or about to be
+				case w := <-done:
+					t.Fatalf("poll answered %d before it was held", w.Code)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the poll never reached its hold")
+				}
+				if tc.change {
+					fx.rules.keep(1) // the network rule is gone, and nothing bumped
+				}
+				s.BeginShutdown()
+			}
+			var w *httptest.ResponseRecorder
+			select {
+			case w = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the poll was still held 5s after shutdown began (wait=30)")
+			}
+
+			if tc.wantCode == 0 {
+				if w.Body.Len() != 0 || len(w.Header()) != 0 {
+					t.Errorf("wrote headers %v body %q to a client that had gone, want nothing", w.Header(), w.Body.String())
+				}
+				return
+			}
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d body = %q, want %d", w.Code, w.Body.String(), tc.wantCode)
+			}
+			if got := w.Header().Get("X-Atropos-Generation"); got != "1" {
+				t.Errorf("X-Atropos-Generation = %q, want 1", got)
+			}
+			switch got := w.Header().Get("ETag"); {
+			case tc.wantCode == http.StatusNotModified && (got != etag || w.Body.Len() != 0):
+				t.Errorf("304: ETag = %s (want %s), body = %q (want none)", got, etag, w.Body.String())
+			case tc.wantCode == http.StatusOK && (got == etag || !strings.HasPrefix(got, `"1-`)):
+				t.Errorf("200: ETag = %s, want a new generation-1 ETag (was %s)", got, etag)
+			}
+			if tc.wantCode == http.StatusOK {
+				if got := ruleNamesOf(t, w.Body.Bytes()); strings.Join(got, ",") != "r-inline,cachebox:replay:phase-iso" {
+					t.Errorf("rules = %v, want the re-materialized set", got)
+				}
+			}
+			if strings.Contains(logs.String(), "level=ERROR") {
+				t.Errorf("the shutdown went through pollFailed: %q", logs.String())
+			}
+		})
+	}
+}
+
+// End to end with net/http, wired as cmd/manteion wires it: Shutdown runs the
+// RegisterOnShutdown hook before waiting for connections to go idle, a held
+// poll is answered 304 over the wire (Shutdown does not cancel the request, so
+// the re-materialization runs), an SDK's SSE stream ends cleanly, and Shutdown
+// returns within its budget instead of waiting out a 30 s hold.
+func TestServer_ShutdownAnswersHeldPollsAndEndsStreams(t *testing.T) {
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	read := make(chan struct{}, 1)
+	s.generations = desired.NewGenerations(shutdownSpyStore{Store: desired.NewMemoryStore(), read: read}, fx.gens.Broker())
+	mux := http.NewServeMux()
+	s.routes(mux)
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.RegisterOnShutdown(s.BeginShutdown)
+	srv.Start()
+	t.Cleanup(srv.Close)
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
+	first, err := client.Get(srv.URL + "/api/v1/sdk/rules?service=cartservice&instance_id=cart-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	etag := first.Header.Get("ETag")
+
+	sse, err := client.Get(srv.URL + "/api/v1/sdk/events?service=cartservice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sse.Body.Close()
+	streamEnded := make(chan error, 1)
+	go func() { _, err := io.Copy(io.Discard, sse.Body); streamEnded <- err }()
+	for deadline := time.Now().Add(2 * time.Second); s.broker.ClientCount() == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the SSE handler never subscribed")
+		}
+	}
+
+	type answer struct {
+		resp *http.Response
+		err  error
+	}
+	held := make(chan answer, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/sdk/rules?service=cartservice&instance_id=cart-1&version=1&wait=30", nil)
+		req.Header.Set("If-None-Match", etag)
+		resp, err := client.Do(req)
+		held <- answer{resp, err}
+	}()
+	select {
+	case <-read: // the poll is held
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poll never reached its hold")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Config.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v (a held poll or a stream kept it waiting)", err)
+	}
+	a := <-held
+	if a.err != nil {
+		t.Fatalf("held poll: %v", a.err)
+	}
+	a.resp.Body.Close()
+	if a.resp.StatusCode != http.StatusNotModified || a.resp.Header.Get("ETag") != etag {
+		t.Errorf("held poll: status = %d ETag = %s, want 304 %s", a.resp.StatusCode, a.resp.Header.Get("ETag"), etag)
+	}
+	select {
+	case err := <-streamEnded:
+		if err != nil {
+			t.Errorf("SSE stream ended with %v, want a clean end", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the SSE stream outlived Shutdown")
 	}
 }
 

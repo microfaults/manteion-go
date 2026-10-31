@@ -158,11 +158,12 @@ const maxPollWait = 60 * time.Second
 // @Description  Records the instance's observed generation (version) and poll time,
 // @Description  materializes DesiredState(service, instance) and compares its ETag with
 // @Description  If-None-Match. With wait>0 (seconds, max 60) and a matching ETag the
-// @Description  request is held until the service's generation changes or wait elapses,
-// @Description  then re-materialized. 200 carries the RuleSync body (version = generation,
-// @Description  etag, rules, active_faults, freeze_cfg, replay_set) with ETag and
-// @Description  X-Atropos-Generation headers; 304 carries the same headers and no body —
-// @Description  the instance adopts X-Atropos-Generation without re-applying.
+// @Description  request is held until the service's generation changes, wait elapses or
+// @Description  the server begins shutting down, then re-materialized. 200 carries the
+// @Description  RuleSync body (version = generation, etag, rules, active_faults,
+// @Description  freeze_cfg, replay_set) with ETag and X-Atropos-Generation headers; 304
+// @Description  carries the same headers and no body — the instance adopts
+// @Description  X-Atropos-Generation without re-applying.
 // @Tags         sdk
 // @Produce      json
 // @Param        service        query   string  true   "service name"
@@ -223,7 +224,7 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(wait + 15*time.Second)); err != nil {
 			s.logger.Debug("poll: extend write deadline failed", "error", err) // httptest.ResponseRecorder: unsupported
 		}
-		if _, err := s.generations.Wait(ctx, service, doc.Generation, wait); err != nil {
+		if err := s.hold(ctx, service, doc.Generation, wait); err != nil {
 			s.pollFailed(ctx, w, "wait for a generation change", service, err)
 			return
 		}
@@ -246,6 +247,25 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ruleSyncFrom(doc))
+}
+
+// hold parks a poll until the service's generation passes after, wait
+// elapses, or the server begins shutting down (at once if it already has). A
+// hold the shutdown ends returns nil like an elapsed wait, whatever the
+// interrupted store read reported: the caller re-materializes on the request's
+// own context and answers 304 or 200, so http.Server.Shutdown is not kept
+// waiting out the hold. The client leaving and store errors are returned.
+func (s *Server) hold(ctx context.Context, service string, after uint64, wait time.Duration) error {
+	shutdown := s.shutdownContext()
+	holdCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(shutdown, cancel)
+	defer stop()
+	_, err := s.generations.Wait(holdCtx, service, after, wait)
+	if err != nil && ctx.Err() == nil && shutdown.Err() != nil {
+		return nil // cut short by the shutdown, not by the client or the store
+	}
+	return err
 }
 
 // pollInstance reads the polling instance's registration, which selects its

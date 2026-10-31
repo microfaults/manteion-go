@@ -145,6 +145,10 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	// Shutdown waits for in-flight requests, and a held long-poll (up to 60 s)
+	// or an SDK's SSE stream would outlast its 10 s budget below: on Shutdown,
+	// held polls answer at once as if their wait had elapsed and streams end.
+	httpServer.RegisterOnShutdown(srv.BeginShutdown)
 
 	// Policy engine is WIP-frozen (deprecated until the phase-aware rebuild):
 	// schema and CRUD endpoints stay, the evaluation loop is opt-in.
