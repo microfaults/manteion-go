@@ -1471,7 +1471,10 @@ paths:
         \ and ETag. 200 carries the RuleSync body\n(version = generation, etag, rules,\
         \ active_faults, freeze_cfg,\nreplay_set) with ETag and X-Atropos-Generation\
         \ headers; 304 carries the\nsame headers and no body \u2014 the instance adopts\
-        \ X-Atropos-Generation\nwithout re-applying."
+        \ X-Atropos-Generation\nwithout re-applying. An instance_id manteion does\
+        \ not know (deregistered,\npurged, or a database reset) is answered 404, on\
+        \ which the SDK registers\nagain; a poll without instance_id is served the\
+        \ unfiltered document."
       parameters:
       - description: service name
         in: query
@@ -1479,8 +1482,8 @@ paths:
         required: true
         schema:
           type: string
-      - description: SDK instance ID; selects the capability filter and records observed
-          state
+      - description: 'SDK instance ID; selects the capability filter and records observed
+          state (unknown: 404)'
         in: query
         name: instance_id
         schema:
@@ -1516,6 +1519,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/api.ErrorResponse'
           description: service query parameter required
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: 'unknown instance_id: the instance registers again'
         '500':
           content:
             application/json:

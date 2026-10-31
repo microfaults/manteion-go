@@ -13,6 +13,10 @@ probing.
 - The touch runs when the poll **arrives**: before the `If-None-Match` / `304
   Not Modified` decision and before any hold, so liveness stays accurate even
   when nothing changes.
+- A poll naming an `instance_id` manteion does not know (deregistered, purged,
+  or a database reset) is answered `404`, and the SDK registers again: the
+  registry, not the poll, is what the orchestrator's convergence barrier reads,
+  so an unregistered pod must not keep applying documents unseen.
 - The poll is a long-poll: when the instance holds the current generation
   (`version`) and its ETag (the content hash alone) is current, manteion holds
   the request until the service's generation moves or `wait` elapses (at most

@@ -51,7 +51,9 @@ recording surfaces as a verdict, not as silently skewed numbers.
   or the wait elapses (a long-poll), then re-materialized; a matching ETag with an older `version`
   is answered 304 at once with the current generation, which the instance adopts without
   re-applying. The document is filtered by the instance's capabilities; an empty rule array is
-  authoritative (clears SDK rules and triggers the drain tracker).
+  authoritative (clears SDK rules and triggers the drain tracker). An `instance_id` manteion does
+  not know (deregistered, purged, a database reset) is answered 404, on which the SDK registers
+  again; a poll without `instance_id` gets the unfiltered document.
 - **Register** — `POST /api/v1/sdk/register`: instance identity, published routes, `host` and
   `capabilities`; the response is `status` plus the materialized desired state (the 200 poll body),
   filtered by the advertised capabilities. Re-registering with other capabilities bumps the

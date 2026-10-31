@@ -175,17 +175,20 @@ const maxPollWait = 60 * time.Second
 // @Description  (version = generation, etag, rules, active_faults, freeze_cfg,
 // @Description  replay_set) with ETag and X-Atropos-Generation headers; 304 carries the
 // @Description  same headers and no body — the instance adopts X-Atropos-Generation
-// @Description  without re-applying.
+// @Description  without re-applying. An instance_id manteion does not know (deregistered,
+// @Description  purged, or a database reset) is answered 404, on which the SDK registers
+// @Description  again; a poll without instance_id is served the unfiltered document.
 // @Tags         sdk
 // @Produce      json
 // @Param        service        query   string  true   "service name"
-// @Param        instance_id    query   string  false  "SDK instance ID; selects the capability filter and records observed state"
+// @Param        instance_id    query   string  false  "SDK instance ID; selects the capability filter and records observed state (unknown: 404)"
 // @Param        version        query   integer false  "generation the instance currently holds, recorded as observed_generation; absent, unparseable or above 9223372036854775807 reads as 0"
 // @Param        wait           query   integer false  "long-poll hold in seconds (0-60, default 0)"
 // @Param        If-None-Match  header  string  false  "ETag of the last document the instance applied or confirmed"
 // @Success      200  {object}  atroposdk.RuleSync  "desired state; headers ETag, X-Atropos-Generation"
 // @Success      304  "unchanged; headers ETag, X-Atropos-Generation"
 // @Failure      400  {object}  api.ErrorResponse  "service query parameter required"
+// @Failure      404  {object}  api.ErrorResponse  "unknown instance_id: the instance registers again"
 // @Failure      500  {object}  api.ErrorResponse  "desired state could not be materialized"
 // @Router       /sdk/rules [get]
 func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
@@ -209,14 +212,22 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Observed state first (contract §2): the generation the instance holds and
-	// its poll time, before any 304 decision. Best-effort — a purged row must
-	// not break polling.
+	// its poll time, before any 304 decision. Best-effort, except that a row
+	// that is not there means manteion does not know the instance: 404, and
+	// the SDK registers again.
 	if instanceID != "" {
-		if err := s.registry.RecordPoll(ctx, instanceID, observed); err != nil {
+		if err := s.registry.RecordPoll(ctx, instanceID, observed); errors.Is(err, store.ErrNotFound) {
+			s.unknownPollInstance(w, service, instanceID)
+			return
+		} else if err != nil {
 			s.logger.Warn("record poll failed", "instance_id", instanceID, "error", err)
 		}
 	}
 	inst, err := s.pollInstance(ctx, instanceID)
+	if errors.Is(err, store.ErrNotFound) {
+		s.unknownPollInstance(w, service, instanceID)
+		return
+	}
 	if err != nil {
 		s.pollFailed(ctx, w, "read instance", service, err)
 		return
@@ -248,8 +259,11 @@ func (s *Server) handlePollRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Re-read the instance: it may have re-registered with other
-		// capabilities while parked (the change that bumped).
-		if inst, err = s.pollInstance(ctx, instanceID); err != nil {
+		// capabilities while parked (the change that bumped), or deregistered.
+		if inst, err = s.pollInstance(ctx, instanceID); errors.Is(err, store.ErrNotFound) {
+			s.unknownPollInstance(w, service, instanceID)
+			return
+		} else if err != nil {
 			s.pollFailed(ctx, w, "re-read instance after the hold", service, err)
 			return
 		}
@@ -297,17 +311,25 @@ func (s *Server) hold(ctx context.Context, service string, after uint64, wait ti
 }
 
 // pollInstance reads the polling instance's registration, which selects its
-// capability filter. No instance_id, or one whose row is gone (a replaced or
-// purged pod still polling), means no registration: the unfiltered document.
+// capability filter. No instance_id means no registration: nil, the
+// unfiltered document. An instance_id whose row is gone (a deregistered or
+// purged pod still polling, or a database reset) is store.ErrNotFound.
 func (s *Server) pollInstance(ctx context.Context, id string) (*model.SDKInstance, error) {
 	if id == "" {
 		return nil, nil
 	}
-	inst, err := s.registry.Get(ctx, id)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
-	}
-	return inst, err
+	return s.registry.Get(ctx, id)
+}
+
+// unknownPollInstance answers a poll from an instance manteion does not know
+// with 404, on which the SDK registers again (once per loss). Serving it the
+// unfiltered document instead would let a pod apply every rule while invisible
+// to the orchestrator's convergence barrier, which reads registered instances
+// only.
+func (s *Server) unknownPollInstance(w http.ResponseWriter, service, instanceID string) {
+	s.logger.Info("poll from an unknown instance; answered 404 so it registers again",
+		"service", service, "instance_id", instanceID)
+	writeError(w, http.StatusNotFound, "instance not found")
 }
 
 // pollFailed answers a poll whose step failed: with nothing when the client
