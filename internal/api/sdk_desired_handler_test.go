@@ -353,10 +353,19 @@ func TestHandleRegister_MaterializeFailureIsDegraded201(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (a broken rule must not crash-loop the pod); body = %s", w.Code, w.Body.String())
 	}
+	// No document: [] would be an authoritative clear, and a live instance
+	// re-registering while polls answer 500 must keep the faults it has armed.
 	var raw map[string]json.RawMessage
-	_ = json.Unmarshal(w.Body.Bytes(), &raw)
-	if string(raw["rules"]) != "null" || string(raw["active_faults"]) != "[]" || string(raw["version"]) != "0" {
-		t.Errorf("degraded body = %s, want rules:null active_faults:[] version:0", w.Body.String())
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for k, v := range raw {
+		got[k] = string(v)
+	}
+	want := map[string]string{"status": `"registered"`, "version": `0`, "etag": `""`, "rules": `null`, "active_faults": `null`}
+	if !maps.Equal(got, want) {
+		t.Errorf("degraded body = %s, want exactly %v (no freeze_cfg or replay_set)", w.Body.String(), want)
 	}
 	if _, err := fx.reg.Get(context.Background(), "cart-1"); err != nil {
 		t.Error("registration must be persisted even when materialization fails")

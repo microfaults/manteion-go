@@ -74,7 +74,8 @@ func (s *Server) activeFaultsForService(ctx context.Context, service string) ([]
 // @Description  advertised capabilities — so the SDK converges before its first poll.
 // @Description  Registering with capabilities different from the stored ones bumps the
 // @Description  service generation. If the desired state cannot be materialized the
-// @Description  registration still succeeds and rules is null ("no change").
+// @Description  registration still succeeds with no document (version 0, empty etag,
+// @Description  rules and active_faults null), which the SDK applies as nothing.
 // @Tags         sdk
 // @Accept       json
 // @Produce      json
@@ -111,10 +112,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.materializer.Materialize(ctx, inst.Service, &inst)
 	if err != nil {
 		// Never fail registration on a data error: the SDK would refuse to
-		// start. rules:null is the SDK's "no change"; the poll reports the
-		// error as a 500 until the rule is fixed.
+		// start. Answer with no document instead — version 0, an empty etag,
+		// null rules and active_faults, no freeze_cfg or replay_set — which
+		// the SDK applies as nothing, so an instance re-registering while its
+		// polls fail keeps what it has armed ([] would clear it). The poll
+		// reports the error as a 500 until the data is fixed.
 		s.logger.Error("register: materialize desired state failed", "service", inst.Service, "error", err)
-		resp.ActiveFaults = []atroposdk.FaultRequest{}
 		writeJSON(w, http.StatusCreated, resp)
 		return
 	}

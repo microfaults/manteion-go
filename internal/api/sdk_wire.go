@@ -15,8 +15,8 @@ import (
 type RuleSyncWire struct {
 	Version      uint64                   `json:"version"` // the generation, under the historical name
 	Etag         string                   `json:"etag"`
-	Rules        []atroposdk.CompiledRule `json:"rules"`         // null = "no change" (degraded register only)
-	ActiveFaults []atroposdk.FaultRequest `json:"active_faults"` // never null
+	Rules        []atroposdk.CompiledRule `json:"rules"`         // null only on a degraded register (version 0, empty etag)
+	ActiveFaults []atroposdk.FaultRequest `json:"active_faults"` // null only on a degraded register (version 0, empty etag)
 	FreezeCfg    *atroposdk.DelayRequest  `json:"freeze_cfg,omitempty"`
 	ReplaySet    *model.ReplaySetRef      `json:"replay_set,omitempty"`
 }
