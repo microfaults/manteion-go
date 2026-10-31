@@ -11,8 +11,9 @@
 //	MANTEION_TEST_DB=1 go test ./internal/orchestrator/ -v -count=1
 //
 // Zeus is faked with an httptest server speaking the attacks/workflows
-// surface; the atrocontrol controller runs against an empty SDK fleet
-// (fanout to zero targets), exactly like the legacy FSM suite.
+// surface. The SDK fleet is the sdk_instances table: empty unless a test
+// registers instances, whose polls and status reports the tests write
+// directly (fake_sdk_test.go) for the convergence barrier to read.
 package orchestrator
 
 import (
@@ -91,8 +92,8 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// newOrch builds an orchestrator against the shared repos, an empty SDK
-// fleet, and (optionally) a fake zeus. Poll cadence is tightened so the
+// newOrch builds an orchestrator against the shared repos, the registered
+// SDK fleet, and (optionally) a fake zeus. Poll cadence is tightened so the
 // suite runs in seconds.
 func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 	t.Helper()

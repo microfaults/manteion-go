@@ -2,8 +2,8 @@
 
 Control plane of the faults-lab interventional performance-attribution instrument. Manteion owns
 the experiment/phase state machine, the rule oracle the atropos-go SDKs poll, the recorded-cache
-store, and the zeus load driver: it freezes services, pushes recordings back into them, drives a
-fixed load, and judges whether the resulting latency deltas are scientifically valid.
+store, and the zeus load driver: it freezes services, serves their recordings back to them as replay
+sets, drives a fixed load, and judges whether the resulting latency deltas are scientifically valid.
 
 ## The instrument in one paragraph
 
@@ -12,13 +12,13 @@ phases. The **baseline** phase replays a fixed workflow (zeus → k6) while ever
 SDK records its egress HTTP responses and pushes them to manteion (NDJSON batches with
 per-`(experiment, phase)` accounting); the phase ends with a **drain barrier** — every expected SDK
 instance must flush and account for its records before the phase may complete. An **isolation**
-phase pushes the baseline recording *back into* the target service (staged `begin/chunk/commit`
-preload verified by a W5 checksum), **freezes** it — its egress is answered from the installed
-replay set with a synthetic delay, and misses fail closed (a counted synthetic 503, never a live
-call) — replays the same load, and reads the latency delta. Every frozen phase gets a **fidelity
-verdict** (`VALID | VALID_WITH_WARNINGS | INVALID`) computed from per-phase SDK counters, so a
-leak, a mis-keyed record, or an incomplete recording surfaces as a verdict, not as silently skewed
-numbers.
+phase turns the baseline recording into an immutable replay-set artifact that the target service's
+instances pull and verify (entry count and W5 checksum) before any load starts, **freezes** the
+service — its egress is answered from the installed replay set with a synthetic delay, and misses
+fail closed (a counted synthetic 503, never a live call) — replays the same load, and reads the
+latency delta. Every frozen phase gets a **fidelity verdict** (`VALID | VALID_WITH_WARNINGS |
+INVALID`) computed from per-phase SDK counters, so a leak, a mis-keyed record, or an incomplete
+recording surfaces as a verdict, not as silently skewed numbers.
 
 ## Packages
 
@@ -27,11 +27,11 @@ numbers.
 | `internal/model/` | Domain types + `Validate()`; `enums.go` is the Go source of truth for the PG enum vocabularies. |
 | `internal/store/` | Postgres repositories (pgx). CAS phase/experiment transitions live here (`TransitionPhase` with explicit from-sets). |
 | `internal/db/` | Pool init + append-only migrations. **Schema epoch 2**: `Migrate` refuses a database whose history it doesn't recognize — resetting means dropping the database. |
-| `internal/orchestrator/` | The experiment FSM. `enterPhase`: generation bump → preload gate → freeze gate → phase rules → workflow materialization → zeus runs + additive attacks → poller. `finishPhase`: the single terminal path — CAS `running→draining→completed` for recording phases (drain barrier), fidelity verdict *before* thaw, harvest exactly once, then experiment advance. Every transition (enter, pause, drain, finish) bumps the generation of each service the phase touches. Phase-level pause (experiment pause is derived; a paused phase's rules and cache-box role leave the desired state until resume); `Recover` reconciles crash state at startup. |
+| `internal/orchestrator/` | The experiment FSM. `enterPhase`: replay-set artifacts for a frozen phase (built from the baseline recording and assigned to `(phase, service)` on a fresh start, re-read on a resume) → one generation bump per service the phase touches → convergence barrier (every alive instance observes the bump and, on a frozen service, holds the assigned replay set committed, within `MANTEION_CONVERGE_TIMEOUT`; a timeout fails the phase naming the lagging instances, suspect ones are named but not waited on) → workflow materialization → zeus runs + additive attacks → poller. Nothing is pushed to instances: rules, freeze config and replay sets reach them through their polls. `finishPhase`: the single terminal path — CAS `running→draining→completed` for recording phases (drain barrier), stop load, fidelity verdict *before* the exit bump that thaws, bump and a non-fatal wait, harvest exactly once, then experiment advance. Every transition (enter, pause, drain, finish) bumps the generation of each service the phase touches. Phase-level pause (experiment pause is derived; a paused phase's rules, cache-box role, freeze config and replay set leave the desired state until resume, which bumps and waits like an entry and leaves the phase paused if the fleet does not converge); `Recover` reconciles crash state at startup. |
 | `internal/orchestrator/{drain,verdict,admission}.go` | Drain barrier + gap classification, per-phase verdict from W6 snapshots, refusal of overlapping concurrent experiments (the SDK is single-tenant). |
 | `internal/cachestore/` | NDJSON cache store: batch-seq dedup, per-key accounting, collision stats, drain-report ledger, W5 checksum. |
 | `internal/desired/` | Desired-state materializer (protocol v1): per-service generations (`service_generations`; a bump wakes held long-polls and SSE subscribers) and `Materializer`, which builds each `(service, instance)` document from the database — phase-aware rules, active fault configs, the synthesized cache-box rule, and `freeze_cfg` and `replay_set`, derived from the running phase that freezes the service and the artifact assigned to its `(phase, service)` (`PhaseSources`) — filtered by the instance's capabilities (a host without a cache-box gets neither of those two), with ETag `"<sha256[:16]>"`: the content hash alone (the generation rides `X-Atropos-Generation` and the body's `version`), so a bump that leaves an instance's document unchanged keeps its ETag. Every input change bumps the generation except, in plan 1: a fault config's time-based expiry, which changes the document before the reaper's bump (`docs/long-running-faults.md`); a fault-spec edit (`PUT /api/v1/faults/specs/{id}`); attaching or detaching a phase's rules (`AttachPhaseRules` on experiment and phase create, `UpdatePhase` on a phase edit: a standalone rule attached to a pending phase goes dark, a detached one live again); and deleting a phase or an experiment (the delete cascades to `phase_rules`). Their content hash still moves: a non-held poll sees them at once, a held one when its wait elapses or the next bump arrives, so within one wait. |
-| `internal/atrocontrol/` | SDK fanout controller: freeze/thaw, rule push, staged preload driver, fidelity pulls. Its in-memory intent tracker is no longer read for the register and poll answers (everything in them, `freeze_cfg` and `replay_set` included, comes from the database) and goes with the push paths in plan 2. Tracker writes are field-scoped: freeze and thaw are the only writers of the tracked freeze config (rule pushes and fault injection leave it alone), and a restart loses it. Liveness filter is `FilterLive` — `stale` (slow-polling) pods are live and owe drain records; only `dead` is excluded. |
+| `internal/atrocontrol/` | SDK controller: live-instance resolution (the orchestrator's convergence barrier and verdict) and fidelity pulls. Its push paths (freeze/thaw, rule push, staged preload driver) no longer have an orchestrator caller; only the opt-in policy engine still pushes rules. Its in-memory intent tracker is no longer read for the register and poll answers (everything in them, `freeze_cfg` and `replay_set` included, comes from the database) and goes with the push paths in plan 2. Tracker writes are field-scoped: freeze and thaw are the only writers of the tracked freeze config (rule pushes and fault injection leave it alone), and a restart loses it. Liveness filter is `FilterLive` — `stale` (slow-polling) pods are live and owe drain records; only `dead` is excluded. The convergence barrier waits on `alive` instances only and names `stale` ones. |
 | `internal/atropos/` | HTTP client for individual SDK instances (delay, preload, fidelity, clear). |
 | `internal/zeus/` | HTTP client for zeus (workflows, runs, attacks, datasets). |
 | `internal/ruleconv/` | Rule → wire compilation. Wire structs (`CompiledRule`, `FaultRequest`, `DelayRequest`) are **imported from atropos-go** — one contract, two repos; the poll, register and status bodies are atropos-go's own `RuleSync`, `RegisterResponse` and `StatusReport` (`internal/api/sdk_wire.go`), so a shape drift fails the build; `model.ReplaySetRef` stays the persistence type and converts at that boundary. Cache-box rules are **synthesized per running phase** (`SynthesizeCacheBoxRule`), never stored. |
@@ -65,8 +65,11 @@ numbers.
 - **Drain** — `POST /api/v1/sdk/cachebox/drain`: per-`(experiment, phase)` instance report; the
   barrier compares manteion-received counts against SDK-recorded counts, with a W6 fidelity-pull
   fallback for lost reports.
-- **Preload** — SDK-side `POST /cachebox/preload/{begin,chunk,commit,abort}`; commit verifies the
-  W5 checksum (implementation pinned to an identical cross-repo test vector in both repos).
+- **Replay sets** — immutable NDJSON artifacts at `GET /api/v1/cache/artifacts/{id}` (`HEAD`,
+  `Range`), pulled by the instance when the poll's `replay_set` names one (id, the
+  `(experiment, phase)` pair, count, W5 digest); the instance stages, verifies and commits the set
+  and reports its state, which the convergence barrier reads (W5 implementation pinned to an
+  identical cross-repo test vector in both repos).
 - **SSE** — `GET /api/v1/sdk/events?service=`: `rules_changed` with data `{"generation":G}` on every
   generation change (orchestrator transitions included) nudges the instance to poll at once; the
   long-poll is primary.
@@ -89,7 +92,8 @@ datasets pass through; attacks are orchestrator-managed, not proxied).
 | `ZEUS_URL` | `http://archer:8080` | zeus base URL |
 | `PROMETHEUS_URL` | `http://prometheus:9090` | Prometheus instant-query client |
 | `CACHE_DIR` | `/var/cache/manteion` | NDJSON cache store root |
-| `MANTEION_PRELOAD_TIMEOUT` | `60s` | Per-instance staged-preload budget |
+| `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier: how long a phase entry or resume waits for every alive instance to observe its bump (and hold a frozen service's replay set committed) before failing; exit and drain wait as long and only log |
+| `MANTEION_PRELOAD_TIMEOUT` | `60s` | Staged-preload transport budget; nothing preloads since phase entry builds replay-set artifacts (removed with the push paths) |
 | `MANTEION_DRAIN_TIMEOUT` | `30s` | Drain-barrier wait before gap classification |
 | `MANTEION_ALLOW_DEGRADED_BASELINE` | `false` | Permit isolation phases over a degraded baseline recording |
 | `MANTEION_POLICY_ENGINE` | `off` | WIP-frozen policy loop |
@@ -106,16 +110,13 @@ development against a sibling checkout, use an uncommitted workspace file:
 go work init . ../atropos-go   # never commit go.work
 ```
 
-**Plan 1 runs no experiments with the desired-state SDK.** This plan-1 materializer must not run
-experiments against the branch SDK (atropos `feat/atroposd`, plan C) until plan 2 lands; the older
-SDK, which sends no `If-None-Match` and re-applies every 200, is not affected. A 200 without
-`replay_set` clears the SDK's replay set, and none is served yet (nothing assigns replay-set artifacts until the
-orchestrator builds them, in plan 2), so a frozen instance drops the set its preload just installed at the
-first 200 after the freeze (within one wait). The phase-entry rule
-push through `/admin/rules` replaces the rules the SDK applied from the document with the phase's
-rules alone (no standalone rules, no cache-box rule) and leaves its held ETag in place, so later
-polls answer 304 and never restore them. The phase-end nil push clears every rule on the phase's
-services the same way, after the post-phase 200, and later 304s never restore them either.
+**Plan 2 is in progress.** Phase entry and exit no longer push to SDK instances: entry assigns the
+replay-set artifacts, bumps each service once and waits for the fleet to converge, and exit bumps
+after the fidelity verdict (`docs/plans/2026-10-30-desired-state-manteion-2-orchestrator.md`, Task
+5). Until plan 2 is complete, the opt-in policy engine still pushes rules through `/admin/rules`,
+which replaces the rules the SDK applied from its document and keeps its held ETag, so later polls
+answer 304 and never restore them; and ingest dedupes on `(experiment, phase, instance, batch_seq)`
+without the SDK's `epoch`.
 
 ## Development
 

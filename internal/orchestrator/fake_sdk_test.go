@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,19 +13,15 @@ import (
 
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
-	"manteion-go/internal/ruleconv"
 )
 
-// fakeSDK is an httptest SDK control server for orchestrator preload/freeze gate
-// tests. It implements the staged preload endpoints (§W4) and the freeze/clear
-// admin routes. When commitOK is true it echoes the requested count+checksum
-// (a clean verify-commit); when false it returns a 409 checksum mismatch. It
-// records whether freeze was ever asserted, so a test can prove the preload gate
-// aborts BEFORE freeze.
+// fakeSDK is an httptest SDK control server for the orchestrator tests. It
+// serves the one route manteion still calls on an instance at a phase exit,
+// GET /cachebox/fidelity (the verdict pull and the drain fallback); phase entry
+// and exit reach instances through their polls, which the tests simulate on
+// the database (registerSDK, ackGenerations, ackAssigned).
 type fakeSDK struct {
-	server    *httptest.Server
-	commitOK  bool
-	freezeHit atomic.Bool
+	server *httptest.Server
 	// fidelity, when set, is served at GET /cachebox/fidelity; nil ⇒ 503 (used
 	// to simulate a missing-telemetry instance).
 	fidelity *atroposdk.FidelitySnapshot
@@ -34,64 +29,12 @@ type fakeSDK struct {
 	// genAtPull is where a test's onFidelity records the generation it saw.
 	onFidelity func()
 	genAtPull  atomic.Uint64
-
-	// mu guards pushed, the compiled rule names POSTed to /admin/rules — lets
-	// tests assert the push channel is a strict projection of the poll
-	// predicate (enabled rules only).
-	mu     sync.Mutex
-	pushed []string
-}
-
-// rulesPushed returns the names of every compiled rule the fake received on
-// POST /admin/rules, in arrival order.
-func (f *fakeSDK) rulesPushed() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.pushed...)
 }
 
 func newFakeSDK(t *testing.T) *fakeSDK {
 	t.Helper()
-	f := &fakeSDK{commitOK: true}
+	f := &fakeSDK{}
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("POST /cachebox/preload/begin", func(w http.ResponseWriter, _ *http.Request) {
-		writeTestJSON(w, http.StatusOK, atroposdk.PreloadBeginResponse{OK: true})
-	})
-	mux.HandleFunc("POST /cachebox/preload/chunk", func(w http.ResponseWriter, r *http.Request) {
-		var req atroposdk.PreloadChunkRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		writeTestJSON(w, http.StatusOK, atroposdk.PreloadChunkResponse{StagedTotal: len(req.Entries)})
-	})
-	mux.HandleFunc("POST /cachebox/preload/commit", func(w http.ResponseWriter, r *http.Request) {
-		var req atroposdk.PreloadCommitRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if f.commitOK {
-			writeTestJSON(w, http.StatusOK, atroposdk.PreloadCommitResponse{OK: true, Loaded: req.TotalEntries, Checksum: req.Checksum})
-			return
-		}
-		writeTestJSON(w, http.StatusConflict, atroposdk.PreloadCommitResponse{OK: false, Loaded: req.TotalEntries, Checksum: "deadbeef-mismatch"})
-	})
-	mux.HandleFunc("POST /cachebox/preload/abort", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("POST /admin/rules", func(w http.ResponseWriter, r *http.Request) {
-		var rules []ruleconv.CompiledRule
-		_ = json.NewDecoder(r.Body).Decode(&rules)
-		f.mu.Lock()
-		for _, cr := range rules {
-			f.pushed = append(f.pushed, cr.Name)
-		}
-		f.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("POST /admin/cachebox/delay", func(w http.ResponseWriter, _ *http.Request) {
-		f.freezeHit.Store(true)
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("DELETE /admin/cachebox", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
 	mux.HandleFunc("GET /cachebox/fidelity", func(w http.ResponseWriter, _ *http.Request) {
 		if f.onFidelity != nil {
 			f.onFidelity()

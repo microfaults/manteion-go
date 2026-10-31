@@ -7,7 +7,7 @@ Manteion is the central coordination controller for the atropos ecosystem. It tu
 - **atropos-go** — Fault injection + OTel instrumentation SDK embedded in each service. Core interface: `Evaluator.Evaluate(ctx, Request) *Decision`. Three fault categories: inline (error/hang/latency), network (blackhole/drip/latency/retransmit_delay/rst/throttle), resource (cpu/disk/io/memory). Always-on tracing with `atropos.*` span attributes.
 - **zeus-go** — Load generation platform. Archer REST API orchestrates k6 workloads (broad traffic) and vegeta attacks (precision endpoint loads). After policy migration to manteion, Archer is a pure execution engine.
 - **service-beds** — Go HTTP recreations of Google's Online Boutique (13 services) with OTel + atropos instrumentation. Deployed via Skaffold/Kubernetes.
-- **manteion-go** (this repo) — Sits between SDKs (atropos-go) and load gen (zeus-go). Pushes evaluator rules and cache-box mode changes to SDK instances. Orchestrates experiments. Owns policy evaluation.
+- **manteion-go** (this repo) — Sits between SDKs (atropos-go) and load gen (zeus-go). Serves evaluator rules and cache-box state to SDK instances as a desired-state document they poll. Orchestrates experiments. Owns policy evaluation.
 
 ## Research Context
 
@@ -24,7 +24,7 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 4. Compute: `delta_service = baseline_latency - isolated_latency`
 5. Interaction detection: `delta_combined - sum(delta_individual)` — nonzero means superadditive interference
 
-**Manteion's role in the roadmap:** Phase 2 of the atropos vision. Phase 1 (cache-box core in atropos-go SDK) provides the primitive. Manteion pushes mode changes and rules to SDK instances, coordinates experiment enrollment, and provides the central control plane. Phase 3 (analysis integration) builds automated latency decomposition on top.
+**Manteion's role in the roadmap:** Phase 2 of the atropos vision. Phase 1 (cache-box core in atropos-go SDK) provides the primitive. Manteion serves mode changes and rules to SDK instances, coordinates experiment enrollment, and provides the central control plane. Phase 3 (analysis integration) builds automated latency decomposition on top.
 
 **Key references:** LDFI, Coz (causal profiling), 3MileBeach (tracing + fault injection with baggage), Filibuster (boundary instrumentation), ShapleyIQ (game-theoretic attribution — observational, not interventional).
 
@@ -36,7 +36,7 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 - PostgreSQL-backed persistence via pgx/v5 (`internal/db/` for connection management and migrations, `internal/store/` for domain repositories)
 - HTTP proxy to zeus-go Archer for workload/attack operations
 - Desired-state SDK polling (`internal/desired/`): a per-service generation bumped with every input change, a materialized document per instance with a content ETag, and a long-polling `GET /api/v1/sdk/rules` that answers 304 Not Modified when `If-None-Match` names the current ETag. Plan-1 exceptions move the ETag's content hash but not the generation (a non-held poll sees them at once, a held one when its wait elapses or the next bump arrives, so within one wait): a fault config's time-based expiry, before the reaper's bump (`docs/long-running-faults.md`); fault-spec edits; attaching or detaching a phase's rules (`AttachPhaseRules` on experiment and phase create, `UpdatePhase` on a phase edit); and phase or experiment deletion (cascading to `phase_rules`)
-- Plan 1 must not run experiments against the branch SDK (atropos `feat/atroposd`, plan C) until plan 2 lands; the older SDK, which sends no `If-None-Match` and re-applies every 200, is not affected. A 200 without `replay_set` clears the SDK's replay set, and none is served yet (nothing assigns replay-set artifacts until the orchestrator builds them, in plan 2). The phase-entry rule push through `/admin/rules` replaces the rules the SDK applied from the document with the phase's rules alone and leaves its held ETag in place, so later polls answer 304 and never restore them. The phase-end nil push clears every rule on the phase's services the same way.
+- Plan 2 is in progress: phase entry and exit no longer push to SDK instances (plan 2 Task 5). Entry assigns the replay-set artifacts, bumps each service once and waits up to `MANTEION_CONVERGE_TIMEOUT` for every alive instance to converge; exit bumps after the fidelity verdict. Until plan 2 is complete, the opt-in policy engine still pushes rules through `/admin/rules`, which replaces the rules the SDK applied from its document and keeps its held ETag, so later polls answer 304 and never restore them; and ingest dedupes without the SDK's `epoch`.
 - Docker-compose for local development (postgres:17-alpine)
 
 ### Storage

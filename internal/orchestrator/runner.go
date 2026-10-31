@@ -11,9 +11,6 @@ import (
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
-	"manteion-go/internal/atrocontrol"
-	"manteion-go/internal/cachestore"
-	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/zeus"
@@ -477,52 +474,6 @@ func driverStartFailure(kind, driverID, workflowID string, err error) string {
 // Enter-sequence pieces
 // =========================================================================
 
-// pushPhaseRules compiles the phase's rules and pushes each to its own
-// target service. Compile/load errors are fatal (bad experiment data);
-// fanout errors are warnings (an empty SDK fleet must not fail the phase).
-func (o *Orchestrator) pushPhaseRules(ctx context.Context, p *model.ExperimentPhase) error {
-	prs, err := o.experiments.ListPhaseRules(ctx, p.ID)
-	if err != nil {
-		return fmt.Errorf("list phase rules: %w", err)
-	}
-	if len(prs) == 0 {
-		return nil
-	}
-
-	// Group rule IDs by their target service, preserving position order.
-	byService := make(map[string][]string)
-	var services []string
-	for _, pr := range prs {
-		r, err := o.rules.Get(ctx, pr.RuleID)
-		if err != nil {
-			return fmt.Errorf("load rule %q: %w", pr.RuleID, err)
-		}
-		// Push is a projection of the poll predicate (ForService: enabled AND
-		// attached-to-running — the phase is already 'running' here), never a
-		// second opinion. Pushing a disabled attached rule fired it for up to
-		// one poll interval until the reconciler wiped it (ghost activation).
-		if !r.Enabled {
-			continue
-		}
-		if _, ok := byService[r.Service]; !ok {
-			services = append(services, r.Service)
-		}
-		byService[r.Service] = append(byService[r.Service], r.ID)
-	}
-
-	for _, svc := range services {
-		compiled, err := o.loadCompiledRules(ctx, byService[svc])
-		if err != nil {
-			return err
-		}
-		if _, err := o.controller.PushRules(ctx, svc, compiled); err != nil {
-			o.logger.Warn("orchestrator: push rules failed",
-				"phase_id", p.ID, "service", svc, "error", err)
-		}
-	}
-	return nil
-}
-
 // materializePhaseWorkflows pushes every workflow definition attached to the
 // phase into zeus: best-effort delete of any stale copy under the same id
 // (covers renames, where overwrite-by-name would miss), then register with
@@ -771,33 +722,6 @@ func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
 	}
 }
 
-// =========================================================================
-// Cache-box freeze / thaw / preload
-// =========================================================================
-
-// freezeServices applies the phase's frozen_services cache-box config to
-// each service (the cache-box decomposition primitive). Mu/Sigma come from
-// the service's fitted synthetic-delay distribution. The poll serves the same
-// config on its own: the materializer derives freeze_cfg from the running
-// phase that freezes the service (desired.PhaseSources, through the same
-// desired.FreezeDelayRequest), so a re-registering SDK inherits the freeze
-// from the database, not from the controller's in-memory intent tracker this
-// push also records in. Plan 2's phase entry drops the push for the generation
-// bump and the convergence wait.
-func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) error {
-	for _, fs := range p.FrozenServices {
-		result, err := o.controller.FreezeService(ctx, fs.Service, desired.FreezeDelayRequest(p, fs))
-		if err != nil {
-			return fmt.Errorf("freeze %q: %w", fs.Service, err)
-		}
-		if len(result.Failed) > 0 {
-			return fmt.Errorf("freeze %q: %d of %d instances failed to freeze",
-				fs.Service, len(result.Failed), len(result.Targeted))
-		}
-	}
-	return nil
-}
-
 // stopZeusAttacks stops each of the phase's running zeus attacks. Best-effort:
 // a stop error (e.g. an already-finished attack) is logged, not fatal. Safe to
 // call more than once (the drain barrier stops attacks before the gate; the
@@ -817,86 +741,9 @@ func (o *Orchestrator) stopZeusAttacks(ctx context.Context, pws []model.PhaseWor
 	}
 }
 
-// thawServices clears the phase's frozen_services cache-box freeze. Called
-// at the phase's terminal cleanup, symmetric to freezeServices.
-func (o *Orchestrator) thawServices(ctx context.Context, p *model.ExperimentPhase) {
-	for _, fs := range p.FrozenServices {
-		if _, err := o.controller.ClearService(ctx, fs.Service); err != nil {
-			o.logger.Warn("orchestrator: clear service (thaw) failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
-		}
-	}
-}
-
-// preloadCacheEntries installs each frozen service's baseline recording onto
-// every live SDK instance via the staged, verified §W4 protocol, and returns an
-// error (the phase-abort trigger) unless every instance verify-commits the
-// byte-exact set. The baseline is the experiment's most recently completed
-// phase that persisted its cache and froze nothing.
-//
-// This is a hard gate (INV-4), replacing the old warn-and-continue: a missing
-// baseline, a zero-entry frozen service, a checksum/count mismatch, or any
-// instance failure aborts the isolation phase before freeze and before load —
-// so load never runs all-miss (all-leak) against an unverified replay set.
-func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.ExperimentPhase) error {
-	baseline, err := o.baselinePhase(ctx, p.ExperimentID)
-	if err != nil {
-		return fmt.Errorf("resolve baseline: %w", err)
-	}
-	if baseline == nil {
-		return fmt.Errorf("no completed baseline recording for experiment %q; cannot preload frozen services", p.ExperimentID)
-	}
-
-	// Refuse to build a replay set from a degraded recording (INV-3): its
-	// coverage is unverified, so any isolation run over it is suspect. The
-	// operator can override with MANTEION_ALLOW_DEGRADED_BASELINE.
-	drain, err := o.experiments.GetPhaseDrain(ctx, baseline.ID)
-	if err != nil {
-		return fmt.Errorf("read baseline drain result: %w", err)
-	}
-	if drain.Degraded() && !o.allowDegradedBaseline {
-		return fmt.Errorf("baseline recording %q is degraded (%d missing instances, %d entry shortfall); "+
-			"refusing to preload — set MANTEION_ALLOW_DEGRADED_BASELINE=true to override",
-			baseline.ID, len(drain.MissingInstances), drain.ShortfallEntries)
-	}
-
-	for _, fs := range p.FrozenServices {
-		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, fs.Service)
-		if err != nil {
-			return fmt.Errorf("read baseline entries for %q: %w", fs.Service, err)
-		}
-		if len(entries) == 0 {
-			return fmt.Errorf("baseline recorded zero entries for frozen service %q; nothing to replay", fs.Service)
-		}
-
-		strat := model.ResolveKeyStrategy(fs.KeyStrategy)
-		if err := verifyRecordedStrategy(fs.Service, entries, strat); err != nil {
-			return err
-		}
-		checksum := cachestore.SetChecksum(entries)
-		results, err := o.controller.PreloadService(ctx, fs.Service, atrocontrol.PreloadSpec{
-			ExperimentID:    p.ExperimentID,
-			PhaseID:         p.ID,
-			SourcePhaseID:   baseline.ID,
-			KeyStrategy:     strat,
-			StrategyVersion: model.KeyStrategyVersion(strat),
-			KeyHeaders:      fs.KeyHeaders,
-			MaxBytes:        atrocontrol.DefaultPreloadMaxBytes,
-			Entries:         entries,
-			Checksum:        checksum,
-		})
-		if err != nil {
-			return fmt.Errorf("preload %q: %w", fs.Service, err)
-		}
-		if err := verifyPreload(fs.Service, len(entries), checksum, results); err != nil {
-			return err
-		}
-		o.logger.Info("orchestrator: preload verified",
-			"phase_id", p.ID, "service", fs.Service,
-			"entries", len(entries), "instances", len(results))
-	}
-	return nil
-}
+// =========================================================================
+// Replay sets (the cache-box freeze's inputs)
+// =========================================================================
 
 // buildReplayArtifacts is the replay-set half of a fresh frozen phase's entry
 // (INV-4): for each frozen service it builds an immutable, content-addressed
@@ -985,7 +832,7 @@ func (o *Orchestrator) assignedArtifacts(ctx context.Context, p *model.Experimen
 	return out, nil
 }
 
-// verifyRecordedStrategy is the preload strategy preflight (MANT-5/INV-2): the
+// verifyRecordedStrategy is the replay-set strategy preflight (MANT-5/INV-2): the
 // key strategy the entries were recorded under must equal the strategy the
 // freeze context will replay with, or every key would derive differently and
 // the isolation run would be 100% miss. An entry with an empty key_strategy
@@ -996,30 +843,6 @@ func verifyRecordedStrategy(service string, entries []atroposdk.CacheBoxWireEntr
 		if s := entries[i].KeyStrategy; s != "" && s != expected {
 			return fmt.Errorf("preload %q: key_strategy_mismatch: recorded under %q but the freeze context uses %q "+
 				"(record and replay must key identically)", service, s, expected)
-		}
-	}
-	return nil
-}
-
-// verifyPreload is the per-instance completeness gate (INV-4): every live
-// instance must have verify-committed the exact expected set. Any transport
-// failure, rejected commit, wrong count, or checksum mismatch — or no live
-// instances at all — fails the phase.
-func verifyPreload(service string, expectedCount int, expectedChecksum string, results []atrocontrol.InstancePreloadResult) error {
-	if len(results) == 0 {
-		return fmt.Errorf("preload %q: no live instances to install the replay set", service)
-	}
-	for _, r := range results {
-		switch {
-		case r.Err != nil:
-			return fmt.Errorf("preload %q instance %s: %w", service, r.InstanceID, r.Err)
-		case !r.Committed:
-			return fmt.Errorf("preload %q instance %s: commit rejected (loaded=%d checksum=%s, want %d/%s)",
-				service, r.InstanceID, r.Loaded, r.Checksum, expectedCount, expectedChecksum)
-		case r.Loaded != expectedCount:
-			return fmt.Errorf("preload %q instance %s: loaded %d entries, want %d", service, r.InstanceID, r.Loaded, expectedCount)
-		case r.Checksum != expectedChecksum:
-			return fmt.Errorf("preload %q instance %s: checksum %s, want %s", service, r.InstanceID, r.Checksum, expectedChecksum)
 		}
 	}
 	return nil
@@ -1053,6 +876,10 @@ func (o *Orchestrator) baselinePhase(ctx context.Context, experimentID string) (
 	}
 	return best, nil
 }
+
+// =========================================================================
+// Desired-state services and bumps
+// =========================================================================
 
 // phaseServices returns the de-duplicated union of the phase's frozen
 // services and its rules' target services — every service the phase may

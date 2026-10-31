@@ -33,10 +33,13 @@ A faithful recording ⇒ baseline `recorded_entry_count > 0` **and** isolation
 3. manteion's `cachestore` persists entries under `{phase_id}/{service}.jsonl`.
    On baseline completion, `harvestCacheStats` writes `recorded_entry_count`
    per recording service (`cachestore.Services` + `Read`).
-4. The **isolation** phase preloads the baseline entries to the frozen service
-   (`PreloadEntries`) and freezes it in replay. On completion, harvest reads
-   live `Store.Hits/Misses` → `cache_hit_rate` + `request_count`, and carries
-   the baseline coverage as `recorded_entry_count`.
+4. The **isolation** phase builds a replay-set artifact from the baseline
+   entries and assigns it to the frozen service (`buildReplayArtifacts`); its
+   instances pull and commit it before any load starts (the convergence
+   barrier waits for that), and the service is frozen in replay. On
+   completion, harvest reads live `Store.Hits/Misses` → `cache_hit_rate` +
+   `request_count`, and carries the baseline coverage as
+   `recorded_entry_count`.
 
 The record and replay rules are cache-box rules: an instance only receives
 them if it advertises the `cachebox` capability (or no capabilities, which
