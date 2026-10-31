@@ -62,8 +62,9 @@ func main() {
 	defer db.Close(database)
 
 	// Create repositories. Generations is the desired-state change fabric: the
-	// rule repo bumps it in-transaction, the API bumps it for fault configs, and
-	// both wake the same long-polls and SSE subscribers.
+	// rule repo bumps it in-transaction, the API bumps it for fault configs, the
+	// orchestrator bumps it on phase transitions, and every bump wakes the same
+	// long-polls and SSE subscribers.
 	gens := desired.NewGenerations(store.NewGenerationRepo(database), desired.NewBroker())
 	ruleRepo := store.NewRuleRepo(database, gens)
 	faultRepo := store.NewFaultRepo(database)
@@ -102,7 +103,7 @@ func main() {
 		os.Exit(1)
 	}
 	phaseFaultEventRepo := store.NewPhaseFaultEventRepo(database)
-	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, logger)
+	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, gens, logger)
 	// Drain barrier (MANT-2): MANTEION_DRAIN_TIMEOUT must be ≥ 3× the SDK poll
 	// interval + flush time (default 30s); MANTEION_ALLOW_DEGRADED_BASELINE lets
 	// isolation phases start from a degraded recording.

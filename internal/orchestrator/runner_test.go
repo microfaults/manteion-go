@@ -2,12 +2,14 @@ package orchestrator
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
+	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 )
 
@@ -97,49 +99,144 @@ func TestFinishPhase_StopsLoadBeforeThawAndClear(t *testing.T) {
 	}
 }
 
-// TestEnterPhase_BumpsVersionOnResume pins M5: the rule version must be bumped on
-// EVERY enter of a cache-box phase, not just a fresh one. Version is the SDK poll
-// gate — a resume (fresh=false) that skips the bump leaves an SDK stuck at its old
-// version 304ing forever, so the frozen service never receives the synthesized
-// replay rule and runs live (no synthetic delay, live downstream calls, zero
-// counters) for the rest of the phase.
-func TestEnterPhase_BumpsVersionOnResume(t *testing.T) {
+// TestEnterPhase_BumpsGenerationOnEveryEnter pins M5 on desired-state v1: every
+// enter of a phase (fresh AND resume) bumps the generation of each service the
+// phase's desired state touches — the frozen services of the phase, the rules'
+// target services, and for a baseline the services frozen anywhere in the
+// experiment (their record rule is what the baseline synthesizes). A resume
+// that skipped the bump would leave a long-polling SDK holding until its wait
+// elapsed with no replay rule, running live.
+func TestEnterPhase_BumpsGenerationOnEveryEnter(t *testing.T) {
 	ctx := context.Background()
 	o := newOrch(t, "")    // nil zeus → no load drivers
 	o.autoComplete = false // don't spawn an async finishPhase that would also bump
 	exp := mkExp(t)
 
-	version := func() uint64 {
-		v, err := o.rules.Version(ctx)
+	gen := func(svc string) uint64 {
+		t.Helper()
+		g, err := o.generations.Get(ctx, svc)
 		if err != nil {
-			t.Fatalf("read rule version: %v", err)
+			t.Fatalf("read generation: %v", err)
 		}
-		return v
+		return g
 	}
 
-	// Fresh enter of a cache-box (persist_cache baseline) phase bumps.
+	// A baseline records the services frozen later in the experiment: entering
+	// it bumps "frontend" (frozen in the isolation phase) and nothing else.
 	base := mkRunningBaseline(t, exp.ID, 0)
-	v0 := version()
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	f0, c0 := gen("frontend"), gen("checkoutservice")
 	if err := o.enterPhase(ctx, base, true); err != nil {
 		t.Fatalf("enterPhase fresh baseline: %v", err)
 	}
-	if v1 := version(); v1 <= v0 {
-		t.Fatalf("fresh enter of cache-box phase did not bump rule version: %d -> %d", v0, v1)
+	if gen("frontend") != f0+1 || gen("checkoutservice") != c0 {
+		t.Fatalf("fresh baseline enter: frontend %d→%d, checkout %d→%d; want frontend +1 only", f0, gen("frontend"), c0, gen("checkoutservice"))
 	}
 
-	// Resume (fresh=false) of a frozen isolation phase MUST also bump. A live SDK
-	// instance is needed so the freeze fan-out has a target (an empty fleet is a
-	// freeze-gate error, not a no-op).
+	// Resume (fresh=false) of the frozen isolation phase bumps again. A resume
+	// skips the preload gate but not the freeze gate, and an empty fleet is a
+	// freeze-gate error, so a live SDK instance gives the freeze fan-out a target.
 	sdk := newFakeSDK(t, true)
 	registerSDK(t, "frontend", sdk.server.URL)
-	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
-	v2 := version()
+	f1 := gen("frontend")
 	if err := o.enterPhase(ctx, iso, false); err != nil {
 		t.Fatalf("enterPhase resume isolation: %v", err)
 	}
-	if v3 := version(); v3 <= v2 {
-		t.Fatalf("resume (fresh=false) of frozen phase did not bump rule version: %d -> %d "+
-			"(M5: SDK 304s forever, frozen service goes live)", v2, v3)
+	if gen("frontend") != f1+1 {
+		t.Fatalf("resume of frozen phase did not bump frontend: %d → %d", f1, gen("frontend"))
+	}
+}
+
+// generation reads svc's current generation through the orchestrator's store.
+func generation(t *testing.T, o *Orchestrator, svc string) uint64 {
+	t.Helper()
+	g, err := o.generations.Get(context.Background(), svc)
+	if err != nil {
+		t.Fatalf("read generation of %s: %v", svc, err)
+	}
+	return g
+}
+
+// TestBumpDesired_OncePerServiceReturnsTargets pins the bump behind every
+// transition: a baseline's desired services are its own (rule targets, frozen
+// services) plus every service frozen anywhere in its experiment, a service
+// that is both is bumped once, and the result maps each service to the
+// generation it reached (the convergence targets plan 2 waits on).
+func TestBumpDesired_OncePerServiceReturnsTargets(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	// Services no other test touches, so an exact count cannot see a stray bump.
+	both, frozen := id.New("svc-both"), id.New("svc-frozen")
+
+	base := mkRunningBaseline(t, exp.ID, 0)
+	mkRunningIsolation(t, exp.ID, both, 1)
+	mkRunningIsolation(t, exp.ID, frozen, 2)
+	// A baseline phase rule on a service the experiment also freezes.
+	rule := &model.Rule{
+		ID: id.New("rule"), Name: "bump-dedup", Service: both, Enabled: true,
+		Action:    model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: "exact"}},
+		Mode:      "inline",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := testRuleRepo.Create(ctx, rule); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rule.ID) })
+	if err := testExpRepo.AttachPhaseRules(ctx, base.ID, []string{rule.ID}); err != nil {
+		t.Fatalf("attach rule: %v", err)
+	}
+
+	b0, f0 := generation(t, o, both), generation(t, o, frozen)
+	targets := o.bumpDesired(ctx, base)
+	if want := map[string]uint64{both: b0 + 1, frozen: f0 + 1}; !maps.Equal(targets, want) {
+		t.Fatalf("bumpDesired targets = %v, want %v", targets, want)
+	}
+	if b, f := generation(t, o, both), generation(t, o, frozen); b != b0+1 || f != f0+1 {
+		t.Fatalf("generations %s %d→%d, %s %d→%d; want each +1 exactly", both, b0, b, frozen, f0, f)
+	}
+}
+
+// TestPhaseExit_BumpsGenerationPerTransition pins the exit side: the drain
+// barrier (running → draining) and the terminal transition each bump every
+// desired service once. The drain bump is the one the SDK's drain tracker
+// needs: the record rule left the document when the phase stopped running,
+// and only a bump wakes a held long-poll to see it go. The terminal bump is
+// what wakes an isolation phase's pollers to its replay rule's removal.
+func TestPhaseExit_BumpsGenerationPerTransition(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.WithDrainTimeout(5 * time.Second) // the gate waits for the report below, never times out
+	exp := mkExp(t)                     // planned: the re-advance after each finish starts nothing
+	svc := id.New("svc-exit")
+	base := mkRunningBaseline(t, exp.ID, 0)
+	iso := mkRunningIsolation(t, exp.ID, svc, 1)
+
+	// Recording phase: a pusher owes a drain report, so the phase holds at
+	// 'draining' — one bump there, a second at draining → completed.
+	ingestN(t, o, exp.ID, base.ID, svc, "i1", 1, 2)
+	g0 := generation(t, o, svc)
+	done := make(chan bool, 1)
+	go func() { done <- o.finishPhase(context.Background(), base.ID, "completed", "running") }()
+	waitFor(t, "the drain barrier's bump", 2*time.Second, func() bool { return generation(t, o, svc) == g0+1 })
+	if s := getPhase(t, base.ID).Status; s != "draining" {
+		t.Fatalf("phase %q at the first bump, want draining (the drain barrier must bump)", s)
+	}
+	report(o, exp.ID, base.ID, svc, "i1", 2)
+	if !<-done {
+		t.Fatal("finishPhase(baseline) = false, want true")
+	}
+	if g := generation(t, o, svc); g != g0+2 {
+		t.Fatalf("baseline exit: %d → %d, want +2 (one at draining, one at completed)", g0, g)
+	}
+
+	// Isolation phase: no drain, one bump at the terminal transition.
+	g1 := generation(t, o, svc)
+	if !o.finishPhase(ctx, iso.ID, "completed", "running") {
+		t.Fatal("finishPhase(isolation) = false, want true")
+	}
+	if g := generation(t, o, svc); g != g1+1 {
+		t.Fatalf("isolation exit: %d → %d, want +1", g1, g)
 	}
 }
 

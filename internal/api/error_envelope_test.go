@@ -23,7 +23,7 @@ func noDBServer() *Server {
 	logger := discardLogger()
 	return &Server{
 		logger: logger,
-		orch:   orchestrator.New(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, logger),
+		orch:   orchestrator.New(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, logger),
 	}
 }
 

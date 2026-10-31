@@ -12,6 +12,7 @@ import (
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/db"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/orchestrator"
@@ -52,7 +53,8 @@ func TestHandleStopPhaseFlat_SurvivesClientDisconnect(t *testing.T) {
 		expRepo, store.NewRuleRepo(database, nil), store.NewFaultRepo(database),
 		store.NewWorkloadRepo(database), store.NewWorkflowRepo(database),
 		controller, nil, nil, cachestore.New(t.TempDir()),
-		store.NewPhaseFaultEventRepo(database), logger,
+		store.NewPhaseFaultEventRepo(database),
+		desired.NewGenerations(store.NewGenerationRepo(database), desired.NewBroker()), logger,
 	)
 	orch.WithDrainTimeout(2 * time.Second)
 	orch.WithDrainPollInterval(20 * time.Millisecond)

@@ -29,6 +29,7 @@ import (
 
 	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/cachestore"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/model"
 	"manteion-go/internal/promql"
 	"manteion-go/internal/store"
@@ -49,6 +50,7 @@ type Orchestrator struct {
 	zeusClient  *zeus.Client
 	cacheStore  *cachestore.Store
 	faultEvents *store.PhaseFaultEventRepo
+	generations *desired.Generations // per-service desired-state generations, bumped on phase transitions
 	logger      *slog.Logger
 
 	maxPollDuration time.Duration
@@ -90,6 +92,7 @@ func New(
 	zeusClient *zeus.Client,
 	cs *cachestore.Store,
 	faultEvents *store.PhaseFaultEventRepo,
+	gens *desired.Generations,
 	logger *slog.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
@@ -103,6 +106,7 @@ func New(
 		zeusClient:        zeusClient,
 		cacheStore:        cs,
 		faultEvents:       faultEvents,
+		generations:       gens,
 		logger:            logger,
 		maxPollDuration:   defaultMaxPollDuration,
 		pollInterval:      defaultZeusPollInterval,

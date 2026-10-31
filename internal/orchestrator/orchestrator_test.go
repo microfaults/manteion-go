@@ -35,6 +35,7 @@ import (
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/db"
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
@@ -106,8 +107,9 @@ func newOrch(t *testing.T, zeusURL string) *Orchestrator {
 	if zeusURL != "" {
 		zc = zeus.NewClient(zeusURL)
 	}
+	gens := desired.NewGenerations(store.NewGenerationRepo(testDB), desired.NewBroker())
 	o := New(testExpRepo, testRuleRepo, testFaultRepo, testWorkloadRepo, testWorkflowRepo,
-		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB), logger)
+		controller, nil, zc, cachestore.New(t.TempDir()), store.NewPhaseFaultEventRepo(testDB), gens, logger)
 	o.WithPollInterval(50 * time.Millisecond)
 	o.WithMaxPollDuration(15 * time.Second)
 	// Keep the drain barrier fast so tests never wait the 30s production bound;

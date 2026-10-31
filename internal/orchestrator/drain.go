@@ -17,16 +17,16 @@ type drainTarget struct {
 
 // runDrainBarrier is the winner-only body of a recording phase's drain (the
 // caller already CAS'd running → draining). It stops attacks and the poller so
-// no new records are generated, bumps the rule version so the recording rule
-// drops from the poll set (the SDK's drain tracker then flushes + reports),
-// waits (bounded) for every expected instance, and persists the outcome.
+// no new records are generated; bumps the generation of every service the phase
+// records — no longer 'running', the phase has dropped their record rule from
+// the materialized desired state, and the bump wakes their held long-polls so
+// the SDK's drain tracker sees the rule go and flushes + reports; waits
+// (bounded) for every expected instance; and persists the outcome.
 func (o *Orchestrator) runDrainBarrier(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow) {
 	o.cancelPoller(p.ID)
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
-	if err := o.rules.BumpVersion(ctx); err != nil {
-		o.logger.Warn("orchestrator: drain: bump version failed", "phase_id", p.ID, "error", err)
-	}
+	o.bumpDesired(ctx, p)
 
 	result := o.awaitDrain(ctx, p)
 	if err := o.experiments.UpsertPhaseDrain(ctx, p.ID, result); err != nil {

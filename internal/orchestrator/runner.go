@@ -139,23 +139,22 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: load experiment: %w", err))
 	}
 
-	// A cache-box phase becoming active changes the rule set SDKs synthesize on
-	// poll: a baseline (persist_cache) adds record rules, an isolation phase
-	// (frozen_services) adds replay rules. Bump the rule version so SDKs re-poll
-	// and pick them up (the phase is already 'running' here). Cleared on finish.
+	// The phase is 'running' here, so the materialized desired state of every
+	// service it touches has changed: its phase rules are served, an isolation
+	// phase synthesizes a replay rule for each frozen service, and a baseline
+	// (persist_cache) a record rule for each service frozen anywhere in the
+	// experiment. Bump each one's generation: that is what wakes their held
+	// long-polls to fetch the new document. Unconditional — a fault-rule phase
+	// changes desired state as much as a cache-box one. endPhase (and, for a
+	// recording phase, the drain barrier before it) bumps the same services
+	// again when the phase leaves 'running'.
 	//
-	// This fires on EVERY enter of a cache-box phase, not just a fresh start (M5):
-	// on resume (fresh=false) the paused phase had dropped out of the synthesized
-	// set, and an unrelated rule edit may have bumped the version past what a
-	// frozen SDK last saw. Without a bump here that SDK 304s forever — the frozen
-	// service never receives its replay rule and runs live (no synthetic delay,
-	// live downstream calls, zero counters) for the rest of the phase.
-	if p.PersistCache || len(p.FrozenServices) > 0 {
-		if err := o.rules.BumpVersion(ctx); err != nil {
-			o.logger.Warn("orchestrator: bump version for cache-box phase start failed",
-				"phase_id", p.ID, "error", err)
-		}
-	}
+	// This fires on EVERY enter, not just a fresh start (M5): a paused phase had
+	// dropped out of the document, and a resume that skipped the bump would leave
+	// a long-polling SDK holding until its wait elapsed, the frozen service
+	// running live (no replay rule, no synthetic delay, live downstream calls)
+	// in the meantime.
+	o.bumpDesired(ctx, p)
 
 	// Cache preload is a HARD GATE on a fresh start of a frozen phase (INV-4):
 	// load may only begin against a replay set that every live instance has
@@ -345,17 +344,15 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
 
-	// A finished cache-box phase drops out of the synthesized rule set — bump
-	// the rule version so SDKs re-poll and stop recording/replaying. For a
-	// recording (persist_cache) phase this rule-set removal is what the SDK's
-	// drain tracker keys off (MANT-2): the phase is terminal here, so the poll
-	// no longer synthesizes its cache-box rule.
-	if p.PersistCache || len(p.FrozenServices) > 0 {
-		if err := o.rules.BumpVersion(ctx); err != nil {
-			o.logger.Warn("orchestrator: bump version for cache-box phase stop failed",
-				"phase_id", phaseID, "error", err)
-		}
-	}
+	// The phase is terminal: its rules are no longer served and its cache-box
+	// rule no longer synthesized, so the desired state of every service it
+	// touched changes. Bump each one's generation so their held long-polls wake
+	// and the SDKs stop recording/replaying and drop the phase's rules now. A
+	// completed recording (persist_cache) phase already lost its record rule at
+	// running → draining, where the drain barrier bumped — that removal is what
+	// the SDK's drain tracker keys off (MANT-2); for a recording phase that
+	// failed or was skipped without draining, this bump is the removal signal.
+	o.bumpDesired(ctx, p)
 
 	for _, svc := range o.phaseServices(ctx, p) {
 		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
@@ -971,6 +968,44 @@ func (o *Orchestrator) phaseServices(ctx context.Context, p *model.ExperimentPha
 		add(r.Service)
 	}
 	return svcs
+}
+
+// desiredServices is every service whose materialized desired state this
+// phase changes: the frozen services and rule targets (phaseServices), plus,
+// for a baseline, the services frozen anywhere in the experiment — the
+// baseline is what synthesizes their record rule (ActiveCacheBoxPhaseForService).
+func (o *Orchestrator) desiredServices(ctx context.Context, p *model.ExperimentPhase) []string {
+	svcs := o.phaseServices(ctx, p)
+	if !p.PersistCache {
+		return svcs
+	}
+	seen := make(map[string]struct{}, len(svcs))
+	for _, s := range svcs {
+		seen[s] = struct{}{}
+	}
+	for _, s := range o.experimentFrozenServices(ctx, p.ExperimentID) {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			svcs = append(svcs, s)
+		}
+	}
+	return svcs
+}
+
+// bumpDesired bumps the generation of every service this phase's desired
+// state touches (one bump each, in the same order every time) and returns the
+// targets — the generations instances must observe to have converged.
+func (o *Orchestrator) bumpDesired(ctx context.Context, p *model.ExperimentPhase) map[string]uint64 {
+	targets := map[string]uint64{}
+	for _, svc := range o.desiredServices(ctx, p) {
+		gen, err := o.generations.Bump(ctx, svc)
+		if err != nil {
+			o.logger.Warn("orchestrator: bump generation failed", "phase_id", p.ID, "service", svc, "error", err)
+			continue
+		}
+		targets[svc] = gen
+	}
+	return targets
 }
 
 // =========================================================================

@@ -20,7 +20,9 @@ A faithful recording ⇒ baseline `recorded_entry_count > 0` **and** isolation
 ## How the pieces wire (manteion side)
 
 1. The orchestrator starts a **baseline** phase (`persist_cache=true`, no frozen
-   services). Starting/finishing it bumps `rule_version` so SDKs re-poll.
+   services). Starting it, draining it and finishing it each bump the
+   generation of the services it records (those frozen anywhere in the
+   experiment), which wakes their long-polls.
 2. The SDK poll/register response carries `recording_phase_id` =
    `ExperimentRepo.RunningPersistCachePhaseID` (the running baseline). The
    atropos SDK hands it to `ApplyTargets.PhaseIDSink` →
