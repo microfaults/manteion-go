@@ -113,6 +113,7 @@ var migrations = []migration{
 	{10, "phase_workflows: dataset_id (zeus dataset per workflow; NULL = MANTEION_ZEUS_DATASET_ID fallback)", migration10},
 	{11, "experiments + experiment_phases: failure_reason (why a failed row failed)", migration11},
 	{12, "sdk_instances: host/capabilities + observed state; service_generations (desired-state v1)", migration12},
+	{13, "replay_artifacts: content-addressed replay sets per (phase, service) (desired-state v1)", migration13},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -684,4 +685,26 @@ CREATE TABLE IF NOT EXISTS service_generations (
     generation BIGINT NOT NULL DEFAULT 1,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+`
+
+// migration13 records replay-set artifacts (desired-state v1 §2): the
+// content-addressed NDJSON file built from a baseline recording at isolation
+// phase entry and assigned to the (phase, service) it is installed under. The
+// id repeats across phases that replay the same recording (same bytes, same
+// file); the pair is the key. Rows go with their phase; the file on disk is
+// left for the operator (artifacts are small and immutable).
+const migration13 = `
+CREATE TABLE IF NOT EXISTS replay_artifacts (
+    id            TEXT NOT NULL,                       -- 'sha256:<hex>' of the file bytes
+    experiment_id TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    phase_id      TEXT NOT NULL REFERENCES experiment_phases(id) ON DELETE CASCADE,
+    service       TEXT NOT NULL,
+    entry_count   BIGINT NOT NULL,
+    w5_sha256     TEXT NOT NULL,                       -- §W5 digest over the entries
+    size_bytes    BIGINT NOT NULL,
+    path          TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (phase_id, service)
+);
+CREATE INDEX IF NOT EXISTS idx_replay_artifacts_id ON replay_artifacts(id);
 `

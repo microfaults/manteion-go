@@ -54,6 +54,7 @@ func truncateAll(conn *sql.DB) {
 		"attack_results",
 		"attacks",
 		"fault_configs",
+		"replay_artifacts",
 		"experiment_phases",
 		"experiments",
 		"workflows",
