@@ -81,7 +81,8 @@ type Document struct {
 // Materialize reads the service's inputs and returns inst's Document. A nil
 // inst (or one that advertised no capabilities) gets everything. The freeze
 // config and replay set go only to a host with a cache-box, the one place that
-// can install a delay source or a replay set.
+// can install a delay source or a replay set. Any failure returns the zero
+// Document and the error: there is no partial document to serve.
 func (m *Materializer) Materialize(ctx context.Context, service string, inst *model.SDKInstance) (Document, error) {
 	// Read the generation first so a document never claims a generation newer
 	// than its data: a bump landing mid-read leaves the document at the older
@@ -127,8 +128,10 @@ func (m *Materializer) Materialize(ctx context.Context, service string, inst *mo
 			}
 		}
 	}
-	doc.ETag, err = etag(gen, doc)
-	return doc, err
+	if doc.ETag, err = etag(gen, doc); err != nil {
+		return Document{}, err
+	}
+	return doc, nil
 }
 
 // etag is "<generation>-<sha256 hex[:16]>" over the canonical JSON of the

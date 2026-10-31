@@ -348,10 +348,26 @@ func TestMaterialize_SourceErrorsAbort(t *testing.T) {
 			if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), tc.name) {
 				t.Fatalf("err = %v, want it to name %q and wrap the source error", err, tc.name)
 			}
-			if d.ETag != "" || d.Rules != nil {
-				t.Errorf("a failed materialization returned a document: %+v", d)
+			if !reflect.DeepEqual(d, Document{}) {
+				t.Errorf("a failed materialization returned a partial document: %+v", d)
 			}
 		})
+	}
+}
+
+// A document that cannot be hashed cannot be served: Materialize returns the
+// error and nothing else, not a document without an ETag.
+func TestMaterialize_UnhashableDocumentAborts(t *testing.T) {
+	m, _ := newTestMaterializer(5)
+	m.FaultConfigs = &fakeConfigs{configs: []*model.FaultConfig{
+		{ID: "fc-bad", Service: "cart", Category: "inline", FaultType: "latency", Params: json.RawMessage(`{`)},
+	}}
+	d, err := m.Materialize(context.Background(), "cart", nil)
+	if err == nil || !strings.Contains(err.Error(), "canonical json") {
+		t.Fatalf("err = %v, want the canonical-json failure", err)
+	}
+	if !reflect.DeepEqual(d, Document{}) {
+		t.Errorf("a failed materialization returned a partial document: %+v", d)
 	}
 }
 
