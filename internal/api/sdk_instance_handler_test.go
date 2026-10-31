@@ -111,6 +111,9 @@ type fakeServiceFaultConfigs struct {
 	cancelled []string         // every successful MarkCancelled, in call order
 	cancelErr map[string]error // per-config MarkCancelled failure injection
 	listErr   error
+
+	gens        *desired.Generations // the server's (newSDKInstanceServer), read at each MarkCancelled
+	genAtCancel []uint64             // the config's service generation at each MarkCancelled call
 }
 
 func (f *fakeServiceFaultConfigs) ListActiveForService(_ context.Context, service string) ([]*model.FaultConfig, error) {
@@ -127,7 +130,14 @@ func (f *fakeServiceFaultConfigs) ListActiveForService(_ context.Context, servic
 	return out, nil
 }
 
-func (f *fakeServiceFaultConfigs) MarkCancelled(_ context.Context, id string) error {
+func (f *fakeServiceFaultConfigs) MarkCancelled(ctx context.Context, id string) error {
+	for _, c := range f.active {
+		if c.ID == id && f.gens != nil {
+			if g, err := f.gens.Get(ctx, c.Service); err == nil {
+				f.genAtCancel = append(f.genAtCancel, g)
+			}
+		}
+	}
 	if err := f.cancelErr[id]; err != nil {
 		return err
 	}
@@ -195,9 +205,11 @@ func sdkTestFaultConfigs() *fakeServiceFaultConfigs {
 }
 
 func newSDKInstanceServer(insts *fakeSDKInstances, rules *fakeServiceRules, phases *fakePhaseHistory, configs *fakeServiceFaultConfigs) *Server {
+	gens := desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker())
+	configs.gens = gens
 	return &Server{
 		sdkInstances: insts, serviceRules: rules, phaseHistory: phases, serviceFaultConfigs: configs,
-		generations: desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker()),
+		generations: gens,
 		logger:      discardLogger(),
 	}
 }
@@ -481,6 +493,7 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 			wantDisabled:  []string{"rule-cart-hi"},
 			wantOff:       []string{"rule-cart-hi"},
 			wantCancelled: []string{},
+			wantGens:      map[string]uint64{"cartservice": 2},
 		},
 		{
 			name:  "fault config gone between list and cancel is skipped",
@@ -528,6 +541,23 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 			wantGens:      map[string]uint64{"cartservice": 2, "checkoutservice": 1},
 		},
 		{
+			name:  "a rule update and a config cancel both fail → 500 naming both, the rest done and bumped once",
+			id:    "cart-7f3a",
+			insts: sdkTestInstances(),
+			rules: &fakeServiceRules{rules: sdkTestRules(), updateErr: map[string]error{"rule-cart-hi": errors.New("boom")}},
+			configs: func() *fakeServiceFaultConfigs {
+				f := sdkTestFaultConfigs()
+				f.cancelErr = map[string]error{"fc-cart-1": errors.New("boom")}
+				return f
+			}(),
+			wantStatus:    http.StatusInternalServerError,
+			wantError:     "kill-switch: 1 of 2 rules could not be disabled, 1 of 2 fault configs could not be cancelled; retry",
+			wantOff:       []string{"rule-cart-lo"},
+			wantOn:        []string{"rule-cart-hi", "rule-checkout"},
+			wantCancelled: []string{"fc-cart-2"},
+			wantGens:      map[string]uint64{"cartservice": 2},
+		},
+		{
 			name:       "rule lookup failure → 500",
 			id:         "cart-7f3a",
 			insts:      sdkTestInstances(),
@@ -549,6 +579,7 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 			wantStatus: http.StatusInternalServerError,
 			wantError:  "failed to list fault configs",
 			wantOff:    []string{"rule-cart-hi", "rule-cart-lo"},
+			wantGens:   map[string]uint64{"cartservice": 1}, // 500 before the final bump; the real repo's rule updates bump on their own
 		},
 	}
 	for _, tc := range tests {
@@ -597,6 +628,15 @@ func TestHandleInstanceKillSwitch(t *testing.T) {
 			for svc, want := range tc.wantGens {
 				if got := generationOf(t, s, svc); got != want {
 					t.Errorf("generation of %s = %d, want %d", svc, got, want)
+				}
+			}
+			// The bump comes after the last cancel: every cancel ran at the
+			// generation from before it.
+			if final := generationOf(t, s, "cartservice"); final > 1 {
+				for _, g := range configs.genAtCancel {
+					if g >= final {
+						t.Errorf("a cancel ran at generation %d, after the kill switch's bump to %d", g, final)
+					}
 				}
 			}
 
