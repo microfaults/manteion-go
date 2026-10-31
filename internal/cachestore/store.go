@@ -40,7 +40,7 @@ type Store struct {
 	root string
 
 	mu           sync.Mutex
-	dedup        map[string]map[string]struct{}              // pair -> "instance\x00batch_seq" -> seen
+	dedup        map[string]map[string]struct{}              // pair -> "instance\x00epoch\x00batch_seq" -> seen
 	received     map[string]map[string]int64                 // pair -> "service\x00instance"   -> entries persisted
 	seenKeys     map[string]map[string]entrySig              // pair\x00service -> cache key -> last-seen signature (collision detection)
 	collisions   map[string]*collisionCounts                 // pair\x00service -> divergent/identical tallies
@@ -62,7 +62,7 @@ type collisionCounts struct {
 // IngestResult reports the outcome of an Ingest call.
 type IngestResult struct {
 	Accepted  int  // entries appended (0 on a duplicate)
-	Duplicate bool // true when (instance, batch_seq) was already ingested
+	Duplicate bool // true when (instance, epoch, batch_seq) was already ingested
 }
 
 // New creates a Store backed by the given root directory. The directory and
@@ -135,16 +135,23 @@ func (s *Store) appendLocked(experimentID, phaseID, service string, entries []at
 }
 
 // Ingest atomically dedupes, persists, counts, and collision-scans one push
-// batch for (experiment_id, phase_id, service, instance) at batch_seq. A
-// batch_seq already seen for the (exp, phase, instance) is a no-op reported as
-// a duplicate: SDKs retry batches, and this keeps received counts exact and the
-// NDJSON file free of duplicate lines (INV-7).
-func (s *Store) Ingest(experimentID, phaseID, service, instance string, batchSeq int, entries []atroposdk.CacheBoxWireEntry) (IngestResult, error) {
+// batch for (experiment_id, phase_id, service, instance) at (epoch, batch_seq).
+// An (epoch, batch_seq) already seen for the (exp, phase, instance) is a no-op
+// reported as a duplicate: SDKs retry batches, and this keeps received counts
+// exact and the NDJSON file free of duplicate lines (INV-7).
+//
+// epoch is the instance process's start time in unix nanoseconds. A restarted
+// instance starts batch_seq over at 1, so without the epoch in the key its first
+// batches would collide with its previous process's and be swallowed as retries.
+// 0 means the client sent no epoch (an old SDK): the batch is keyed by
+// (instance, batch_seq) alone, as before. The received count stays per
+// (experiment, phase, service, instance): a restart adds to it, never splits it.
+func (s *Store) Ingest(experimentID, phaseID, service, instance string, epoch int64, batchSeq int, entries []atroposdk.CacheBoxWireEntry) (IngestResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	pair := pairKey(experimentID, phaseID)
-	dk := instance + "\x00" + strconv.Itoa(batchSeq)
+	dk := instance + "\x00" + strconv.FormatInt(epoch, 10) + "\x00" + strconv.Itoa(batchSeq)
 	if seen := s.dedup[pair]; seen != nil {
 		if _, ok := seen[dk]; ok {
 			return IngestResult{Accepted: 0, Duplicate: true}, nil
@@ -152,7 +159,7 @@ func (s *Store) Ingest(experimentID, phaseID, service, instance string, batchSeq
 	}
 
 	// Persist before recording dedupe/accounting: a failed append leaves the
-	// batch_seq unseen so the SDK's retry is accepted rather than swallowed.
+	// batch unseen so the SDK's retry is accepted rather than swallowed.
 	if err := s.appendLocked(experimentID, phaseID, service, entries); err != nil {
 		return IngestResult{}, err
 	}

@@ -27,14 +27,22 @@ type phaseReader interface {
 //
 // The (ExperimentID, PhaseID) pair is authoritative: the push is accepted only
 // when it names the exact experiment phase that is actively recording (INV-5),
-// never inferred from PhaseID alone. BatchSeq is 1-based and monotonic per
-// (experiment_id, phase_id, instance) so retried batches dedupe.
+// never inferred from PhaseID alone.
+//
+// A batch is deduped on (ExperimentID, PhaseID, Instance, Epoch, BatchSeq), so a
+// retried batch repeats its key and is a no-op. BatchSeq is 1-based and
+// monotonic within one Epoch. Epoch is the instance's start time in unix
+// nanoseconds: a restarted instance starts BatchSeq over at 1 under a new Epoch,
+// so its batches never collide with its previous process's. Old clients send no
+// epoch; it decodes as 0 and they keep the old (experiment, phase, instance,
+// batch_seq) key.
 type ingestEnvelope struct {
 	Service      string                        `json:"service"`
 	Instance     string                        `json:"instance"`
 	ExperimentID string                        `json:"experiment_id"`
 	PhaseID      string                        `json:"phase_id"`
 	BatchSeq     int                           `json:"batch_seq"`
+	Epoch        int64                         `json:"epoch,omitempty"`
 	Entries      []atroposdk.CacheBoxWireEntry `json:"entries"`
 }
 
@@ -56,7 +64,7 @@ func isActiveRecordingPair(p *model.ExperimentPhase) bool {
 // handleCacheIngest receives cache-box entries from SDK instances and persists
 // them under the (experiment_id, phase_id) pair. The push is accepted only when
 // that pair names an actively recording phase (INV-5); retried batches (same
-// batch_seq) are deduped so received counts stay exact (INV-7).
+// epoch and batch_seq) are deduped so received counts stay exact (INV-7).
 func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 	var env ingestEnvelope
 	defer r.Body.Close()
@@ -102,7 +110,7 @@ func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.cacheStore.Ingest(env.ExperimentID, env.PhaseID, env.Service, env.Instance, env.BatchSeq, env.Entries)
+	res, err := s.cacheStore.Ingest(env.ExperimentID, env.PhaseID, env.Service, env.Instance, env.Epoch, env.BatchSeq, env.Entries)
 	if err != nil {
 		s.logger.Error("cache ingest: write failed",
 			"experiment_id", env.ExperimentID, "phase_id", env.PhaseID, "error", err)

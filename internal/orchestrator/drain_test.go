@@ -35,7 +35,7 @@ func ingestN(t *testing.T, o *Orchestrator, exp, phase, service, instance string
 	for i := range entries {
 		entries[i] = atroposdk.CacheBoxWireEntry{Key: fmt.Sprintf("%s-%d", instance, i), StatusCode: 200}
 	}
-	if _, err := o.cacheStore.Ingest(exp, phase, service, instance, batchSeq, entries); err != nil {
+	if _, err := o.cacheStore.Ingest(exp, phase, service, instance, 0, batchSeq, entries); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
 }

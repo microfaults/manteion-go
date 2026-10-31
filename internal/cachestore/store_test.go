@@ -57,7 +57,7 @@ func TestIngest_DuplicateBatchSeqNotDoubleCounted(t *testing.T) {
 
 	entries := []atroposdk.CacheBoxWireEntry{{Key: "k1"}, {Key: "k2"}, {Key: "k3"}}
 
-	first, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 1, entries)
+	first, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 0, 1, entries)
 	if err != nil {
 		t.Fatalf("first Ingest: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestIngest_DuplicateBatchSeqNotDoubleCounted(t *testing.T) {
 	}
 
 	// Same batch_seq redelivered (SDK retry): duplicate, nothing appended.
-	dup, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 1, entries)
+	dup, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 0, 1, entries)
 	if err != nil {
 		t.Fatalf("dup Ingest: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestIngest_DuplicateBatchSeqNotDoubleCounted(t *testing.T) {
 	}
 
 	// A new batch_seq from the same instance accumulates.
-	next, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 2, []atroposdk.CacheBoxWireEntry{{Key: "k4"}})
+	next, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 0, 2, []atroposdk.CacheBoxWireEntry{{Key: "k4"}})
 	if err != nil {
 		t.Fatalf("next Ingest: %v", err)
 	}
@@ -99,6 +99,27 @@ func TestIngest_DuplicateBatchSeqNotDoubleCounted(t *testing.T) {
 	}
 }
 
+// TestIngest_EpochSeparatesRestarts pins desired-state v1 ingest: a restarted
+// instance restarts batch_seq at 1 under a new epoch, so (instance, epoch, seq)
+// must not collide with the previous process's batches; the same epoch and seq
+// is still a duplicate, and epoch 0 (old clients) behaves as before.
+func TestIngest_EpochSeparatesRestarts(t *testing.T) {
+	s := New(t.TempDir())
+	e := []atroposdk.CacheBoxWireEntry{{Key: "k1"}}
+	if r, _ := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 100, 1, e); r.Duplicate {
+		t.Fatal("first batch reported duplicate")
+	}
+	if r, _ := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 200, 1, e); r.Duplicate || r.Accepted != 1 {
+		t.Fatalf("new epoch, same seq = %+v, want accepted", r)
+	}
+	if r, _ := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 200, 1, e); !r.Duplicate {
+		t.Fatal("same epoch and seq must be a duplicate")
+	}
+	if got := s.ReceivedCount("exp-1", "phase-1", "frontend", "inst-a"); got != 2 {
+		t.Fatalf("received = %d, want 2", got)
+	}
+}
+
 // TestIngest_CollisionStats pins MANT-3 ingest-side collision accounting (Q3):
 // a repeated key with a differing (status, response_body_sha256) is a
 // divergent collision; a repeated key matching the last-seen signature is an
@@ -107,7 +128,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 	s := New(t.TempDir())
 
 	// First sighting of key K — no collision.
-	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 1,
+	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 0, 1,
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: "sha-A"}}); err != nil {
 		t.Fatalf("ingest 1: %v", err)
 	}
@@ -116,7 +137,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 	}
 
 	// Same key, different body sha — divergent collision.
-	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 2,
+	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 0, 2,
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: "sha-B"}}); err != nil {
 		t.Fatalf("ingest 2: %v", err)
 	}
@@ -126,7 +147,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 
 	// Same key from a different instance, matching the latest signature —
 	// identical collision (cross-instance, still counted).
-	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-b", 1,
+	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-b", 0, 1,
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: "sha-B"}}); err != nil {
 		t.Fatalf("ingest 3: %v", err)
 	}
@@ -135,7 +156,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 	}
 
 	// A different status on the same key is also divergent.
-	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-b", 2,
+	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-b", 0, 2,
 		[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 500, ResponseBodySHA256: "sha-B"}}); err != nil {
 		t.Fatalf("ingest 4: %v", err)
 	}
@@ -144,7 +165,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 	}
 
 	// A brand-new key is never a collision.
-	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 3,
+	if _, err := s.Ingest("exp-1", "phase-1", "frontend", "inst-a", 0, 3,
 		[]atroposdk.CacheBoxWireEntry{{Key: "OTHER", StatusCode: 200, ResponseBodySHA256: "sha-C"}}); err != nil {
 		t.Fatalf("ingest 5: %v", err)
 	}
@@ -160,7 +181,7 @@ func TestIngest_CollisionStats(t *testing.T) {
 		if seq == 2 {
 			sha = "sha-Y"
 		}
-		if _, err := s.Ingest("exp-1", "phase-1", "checkoutservice", "inst-c", seq,
+		if _, err := s.Ingest("exp-1", "phase-1", "checkoutservice", "inst-c", 0, seq,
 			[]atroposdk.CacheBoxWireEntry{{Key: "K", StatusCode: 200, ResponseBodySHA256: sha}}); err != nil {
 			t.Fatalf("ingest checkout %d: %v", seq, err)
 		}

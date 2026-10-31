@@ -145,7 +145,7 @@ func TestFinishPhase_VerdictValidCleanRun(t *testing.T) {
 // drive collision detection deterministically.
 func ingestSig(t *testing.T, o *Orchestrator, exp, phase, service, instance string, batchSeq int, key, sha string) {
 	t.Helper()
-	_, err := o.cacheStore.Ingest(exp, phase, service, instance, batchSeq,
+	_, err := o.cacheStore.Ingest(exp, phase, service, instance, 0, batchSeq,
 		[]atroposdk.CacheBoxWireEntry{{Key: key, StatusCode: 200, ResponseBodySHA256: sha}})
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
