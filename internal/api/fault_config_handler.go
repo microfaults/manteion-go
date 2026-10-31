@@ -164,9 +164,22 @@ func (s *Server) handleCancelFaultConfig(w http.ResponseWriter, r *http.Request)
 }
 
 // bumpGeneration bumps a service's desired-state generation after an input
-// change made outside the rule repo (fault configs fire/cancel/expire). Pollers
-// wake and SSE subscribers are nudged by Generations itself. Best-effort.
+// change made outside the rule repo (fault configs fire/cancel/delete/expire).
+// Pollers wake and SSE subscribers are nudged by Generations itself.
+// Best-effort: the write that made the bump necessary has already committed, so
+// both bumps run on a context a client hang-up cannot cancel, and a failure is
+// only logged.
 func (s *Server) bumpGeneration(ctx context.Context, service string) {
+	ctx = context.WithoutCancel(ctx)
+
+	// TODO(desired-state Task 6): remove once the poll is keyed on generations/ETag
+	// The poll still compares rule_version, so an up-to-date SDK would answer 304
+	// to this change. Bump it first: the announcement made by Generations.Bump
+	// below wakes pollers that re-poll at once, and they must find the new version.
+	if err := s.rulever.BumpVersion(ctx); err != nil {
+		s.logger.Warn("bump rule_version failed", "service", service, "error", err)
+	}
+
 	if _, err := s.generations.Bump(ctx, service); err != nil {
 		s.logger.Warn("bump generation failed", "service", service, "error", err)
 	}

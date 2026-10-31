@@ -22,6 +22,8 @@ func (f *fakeRuleVersioner) Version(_ context.Context) (uint64, error) {
 	return 1, nil
 }
 
+func (f *fakeRuleVersioner) BumpVersion(_ context.Context) error { return f.err }
+
 func TestHandleInit_AllGatesPass(t *testing.T) {
 	s := &Server{
 		logger:  slog.New(slog.DiscardHandler),

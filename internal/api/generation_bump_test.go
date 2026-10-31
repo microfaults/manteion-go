@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
 	"manteion-go/internal/db"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
@@ -35,36 +37,108 @@ func (failingGenerationStore) Bump(context.Context, *sql.Tx, string) (uint64, er
 	return 0, errors.New("store down")
 }
 
-// TestBumpGeneration pins the out-of-band bump the fault-config handlers and
-// the reaper use: it bumps the service, announces the new generation, and is
-// best-effort — a store failure is logged, never propagated or announced.
+// bumpLog records, in call order, the bumps made through the spies below.
+type bumpLog struct{ calls []string }
+
+// spyRuleVersion is a ruleVersioner that records BumpVersion. Like a database
+// driver it refuses to run on a cancelled context.
+type spyRuleVersion struct {
+	log *bumpLog
+	err error // returned by BumpVersion once it is recorded
+}
+
+func (s *spyRuleVersion) Version(context.Context) (uint64, error) { return 1, nil }
+
+func (s *spyRuleVersion) BumpVersion(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.log.calls = append(s.log.calls, "rule_version")
+	return s.err
+}
+
+// spyGenerationStore wraps a desired.Store, recording Bump and refusing to run
+// on a cancelled context, as a database driver would.
+type spyGenerationStore struct {
+	desired.Store
+	log *bumpLog
+}
+
+func (s spyGenerationStore) Bump(ctx context.Context, tx *sql.Tx, service string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.log.calls = append(s.log.calls, "generation "+service)
+	return s.Store.Bump(ctx, tx, service)
+}
+
+// TestBumpGeneration pins the out-of-band bump the fault-config handlers and the
+// reaper use. Until the poll is keyed on generations it moves rule_version too,
+// and first: the announcement made by the generation bump wakes pollers that
+// re-poll at once and must find the new version. Both halves are best-effort
+// (a failure is logged, never propagated or allowed to skip the other half) and
+// run on a context a client hang-up cannot cancel.
 func TestBumpGeneration(t *testing.T) {
 	ctx := context.Background()
-	broker := desired.NewBroker()
-	ch := broker.Subscribe("cart")
-	defer broker.Unsubscribe("cart", ch)
-
-	s := &Server{logger: discardLogger(), generations: desired.NewGenerations(desired.NewMemoryStore(), broker)}
-	s.bumpGeneration(ctx, "cart")
-	if gen, _ := s.generations.Get(ctx, "cart"); gen != 2 {
-		t.Fatalf("generation = %d, want 2", gen)
+	setup := func(versions *spyRuleVersion, genStore desired.Store) (*Server, chan desired.Event) {
+		broker := desired.NewBroker()
+		ch := broker.Subscribe("cart")
+		t.Cleanup(func() { broker.Unsubscribe("cart", ch) })
+		return &Server{logger: discardLogger(), rulever: versions, generations: desired.NewGenerations(genStore, broker)}, ch
 	}
-	select {
-	case ev := <-ch:
-		if ev.Type != "rules_changed" || ev.Data != `{"generation":2}` {
-			t.Fatalf("event = %+v, want rules_changed {\"generation\":2}", ev)
+	wantAnnounced := func(t *testing.T, ch chan desired.Event) {
+		t.Helper()
+		if got, want := drainEvents(ch), []string{`rules_changed {"generation":2}`}; !slices.Equal(got, want) {
+			t.Errorf("events = %q, want %q", got, want)
 		}
-	default:
-		t.Fatal("bump was not announced")
 	}
 
-	s = &Server{logger: discardLogger(), generations: desired.NewGenerations(failingGenerationStore{}, broker)}
-	s.bumpGeneration(ctx, "cart") // must not panic or announce
-	select {
-	case ev := <-ch:
-		t.Fatalf("failed bump was announced: %+v", ev)
-	default:
-	}
+	t.Run("rule_version first, then the generation, which is announced", func(t *testing.T) {
+		var log bumpLog
+		s, ch := setup(&spyRuleVersion{log: &log}, spyGenerationStore{Store: desired.NewMemoryStore(), log: &log})
+		s.bumpGeneration(ctx, "cart")
+		if want := []string{"rule_version", "generation cart"}; !slices.Equal(log.calls, want) {
+			t.Errorf("bumps = %q, want %q", log.calls, want)
+		}
+		if gen, _ := s.generations.Get(ctx, "cart"); gen != 2 {
+			t.Errorf("generation = %d, want 2", gen)
+		}
+		wantAnnounced(t, ch)
+	})
+
+	t.Run("a failed rule_version bump does not skip the generation bump", func(t *testing.T) {
+		var log bumpLog
+		s, ch := setup(&spyRuleVersion{log: &log, err: errors.New("db down")}, spyGenerationStore{Store: desired.NewMemoryStore(), log: &log})
+		s.bumpGeneration(ctx, "cart")
+		if want := []string{"rule_version", "generation cart"}; !slices.Equal(log.calls, want) {
+			t.Errorf("bumps = %q, want %q", log.calls, want)
+		}
+		wantAnnounced(t, ch)
+	})
+
+	t.Run("a failed generation bump is not propagated or announced", func(t *testing.T) {
+		var log bumpLog
+		s, ch := setup(&spyRuleVersion{log: &log}, failingGenerationStore{})
+		s.bumpGeneration(ctx, "cart") // must not panic
+		if want := []string{"rule_version"}; !slices.Equal(log.calls, want) {
+			t.Errorf("bumps = %q, want %q", log.calls, want)
+		}
+		if got := drainEvents(ch); len(got) != 0 {
+			t.Errorf("failed bump was announced: %q", got)
+		}
+	})
+
+	t.Run("a cancelled request does not skip either bump", func(t *testing.T) {
+		var log bumpLog
+		s, ch := setup(&spyRuleVersion{log: &log}, spyGenerationStore{Store: desired.NewMemoryStore(), log: &log})
+		gone, cancel := context.WithCancel(ctx)
+		cancel() // the client hung up after the write committed
+		s.bumpGeneration(gone, "cart")
+		if want := []string{"rule_version", "generation cart"}; !slices.Equal(log.calls, want) {
+			t.Errorf("bumps = %q, want %q", log.calls, want)
+		}
+		wantAnnounced(t, ch)
+	})
 }
 
 // TestNewServer_SSEStreamsGenerationBumps pins that the SSE endpoint
@@ -244,6 +318,30 @@ func (e *genEnv) rule(name, service, specID string) {
 	e.t.Cleanup(func() { _, _ = e.db.Exec(`DELETE FROM rules WHERE id = $1`, r.ID) })
 }
 
+// awaitExpired blocks until every config in ids is past its duration, i.e. the
+// reaper would complete it.
+func (e *genEnv) awaitExpired(ids []string) {
+	e.t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		expired, err := e.s.faultConfigs.ListExpired(e.ctx)
+		if err != nil {
+			e.t.Fatalf("list expired: %v", err)
+		}
+		n := 0
+		for _, f := range expired {
+			if slices.Contains(ids, f.ID) {
+				n++
+			}
+		}
+		if n == len(ids) {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("only %d of %d configs expired within 5s", n, len(ids))
+		}
+	}
+}
+
 // faultConfig persists a ready latency fault config on service.
 func (e *genEnv) faultConfig(service string, durationMs int64) string {
 	e.t.Helper()
@@ -389,24 +487,7 @@ func TestFaultConfigReaper_BumpsEachAffectedServiceOnce_DB(t *testing.T) {
 	if err := e.s.faultConfigs.MarkFired(e.ctx, running); err != nil {
 		t.Fatalf("fire %s: %v", running, err)
 	}
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		expired, err := e.s.faultConfigs.ListExpired(e.ctx)
-		if err != nil {
-			t.Fatalf("list expired: %v", err)
-		}
-		n := 0
-		for _, f := range expired {
-			if slices.Contains(expiring, f.ID) {
-				n++
-			}
-		}
-		if n == len(expiring) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d configs expired within 5s", n, len(expiring))
-		}
-	}
+	e.awaitExpired(expiring)
 
 	e.s.reapExpiredFaultConfigs(e.ctx)
 	e.wantGeneration(svc, g0+1)
@@ -424,6 +505,82 @@ func TestFaultConfigReaper_BumpsEachAffectedServiceOnce_DB(t *testing.T) {
 	e.s.reapExpiredFaultConfigs(e.ctx) // nothing left to complete
 	e.wantGeneration(svc, g0+1)
 	e.wantEvents(ev)
+}
+
+// TestFaultConfigChanges_ReachAnUpToDatePoll_DB pins the bridge to the poll that
+// is still keyed on rule_version: whatever changes a service's fault configs
+// (fire, cancel, delete, expiry) must move rule_version too, or an SDK holding
+// the latest version answers 304 and never learns of it.
+func TestFaultConfigChanges_ReachAnUpToDatePoll_DB(t *testing.T) {
+	e := newGenEnv(t)
+	svc := "svc-" + e.tag
+	t.Cleanup(func() { _, _ = e.db.Exec(`DELETE FROM service_generations WHERE service = $1`, svc) })
+
+	latest := func() uint64 { // the version an SDK that is up to date holds
+		v, err := e.s.rules.Version(e.ctx)
+		if err != nil {
+			t.Fatalf("rule_version: %v", err)
+		}
+		return v
+	}
+	// wantPoll polls as an SDK holding version have and expects the status and,
+	// on a 200, exactly these active fault ids.
+	wantPoll := func(step string, have uint64, wantCode int, wantFaults ...string) {
+		t.Helper()
+		w := e.do(http.MethodGet, fmt.Sprintf("/api/v1/sdk/rules?service=%s&version=%d", svc, have), nil)
+		faults := []string{}
+		if w.Code == http.StatusOK {
+			var sync atroposdk.RuleSync
+			if err := json.Unmarshal(w.Body.Bytes(), &sync); err != nil {
+				t.Fatalf("%s: decode RuleSync: %v", step, err)
+			}
+			for _, f := range sync.ActiveFaults {
+				faults = append(faults, f.ID)
+			}
+		}
+		if w.Code != wantCode || (wantCode == http.StatusOK && !slices.Equal(faults, wantFaults)) {
+			t.Fatalf("%s: poll(version=%d) = %d with active faults %q, want %d with %q", step, have, w.Code, faults, wantCode, wantFaults)
+		}
+	}
+	act := func(method, path string, wantStatus int) {
+		t.Helper()
+		if w := e.do(method, path, nil); w.Code != wantStatus {
+			t.Fatalf("%s %s: status = %d, want %d, body = %s", method, path, w.Code, wantStatus, w.Body.String())
+		}
+	}
+
+	have := latest()
+	wantPoll("baseline", have, http.StatusNotModified)
+
+	first := e.faultConfig(svc, 0)
+	act(http.MethodPost, "/api/v1/faults/configs/"+first+"/fire", http.StatusOK)
+	wantPoll("after fire", have, http.StatusOK, first)
+	have = latest()
+	wantPoll("after fire, up to date", have, http.StatusNotModified)
+
+	act(http.MethodPost, "/api/v1/faults/configs/"+first+"/cancel", http.StatusOK)
+	wantPoll("after cancel", have, http.StatusOK)
+	have = latest()
+
+	second := e.faultConfig(svc, 0)
+	act(http.MethodPost, "/api/v1/faults/configs/"+second+"/fire", http.StatusOK)
+	wantPoll("after second fire", have, http.StatusOK, second)
+	have = latest()
+	act(http.MethodDelete, "/api/v1/faults/configs/"+second, http.StatusNoContent)
+	wantPoll("after deleting the active config", have, http.StatusOK)
+	have = latest()
+
+	// Expiry: the poll already omits an expired fault, but nothing moves the
+	// version until the reaper completes it.
+	expiring := e.faultConfig(svc, 1)
+	if err := e.s.faultConfigs.MarkFired(e.ctx, expiring); err != nil {
+		t.Fatalf("fire %s: %v", expiring, err)
+	}
+	e.awaitExpired([]string{expiring})
+	have = latest()
+	wantPoll("expired, before the sweep", have, http.StatusNotModified)
+	e.s.reapExpiredFaultConfigs(e.ctx)
+	wantPoll("after the sweep", have, http.StatusOK)
 }
 
 // TestKillSwitch_BumpsEachDisabledRulesServiceGeneration_DB pins that the

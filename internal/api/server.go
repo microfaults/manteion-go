@@ -25,9 +25,11 @@ type dbPinger interface {
 	PingContext(ctx context.Context) error
 }
 
-// ruleVersioner abstracts rule-version reads for health checks and testing.
+// ruleVersioner abstracts rule-version reads (health checks) and bumps (see
+// bumpGeneration) for testing.
 type ruleVersioner interface {
 	Version(ctx context.Context) (uint64, error)
+	BumpVersion(ctx context.Context) error
 }
 
 // Server holds all dependencies for the manteion API.
