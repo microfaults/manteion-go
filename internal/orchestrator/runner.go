@@ -466,13 +466,16 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	// instances drop the phase's rules, replay rule and replay set, or that
 	// traffic is harvested as frozen data (silent, plausible numbers); the
 	// poller goes first, or it would read the stopped load as a natural end and
-	// race this finish. INV-6: from the CAS on the phase is out of the
+	// race this finish. INV-6: the verdict reads the instances while they still
+	// serve the phase, the ordering the contract rules (verdict before the
+	// thaw); from the CAS on the phase is out of its frozen services'
 	// documents, and an instance whose held poll re-materializes in that window
-	// (its wait elapsing) drops the replay set and reports
-	// Preload.Committed=false. All of this is idempotent or read-only — the
-	// recording-phase drain barrier already stopped the load — so a caller that
-	// then loses the CAS has changed nothing; only the winner records the
-	// verdict.
+	// (its wait elapsing) applies a document without the replay rule and the
+	// replay set. (At the atropos pin, dropping the set leaves the pair's
+	// preload state and counters in place; the ordering does not rely on it.)
+	// All of this is idempotent or read-only — the recording-phase drain
+	// barrier already stopped the load — so a caller that then loses the CAS
+	// has changed nothing; only the winner records the verdict.
 	o.cancelPoller(phaseID)
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)

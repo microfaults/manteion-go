@@ -38,11 +38,11 @@ type fidelityPull struct {
 }
 
 // pullFidelity pulls every frozen instance's W6 fidelity snapshot for the
-// phase. endPhase calls it before the terminal transition, while the phase
-// still holds its status: its instances still hold the replay set (one that
-// applied a document without it would report Preload.Committed=false) and
-// their counters are intact. It only reads; recordVerdict turns the pull into
-// the verdict.
+// phase. endPhaseClaimed calls it before the terminal transition, while the
+// phase still holds its status, so the instances are read while their
+// documents still carry its replay rule and replay set (the ruled ordering:
+// the verdict before the thaw). It only reads; recordVerdict turns the pull
+// into the verdict.
 func (o *Orchestrator) pullFidelity(ctx context.Context, p *model.ExperimentPhase) *fidelityPull {
 	fidelity := map[string]replayFidelity{}
 	var snapshots []atroposdk.FidelitySnapshot
