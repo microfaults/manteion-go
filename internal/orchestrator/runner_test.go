@@ -134,10 +134,16 @@ func TestEnterPhase_BumpsGenerationOnEveryEnter(t *testing.T) {
 	}
 
 	// Resume (fresh=false) of the frozen isolation phase bumps again. A resume
-	// skips the preload gate but not the freeze gate, and an empty fleet is a
-	// freeze-gate error, so a live SDK instance gives the freeze fan-out a target.
-	sdk := newFakeSDK(t, true)
-	registerSDK(t, "frontend", sdk.server.URL)
+	// re-reads the replay set its fresh start assigned and waits like an entry:
+	// a frozen service needs an alive instance holding that set committed.
+	seedBaselineAt(t, o, exp.ID, "frontend", 2, 1) // the running baseline above recorded nothing
+	artifacts, err := o.buildReplayArtifacts(ctx, iso)
+	if err != nil {
+		t.Fatalf("assign the replay set: %v", err)
+	}
+	o.WithConvergeTimeout(5 * time.Second) // returns once the instance acks
+	instID := registerSDK(t, "frontend", newFakeSDK(t).server.URL)
+	ackGenerations(t, o, instID, "frontend", artifacts["frontend"])
 	f1 := gen("frontend")
 	if err := o.enterPhase(ctx, iso, false); err != nil {
 		t.Fatalf("enterPhase resume isolation: %v", err)
@@ -188,7 +194,10 @@ func TestBumpDesired_OncePerServiceReturnsTargets(t *testing.T) {
 	}
 
 	b0, f0 := generation(t, o, both), generation(t, o, frozen)
-	targets := o.bumpDesired(ctx, base)
+	targets, err := o.bumpDesired(ctx, base)
+	if err != nil {
+		t.Fatalf("bumpDesired: %v", err)
+	}
 	if want := map[string]uint64{both: b0 + 1, frozen: f0 + 1}; !maps.Equal(targets, want) {
 		t.Fatalf("bumpDesired targets = %v, want %v", targets, want)
 	}

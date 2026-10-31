@@ -12,7 +12,7 @@ import (
 // returns the persisted verdict.
 func finishIsolationVerdict(t *testing.T, o *Orchestrator, exp, isoID string, snap *atroposdk.FidelitySnapshot) {
 	t.Helper()
-	sdk := newFakeSDK(t, true)
+	sdk := newFakeSDK(t)
 	sdk.fidelity = snap
 	registerSDK(t, "frontend", sdk.server.URL)
 	if !o.finishPhase(context.Background(), isoID, "completed", "running") {

@@ -147,8 +147,8 @@ func TestScheduler_RefusesDegradedBaseline(t *testing.T) {
 		[]atroposdk.CacheBoxWireEntry{{Key: "k1", StatusCode: 200, Body: []byte("v1")}}); err != nil {
 		t.Fatal(err)
 	}
-	sdk := newFakeSDK(t, true)
-	registerSDK(t, "frontend", sdk.server.URL)
+	sdk := newFakeSDK(t)
+	instID := registerSDK(t, "frontend", sdk.server.URL)
 
 	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
 	err := o.enterPhase(ctx, iso, true)
@@ -159,9 +159,12 @@ func TestScheduler_RefusesDegradedBaseline(t *testing.T) {
 		t.Fatalf("phase status = %q, want failed", s)
 	}
 
-	// The override lets it proceed.
+	// The override lets it proceed: the set is built and assigned, and the
+	// instance converges on it.
 	o.WithAllowDegradedBaseline(true)
+	o.WithConvergeTimeout(5 * time.Second) // returns once the instance acks
 	iso2 := mkRunningIsolation(t, exp.ID, "frontend", 2)
+	ackAssigned(t, o, instID, iso2.ID, "frontend", "committed")
 	if err := o.enterPhase(ctx, iso2, true); err != nil {
 		t.Fatalf("with override, enterPhase err = %v, want nil", err)
 	}
@@ -185,9 +188,9 @@ func TestClassifyDrainTimeout_AmnesiaSnapshotNotClean(t *testing.T) {
 	// i-amnesia: an SDK that crashed+restarted answers an all-zero snapshot;
 	// manteion received 3 of its entries, so data was lost → must be degraded.
 	// i-exact: enqueued==received, no drops → genuinely complete → clean.
-	amnesia := newFakeSDK(t, true)
+	amnesia := newFakeSDK(t)
 	amnesia.fidelity = &atroposdk.FidelitySnapshot{RecordEnqueued: 0, RecordPushed: 0, RecordDropped: 0}
-	exact := newFakeSDK(t, true)
+	exact := newFakeSDK(t)
 	exact.fidelity = &atroposdk.FidelitySnapshot{RecordEnqueued: 5, RecordPushed: 5, RecordDropped: 0}
 
 	ingestN(t, o, exp, phase, "frontend", "i-amnesia", 1, 3) // received=3

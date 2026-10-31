@@ -803,13 +803,15 @@ func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A cooperative SDK instance for frontend: verify-commits the preload and
-	// accepts the freeze, so the frozen phase clears the MANT-1 gates. The
-	// baseline's drain will degrade (this registered instance sends no drain
-	// report in-test), so allow a degraded baseline — this test asserts audit
-	// events, not drain fidelity.
-	sdk := newFakeSDK(t, true)
-	registerSDK(t, "frontend", sdk.server.URL)
+	// A cooperative SDK instance for frontend: it observes every bump and
+	// commits the replay set the frozen phase assigns, so both phases clear
+	// the converge gate. The baseline's drain will degrade (this registered
+	// instance sends no drain report in-test), so allow a degraded baseline —
+	// this test asserts audit events, not drain fidelity.
+	sdk := newFakeSDK(t)
+	instID := registerSDK(t, "frontend", sdk.server.URL)
+	ackAssigned(t, o, instID, fp.ID, "frontend", "committed")
+	o.WithConvergeTimeout(5 * time.Second) // returns once the instance acks
 	o.WithAllowDegradedBaseline(true)
 
 	// Attach a cachebox-action rule to fp so recordRuleEvents fires.

@@ -18,7 +18,12 @@ func (o *Orchestrator) experimentServiceSet(ctx context.Context, experimentID st
 	}
 	set := map[string]bool{}
 	for _, p := range phases {
-		for _, svc := range o.phaseServices(ctx, p) {
+		svcs, err := o.phaseServices(ctx, p)
+		if err != nil {
+			o.logger.Warn("orchestrator: admission: phase services incomplete",
+				"phase_id", p.ID, "error", err)
+		}
+		for _, svc := range svcs {
 			set[svc] = true
 		}
 	}

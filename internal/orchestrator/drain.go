@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"manteion-go/internal/model"
@@ -26,7 +27,7 @@ func (o *Orchestrator) runDrainBarrier(ctx context.Context, p *model.ExperimentP
 	o.cancelPoller(p.ID)
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
-	o.bumpDesired(ctx, p)
+	_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service
 
 	result := o.awaitDrain(ctx, p)
 	if err := o.experiments.UpsertPhaseDrain(ctx, p.ID, result); err != nil {
@@ -135,7 +136,11 @@ func (o *Orchestrator) classifyDrainTimeout(ctx context.Context, p *model.Experi
 // mid-phase or have since deregistered).
 func (o *Orchestrator) expectedDrainSet(ctx context.Context, p *model.ExperimentPhase) map[string]drainTarget {
 	expected := map[string]drainTarget{}
-	for _, svc := range o.experimentFrozenServices(ctx, p.ExperimentID) {
+	frozen, err := o.experimentFrozenServices(ctx, p.ExperimentID)
+	if err != nil {
+		o.logger.Warn("orchestrator: drain: list phases failed", "experiment_id", p.ExperimentID, "error", err)
+	}
+	for _, svc := range frozen {
 		instances, err := o.controller.InstancesForService(ctx, svc)
 		if err != nil {
 			o.logger.Warn("orchestrator: drain: list instances failed", "service", svc, "error", err)
@@ -156,11 +161,10 @@ func (o *Orchestrator) expectedDrainSet(ctx context.Context, p *model.Experiment
 // experimentFrozenServices is the set of services frozen anywhere in the
 // experiment — the services its baseline records (MANT-4) and thus the services
 // whose instances owe drain reports.
-func (o *Orchestrator) experimentFrozenServices(ctx context.Context, experimentID string) []string {
+func (o *Orchestrator) experimentFrozenServices(ctx context.Context, experimentID string) ([]string, error) {
 	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
 	if err != nil {
-		o.logger.Warn("orchestrator: drain: list phases failed", "experiment_id", experimentID, "error", err)
-		return nil
+		return nil, fmt.Errorf("list the phases of experiment %q: %w", experimentID, err)
 	}
 	seen := map[string]bool{}
 	var svcs []string
@@ -172,5 +176,5 @@ func (o *Orchestrator) experimentFrozenServices(ctx context.Context, experimentI
 			}
 		}
 	}
-	return svcs
+	return svcs, nil
 }

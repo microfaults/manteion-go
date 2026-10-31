@@ -55,7 +55,7 @@ func TestPushPhaseRules_SkipsDisabledRules(t *testing.T) {
 		t.Fatalf("attach phase rules: %v", err)
 	}
 
-	sdk := newFakeSDK(t, true)
+	sdk := newFakeSDK(t)
 	registerSDK(t, "frontend", sdk.server.URL)
 
 	if err := o.pushPhaseRules(ctx, ph); err != nil {

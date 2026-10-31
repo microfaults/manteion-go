@@ -104,7 +104,7 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 		o.logger.Warn("orchestrator: pause: load phase for the generation bump failed",
 			"phase_id", phaseID, "error", err)
 	} else {
-		o.bumpDesired(ctx, p)
+		_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service; the pause stands
 	}
 	o.logger.Info("orchestrator: phase paused", "phase_id", phaseID)
 	return nil
@@ -137,15 +137,19 @@ func (o *Orchestrator) StopPhase(ctx context.Context, phaseID, finalStatus strin
 }
 
 // enterPhase runs the phase enter sequence after the running claim. Data
-// errors (broken rules, unloadable workflows, zero startable attacks) fail
-// the phase via failPhase, recording the error as the phase's failure
-// reason; fanout errors against an empty/struggling SDK fleet are warnings,
-// matching the legacy FSM.
+// errors (broken rules, unloadable workflows, zero startable attacks) and a
+// fleet that does not converge fail the phase via failPhase, recording the
+// error as the phase's failure reason.
 func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase, fresh bool) error {
+	// The converge gate can hold the caller for MANTEION_CONVERGE_TIMEOUT, and
+	// a caller that goes away meanwhile (an operator's client hanging up) must
+	// leave the phase failed with its reason, not wedged 'running' with no load
+	// driver and no poller: the failure is finalized on a context it cannot
+	// cancel.
 	fail := func(err error) error {
 		o.logger.Error("orchestrator: phase enter failed",
 			"phase_id", p.ID, "error", err)
-		o.failPhase(ctx, p.ID, failureReason(err), "running")
+		o.failPhase(context.WithoutCancel(ctx), p.ID, failureReason(err), "running")
 		return err
 	}
 
@@ -154,49 +158,54 @@ func (o *Orchestrator) enterPhase(ctx context.Context, p *model.ExperimentPhase,
 		return fail(fmt.Errorf("orchestrator: load experiment: %w", err))
 	}
 
-	// The phase is 'running' here, so the materialized desired state of every
-	// service it touches has changed: its phase rules are served, an isolation
-	// phase synthesizes a replay rule for each frozen service, and a baseline
-	// (persist_cache) a record rule for each service frozen anywhere in the
-	// experiment. Bump each one's generation: that is what wakes their held
-	// long-polls to fetch the new document. Unconditional — a fault-rule phase
-	// changes desired state as much as a cache-box one. endPhase (and, for a
-	// recording phase, the drain barrier before it) bumps the same services
-	// again when the phase leaves 'running'.
-	//
-	// This fires on EVERY enter, not just a fresh start (M5): a paused phase had
-	// dropped out of the document, and a resume that skipped the bump would leave
-	// a long-polling SDK holding until its wait elapsed, the frozen service
-	// running live (no replay rule, no synthetic delay, live downstream calls)
-	// in the meantime.
-	o.bumpDesired(ctx, p)
-
-	// Cache preload is a HARD GATE on a fresh start of a frozen phase (INV-4):
-	// load may only begin against a replay set that every live instance has
-	// verify-committed (byte-exact count + checksum). A missing baseline, a
-	// zero-entry frozen service, or any instance failing/mismatching aborts the
-	// phase here — before freeze and before any load. A resume continues with
-	// whatever the boxes already hold.
-	if fresh && len(p.FrozenServices) > 0 {
-		if err := o.preloadCacheEntries(ctx, p); err != nil {
+	// Replay sets (INV-4): a fresh frozen phase builds one immutable artifact
+	// per frozen service from the baseline recording and assigns it; a resume
+	// re-reads the assignment. Both refusals (no baseline, zero entries,
+	// degraded recording) keep the preload-gate wording.
+	var artifacts map[string]string
+	if len(p.FrozenServices) > 0 {
+		if fresh {
+			artifacts, err = o.buildReplayArtifacts(ctx, p)
+		} else {
+			artifacts, err = o.assignedArtifacts(ctx, p)
+		}
+		if err != nil {
 			return fail(fmt.Errorf("orchestrator: preload gate: %w", err))
 		}
 	}
 
-	// Freeze is idempotent (intent-tracked), so re-freezing on resume re-asserts
-	// desired state. For a frozen service an un-asserted freeze is a leak
-	// (INV-4), so freeze-fanout failure is phase-fatal.
-	if err := o.freezeServices(ctx, p); err != nil {
-		return fail(fmt.Errorf("orchestrator: freeze gate: %w", err))
+	// Inputs are written (phase running, rules attached, artifacts assigned,
+	// freeze config derived from the phase). Bump every service once and wait
+	// for the fleet to observe it (contract §4) — this replaces freeze, rule
+	// push and preload; a timeout fails the phase naming the laggards. A bump
+	// that fails is a convergence failure, never "nothing to wait for". Every
+	// enter bumps, a resume included (M5): a paused phase had dropped out of
+	// the document, so its frozen services were serving live.
+	targets, err := o.bumpDesired(ctx, p)
+	if err == nil {
+		err = o.waitConverged(ctx, targets, artifacts, o.convergeTimeout)
 	}
-	if fresh {
-		o.recordFreezeEvents(ctx, p)
+	if err != nil {
+		return fail(fmt.Errorf("orchestrator: converge gate: %w", err))
 	}
 
-	if err := o.pushPhaseRules(ctx, p); err != nil {
-		return fail(fmt.Errorf("orchestrator: push phase rules: %w", err))
+	// The wait can be long: a pause or stop that landed meanwhile owns the
+	// phase now, and no load may start for a phase that left 'running'.
+	cur, err := o.experiments.GetPhase(ctx, p.ID)
+	if err != nil {
+		return fail(fmt.Errorf("orchestrator: reload phase after the converge gate: %w", err))
 	}
+	if cur.Status != "running" {
+		o.logger.Warn("orchestrator: phase left running during the converge gate; no load started",
+			"phase_id", p.ID, "status", cur.Status)
+		return invalidState("phase", p.ID, cur.Status, "running",
+			fmt.Sprintf("orchestrator: phase %q left running while its fleet converged (now %s); no load started", p.ID, cur.Status))
+	}
+	o.logger.Info("orchestrator: fleet converged on phase entry",
+		"phase_id", p.ID, "services", len(targets), "frozen", len(artifacts), "fresh", fresh)
+
 	if fresh {
+		o.recordFreezeEvents(ctx, p)
 		o.recordRuleEvents(ctx, p)
 	}
 
@@ -367,9 +376,10 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 	// running → draining, where the drain barrier bumped — that removal is what
 	// the SDK's drain tracker keys off (MANT-2); for a recording phase that
 	// failed or was skipped without draining, this bump is the removal signal.
-	o.bumpDesired(ctx, p)
+	_, _ = o.bumpDesired(ctx, p) // a failed bump is logged per service
 
-	for _, svc := range o.phaseServices(ctx, p) {
+	svcs, _ := o.phaseServices(ctx, p) // an unreadable rule was logged by the bump above
+	for _, svc := range svcs {
 		if _, err := o.controller.PushRules(ctx, svc, nil); err != nil {
 			o.logger.Warn("orchestrator: clear rules failed on finish",
 				"phase_id", phaseID, "service", svc, "error", err)
@@ -859,6 +869,93 @@ func (o *Orchestrator) preloadCacheEntries(ctx context.Context, p *model.Experim
 	return nil
 }
 
+// buildReplayArtifacts is the replay-set half of a fresh frozen phase's entry
+// (INV-4): for each frozen service it builds an immutable, content-addressed
+// artifact from the experiment's baseline recording (cachestore.BuildArtifact)
+// and assigns it to the (phase, service) pair, which is what the materializer
+// serves as that service's replay_set (desired.PhaseSources). It returns
+// service → artifact id: the sets the convergence barrier waits for. The
+// baseline is the experiment's most recently completed phase that persisted
+// its cache and froze nothing.
+//
+// The refusals are the former preload gate's, with its wording: no completed
+// baseline, a degraded one (unless MANTEION_ALLOW_DEGRADED_BASELINE), a frozen
+// service that recorded zero entries, or entries recorded under another key
+// strategy than the freeze replays with. Load never starts against a replay set
+// that cannot be built.
+func (o *Orchestrator) buildReplayArtifacts(ctx context.Context, p *model.ExperimentPhase) (map[string]string, error) {
+	baseline, err := o.baselinePhase(ctx, p.ExperimentID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve baseline: %w", err)
+	}
+	if baseline == nil {
+		return nil, fmt.Errorf("no completed baseline recording for experiment %q; cannot preload frozen services", p.ExperimentID)
+	}
+
+	// Refuse to build a replay set from a degraded recording (INV-3): its
+	// coverage is unverified, so any isolation run over it is suspect. The
+	// operator can override with MANTEION_ALLOW_DEGRADED_BASELINE.
+	drain, err := o.experiments.GetPhaseDrain(ctx, baseline.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read baseline drain result: %w", err)
+	}
+	if drain.Degraded() && !o.allowDegradedBaseline {
+		return nil, fmt.Errorf("baseline recording %q is degraded (%d missing instances, %d entry shortfall); "+
+			"refusing to preload — set MANTEION_ALLOW_DEGRADED_BASELINE=true to override",
+			baseline.ID, len(drain.MissingInstances), drain.ShortfallEntries)
+	}
+
+	out := make(map[string]string, len(p.FrozenServices))
+	for _, fs := range p.FrozenServices {
+		// The entries are read once here for the two preflights, and again by
+		// BuildArtifact, which encodes them.
+		entries, err := o.cacheStore.Read(baseline.ExperimentID, baseline.ID, fs.Service)
+		if err != nil {
+			return nil, fmt.Errorf("read baseline entries for %q: %w", fs.Service, err)
+		}
+		if len(entries) == 0 {
+			return nil, fmt.Errorf("baseline recorded zero entries for frozen service %q; nothing to replay", fs.Service)
+		}
+		if err := verifyRecordedStrategy(fs.Service, entries, model.ResolveKeyStrategy(fs.KeyStrategy)); err != nil {
+			return nil, err
+		}
+		info, err := o.cacheStore.BuildArtifact(baseline.ExperimentID, baseline.ID, fs.Service)
+		if err != nil {
+			return nil, fmt.Errorf("build replay set for %q: %w", fs.Service, err)
+		}
+		if err := o.artifacts.Upsert(ctx, &model.ReplayArtifact{
+			ID: info.ID, ExperimentID: p.ExperimentID, PhaseID: p.ID, Service: fs.Service,
+			EntryCount: info.Count, W5SHA256: info.W5SHA256, SizeBytes: info.SizeBytes, Path: info.Path,
+		}); err != nil {
+			return nil, fmt.Errorf("assign replay set for %q: %w", fs.Service, err)
+		}
+		out[fs.Service] = info.ID
+		o.logger.Info("orchestrator: replay set assigned",
+			"phase_id", p.ID, "service", fs.Service, "artifact", info.ID,
+			"entries", info.Count, "baseline_phase_id", baseline.ID)
+	}
+	return out, nil
+}
+
+// assignedArtifacts is the replay-set half of a resume: the artifacts the
+// phase's fresh start assigned, service → artifact id, re-read rather than
+// rebuilt, so a resumed phase replays exactly the sets it started with. A
+// frozen service with none assigned is an error.
+func (o *Orchestrator) assignedArtifacts(ctx context.Context, p *model.ExperimentPhase) (map[string]string, error) {
+	out := make(map[string]string, len(p.FrozenServices))
+	for _, fs := range p.FrozenServices {
+		a, err := o.artifacts.ForPhaseService(ctx, p.ID, fs.Service)
+		if err != nil {
+			return nil, fmt.Errorf("read the replay set assigned to %q: %w", fs.Service, err)
+		}
+		if a == nil {
+			return nil, fmt.Errorf("no replay set assigned for frozen service %q (resume before a fresh start?)", fs.Service)
+		}
+		out[fs.Service] = a.ID
+	}
+	return out, nil
+}
+
 // verifyRecordedStrategy is the preload strategy preflight (MANT-5/INV-2): the
 // key strategy the entries were recorded under must equal the strategy the
 // freeze context will replay with, or every key would derive differently and
@@ -930,8 +1027,9 @@ func (o *Orchestrator) baselinePhase(ctx context.Context, experimentID string) (
 
 // phaseServices returns the de-duplicated union of the phase's frozen
 // services and its rules' target services — every service the phase may
-// have touched, for rule-clearing at teardown.
-func (o *Orchestrator) phaseServices(ctx context.Context, p *model.ExperimentPhase) []string {
+// have touched. An error means some rule could not be read: the services
+// returned are then incomplete, every one that could be resolved.
+func (o *Orchestrator) phaseServices(ctx context.Context, p *model.ExperimentPhase) ([]string, error) {
 	seen := make(map[string]struct{})
 	var svcs []string
 	add := func(s string) {
@@ -948,58 +1046,69 @@ func (o *Orchestrator) phaseServices(ctx context.Context, p *model.ExperimentPha
 	}
 	prs, err := o.experiments.ListPhaseRules(ctx, p.ID)
 	if err != nil {
-		o.logger.Warn("orchestrator: phase services: list rules failed",
-			"phase_id", p.ID, "error", err)
-		return svcs
+		return svcs, fmt.Errorf("list the rules of phase %q: %w", p.ID, err)
 	}
+	var errs []error
 	for _, pr := range prs {
 		r, err := o.rules.Get(ctx, pr.RuleID)
 		if err != nil {
-			o.logger.Warn("orchestrator: phase services: load rule failed",
-				"rule_id", pr.RuleID, "error", err)
+			errs = append(errs, fmt.Errorf("load rule %q: %w", pr.RuleID, err))
 			continue
 		}
 		add(r.Service)
 	}
-	return svcs
+	return svcs, errors.Join(errs...)
 }
 
 // desiredServices is every service whose materialized desired state this
 // phase changes: the frozen services and rule targets (phaseServices), plus,
 // for a baseline, the services frozen anywhere in the experiment — the
 // baseline is what synthesizes their record rule (ActiveCacheBoxPhaseForService).
-func (o *Orchestrator) desiredServices(ctx context.Context, p *model.ExperimentPhase) []string {
-	svcs := o.phaseServices(ctx, p)
+// An error means the list is incomplete (see phaseServices).
+func (o *Orchestrator) desiredServices(ctx context.Context, p *model.ExperimentPhase) ([]string, error) {
+	svcs, err := o.phaseServices(ctx, p)
 	if !p.PersistCache {
-		return svcs
+		return svcs, err
 	}
+	frozen, ferr := o.experimentFrozenServices(ctx, p.ExperimentID)
 	seen := make(map[string]struct{}, len(svcs))
 	for _, s := range svcs {
 		seen[s] = struct{}{}
 	}
-	for _, s := range o.experimentFrozenServices(ctx, p.ExperimentID) {
+	for _, s := range frozen {
 		if _, ok := seen[s]; !ok {
 			seen[s] = struct{}{}
 			svcs = append(svcs, s)
 		}
 	}
-	return svcs
+	return svcs, errors.Join(err, ferr)
 }
 
 // bumpDesired bumps the generation of every service this phase's desired
 // state touches (one bump each, in the same order every time) and returns the
-// targets — the generations instances must observe to have converged.
-func (o *Orchestrator) bumpDesired(ctx context.Context, p *model.ExperimentPhase) map[string]uint64 {
+// targets — the generations instances must observe to have converged. Every
+// service it can resolve is bumped; a service it cannot resolve or bump is
+// missing from targets and named in the error (each one logged too). A caller
+// that waits must treat that error as a convergence failure: a missing target
+// is never "nothing to wait for".
+func (o *Orchestrator) bumpDesired(ctx context.Context, p *model.ExperimentPhase) (map[string]uint64, error) {
+	svcs, err := o.desiredServices(ctx, p)
+	if err != nil {
+		o.logger.Warn("orchestrator: resolve the services to bump failed", "phase_id", p.ID, "error", err)
+		err = fmt.Errorf("resolve the services to bump: %w", err)
+	}
+	errs := []error{err}
 	targets := map[string]uint64{}
-	for _, svc := range o.desiredServices(ctx, p) {
+	for _, svc := range svcs {
 		gen, err := o.generations.Bump(ctx, svc)
 		if err != nil {
 			o.logger.Warn("orchestrator: bump generation failed", "phase_id", p.ID, "service", svc, "error", err)
+			errs = append(errs, fmt.Errorf("bump the generation of %q: %w", svc, err))
 			continue
 		}
 		targets[svc] = gen
 	}
-	return targets
+	return targets, errors.Join(errs...)
 }
 
 // =========================================================================

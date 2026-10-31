@@ -2,13 +2,21 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	atroposdk "git.ucsc.edu/microfaults/atropos-go"
+
+	"manteion-go/internal/desired"
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
+	"manteion-go/internal/store"
 )
 
 // bumpService bumps svc's generation and returns it: a convergence target.
@@ -209,5 +217,266 @@ func TestWaitConverged_ReplaySetMustBeTheAssignedOneCommitted(t *testing.T) {
 	report(art, "committed")
 	if err := o.waitConverged(ctx, targets, artifacts, 5*time.Second); err != nil {
 		t.Fatalf("committed: waitConverged = %v, want nil", err)
+	}
+}
+
+// seedBaseline completes a baseline with n recorded entries for service.
+func seedBaseline(t *testing.T, o *Orchestrator, expID, service string, n int) *model.ExperimentPhase {
+	t.Helper()
+	return seedBaselineAt(t, o, expID, service, 0, n)
+}
+
+// seedBaselineAt is seedBaseline at position pos.
+func seedBaselineAt(t *testing.T, o *Orchestrator, expID, service string, pos, n int) *model.ExperimentPhase {
+	t.Helper()
+	base := mkCompletedBaseline(t, expID, pos)
+	entries := make([]atroposdk.CacheBoxWireEntry, n)
+	for i := range entries {
+		entries[i] = atroposdk.CacheBoxWireEntry{Key: "k" + string(rune('a'+i)), StatusCode: 200, Body: []byte("v")}
+	}
+	if err := o.cacheStore.Append(expID, base.ID, service, entries); err != nil {
+		t.Fatal(err)
+	}
+	return base
+}
+
+// mkRunningRulePhase creates a running phase that freezes nothing and attaches
+// one enabled inline-latency rule targeting service (with its fault spec).
+func mkRunningRulePhase(t *testing.T, expID, service string, pos int) *model.ExperimentPhase {
+	t.Helper()
+	ctx := context.Background()
+	tag := id.New("rulephase")
+	specID := "spec-" + tag
+	spec := &model.FaultSpec{
+		ID: specID, Name: "rulephase-spec", Category: "inline", FaultType: "latency",
+		Host: "process", Params: json.RawMessage(`{"delay":"100ms"}`), CreatedAt: time.Now(),
+	}
+	if err := testFaultRepo.CreateSpec(ctx, spec); err != nil {
+		t.Fatalf("seed fault spec: %v", err)
+	}
+	t.Cleanup(func() { _ = testFaultRepo.DeleteSpec(context.Background(), specID) })
+	rule := &model.Rule{
+		ID: "rule-" + tag, Name: "rule-" + tag, Service: service, Enabled: true, Priority: 10,
+		Mode: "background", StartPolicy: "always_start",
+		Action:    model.RuleAction{Type: "fault_spec", FaultSpecID: specID},
+		Match:     model.MatchCriteria{InjectionPoint: "ingress"},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := testRuleRepo.Create(ctx, rule); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rule.ID) })
+	p := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: expID, Name: fmt.Sprintf("rules-%d", pos), Position: pos, Status: "pending"}
+	if err := testExpRepo.CreatePhase(ctx, p); err != nil {
+		t.Fatalf("create phase: %v", err)
+	}
+	if err := testExpRepo.AttachPhaseRules(ctx, p.ID, []string{rule.ID}); err != nil {
+		t.Fatalf("attach phase rule: %v", err)
+	}
+	if err := testExpRepo.UpdatePhaseStatus(ctx, p.ID, "running"); err != nil {
+		t.Fatalf("run phase: %v", err)
+	}
+	return p
+}
+
+// waitGeneration polls (no testing.T calls, safe on any goroutine) until svc's
+// generation passes after, for at most 5s, and reports whether it did.
+func waitGeneration(o *Orchestrator, svc string, after uint64) bool {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if g, err := o.generations.Get(context.Background(), svc); err == nil && g > after {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEnterPhase_ConvergesWhenInstancesAck(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.autoComplete = false
+	o.WithConvergeTimeout(5 * time.Second) // returns once the instance acks
+	exp := mkExp(t)
+	seedBaseline(t, o, exp.ID, "frontend", 2)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	sdk := newFakeSDK(t)
+	instID := registerSDK(t, "frontend", sdk.server.URL)
+	// The artifact id is only known once built; ack whatever is assigned.
+	ackAssigned(t, o, instID, iso.ID, "frontend", "committed")
+
+	if err := o.enterPhase(ctx, iso, true); err != nil {
+		t.Fatalf("enterPhase: %v", err)
+	}
+	a, err := o.artifacts.ForPhaseService(ctx, iso.ID, "frontend")
+	if err != nil || a == nil || a.EntryCount != 2 || a.ExperimentID != exp.ID || !strings.HasPrefix(a.ID, "sha256:") {
+		t.Fatalf("artifact = %+v, %v", a, err)
+	}
+	if got := getPhase(t, iso.ID).Status; got != "running" {
+		t.Fatalf("phase status = %q, want running", got)
+	}
+}
+
+func TestEnterPhase_ReplaySetNotCommittedAborts(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	seedBaseline(t, o, exp.ID, "frontend", 1)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	instID := registerSDK(t, "frontend", newFakeSDK(t).server.URL)
+	ackGenerations(t, o, instID, "frontend", "") // generation yes, replay set never
+
+	err := o.enterPhase(ctx, iso, true)
+	if err == nil || !strings.Contains(err.Error(), "converge gate") || !strings.Contains(err.Error(), instID) || !strings.Contains(err.Error(), "replay_set") {
+		t.Fatalf("enterPhase err = %v, want a converge-gate abort naming %s and its replay_set state", err, instID)
+	}
+	if got := getPhase(t, iso.ID); got.Status != "failed" || !strings.Contains(got.FailureReason, instID) {
+		t.Fatalf("phase = %s / %q, want failed with the lagging instance", got.Status, got.FailureReason)
+	}
+}
+
+func TestEnterPhase_ReplaySetFailedAbortsEarly(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.WithConvergeTimeout(5 * time.Second)
+	exp := mkExp(t)
+	seedBaseline(t, o, exp.ID, "frontend", 1)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	instID := registerSDK(t, "frontend", newFakeSDK(t).server.URL)
+	ackAssigned(t, o, instID, iso.ID, "frontend", "failed", "fetch: 416")
+
+	start := time.Now()
+	err := o.enterPhase(ctx, iso, true)
+	if err == nil || !strings.Contains(err.Error(), "failed") || !strings.Contains(err.Error(), "fetch: 416") {
+		t.Fatalf("enterPhase err = %v, want an early abort carrying the instance's error", err)
+	}
+	if time.Since(start) > 4*time.Second {
+		t.Fatalf("took %v: a failed replay set must abort before the converge timeout", time.Since(start))
+	}
+}
+
+func TestEnterPhase_FrozenServiceWithoutInstancesAborts(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	seedBaseline(t, o, exp.ID, "frontend", 1)
+	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
+	err := o.enterPhase(ctx, iso, true)
+	if err == nil || !strings.Contains(err.Error(), "no live instances") {
+		t.Fatalf("enterPhase err = %v, want 'no live instances' (INV-4)", err)
+	}
+}
+
+func TestEnterPhase_LaggingInstanceFailsWithList(t *testing.T) {
+	// A fault-rule phase (no freeze): a registered instance that never polls
+	// the new generation fails the phase, named with observed/target.
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	ph := mkRunningRulePhase(t, exp.ID, "frontend", 0)
+	instID := registerSDK(t, "frontend", newFakeSDK(t).server.URL)
+	err := o.enterPhase(ctx, ph, true)
+	if err == nil || !strings.Contains(err.Error(), instID) || !strings.Contains(err.Error(), "observed=") {
+		t.Fatalf("enterPhase err = %v, want the lagging instance with observed/target", err)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "failed" || !strings.Contains(got.FailureReason, "converge gate") {
+		t.Fatalf("phase = %s / %q, want failed at the converge gate", got.Status, got.FailureReason)
+	}
+}
+
+// The converge gate can hold its caller for the whole timeout. A caller that
+// goes away meanwhile (an operator's client hanging up on a start) must still
+// leave the phase failed with its reason, not wedged 'running' with no load
+// driver and no poller: the failure is finalized on a context the caller
+// cannot cancel.
+func TestEnterPhase_CallerGoneStillFailsThePhase(t *testing.T) {
+	o := newOrch(t, "")
+	o.WithConvergeTimeout(time.Second)
+	exp := mkExp(t)
+	svc := id.New("svc-gone")
+	ph := mkRunningRulePhase(t, exp.ID, svc, 0)
+	registerSDK(t, svc, "http://never-acks.invalid")
+	g0 := generation(t, o, svc)
+
+	ctx, hangUp := context.WithCancel(context.Background())
+	defer hangUp()
+	go func() {
+		if waitGeneration(o, svc, g0) { // the entry bumped: it is waiting now
+			hangUp()
+		}
+	}()
+	err := o.enterPhase(ctx, ph, true)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("enterPhase err = %v, want the converge gate cut short by the caller", err)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "failed" || !strings.Contains(got.FailureReason, "converge gate") {
+		t.Fatalf("phase = %s / %q, want failed at the converge gate", got.Status, got.FailureReason)
+	}
+}
+
+// A pause (or stop) that lands while the entry waits for the fleet owns the
+// phase from then on: once the wait ends, the entry must see the phase left
+// 'running' and start no load for it.
+func TestEnterPhase_PausedWhileConvergingStartsNoLoad(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	o.WithConvergeTimeout(5 * time.Second)
+	exp := mkExp(t)
+	svc := id.New("svc-paused")
+	ph := mkRunningRulePhase(t, exp.ID, svc, 0)
+	attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1}) // a run would drive it
+	inst := registerSDK(t, svc, "http://acks-late.invalid")
+	g0 := generation(t, o, svc)
+
+	paused := make(chan error, 1)
+	go func() {
+		if !waitGeneration(o, svc, g0) {
+			paused <- errors.New("the entry never bumped")
+			return
+		}
+		err := o.PausePhase(ctx, ph.ID)
+		if g, gerr := o.generations.Get(ctx, svc); err == nil && gerr == nil {
+			err = testSDKRepo.RecordPoll(ctx, inst, g) // the instance converges after the pause
+		}
+		paused <- err
+	}()
+	err := o.enterPhase(ctx, ph, true)
+	if perr := <-paused; perr != nil {
+		t.Fatalf("pause while converging: %v", perr)
+	}
+	var state *ErrInvalidState
+	if !errors.As(err, &state) || state.Current != "paused" {
+		t.Fatalf("enterPhase err = %v, want an invalid-state refusal naming the paused phase", err)
+	}
+	if got := getPhase(t, ph.ID).Status; got != "paused" {
+		t.Fatalf("phase status = %q, want paused (the pause owns it)", got)
+	}
+	if n := fz.runCount(); n != 0 {
+		t.Fatalf("zeus started %d run(s) for a phase that left running", n)
+	}
+}
+
+// bumpFailingStore is a generation store whose bumps fail: reads still work.
+type bumpFailingStore struct{ desired.Store }
+
+func (bumpFailingStore) Bump(context.Context, *sql.Tx, string) (uint64, error) {
+	return 0, errors.New("generation store down")
+}
+
+// Ruling 2: a bump that fails is a convergence failure, never "nothing to wait
+// for": the phase fails at the converge gate instead of starting on instances
+// that were never told about it.
+func TestEnterPhase_FailedBumpFailsThePhase(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.generations = desired.NewGenerations(bumpFailingStore{store.NewGenerationRepo(testDB)}, desired.NewBroker())
+	exp := mkExp(t)
+	svc := id.New("svc-nobump")
+	ph := mkRunningRulePhase(t, exp.ID, svc, 0)
+	err := o.enterPhase(ctx, ph, true)
+	if err == nil || !strings.Contains(err.Error(), "converge gate") || !strings.Contains(err.Error(), svc) {
+		t.Fatalf("enterPhase err = %v, want a converge-gate failure naming %s", err, svc)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "failed" || !strings.Contains(got.FailureReason, "generation store down") {
+		t.Fatalf("phase = %s / %q, want failed with the bump error", got.Status, got.FailureReason)
 	}
 }

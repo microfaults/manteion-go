@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
-
 	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 )
@@ -23,11 +21,17 @@ func mkExp(t *testing.T) *model.Experiment {
 	return exp
 }
 
-// mkCompletedBaseline creates a completed persist_cache baseline phase.
+// mkCompletedBaseline creates a completed persist_cache baseline phase, named
+// "baseline" at position 0 and "baseline-<pos>" elsewhere (phase names are
+// unique per experiment).
 func mkCompletedBaseline(t *testing.T, expID string, pos int) *model.ExperimentPhase {
 	t.Helper()
 	ctx := context.Background()
-	p := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: expID, Name: "baseline", Position: pos, Status: "pending", PersistCache: true}
+	name := "baseline"
+	if pos != 0 {
+		name = fmt.Sprintf("baseline-%d", pos)
+	}
+	p := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: expID, Name: name, Position: pos, Status: "pending", PersistCache: true}
 	if err := testExpRepo.CreatePhase(ctx, p); err != nil {
 		t.Fatalf("create baseline: %v", err)
 	}
@@ -88,33 +92,5 @@ func TestEnterPhase_ZeroEntriesAborts(t *testing.T) {
 	}
 	if got := getPhase(t, iso.ID).Status; got != "failed" {
 		t.Fatalf("phase status = %q, want failed", got)
-	}
-}
-
-// TestEnterPhase_PreloadMismatchAborts pins MANT-1/INV-4: an instance whose
-// commit checksum mismatches fails the gate BEFORE freeze and before any load.
-func TestEnterPhase_PreloadMismatchAborts(t *testing.T) {
-	ctx := context.Background()
-	o := newOrch(t, "")
-	exp := mkExp(t)
-	base := mkCompletedBaseline(t, exp.ID, 0)
-	if err := o.cacheStore.Append(exp.ID, base.ID, "frontend",
-		[]atroposdk.CacheBoxWireEntry{{Key: "k1", StatusCode: 200, Body: []byte("v1")}}); err != nil {
-		t.Fatal(err)
-	}
-	iso := mkRunningIsolation(t, exp.ID, "frontend", 1)
-
-	sdk := newFakeSDK(t, false) // commit returns a 409 checksum mismatch
-	registerSDK(t, "frontend", sdk.server.URL)
-
-	err := o.enterPhase(ctx, iso, true)
-	if err == nil || !strings.Contains(err.Error(), "checksum") {
-		t.Fatalf("enterPhase err = %v, want a checksum-mismatch abort", err)
-	}
-	if got := getPhase(t, iso.ID).Status; got != "failed" {
-		t.Fatalf("phase status = %q, want failed", got)
-	}
-	if sdk.freezeHit.Load() {
-		t.Fatal("freeze was asserted despite a failed preload — the gate must abort before freeze")
 	}
 }

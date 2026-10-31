@@ -46,9 +46,9 @@ func (f *fakeSDK) rulesPushed() []string {
 	return append([]string(nil), f.pushed...)
 }
 
-func newFakeSDK(t *testing.T, commitOK bool) *fakeSDK {
+func newFakeSDK(t *testing.T) *fakeSDK {
 	t.Helper()
-	f := &fakeSDK{commitOK: commitOK}
+	f := &fakeSDK{commitOK: true}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /cachebox/preload/begin", func(w http.ResponseWriter, _ *http.Request) {
@@ -125,6 +125,36 @@ func registerSDK(t *testing.T, service, addr string) string {
 // the replay set committed under it. Stops at test cleanup.
 func ackGenerations(t *testing.T, o *Orchestrator, instanceID, service, artifact string) {
 	t.Helper()
+	simulateInstance(t, o, instanceID, service, func(context.Context) *model.ObservedStatus {
+		if artifact == "" {
+			return nil
+		}
+		return &model.ObservedStatus{ReplaySet: &model.ReplaySetStatus{ID: artifact, State: "committed"}}
+	})
+}
+
+// ackAssigned is ackGenerations for a replay set that is not built yet: every
+// 20ms it records the service's current generation as observed and, once a
+// set is assigned to (phaseID, service), reports that set in state, with errs
+// as the instance's errors. Stops at test cleanup.
+func ackAssigned(t *testing.T, o *Orchestrator, instanceID, phaseID, service, state string, errs ...string) {
+	t.Helper()
+	simulateInstance(t, o, instanceID, service, func(ctx context.Context) *model.ObservedStatus {
+		a, err := o.artifacts.ForPhaseService(ctx, phaseID, service)
+		if err != nil || a == nil {
+			return nil
+		}
+		return &model.ObservedStatus{Errors: errs, ReplaySet: &model.ReplaySetStatus{ID: a.ID, State: state}}
+	})
+}
+
+// simulateInstance runs the loop behind ackGenerations and ackAssigned on a
+// goroutine that makes no testing.T calls: every 20ms it records the
+// service's current generation as the instance's observed one (a poll) and,
+// when report returns a status, stores it applied at that generation (a status
+// report). It stops when the test is cleaned up.
+func simulateInstance(t *testing.T, o *Orchestrator, instanceID, service string, report func(context.Context) *model.ObservedStatus) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() {
@@ -140,9 +170,9 @@ func ackGenerations(t *testing.T, o *Orchestrator, instanceID, service, artifact
 					continue
 				}
 				_ = testSDKRepo.RecordPoll(ctx, instanceID, gen)
-				if artifact != "" {
-					_ = testSDKRepo.RecordStatus(ctx, instanceID, model.ObservedStatus{AppliedGeneration: gen,
-						ReplaySet: &model.ReplaySetStatus{ID: artifact, State: "committed"}})
+				if st := report(ctx); st != nil {
+					st.AppliedGeneration = gen
+					_ = testSDKRepo.RecordStatus(ctx, instanceID, *st)
 				}
 			}
 		}

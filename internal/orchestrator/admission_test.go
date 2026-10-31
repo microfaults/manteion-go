@@ -43,7 +43,7 @@ func TestPreload_StrategyMismatchFailsPreflight(t *testing.T) {
 	if err := testExpRepo.UpdatePhaseStatus(ctx, iso.ID, "running"); err != nil {
 		t.Fatal(err)
 	}
-	sdk := newFakeSDK(t, true) // cooperative — but preflight aborts before contact
+	sdk := newFakeSDK(t) // cooperative — but preflight aborts before any replay set exists
 	registerSDK(t, "frontend", sdk.server.URL)
 
 	err := o.enterPhase(ctx, iso, true)
@@ -53,8 +53,8 @@ func TestPreload_StrategyMismatchFailsPreflight(t *testing.T) {
 	if s := getPhase(t, iso.ID).Status; s != "failed" {
 		t.Fatalf("phase status = %q, want failed", s)
 	}
-	if sdk.freezeHit.Load() {
-		t.Fatal("freeze asserted despite a preflight failure")
+	if a, err := o.artifacts.ForPhaseService(ctx, iso.ID, "frontend"); err != nil || a != nil {
+		t.Fatalf("replay set assigned despite a preflight failure: %+v, %v", a, err)
 	}
 }
 
