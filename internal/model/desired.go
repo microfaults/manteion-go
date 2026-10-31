@@ -28,9 +28,11 @@ func ValidReplaySetState(s string) bool {
 }
 
 // ObservedStatus is what POST /api/v1/sdk/status persists. The report is a full
-// snapshot of what the instance holds, so every field replaces the stored one:
-// empty Unsupported and Errors clear, and an absent (nil) ReplaySet means the
-// instance holds none and clears the stored id/state.
+// snapshot of what the instance holds, so each field but AppliedGeneration
+// replaces the stored one: empty Unsupported and Errors clear, and an absent
+// (nil) ReplaySet means the instance holds none and clears the stored id/state.
+// AppliedGeneration only raises the stored observed generation, whose
+// authoritative writer is the poll.
 type ObservedStatus struct {
 	AppliedGeneration uint64
 	Etag              string

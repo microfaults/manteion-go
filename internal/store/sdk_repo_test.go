@@ -225,3 +225,66 @@ func TestSDKRepo_EmptyListsAreSQLNull(t *testing.T) {
 			capsNull, unsupportedNull, errorsNull)
 	}
 }
+
+// TestSDKRepo_StatusNeverLowersTheObservedGeneration pins the two writers of
+// observed_generation. The poll records the generation the instance says it
+// holds, unconditionally: it is the authoritative writer. A status report only
+// moves it forward: one built before the instance adopted a newer generation
+// from a 304, but processed after its next poll, must not set it back (that
+// poll may be held, and the instance would read as lagging the whole hold).
+// The rest of such a report is still stored, and re-registering still resets
+// the generation.
+func TestSDKRepo_StatusNeverLowersTheObservedGeneration(t *testing.T) {
+	conn := testutil.TestDB(t)
+	ctx := context.Background()
+	repo := NewSDKRepo(conn)
+
+	inst := &model.SDKInstance{ID: "inst-monotonic", Service: "cartservice", Address: "10.0.0.5:9090"}
+	if err := repo.Register(ctx, inst); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	observed := func(step string, want uint64) *model.SDKInstance {
+		t.Helper()
+		got, err := repo.Get(ctx, inst.ID)
+		if err != nil {
+			t.Fatalf("%s: get: %v", step, err)
+		}
+		if got.ObservedGeneration != want {
+			t.Errorf("%s: observed_generation = %d, want %d", step, got.ObservedGeneration, want)
+		}
+		return got
+	}
+	poll := func(gen uint64) {
+		t.Helper()
+		if err := repo.RecordPoll(ctx, inst.ID, gen); err != nil {
+			t.Fatalf("record poll %d: %v", gen, err)
+		}
+	}
+	status := func(st model.ObservedStatus) {
+		t.Helper()
+		if err := repo.RecordStatus(ctx, inst.ID, st); err != nil {
+			t.Fatalf("record status %d: %v", st.AppliedGeneration, err)
+		}
+	}
+
+	poll(5)
+	status(model.ObservedStatus{AppliedGeneration: 4, Etag: "0123456789abcdef", Errors: []string{"late"},
+		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "failed"}})
+	if got := observed("a status at 4 after a poll at 5", 5); got.ObservedEtag != "0123456789abcdef" ||
+		len(got.ObservedErrors) != 1 || got.ReplaySetState != "failed" || got.ObservedAt == nil {
+		t.Errorf("the late report's other columns were not stored: %+v", got)
+	}
+
+	status(model.ObservedStatus{AppliedGeneration: 6})
+	observed("a status at 6", 6)
+
+	poll(3) // the poll stays authoritative, even downwards
+	observed("a poll at 3", 3)
+
+	if err := repo.Register(ctx, inst); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	observed("re-registered", 0)
+	status(model.ObservedStatus{AppliedGeneration: 2})
+	observed("a status at 2 after re-registering", 2)
+}

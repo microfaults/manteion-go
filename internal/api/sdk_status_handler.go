@@ -34,9 +34,11 @@ type StatusReport struct {
 // @Description  Sent by an SDK instance after every apply and whenever its replay-set
 // @Description  state changes (fetching|committed|failed). The report is a full snapshot
 // @Description  of what the instance holds and replaces the previous one: it stores
-// @Description  applied_generation, etag, unsupported rules and errors (empty lists clear)
-// @Description  and the replay-set id and state (an absent replay_set means the instance
-// @Description  holds none and clears them) on the instance row, where GET /sdk/instances
+// @Description  etag, unsupported rules and errors (empty lists clear) and the replay-set
+// @Description  id and state (an absent replay_set means the instance holds none and
+// @Description  clears them) on the instance row, and raises observed_generation to
+// @Description  applied_generation, never lowering it (the poll records the version the
+// @Description  instance holds and is its authoritative writer). GET /sdk/instances
 // @Description  exposes them and the orchestrator's convergence barrier reads them.
 // @Tags         sdk
 // @Accept       json

@@ -245,11 +245,14 @@ func (r *SDKRepo) RecordPoll(ctx context.Context, id string, observedGeneration 
 }
 
 // RecordStatus stores an instance's POST /api/v1/sdk/status report. The report
-// is a full snapshot of what the instance holds, so every observed column is
-// overwritten: an absent ReplaySet means the instance holds no set and clears
-// the stored id and state (keeping them would leave a stale committed/failed
-// state behind after a thaw or phase end, and artifact ids are content hashes
-// that can recur).
+// is a full snapshot of what the instance holds, so the observed columns are
+// overwritten, all but observed_generation: an absent ReplaySet means the
+// instance holds no set and clears the stored id and state (keeping them would
+// leave a stale committed/failed state behind after a thaw or phase end, and
+// artifact ids are content hashes that can recur). observed_generation only
+// moves forward here: the poll (RecordPoll) is its authoritative writer, and a
+// report built before the instance adopted a newer generation from a 304 but
+// processed after its next poll must not set it back. Register still resets it.
 func (r *SDKRepo) RecordStatus(ctx context.Context, id string, st model.ObservedStatus) error {
 	unsupported, err := jsonbOrNull(st.Unsupported)
 	if err != nil {
@@ -265,7 +268,7 @@ func (r *SDKRepo) RecordStatus(ctx context.Context, id string, st model.Observed
 	}
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE sdk_instances SET
-			observed_generation = $2, observed_etag = $3,
+			observed_generation = GREATEST(observed_generation, $2), observed_etag = $3,
 			observed_unsupported = $4, observed_errors = $5,
 			replay_set_id = $6, replay_set_state = $7,
 			observed_at = now()

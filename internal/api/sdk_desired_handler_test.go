@@ -33,8 +33,9 @@ import (
 // fakeRegistry is the DB-free sdk_instances table for the desired-state
 // handlers: Register upserts, RecordPoll/RecordStatus mutate the row in place.
 // It mirrors store.SDKRepo's contract: Register validates, stores an empty
-// capability list as absent (NULL) and clears the observed state; a status
-// report is a full snapshot. Timestamps are not modelled.
+// capability list as absent (NULL) and clears the observed state; a poll sets
+// the observed generation; a status report is a full snapshot that only
+// raises it. Timestamps are not modelled.
 type fakeRegistry struct {
 	mu    sync.Mutex
 	byID  map[string]*model.SDKInstance
@@ -109,7 +110,7 @@ func (f *fakeRegistry) RecordStatus(_ context.Context, id string, st model.Obser
 	if !ok {
 		return store.ErrNotFound
 	}
-	i.ObservedGeneration, i.ObservedEtag = st.AppliedGeneration, st.Etag
+	i.ObservedGeneration, i.ObservedEtag = max(i.ObservedGeneration, st.AppliedGeneration), st.Etag
 	i.ObservedUnsupported, i.ObservedErrors = st.Unsupported, st.Errors
 	i.ReplaySetID, i.ReplaySetState = "", "" // a report without replay_set holds none
 	if st.ReplaySet != nil {

@@ -2023,7 +2023,7 @@
         },
         "/sdk/status": {
             "post": {
-                "description": "Sent by an SDK instance after every apply and whenever its replay-set\nstate changes (fetching|committed|failed). The report is a full snapshot\nof what the instance holds and replaces the previous one: it stores\napplied_generation, etag, unsupported rules and errors (empty lists clear)\nand the replay-set id and state (an absent replay_set means the instance\nholds none and clears them) on the instance row, where GET /sdk/instances\nexposes them and the orchestrator's convergence barrier reads them.",
+                "description": "Sent by an SDK instance after every apply and whenever its replay-set\nstate changes (fetching|committed|failed). The report is a full snapshot\nof what the instance holds and replaces the previous one: it stores\netag, unsupported rules and errors (empty lists clear) and the replay-set\nid and state (an absent replay_set means the instance holds none and\nclears them) on the instance row, and raises observed_generation to\napplied_generation, never lowering it (the poll records the version the\ninstance holds and is its authoritative writer). GET /sdk/instances\nexposes them and the orchestrator's convergence barrier reads them.",
                 "requestBody": {
                     "content": {
                         "application/json": {

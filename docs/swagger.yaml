@@ -1433,11 +1433,15 @@ paths:
 
         of what the instance holds and replaces the previous one: it stores
 
-        applied_generation, etag, unsupported rules and errors (empty lists clear)
+        etag, unsupported rules and errors (empty lists clear) and the replay-set
 
-        and the replay-set id and state (an absent replay_set means the instance
+        id and state (an absent replay_set means the instance holds none and
 
-        holds none and clears them) on the instance row, where GET /sdk/instances
+        clears them) on the instance row, and raises observed_generation to
+
+        applied_generation, never lowering it (the poll records the version the
+
+        instance holds and is its authoritative writer). GET /sdk/instances
 
         exposes them and the orchestrator''s convergence barrier reads them.'
       requestBody:

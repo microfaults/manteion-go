@@ -58,7 +58,8 @@ numbers.
   generation.
 - **Status** — `POST /api/v1/sdk/status`: the instance's report after every apply and on each
   replay-set state change (`applied_generation`, `etag`, unsupported rules, errors, replay-set
-  id/state), a full snapshot stored on the instance row (`observed_*`, `replay_set_*`).
+  id/state), a full snapshot stored on the instance row (`observed_*`, `replay_set_*`), except
+  that a report never lowers `observed_generation` (the poll is its authoritative writer).
 - **Ingest** — `POST /api/v1/cache/ingest`: recorded-entry batches, deduped by
   `(experiment, phase, instance, batch_seq)`; stays open while the phase drains.
 - **Drain** — `POST /api/v1/sdk/cachebox/drain`: per-`(experiment, phase)` instance report; the
