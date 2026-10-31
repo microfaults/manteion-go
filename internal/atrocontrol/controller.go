@@ -52,9 +52,9 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 	return c
 }
 
-// IntentReader returns the controller's intent tracker, which the
-// desired-state materializer reads (FreezeConfigForService) until plan 2
-// deletes it.
+// IntentReader returns the controller's intent tracker: what the push paths
+// last recorded per service. The desired-state materializer no longer reads it
+// (freeze_cfg comes from the frozen phase); plan 2 deletes it with the pushes.
 func (c *Controller) IntentReader() *IntentTracker { return c.intent }
 
 func (c *Controller) resolveCallOpts(opts []CallOption) callOpts {

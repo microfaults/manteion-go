@@ -255,8 +255,7 @@ func TestPushRules(t *testing.T) {
 // intent: PushRules the rules (nil clears them), FreezeService/ClearService
 // the freeze config, InjectFault/ClearFault the active fault. In enterPhase a
 // frozen service is frozen and then pushed its phase rules; the freeze config
-// must survive that (the materializer serves it as freeze_cfg), and survive
-// the nil push endPhase makes before it thaws.
+// must survive that, and survive the nil push endPhase makes before it thaws.
 func TestControllerIntentWritesAreFieldScoped(t *testing.T) {
 	urls := setupAtroposServers(t, 2)
 	ctrl := newTestController(t, urls, WithLogger(slog.New(slog.DiscardHandler)))
@@ -284,9 +283,6 @@ func TestControllerIntentWritesAreFieldScoped(t *testing.T) {
 	ok("push rules", res, err)
 	if i := intent(); i.FreezeCfg == nil || i.FreezeCfg.Mu != 1.0 || len(i.Rules) != 1 || i.RunID != "run-1" {
 		t.Fatalf("after freeze then rule push: %+v, want the freeze config kept and the rules recorded", i)
-	}
-	if cfg, _ := ctrl.IntentReader().FreezeConfigForService(ctx, svc); cfg == nil || cfg.Mu != 1.0 {
-		t.Fatalf("FreezeConfigForService after the rule push = %+v, want the freeze config", cfg)
 	}
 
 	res, err = ctrl.InjectFault(ctx, svc, atroposdk.FaultRequest{FaultType: "latency", Params: json.RawMessage(`{"delay":"200ms"}`)})

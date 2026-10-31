@@ -738,10 +738,13 @@ func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
 
 // freezeServices applies the phase's frozen_services cache-box config to
 // each service (the cache-box decomposition primitive). Mu/Sigma come from
-// the service's fitted synthetic-delay distribution. FreezeService records the
-// config in the controller's in-memory intent tracker (lost on a manteion
-// restart), which the materializer serves as freeze_cfg, so a re-registering
-// SDK inherits the freeze until plan 2 derives it from the frozen phase.
+// the service's fitted synthetic-delay distribution. The poll serves the same
+// config on its own: the materializer derives freeze_cfg from the running
+// phase that freezes the service (desired.PhaseSources, through the same
+// desired.FreezeDelayRequest), so a re-registering SDK inherits the freeze
+// from the database, not from the controller's in-memory intent tracker this
+// push also records in. Plan 2's phase entry drops the push for the generation
+// bump and the convergence wait.
 func (o *Orchestrator) freezeServices(ctx context.Context, p *model.ExperimentPhase) error {
 	for _, fs := range p.FrozenServices {
 		result, err := o.controller.FreezeService(ctx, fs.Service, desired.FreezeDelayRequest(p, fs))

@@ -54,6 +54,7 @@ is desired), and the SDK reconciles against them. Two consequences worth knowing
   (plural) instead of the legacy singular `active_fault`, which the old SDK
   ignored. Experiment faults held in the in-memory intent tracker are no longer
   served.
-- `freeze_cfg` is still read from the **in-memory** intent tracker until it is
-  derived from the frozen phase. If manteion restarts while a service is
-  frozen, the next `200` carries no `freeze_cfg`.
+- `freeze_cfg` is derived from the database: the running phase that freezes
+  the service (and `replay_set` from the artifact assigned to it), not from the
+  in-memory intent tracker, so a manteion restart while a service is frozen
+  does not lose it.

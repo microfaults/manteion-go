@@ -1,7 +1,6 @@
 package atrocontrol
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -12,8 +11,9 @@ import (
 // ServiceIntent is what manteion last pushed service-wide. Each field has one
 // writer, which replaces that field alone: the rules (and RunID) come from
 // PushRules, the freeze config from FreezeService/ClearService, the active
-// fault from InjectFault/ClearFault. So a rule push keeps the freeze config
-// the materializer serves as freeze_cfg, and a thaw keeps the rules.
+// fault from InjectFault/ClearFault. So a rule push keeps the freeze config,
+// and a thaw keeps the rules. The desired-state document does not read it: its
+// freeze_cfg comes from the frozen phase (desired.PhaseSources).
 type ServiceIntent struct {
 	Rules       []ruleconv.CompiledRule `json:"rules,omitempty"`
 	ActiveFault *atroposdk.FaultRequest `json:"active_fault,omitempty"`
@@ -72,15 +72,4 @@ func (t *IntentTracker) Get(service string) (*ServiceIntent, bool) {
 	defer t.mu.RUnlock()
 	i, ok := t.state[service]
 	return i, ok
-}
-
-// FreezeConfigForService is the plan-1 desired.FreezeSource: the freeze
-// config the orchestrator last pushed for the service (FreezeService, until
-// ClearService). Plan 2 replaces it with the frozen phase's config and
-// deletes the tracker.
-func (t *IntentTracker) FreezeConfigForService(_ context.Context, service string) (*atroposdk.DelayRequest, error) {
-	if i, ok := t.Get(service); ok {
-		return i.FreezeCfg, nil
-	}
-	return nil, nil
 }

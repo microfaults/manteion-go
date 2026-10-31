@@ -124,14 +124,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The desired-state materializer: a function of the database (plus, until
-	// plan 2, the intent tracker's freeze config, which freeze/thaw change
-	// without a generation bump) that the SDK handlers serve per instance,
-	// filtered by its capabilities.
+	// The desired-state materializer: a function of the database that the SDK
+	// handlers serve per instance, filtered by its capabilities. freeze_cfg and
+	// replay_set come from the running phase that freezes the service and the
+	// artifact assigned to it; one PhaseSources value fills both seams, so they
+	// always name the same phase.
+	phaseSources := &desired.PhaseSources{Phases: experimentRepo, Artifacts: artifactRepo}
 	mat := &desired.Materializer{
 		Generations: gens, Rules: ruleRepo, FaultConfigs: faultConfigRepo,
 		CacheBox: experimentRepo, Specs: faultRepo,
-		Freeze: controller.IntentReader(), // plan 2: the frozen phase's config
+		Freeze: phaseSources, ReplaySets: phaseSources,
 	}
 
 	// Create the API server with all dependencies.

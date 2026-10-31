@@ -485,16 +485,21 @@ func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, er
 }
 
 // ListRunningPhases returns every phase currently in status 'running' across
-// all experiments (newest-started first), each with its frozen_services — the
-// input to per-service cache-box rule synthesis (MANT-4). Small in practice:
-// at most one running phase per active experiment.
+// all experiments (newest-started first, phases started in the same instant by
+// id), each with its frozen_services — the input to per-service cache-box rule
+// synthesis (MANT-4) and to the freeze config and replay set derived from the
+// phase that freezes a service. The order is total on purpose: callers take the
+// first phase that freezes a service, that choice feeds the materialized
+// document whose ETag hashes it, and a tie left to the scan follows physical
+// position, which every UPDATE and the choice of plan change. Small in
+// practice: at most one running phase per active experiment.
 func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, experiment_id, name, position, status, frozen_services,
 			persist_cache, started_at, completed_at, failure_reason
 		FROM experiment_phases
 		WHERE status = 'running'
-		ORDER BY started_at DESC NULLS LAST`)
+		ORDER BY started_at DESC NULLS LAST, id`)
 	if err != nil {
 		return nil, fmt.Errorf("list running phases: %w", err)
 	}
@@ -562,6 +567,27 @@ func (r *ExperimentRepo) ActiveCacheBoxPhaseForService(ctx context.Context, serv
 		}
 	}
 	return nil, nil
+}
+
+// FrozenServiceForService returns the running phase that freezes service and
+// that phase's cache-box config for it (the replay half of
+// ActiveCacheBoxPhaseForService: the same running phases in the same order,
+// the first that freezes the service wins), or nil, nil when the service is not
+// frozen right now. Recording is not freezing: a service that is only being
+// recorded into a running baseline (persist_cache) is not frozen.
+func (r *ExperimentRepo) FrozenServiceForService(ctx context.Context, service string) (*model.ExperimentPhase, *model.CacheBoxConfig, error) {
+	running, err := r.ListRunningPhases(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, p := range running {
+		for i := range p.FrozenServices {
+			if p.FrozenServices[i].Service == service {
+				return p, &p.FrozenServices[i], nil
+			}
+		}
+	}
+	return nil, nil, nil
 }
 
 // cacheBoxRuleContext builds a resolved rule context from a frozen-service

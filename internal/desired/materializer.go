@@ -63,8 +63,8 @@ type Materializer struct {
 	FaultConfigs FaultConfigSource
 	CacheBox     CacheBoxSource
 	Specs        SpecSource
-	Freeze       FreezeSource    // optional; nil → no freeze_cfg (plan 2 wires the frozen-phase source)
-	ReplaySets   ReplaySetSource // optional; nil → no replay_set (plan 2)
+	Freeze       FreezeSource    // optional; nil → no freeze_cfg (production: *PhaseSources)
+	ReplaySets   ReplaySetSource // optional; nil → no replay_set (production: the same *PhaseSources)
 }
 
 // Document is the desired state for one instance: what the poll and register

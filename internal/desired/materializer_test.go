@@ -245,6 +245,12 @@ func (failing) FreezeConfigForService(context.Context, string) (*atroposdk.Delay
 func (failing) ReplaySetForService(context.Context, string) (*model.ReplaySetRef, error) {
 	return nil, errBoom
 }
+func (failing) FrozenServiceForService(context.Context, string) (*model.ExperimentPhase, *model.CacheBoxConfig, error) {
+	return nil, nil, errBoom
+}
+func (failing) ForPhaseService(context.Context, string, string) (*model.ReplayArtifact, error) {
+	return nil, errBoom
+}
 
 // bumpingRules moves the generation while the rules are read, like a write
 // landing in the middle of a materialization.
@@ -289,8 +295,8 @@ func TestMaterialize_FreezeAndReplaySetNeedACacheBox(t *testing.T) {
 	}
 }
 
-// The freeze and replay-set sources are optional until the orchestrator plan
-// wires them; the document just carries neither.
+// The freeze and replay-set sources are optional; a Materializer without them
+// carries neither.
 func TestMaterialize_OptionalSourcesMayBeNil(t *testing.T) {
 	m, _ := newTestMaterializer(5)
 	m.Freeze, m.ReplaySets = nil, nil
@@ -320,6 +326,81 @@ func TestMaterialize_ETagCoversFreezeAndReplaySet(t *testing.T) {
 	retuned, _ := m.Materialize(ctx, "cart", nil)
 	if retuned.ETag == withSet.ETag {
 		t.Error("retuning the freeze delay did not change the ETag")
+	}
+}
+
+// A replay set goes only to an instance that can hold one: the document of a
+// cache-box host carries it and moves its ETag, one without a cache-box does
+// not get it.
+func TestMaterialize_ReplaySetGoesToACacheBoxHost(t *testing.T) {
+	ctx := context.Background()
+	ref := &model.ReplaySetRef{ID: "sha256:aa", ExperimentID: "exp-1", PhaseID: "phase-iso"}
+	m, _ := newTestMaterializer(5)
+	without, err := m.Materialize(ctx, "cart", inst("inline", "cachebox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if without.ReplaySet != nil {
+		t.Fatalf("replay_set = %+v with no replay-set source", without.ReplaySet)
+	}
+
+	m.ReplaySets = &fakeReplaySets{ref: ref}
+	with, err := m.Materialize(ctx, "cart", inst("inline", "cachebox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(with.ReplaySet, ref) {
+		t.Errorf("cache-box host: replay_set = %+v, want %+v", with.ReplaySet, ref)
+	}
+	if with.ETag == without.ETag {
+		t.Error("the replay set did not move the ETag")
+	}
+	noBox, err := m.Materialize(ctx, "cart", inst("inline"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noBox.ReplaySet != nil {
+		t.Errorf("host without a cache-box: replay_set = %+v, want none", noBox.ReplaySet)
+	}
+}
+
+// PhaseSources fills both seams with one value, and what it serves names the
+// phase the synthesized replay rule names: the freeze config's context is the
+// rule's context, and the replay set is installed under the same pair (the
+// cache-box serves a set only to the rule whose context matches).
+func TestMaterialize_PhaseSourcesNameTheReplayRulesPhase(t *testing.T) {
+	m, _ := newTestMaterializer(5)
+	p := &model.ExperimentPhase{ID: "phase-iso", ExperimentID: "exp-1"}
+	cfg := &model.CacheBoxConfig{Service: "cart", Mode: "replay", KeyStrategy: "canonical_v2"}
+	ps := &PhaseSources{
+		Phases: &fakeFrozen{phase: p, cfg: cfg},
+		Artifacts: &fakeArtifacts{byKey: map[string]*model.ReplayArtifact{
+			"phase-iso/cart": {ID: "sha256:aa", EntryCount: 3, W5SHA256: "w5", SizeBytes: 120},
+		}},
+	}
+	m.Freeze, m.ReplaySets = ps, ps
+
+	d, err := m.Materialize(context.Background(), "cart", inst("inline", "cachebox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replay *atroposdk.CompiledCacheBox
+	for i := range d.Rules {
+		if d.Rules[i].Name == "cachebox:replay:phase-iso" {
+			replay = d.Rules[i].CacheBox
+		}
+	}
+	if replay == nil || replay.Context == nil || d.FreezeCfg == nil || d.ReplaySet == nil {
+		t.Fatalf("replay rule = %+v, freeze_cfg = %+v, replay_set = %+v; want all three", replay, d.FreezeCfg, d.ReplaySet)
+	}
+	if !reflect.DeepEqual(d.FreezeCfg.Context, replay.Context) {
+		t.Errorf("freeze_cfg context = %+v, replay rule context = %+v; want the same", d.FreezeCfg.Context, replay.Context)
+	}
+	if d.ReplaySet.ExperimentID != replay.Context.ExperimentID || d.ReplaySet.PhaseID != replay.Context.PhaseID ||
+		d.ReplaySet.KeyStrategy != replay.Context.KeyStrategy {
+		t.Errorf("replay_set pair = (%s, %s, %s), replay rule context = (%s, %s, %s); want the same",
+			d.ReplaySet.ExperimentID, d.ReplaySet.PhaseID, d.ReplaySet.KeyStrategy,
+			replay.Context.ExperimentID, replay.Context.PhaseID, replay.Context.KeyStrategy)
 	}
 }
 

@@ -22,9 +22,6 @@ import (
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
-	"manteion-go/internal/atrocontrol"
-	"manteion-go/internal/atropos"
-	"manteion-go/internal/atropostest"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
@@ -1178,98 +1175,116 @@ func TestServer_ShutdownAnswersHeldPollsAndEndsStreams(t *testing.T) {
 	}
 }
 
-// oneInstanceResolver is an atrocontrol fleet with a single instance.
-type oneInstanceResolver struct{ inst *model.SDKInstance }
-
-func (r oneInstanceResolver) ForService(_ context.Context, service string) ([]*model.SDKInstance, error) {
-	if service != r.inst.Service {
-		return nil, nil
-	}
-	return []*model.SDKInstance{r.inst}, nil
+// fakeFrozenPhase is the frozen-phase side of the database for the poll: the
+// running phase that freezes cartservice (nil while none does) and the artifact
+// assigned to it (nil until one is), behind both of PhaseSources' seams.
+type fakeFrozenPhase struct {
+	phase    *model.ExperimentPhase
+	cfg      *model.CacheBoxConfig
+	artifact *model.ReplayArtifact
 }
 
-func (r oneInstanceResolver) ForInstance(_ context.Context, id string) (*model.SDKInstance, error) {
-	if id != r.inst.ID {
-		return nil, store.ErrNotFound
-	}
-	return r.inst, nil
+func (f *fakeFrozenPhase) FrozenServiceForService(context.Context, string) (*model.ExperimentPhase, *model.CacheBoxConfig, error) {
+	return f.phase, f.cfg, nil
 }
 
-// Plan 1 serves freeze_cfg from the controller's intent tracker. enterPhase
-// freezes a frozen service and then pushes the phase's rules to it, and
-// endPhase pushes nil rules before it thaws. Neither rule push may disturb
-// the freeze config: the tracker keeps reporting it and the poll keeps serving
-// it to the service's cache-box instance until thaw clears it. (A rule push
-// that replaced the whole intent dropped it, and the SDK clears its delay
-// source on a document without freeze_cfg.)
-func TestHandlePollRules_RulePushKeepsTheFreezeConfig(t *testing.T) {
-	ctx := context.Background()
-	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice", Capabilities: []string{"inline", "cachebox"}})
-	sdk := &model.SDKInstance{ID: "cart-1", Service: "cartservice", Address: atropostest.NewServer(t).URL}
-	ctrl := atrocontrol.New(atropos.NewClient(), oneInstanceResolver{sdk},
-		atrocontrol.WithDefaultTimeout(5*time.Second), atrocontrol.WithLogger(discardLogger()))
-	fx.mat.Freeze = ctrl.IntentReader()
+func (f *fakeFrozenPhase) ForPhaseService(context.Context, string, string) (*model.ReplayArtifact, error) {
+	return f.artifact, nil
+}
+
+// freeze_cfg and replay_set follow the running phase that freezes the service
+// and the artifact assigned to it: each reaches a cache-box instance's poll
+// under its wire name and moves the ETag when it appears, and both go with the
+// phase. A host without a cache-box never gets them.
+func TestHandlePollRules_FreezeAndReplaySetFollowTheFrozenPhase(t *testing.T) {
+	fx := newDesiredFixture(
+		&model.SDKInstance{ID: "cart-1", Service: "cartservice", Capabilities: []string{"inline", "cachebox"}},
+		&model.SDKInstance{ID: "cart-2", Service: "cartservice", Capabilities: []string{"inline"}})
+	db := &fakeFrozenPhase{}
+	sources := &desired.PhaseSources{Phases: db, Artifacts: db}
+	fx.mat.Freeze, fx.mat.ReplaySets = sources, sources
 	s := fx.server()
 
-	freeze := atroposdk.DelayRequest{Mu: 1.5, Sigma: 0.25, Seed: 7, Context: &atroposdk.CacheBoxContext{
-		ExperimentID: "exp-1", PhaseID: "phase-iso", KeyStrategy: "canonical_v2", StrategyVersion: 2}}
-	want, _ := json.Marshal(freeze)
-	rules := []atroposdk.CompiledRule{{Name: "phase-rule", InjectionPoint: "egress", Mode: "inline",
-		CacheBox: &atroposdk.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}}}
-	ok := func(step string, res atrocontrol.FanoutResult, err error) {
+	// poll answers the instance's document: its ETag and the raw freeze_cfg and
+	// replay_set ("" when absent).
+	poll := func(step, instance string) (etag, freeze, set string) {
 		t.Helper()
-		if err != nil || !res.AllSucceeded() {
-			t.Fatalf("%s: err = %v, failed = %v", step, err, res.Failed)
-		}
-	}
-	// freezeCfgs reports the tracker's freeze config and the polled document's
-	// freeze_cfg, each as JSON ("null" when absent).
-	freezeCfgs := func(step string) (tracked, served string) {
-		t.Helper()
-		cfg, err := ctrl.IntentReader().FreezeConfigForService(ctx, "cartservice")
-		if err != nil {
-			t.Fatalf("%s: FreezeConfigForService: %v", step, err)
-		}
-		raw, _ := json.Marshal(cfg)
-		w := pollWith(t, s, "service=cartservice&instance_id=cart-1", nil)
+		w := pollWith(t, s, "service=cartservice&instance_id="+instance, nil)
 		if w.Code != http.StatusOK {
-			t.Fatalf("%s: poll status = %d body = %s", step, w.Code, w.Body.String())
+			t.Fatalf("%s: poll %s status = %d body = %s", step, instance, w.Code, w.Body.String())
 		}
 		var doc map[string]json.RawMessage
 		if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
 			t.Fatalf("%s: decode: %v", step, err)
 		}
-		served = "null"
-		if fc, ok := doc["freeze_cfg"]; ok {
-			served = string(fc)
-		}
-		return string(raw), served
+		return w.Header().Get("ETag"), string(doc["freeze_cfg"]), string(doc["replay_set"])
 	}
 
-	// enterPhase: freeze, then push the phase's rules.
-	res, err := ctrl.FreezeService(ctx, "cartservice", freeze)
-	ok("freeze", res, err)
-	res, err = ctrl.PushRules(ctx, "cartservice", rules)
-	ok("push the phase rules", res, err)
-	if tracked, served := freezeCfgs("after the rule push"); tracked != string(want) || served != string(want) {
-		t.Errorf("after the rule push: tracker %s, served %s; want both %s", tracked, served, want)
+	etag0, freeze, set := poll("not frozen", "cart-1")
+	if freeze != "" || set != "" {
+		t.Fatalf("not frozen: freeze_cfg %s, replay_set %s; want neither", freeze, set)
 	}
-	if intent, _ := ctrl.IntentReader().Get("cartservice"); intent == nil || len(intent.Rules) != 1 {
-		t.Errorf("the rule push itself was not recorded: %+v", intent)
+	plainETag, _, _ := poll("not frozen", "cart-2")
+
+	// The isolation phase starts running: the delay source is desired, the set
+	// is not (nothing assigned yet).
+	mu, sigma := 1.5, 0.25
+	db.phase = &model.ExperimentPhase{ID: "phase-iso", ExperimentID: "exp-1"}
+	db.cfg = &model.CacheBoxConfig{Service: "cartservice", Mode: "replay_with_delay",
+		SyntheticDelay: &model.SyntheticDelayConfig{FitMu: &mu, FitSigma: &sigma}}
+	wantFreeze, _ := json.Marshal(desired.FreezeDelayRequest(db.phase, *db.cfg))
+	etag1, freeze, set := poll("phase running", "cart-1")
+	if freeze != string(wantFreeze) || set != "" {
+		t.Errorf("phase running: freeze_cfg %s, replay_set %q; want %s and none", freeze, set, wantFreeze)
+	}
+	if etag1 == etag0 {
+		t.Error("the freeze config did not move the ETag")
 	}
 
-	// endPhase: the nil rule push before thaw keeps it as well.
-	res, err = ctrl.PushRules(ctx, "cartservice", nil)
-	ok("clear the rules", res, err)
-	if tracked, served := freezeCfgs("after the nil rule push"); tracked != string(want) || served != string(want) {
-		t.Errorf("after the nil rule push: tracker %s, served %s; want both %s", tracked, served, want)
+	// The artifact is assigned: the set is desired, under the phase's pair.
+	db.artifact = &model.ReplayArtifact{ID: "sha256:aa", EntryCount: 3, W5SHA256: "bb", SizeBytes: 42}
+	wantSet := `{"id":"sha256:aa","experiment_id":"exp-1","phase_id":"phase-iso","key_strategy":"canonical_v2","count":3,"sha256":"bb","size_bytes":42,"url":"/api/v1/cache/artifacts/sha256:aa"}`
+	etag2, freeze, set := poll("artifact assigned", "cart-1")
+	if freeze != string(wantFreeze) || set != wantSet {
+		t.Errorf("artifact assigned: freeze_cfg %s, replay_set %s; want %s and %s", freeze, set, wantFreeze, wantSet)
+	}
+	if etag2 == etag1 {
+		t.Error("the replay set did not move the ETag")
 	}
 
-	// Thaw is what clears it.
-	res, err = ctrl.ClearService(ctx, "cartservice")
-	ok("thaw", res, err)
-	if tracked, served := freezeCfgs("after thaw"); tracked != "null" || served != "null" {
-		t.Errorf("after thaw: tracker %s, served %s; want neither", tracked, served)
+	// A host without a cache-box has nothing to install either in.
+	if etag, freeze, set := poll("artifact assigned", "cart-2"); etag != plainETag || freeze != "" || set != "" {
+		t.Errorf("host without a cache-box: ETag %s (was %s), freeze_cfg %s, replay_set %s; want its document unchanged", etag, plainETag, freeze, set)
+	}
+
+	// The phase stops running: both go, and the document is the one it was.
+	db.phase, db.cfg = nil, nil
+	if etag, freeze, set := poll("phase over", "cart-1"); etag != etag0 || freeze != "" || set != "" {
+		t.Errorf("phase over: ETag %s (was %s), freeze_cfg %s, replay_set %s; want the original document", etag, etag0, freeze, set)
+	}
+}
+
+// The url a replay set carries (desired.ArtifactURLPrefix and the artifact id)
+// is a path the artifact route serves: the SDK fetches it relative to the
+// manteion it polls, so the constant and the route must not drift apart.
+func TestReplaySetURL_IsServedByTheArtifactRoute(t *testing.T) {
+	s, id, body := artifactServer(t) // cache_artifact_handler_test.go
+	db := &fakeFrozenPhase{
+		phase:    &model.ExperimentPhase{ID: "phase-iso", ExperimentID: "exp-1"},
+		cfg:      &model.CacheBoxConfig{Service: "cartservice", Mode: "replay"},
+		artifact: &model.ReplayArtifact{ID: id, EntryCount: 2, W5SHA256: "w5", SizeBytes: int64(len(body))},
+	}
+	ref, err := (&desired.PhaseSources{Phases: db, Artifacts: db}).ReplaySetForService(context.Background(), "cartservice")
+	if err != nil || ref == nil {
+		t.Fatalf("replay set = %+v, %v", ref, err)
+	}
+
+	mux := http.NewServeMux()
+	s.routes(mux)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, ref.URL, nil))
+	if w.Code != http.StatusOK || w.Body.String() != string(body) {
+		t.Errorf("GET %s = %d %q, want the artifact's bytes", ref.URL, w.Code, w.Body.String())
 	}
 }
 
