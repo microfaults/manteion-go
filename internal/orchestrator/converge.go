@@ -51,6 +51,10 @@ const (
 // errLeftRunning instead of after the timeout. Exit and drain waits pass nil.
 func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uint64, artifacts map[string]string, timeout time.Duration, holds func(context.Context) error) error {
 	deadline := time.Now().Add(timeout)
+	interval := o.convergePollInterval
+	if interval <= 0 {
+		interval = defaultConvergePollInterval // an orchestrator not built by New: never spin
+	}
 	logged := map[string]bool{} // suspect instances already named in the log
 	for {
 		if holds != nil {
@@ -84,7 +88,7 @@ func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uin
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w while %d instance(s) lagged: %s", ctx.Err(), len(lagging), strings.Join(lagging, "; "))
-		case <-time.After(min(o.convergePollInterval, remaining)):
+		case <-time.After(min(interval, remaining)):
 		}
 	}
 }
@@ -122,11 +126,11 @@ func (o *Orchestrator) laggingInstances(ctx context.Context, targets map[string]
 				return nil, nil, fmt.Errorf("%s(%s): cannot hold the replay set: its host advertises no cachebox capability (capabilities: %s)",
 					inst.ID, svc, strings.Join(inst.Capabilities, ","))
 			case inst.ObservedGeneration < target:
-				lagging = append(lagging, fmt.Sprintf("%s(%s): observed=%d target=%d", inst.ID, svc, inst.ObservedGeneration, target))
+				lagging = append(lagging, withErrors(fmt.Sprintf("%s(%s): observed=%d target=%d", inst.ID, svc, inst.ObservedGeneration, target), inst))
 			case frozen && inst.ReplaySetID == artifact && inst.ReplaySetState == "failed":
 				return nil, nil, fmt.Errorf("%s(%s): replay set %s failed: %s", inst.ID, svc, artifact, observedErrors(inst))
 			case frozen && (inst.ReplaySetID != artifact || inst.ReplaySetState != "committed"):
-				lagging = append(lagging, fmt.Sprintf("%s(%s): replay_set=%s target=%s/committed", inst.ID, svc, replaySetOf(inst), artifact))
+				lagging = append(lagging, withErrors(fmt.Sprintf("%s(%s): replay_set=%s target=%s/committed", inst.ID, svc, replaySetOf(inst), artifact), inst))
 			}
 		}
 		if frozen && alive == 0 {
@@ -141,15 +145,15 @@ func (o *Orchestrator) laggingInstances(ctx context.Context, targets map[string]
 	return lagging, suspect, nil
 }
 
-// awaitConvergedNonFatal is the bounded wait after an exit or drain bump. The
-// phase has already left 'running', so a straggler only delays this call, and
-// its next poll converges it: observed_generation can lag one poll, and a
-// recording instance reports only after its drain POST. A timeout is logged,
-// never a failure.
-func (o *Orchestrator) awaitConvergedNonFatal(ctx context.Context, p *model.ExperimentPhase, targets map[string]uint64) {
+// awaitConvergedNonFatal is the bounded wait after an exit or a drain bump
+// (barrier names which: "exit" or "drain"). The phase has already left
+// 'running', so a straggler only delays this call, and its next poll
+// converges it: observed_generation can lag one poll, and a recording instance
+// reports only after its drain POST. A timeout is logged, never a failure.
+func (o *Orchestrator) awaitConvergedNonFatal(ctx context.Context, p *model.ExperimentPhase, targets map[string]uint64, barrier string) {
 	if err := o.waitConverged(ctx, targets, nil, o.convergeTimeout, nil); err != nil {
-		o.logger.Warn("orchestrator: fleet did not converge at phase exit; next poll converges stragglers",
-			"phase_id", p.ID, "error", err)
+		o.logger.Warn("orchestrator: fleet did not converge on the "+barrier+" bump; the next poll converges stragglers",
+			"phase_id", p.ID, "barrier", barrier, "error", err)
 	}
 }
 
@@ -162,6 +166,15 @@ func describeSuspects(suspect []*model.SDKInstance, targets map[string]uint64) s
 			inst.ID, inst.Service, inst.LastPollAt.UTC().Format(time.RFC3339), inst.ObservedGeneration, targets[inst.Service]))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// withErrors appends to a lagging line the errors the instance last reported,
+// often the reason it lags.
+func withErrors(line string, inst *model.SDKInstance) string {
+	if len(inst.ObservedErrors) == 0 {
+		return line
+	}
+	return line + " (errors: " + strings.Join(inst.ObservedErrors, " | ") + ")"
 }
 
 // replaySetOf words the replay set an instance last reported: "none", or

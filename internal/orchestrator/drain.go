@@ -30,7 +30,7 @@ func (o *Orchestrator) runDrainBarrier(ctx context.Context, p *model.ExperimentP
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
 	targets, _ := o.bumpDesired(ctx, p) // a failed bump is logged per service
-	o.awaitConvergedNonFatal(ctx, p, targets)
+	o.awaitConvergedNonFatal(ctx, p, targets, "drain")
 
 	result := o.awaitDrain(ctx, p)
 	if err := o.experiments.UpsertPhaseDrain(ctx, p.ID, result); err != nil {

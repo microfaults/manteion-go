@@ -757,3 +757,85 @@ func TestEnterPhase_StoppedWhileConvergingEndsTheWait(t *testing.T) {
 		t.Fatalf("zeus started %d run(s) for a stopped phase", n)
 	}
 }
+
+// A zero poll interval must not turn the barrier into a busy loop: the option
+// falls back to the default, and so does the loop itself for an orchestrator
+// whose field was never set.
+func TestWaitConverged_ZeroPollIntervalDoesNotSpin(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.WithConvergePollInterval(0)
+	if o.convergePollInterval != defaultConvergePollInterval {
+		t.Fatalf("WithConvergePollInterval(0) set %v, want the default %v", o.convergePollInterval, defaultConvergePollInterval)
+	}
+	svc := id.New("svc-spin")
+	target := bumpService(t, o, svc)
+	registerSDK(t, svc, "http://never-acks.invalid")
+	for _, interval := range []time.Duration{o.convergePollInterval, 0} {
+		o.convergePollInterval = interval // 0: a field the option never set
+		spy := spyOnLooks(o, svc)
+		if err := o.waitConverged(ctx, map[string]uint64{svc: target}, nil, 300*time.Millisecond, nil); err == nil {
+			t.Fatal("waitConverged = nil, want the lagging instance's timeout")
+		}
+		if n := spy.looks.Load(); n > 3 {
+			t.Fatalf("interval %v: the barrier looked %d times in 300ms, want a few at the %v default", interval, n, defaultConvergePollInterval)
+		}
+	}
+}
+
+// A lagging line carries the errors the instance last reported, which is
+// usually why it lags (a rule it could not decode, a replay-set pull that
+// keeps failing).
+func TestWaitConverged_LaggingLinesCarryTheInstanceErrors(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	svc := id.New("svc-errs")
+	const art = "sha256:cccc"
+	target := bumpService(t, o, svc)
+	behind := registerSDK(t, svc, "http://behind.invalid")
+	if err := testSDKRepo.RecordStatus(ctx, behind, model.ObservedStatus{AppliedGeneration: target - 1,
+		Errors: []string{"rule r1: decode: unknown fault_type"}}); err != nil {
+		t.Fatal(err)
+	}
+	fetching := registerSDK(t, svc, "http://fetching.invalid")
+	if err := testSDKRepo.RecordStatus(ctx, fetching, model.ObservedStatus{AppliedGeneration: target,
+		Errors: []string{"replay set: chunk 3: 503"}, ReplaySet: &model.ReplaySetStatus{ID: art, State: "fetching"}}); err != nil {
+		t.Fatal(err)
+	}
+	err := o.waitConverged(ctx, map[string]uint64{svc: target}, map[string]string{svc: art}, 200*time.Millisecond, nil)
+	if err == nil {
+		t.Fatal("waitConverged = nil, want both instances lagging")
+	}
+	for _, want := range []string{
+		behind + "(" + svc + "): observed=", "rule r1: decode: unknown fault_type",
+		fetching + "(" + svc + "): replay_set=" + art + "/fetching", "replay set: chunk 3: 503",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// The non-fatal waits say which barrier they belong to: a recording phase's
+// completion waits after its drain bump and again after its exit bump, and a
+// straggler is logged for each.
+func TestAwaitConvergedNonFatal_NamesTheBarrier(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	logs := &logBuffer{}
+	o.logger = slog.New(slog.NewTextHandler(logs, nil))
+	exp := mkExp(t)
+	svc := id.New("svc-barrier")
+	base := mkRunningBaseline(t, exp.ID, 0)
+	mkRunningIsolation(t, exp.ID, svc, 1) // the baseline records svc
+	registerSDK(t, svc, "http://never-acks.invalid")
+
+	if !o.finishPhase(ctx, base.ID, "completed", "running") {
+		t.Fatal("finishPhase returned false")
+	}
+	for _, want := range []string{"barrier=drain", "barrier=exit"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs = %q, want a non-fatal timeout logged with %s", logs.String(), want)
+		}
+	}
+}

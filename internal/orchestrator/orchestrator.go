@@ -154,8 +154,14 @@ func (o *Orchestrator) WithDrainPollInterval(d time.Duration) { o.drainPollInter
 func (o *Orchestrator) WithConvergeTimeout(d time.Duration) { o.convergeTimeout = d }
 
 // WithConvergePollInterval overrides how often the convergence barrier
-// re-reads the fleet's observed state (test seam; default 500ms).
-func (o *Orchestrator) WithConvergePollInterval(d time.Duration) { o.convergePollInterval = d }
+// re-reads the fleet's observed state (test seam; default 500ms). Zero or less
+// keeps the default: the barrier must never spin.
+func (o *Orchestrator) WithConvergePollInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultConvergePollInterval
+	}
+	o.convergePollInterval = d
+}
 
 // WithAllowDegradedBaseline lets isolation phases start from a degraded
 // recording (MANTEION_ALLOW_DEGRADED_BASELINE).

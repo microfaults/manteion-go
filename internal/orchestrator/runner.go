@@ -517,7 +517,7 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	// recording phase that failed or was skipped without draining, this bump is
 	// the removal signal.
 	targets, _ := o.bumpDesired(ctx, p) // a failed bump is logged per service
-	o.awaitConvergedNonFatal(ctx, p, targets)
+	o.awaitConvergedNonFatal(ctx, p, targets, "exit")
 
 	if o.faultEvents != nil {
 		if err := o.faultEvents.EndOpenForPhase(ctx, phaseID, time.Now()); err != nil {
