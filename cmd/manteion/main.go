@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -49,6 +50,15 @@ func main() {
 	zeusURL := envOr("ZEUS_URL", "http://archer:8080")
 	prometheusURL := envOr("PROMETHEUS_URL", "http://prometheus:9090")
 	cacheDir := envOr("CACHE_DIR", "/var/cache/manteion")
+	// MANTEION_CONVERGE_TIMEOUT bounds the convergence barrier (orchestrator
+	// setup below). Zero or less would fail every phase entry at its first
+	// look, and a typo would silently run on the default: startup refuses both.
+	convergeTimeout, err := positiveDurationEnv("MANTEION_CONVERGE_TIMEOUT", 30*time.Second)
+	if err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	drainTimeout := envDurationOr("MANTEION_DRAIN_TIMEOUT", 30*time.Second)
 
 	// Connect to PostgreSQL and run migrations.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -110,11 +120,11 @@ func main() {
 	// alive instance to observe the bump (and, on a frozen service, to hold the
 	// replay set committed), failing the phase on timeout; an exit or drain
 	// waits as long and only logs.
-	orch.WithConvergeTimeout(envDurationOr("MANTEION_CONVERGE_TIMEOUT", 30*time.Second))
+	orch.WithConvergeTimeout(convergeTimeout)
 	// Drain barrier (MANT-2): MANTEION_DRAIN_TIMEOUT must be ≥ 3× the SDK poll
 	// interval + flush time (default 30s); MANTEION_ALLOW_DEGRADED_BASELINE lets
 	// isolation phases start from a degraded recording.
-	orch.WithDrainTimeout(envDurationOr("MANTEION_DRAIN_TIMEOUT", 30*time.Second))
+	orch.WithDrainTimeout(drainTimeout)
 	orch.WithAllowDegradedBaseline(envOr("MANTEION_ALLOW_DEGRADED_BASELINE", "false") == "true")
 	// MANTEION_ZEUS_DATASET_ID is the fallback zeus dataset for phase workflow
 	// rows that carry no dataset_id of their own. Without either, zeus stages
@@ -150,10 +160,14 @@ func main() {
 	)
 
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      srv.Handler(),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:        addr,
+		Handler:     srv.Handler(),
+		ReadTimeout: 10 * time.Second,
+		// The lifecycle handlers answer only once the orchestrator is done,
+		// and a stop can wait out a drain barrier and then an exit bump's
+		// convergence wait (httpWriteTimeout): a shorter write deadline cuts
+		// off the 202 of a stop that succeeded.
+		WriteTimeout: httpWriteTimeout(convergeTimeout, drainTimeout),
 		IdleTimeout:  60 * time.Second,
 	}
 	// Shutdown waits for in-flight requests, and a held long-poll (up to 60 s)
@@ -235,6 +249,36 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// positiveDurationEnv reads the environment variable key as a Go duration
+// that must be positive; unset is fallback. A value that is not a duration,
+// or is zero or negative, is an error naming key.
+func positiveDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not a duration (want e.g. \"30s\"): %w", key, v, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s=%q must be positive", key, v)
+	}
+	return d, nil
+}
+
+// httpWriteTimeout is the HTTP server's write deadline. A stop answers only
+// once the phase has ended, and on the way it can wait out a recording
+// phase's drain barrier — the convergence wait after its bump (up to
+// convergeTimeout) and the report gate (up to drainTimeout) — and then the
+// exit bump's convergence wait (up to convergeTimeout again); a start or a
+// resume waits out one convergence. The extra 30 s covers the rest of the work
+// (zeus calls, fidelity pulls, harvest). The long-poll and SSE handlers set
+// their own deadlines.
+func httpWriteTimeout(convergeTimeout, drainTimeout time.Duration) time.Duration {
+	return 2*convergeTimeout + drainTimeout + 30*time.Second
 }
 
 // envDurationOr parses the environment variable key as a Go duration (e.g.
