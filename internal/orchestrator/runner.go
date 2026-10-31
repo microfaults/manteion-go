@@ -229,15 +229,23 @@ func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhas
 	// the k6 workflow RUN executes the DSL v2 DAG (the primary, workflow-shaped
 	// driver), and a flat vegeta ATTACK against target_url runs additively for
 	// targeted precision load. Start runs first so the DAG is generating traffic
-	// before the additive attacks pile on.
-	runs, err := o.startPhaseRuns(ctx, exp, p)
+	// before the additive attacks pile on. Each handle is recorded only while
+	// the claim holds (writeClaimed); once a write finds it ended, the entry
+	// starts nothing further and stops what it started.
+	runs, err := o.startPhaseRuns(ctx, exp, p, claim)
 	if err != nil {
 		return fail(err)
 	}
+	if runs.claimEnded {
+		return o.abandonLoad(ctx, p, runs, driverStart{})
+	}
 
-	atks, err := o.startPhaseAttacks(ctx, exp, p)
+	atks, err := o.startPhaseAttacks(ctx, exp, p, claim)
 	if err != nil {
 		return fail(err)
+	}
+	if atks.claimEnded {
+		return o.abandonLoad(ctx, p, runs, atks)
 	}
 
 	// Fail only if drivers were configured but NONE of either kind started --
@@ -580,12 +588,15 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 // how many workflow rows configured it, how many actually started, the
 // longest configured duration, the handles zeus knows the started ones by,
 // and one operator-readable line per driver that did not start — the phase's
-// failure reason when none did.
+// failure reason when none did. claimEnded reports that a handle write found
+// the entry's claim ended: the start stopped there, so handles lists every
+// driver it started, including one whose handle it did not record.
 type driverStart struct {
 	started, configured int
 	maxDur              time.Duration
 	handles             []string
 	failures            []string
+	claimEnded          bool
 }
 
 // driverStartFailure words one load driver (kind "run" or "attack") that did
@@ -668,8 +679,10 @@ func withDocID(doc json.RawMessage, id string) (json.RawMessage, error) {
 // recovery can always find the handle; when zeus answers with a different
 // id, the row is overwritten with zeus's (recovery must query the id zeus
 // knows). Each attack that does not start is recorded on the returned
-// driverStart's failures.
-func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (driverStart, error) {
+// driverStart's failures. Both writes are made only while claim holds
+// (writeClaimed); the first that finds it ended stops the start there, with
+// claimEnded set.
+func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase, claim claimToken) (driverStart, error) {
 	var ds driverStart
 	if o.zeusClient == nil {
 		return ds, nil
@@ -688,7 +701,14 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 		ds.configured++
 
 		attackID := id.New("atk")
-		if err := o.experiments.UpdatePhaseWorkflowZeusAttack(ctx, p.ID, pw.WorkflowID, attackID); err != nil {
+		recorded, err := o.writeClaimed(p.ID, claim, func() error {
+			return o.experiments.UpdatePhaseWorkflowZeusAttack(ctx, p.ID, pw.WorkflowID, attackID)
+		})
+		if !recorded {
+			ds.claimEnded = true // nothing started for this row
+			return ds, nil
+		}
+		if err != nil {
 			o.logger.Error("orchestrator: persist attack id failed",
 				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
 			ds.failures = append(ds.failures, driverStartFailure("attack", attackID, pw.WorkflowID,
@@ -726,19 +746,27 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 		}
 		handle := attackID
 		if zeusID != "" && zeusID != attackID {
-			o.logger.Warn("orchestrator: zeus returned different attack id; using zeus id",
-				"phase_id", p.ID, "client_id", attackID, "zeus_id", zeusID)
-			if err := o.experiments.UpdatePhaseWorkflowZeusAttack(ctx, p.ID, pw.WorkflowID, zeusID); err != nil {
-				o.logger.Error("orchestrator: persist zeus attack id failed",
-					"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
-			}
 			handle = zeusID
 		}
-
 		ds.started++
 		ds.handles = append(ds.handles, handle)
 		if d := time.Duration(pw.DurationSec) * time.Second; d > ds.maxDur {
 			ds.maxDur = d
+		}
+		if handle != attackID {
+			o.logger.Warn("orchestrator: zeus returned different attack id; using zeus id",
+				"phase_id", p.ID, "client_id", attackID, "zeus_id", zeusID)
+			recorded, err := o.writeClaimed(p.ID, claim, func() error {
+				return o.experiments.UpdatePhaseWorkflowZeusAttack(ctx, p.ID, pw.WorkflowID, zeusID)
+			})
+			if !recorded {
+				ds.claimEnded = true // the attack runs; its handle is in ds.handles
+				return ds, nil
+			}
+			if err != nil {
+				o.logger.Error("orchestrator: persist zeus attack id failed",
+					"phase_id", p.ID, "workflow_id", pw.WorkflowID, "error", err)
+			}
 		}
 	}
 	return ds, nil
@@ -747,17 +775,18 @@ func (o *Orchestrator) startPhaseAttacks(ctx context.Context, exp *model.Experim
 // startPhaseRuns launches one k6 workflow run per phase_workflows row,
 // executing the workflow's DSL v2 DAG. The run is scoped to the phase:
 // experiment_id + meta_trace_id=phase_id tag the traffic so records and
-// traces slice by phase. The run id is persisted BEFORE StartRun so crash
-// recovery can find the handle even if the response is lost; zeus echoes the
-// id back (manteion mints it). Each run that does not start is recorded on
-// the returned driverStart's failures.
+// traces slice by phase. The run id is persisted AFTER a successful StartRun
+// (see below); zeus echoes the id back (manteion mints it). Each run that
+// does not start is recorded on the returned driverStart's failures. The
+// write is made only while claim holds (writeClaimed); the first that finds it
+// ended stops the start there, with claimEnded set.
 //
 // The workflow is already validated-and-registered in zeus by
 // materializePhaseWorkflows, so a StartRun failure here is a live-fleet
 // problem (zeus down, run rejected), logged per-row rather than fatal — the
 // phase can still be driven by additive attacks, and a fully driver-less
 // phase is handled by the caller (whose failure reason lists these).
-func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase) (driverStart, error) {
+func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment, p *model.ExperimentPhase, claim claimToken) (driverStart, error) {
 	var ds driverStart
 	if o.zeusClient == nil {
 		return ds, nil
@@ -796,17 +825,23 @@ func (o *Orchestrator) startPhaseRuns(ctx context.Context, exp *model.Experiment
 		if zeusRunID == "" {
 			zeusRunID = runID
 		}
-		if err := o.experiments.UpdatePhaseWorkflowZeusRun(ctx, p.ID, pw.WorkflowID, zeusRunID); err != nil {
-			o.logger.Error("orchestrator: persist run id failed",
-				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "run_id", zeusRunID, "error", err)
-			// The run is live in zeus but unrecorded here; still counts as a
-			// started driver so the phase isn't mistaken for driver-less.
-		}
-
 		ds.started++
 		ds.handles = append(ds.handles, zeusRunID)
 		if d := time.Duration(pw.DurationSec) * time.Second; d > ds.maxDur {
 			ds.maxDur = d
+		}
+		recorded, err := o.writeClaimed(p.ID, claim, func() error {
+			return o.experiments.UpdatePhaseWorkflowZeusRun(ctx, p.ID, pw.WorkflowID, zeusRunID)
+		})
+		if !recorded {
+			ds.claimEnded = true // the run runs; its handle is in ds.handles
+			return ds, nil
+		}
+		if err != nil {
+			o.logger.Error("orchestrator: persist run id failed",
+				"phase_id", p.ID, "workflow_id", pw.WorkflowID, "run_id", zeusRunID, "error", err)
+			// The run is live in zeus but unrecorded here; still counts as a
+			// started driver so the phase isn't mistaken for driver-less.
 		}
 	}
 	return ds, nil
@@ -1191,7 +1226,7 @@ func (o *Orchestrator) spawnPoller(phaseID string, phaseDuration time.Duration) 
 func (o *Orchestrator) spawnPollerClaimed(phaseID string, claim claimToken, phaseDuration time.Duration) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if cur, ok := o.claims[phaseID]; !ok || cur != claim {
+	if !o.holdsClaimLocked(phaseID, claim) {
 		return false
 	}
 	o.spawnPollerLocked(phaseID, phaseDuration)

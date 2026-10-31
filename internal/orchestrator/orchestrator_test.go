@@ -254,9 +254,11 @@ type fakeZeus struct {
 	runsReject *fakeReject
 	runsDrop   bool
 	runReasons map[string]string
-	// runStartHook, when set, runs inside POST .../runs before the run is
-	// accepted: something that lands while an entry is starting its load.
-	runStartHook func()
+	// runStartHook and attackStartHook, when set, run inside POST .../runs
+	// and POST /attacks before the driver is accepted: something that lands
+	// while an entry is starting its load.
+	runStartHook    func()
+	attackStartHook func()
 }
 
 // fakeReject is a canned non-2xx answer for POST .../runs.
@@ -350,6 +352,12 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 			ID string `json:"id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.mu.Lock()
+		hook := f.attackStartHook
+		f.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		if req.ID == "" {
 			req.ID = id.New("atk")
 		}
@@ -480,6 +488,14 @@ func (f *fakeZeus) onRunStart(fn func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runStartHook = fn
+}
+
+// onAttackStart makes fn run inside every POST /attacks before the attack is
+// accepted (attackStartHook).
+func (f *fakeZeus) onAttackStart(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attackStartHook = fn
 }
 
 // driverStatuses reports the status of every run and every attack the fake

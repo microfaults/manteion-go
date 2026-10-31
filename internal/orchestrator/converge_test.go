@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -772,11 +773,74 @@ func TestEnterPhase_StoppedWhileConvergingEndsTheWait(t *testing.T) {
 	}
 }
 
-// A pause that lands while an entry calls zeus (after its post-gate check,
-// while its run is starting) ends the entry's claim but finds no load recorded
-// to stop. The entry then registers no poller and stops the run and the attack
-// it started itself, so nothing is left running on the paused phase.
+// A pause that lands while an entry calls zeus, after its post-gate check,
+// ends the entry's claim but finds no load recorded to stop. The entry then
+// stops the load it started itself and records no poller, so nothing is left
+// running on the paused phase. Landing inside the run start, the pause is
+// found by the run's handle write: the entry records nothing and starts no
+// attack. Landing inside the attack start, after both handles were recorded,
+// it is found when the entry records its poller.
 func TestEnterPhase_PausedWhileStartingLoad_StopsTheLoadItStarted(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		hook               func(fz *fakeZeus, fn func())
+		wantRuns, wantAtks int
+	}{
+		{"during its run start", (*fakeZeus).onRunStart, 1, 0},
+		{"during its attack start", (*fakeZeus).onAttackStart, 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fz := newFakeZeus(t)
+			o := newOrch(t, fz.srv.URL)
+			_, phases := mkExperiment(t, 1)
+			ph := phases[0]
+			attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 30, TargetURL: "http://target.invalid/"}) // a run and an attack
+			t.Cleanup(func() { o.cancelPoller(ph.ID) })
+			paused := make(chan error, 1)
+			var once sync.Once
+			tc.hook(fz, func() { once.Do(func() { paused <- o.PausePhase(ctx, ph.ID) }) })
+
+			err := o.StartPhase(ctx, ph.ID)
+			var state *ErrInvalidState
+			if !errors.As(err, &state) || state.Current != "paused" {
+				t.Fatalf("StartPhase = %v, want an invalid-state refusal naming the paused phase", err)
+			}
+			if err := receive(t, "the pause", paused); err != nil {
+				t.Fatalf("pause during the entry's zeus calls: %v", err)
+			}
+			runs, attacks := fz.driverStatuses()
+			if len(runs) != tc.wantRuns || len(attacks) != tc.wantAtks {
+				t.Fatalf("zeus knows runs %v and attacks %v, want %d run(s) and %d attack(s) started", runs, attacks, tc.wantRuns, tc.wantAtks)
+			}
+			for kind, drivers := range map[string]map[string]string{"run": runs, "attack": attacks} {
+				for id, st := range drivers {
+					if st != "stopped" {
+						t.Errorf("%s %s is %s, want stopped: the entry left its load running on a paused phase", kind, id, st)
+					}
+				}
+			}
+			if pollerRunning(o, ph.ID) {
+				t.Error("a poller survives on the paused phase")
+			}
+			if got := getPhase(t, ph.ID); got.Status != "paused" || got.FailureReason != "" {
+				t.Errorf("phase = %s / %q, want paused with no failure (the pause's)", got.Status, got.FailureReason)
+			}
+		})
+	}
+}
+
+// A pause and a resume that land while an entry is inside its run start hand
+// the phase to a second entry, which starts its own run and attack, records
+// their handles on the phase's workflow row and records its poller, all
+// before the first entry's run start returns. The first entry's claim has
+// ended, so it writes no handle over the second entry's: it starts nothing
+// further and stops the run it started. The row names the second entry's run
+// and attack, both still running, and the second entry's poller supervises
+// them. (Written over, the row would name the first entry's stopped drivers,
+// and the second entry's poller would complete the phase while its load ran
+// on, recorded nowhere.)
+func TestEnterPhase_PausedAndResumedWhileStartingLoad_TheResumeKeepsItsHandles(t *testing.T) {
 	ctx := context.Background()
 	fz := newFakeZeus(t)
 	o := newOrch(t, fz.srv.URL)
@@ -784,34 +848,69 @@ func TestEnterPhase_PausedWhileStartingLoad_StopsTheLoadItStarted(t *testing.T) 
 	ph := phases[0]
 	attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 30, TargetURL: "http://target.invalid/"}) // a run and an attack
 	t.Cleanup(func() { o.cancelPoller(ph.ID) })
-	paused := make(chan error, 1)
-	var once sync.Once
-	fz.onRunStart(func() { once.Do(func() { paused <- o.PausePhase(ctx, ph.ID) }) })
+
+	type resumeResult struct {
+		paused, resumed error
+		runID, attackID string // the drivers zeus knows once the resume returned: the resume's own
+	}
+	resumeDone := make(chan resumeResult, 1)
+	var fired atomic.Bool
+	fz.onRunStart(func() {
+		if !fired.CompareAndSwap(false, true) {
+			return // the resume's own run start
+		}
+		var r resumeResult
+		r.paused = o.PausePhase(ctx, ph.ID)
+		r.resumed = o.StartPhase(ctx, ph.ID)
+		runs, attacks := fz.driverStatuses()
+		for id := range runs {
+			r.runID = id
+		}
+		for id := range attacks {
+			r.attackID = id
+		}
+		resumeDone <- r
+	})
 
 	err := o.StartPhase(ctx, ph.ID)
-	var state *ErrInvalidState
-	if !errors.As(err, &state) || state.Current != "paused" {
-		t.Fatalf("StartPhase = %v, want an invalid-state refusal naming the paused phase", err)
+	var resume resumeResult
+	select {
+	case resume = <-resumeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run-start hook never paused and resumed the phase")
 	}
-	if err := receive(t, "the pause", paused); err != nil {
-		t.Fatalf("pause during the run start: %v", err)
+	if resume.paused != nil || resume.resumed != nil {
+		t.Fatalf("pause = %v, resume = %v during the first entry's run start, want both nil", resume.paused, resume.resumed)
+	}
+	var state *ErrInvalidState
+	if !errors.As(err, &state) || state.Current != "running" {
+		t.Errorf("first entry = %v, want an invalid-state refusal naming the running phase (the resume holds it)", err)
+	}
+	pws, lerr := testExpRepo.ListPhaseWorkflows(ctx, ph.ID)
+	if lerr != nil || len(pws) != 1 {
+		t.Fatalf("phase workflows = %+v, %v; want one row", pws, lerr)
+	}
+	if pws[0].ZeusRunID != resume.runID || pws[0].ZeusAttackID != resume.attackID {
+		t.Errorf("row names run %q and attack %q, want the resume's run %q and attack %q",
+			pws[0].ZeusRunID, pws[0].ZeusAttackID, resume.runID, resume.attackID)
 	}
 	runs, attacks := fz.driverStatuses()
-	if len(runs) != 1 || len(attacks) != 1 {
-		t.Fatalf("zeus knows runs %v and attacks %v, want one of each started", runs, attacks)
+	if len(runs) != 2 || len(attacks) != 1 {
+		t.Errorf("zeus knows runs %v and attacks %v, want two runs and one attack: the first entry starts nothing after its claim ended", runs, attacks)
 	}
-	for kind, drivers := range map[string]map[string]string{"run": runs, "attack": attacks} {
-		for id, st := range drivers {
-			if st != "stopped" {
-				t.Errorf("%s %s is %s, want stopped: the entry left its load running on a paused phase", kind, id, st)
-			}
+	for id, st := range runs {
+		if want := map[bool]string{true: "running", false: "stopped"}[id == resume.runID]; st != want {
+			t.Errorf("run %s is %s, want %s", id, st, want)
 		}
 	}
-	if pollerRunning(o, ph.ID) {
-		t.Error("a poller survives on the paused phase")
+	if st := attacks[resume.attackID]; st != "running" {
+		t.Errorf("the resume's attack %s is %q, want running", resume.attackID, st)
 	}
-	if got := getPhase(t, ph.ID); got.Status != "paused" || got.FailureReason != "" {
-		t.Errorf("phase = %s / %q, want paused with no failure (the pause's)", got.Status, got.FailureReason)
+	if !pollerRunning(o, ph.ID) {
+		t.Error("no poller supervises the resume's load")
+	}
+	if got := getPhase(t, ph.ID); got.Status != "running" || got.FailureReason != "" {
+		t.Errorf("phase = %s / %q, want running with no failure (the resume's)", got.Status, got.FailureReason)
 	}
 }
 

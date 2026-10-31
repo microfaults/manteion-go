@@ -23,7 +23,11 @@ import (
 //
 // A phase's status CAS and its claim move together under the phase's
 // transition lock (phaseLock), so the claim a CAS records can never overwrite
-// one recorded by a later CAS. The lock is held for the CAS alone.
+// one recorded by a later CAS. An entry's driver-handle writes on the phase's
+// workflow rows take the same lock (writeClaimed), so none can land after the
+// claim that made it ended: the entry that holds the phase next never finds
+// its handles overwritten by an entry whose claim ended. The lock is held for
+// one CAS or one handle write, never longer.
 
 // claimToken identifies one claim on a phase; zero is no claim.
 type claimToken uint64
@@ -78,8 +82,30 @@ func (o *Orchestrator) claimRunning(phaseID string, cas func() (bool, error)) (c
 func (o *Orchestrator) holdsClaim(phaseID string, claim claimToken) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	return o.holdsClaimLocked(phaseID, claim)
+}
+
+// holdsClaimLocked is holdsClaim for a caller that holds o.mu.
+func (o *Orchestrator) holdsClaimLocked(phaseID string, claim claimToken) bool {
 	cur, ok := o.claims[phaseID]
 	return ok && cur == claim
+}
+
+// writeClaimed runs write, one single-row write an entry makes on its phase
+// (a driver handle on a workflow row), under the phase's transition lock and
+// only while claim is still the phase's current one. It reports whether write
+// ran, and write's error. A claim ends, and a newer one starts, only under
+// that lock, so a write made here lands before the claim ends (a pause, which
+// reads the rows after its CAS, finds the handle and stops its driver) and
+// never over the handles of the entry that holds the phase next.
+func (o *Orchestrator) writeClaimed(phaseID string, claim claimToken, write func() error) (bool, error) {
+	lk := o.phaseLock(phaseID)
+	lk.Lock()
+	defer lk.Unlock()
+	if !o.holdsClaim(phaseID, claim) {
+		return false, nil
+	}
+	return true, write()
 }
 
 // endClaim runs cas, a CAS that takes phaseID out of running (or ends it),
