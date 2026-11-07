@@ -25,8 +25,23 @@ const (
 )
 
 // unsafeBuiltins are refused at compile time: a policy must never reach the
-// network or inspect the process from inside the evaluator.
+// network or inspect the process from inside the evaluator. Against OPA
+// v1.19.1 this closes every network and host path: the only builtins that
+// perform I/O are http.send (topdown/http.go, which also reaches the CA file
+// and environment readers of crypto.go through its TLS options) and
+// net.lookup_ip_addr (topdown/net.go); print is erased because print
+// statements are not enabled. TestSandbox_PinsNondeterministicBuiltins pins
+// this classification to the OPA version.
 var unsafeBuiltins = map[string]struct{}{"http.send": {}, "net.lookup_ip_addr": {}, "opa.runtime": {}}
+
+// harmlessNondeterministicBuiltins are the builtins OPA flags nondeterministic
+// that a policy may still call: they read the clock or a random source and
+// touch neither the network nor the host. Every nondeterministic builtin is in
+// exactly one of this set and unsafeBuiltins.
+var harmlessNondeterministicBuiltins = map[string]struct{}{
+	"rand.intn": {}, "uuid.rfc4122": {}, "time.now_ns": {},
+	"io.jwt.encode_sign": {}, "io.jwt.encode_sign_raw": {}, "io.jwt.decode_verify": {},
+}
 
 // Prepared is a compiled policy, ready to evaluate.
 type Prepared struct {

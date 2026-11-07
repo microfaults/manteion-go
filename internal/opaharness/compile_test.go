@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/open-policy-agent/opa/v1/ast"
 )
 
 const scalarRego = `package atropos
@@ -103,5 +105,37 @@ func TestPrepared_Eval_RejectsNonObjectMutation(t *testing.T) {
 	}
 	if _, err := p.Eval(context.Background(), map[string]any{}); err == nil || !strings.Contains(err.Error(), "decode mutations") {
 		t.Fatalf("err = %v, want a decode error, not a panic", err)
+	}
+}
+
+// TestSandbox_PinsNondeterministicBuiltins pins the sandbox to OPA's builtin
+// catalogue: a nondeterministic builtin an OPA upgrade adds must be classified
+// before the upgrade lands, and a denied builtin that OPA renames must not
+// silently stop being denied.
+func TestSandbox_PinsNondeterministicBuiltins(t *testing.T) {
+	catalogue := map[string]bool{}
+	for _, b := range ast.Builtins {
+		catalogue[b.Name] = true
+		if !b.Nondeterministic {
+			continue
+		}
+		_, denied := unsafeBuiltins[b.Name]
+		_, allowed := harmlessNondeterministicBuiltins[b.Name]
+		if !denied && !allowed {
+			t.Errorf("new nondeterministic builtin %q: classify it (deny or allow) before upgrading OPA", b.Name)
+		}
+		if denied && allowed {
+			t.Errorf("builtin %q is both denied and allowed", b.Name)
+		}
+	}
+	for name := range unsafeBuiltins {
+		if !catalogue[name] {
+			t.Errorf("denied builtin %q is not in OPA's catalogue (renamed or removed?): the denylist no longer covers it", name)
+		}
+	}
+	for name := range harmlessNondeterministicBuiltins {
+		if !catalogue[name] {
+			t.Errorf("allowed builtin %q is not in OPA's catalogue: drop it from harmlessNondeterministicBuiltins", name)
+		}
 	}
 }

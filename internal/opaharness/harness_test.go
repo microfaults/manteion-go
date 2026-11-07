@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -577,5 +578,50 @@ func TestTick_StopsOnCancelledContext(t *testing.T) {
 	th.h.tick(ctx, t0)
 	if len(mut.calls) != 1 || len(dec.records) != 1 || dec.records[0].PolicyID != "opa-hot" {
 		t.Fatalf("calls %d records %d, want only the first policy evaluated before the shutdown", len(mut.calls), len(dec.records))
+	}
+}
+
+// --- non-finite samples ------------------------------------------------------
+
+// nullCountRego reports, as the name of one delete, how many samples of the
+// vector input v are null and how many are finite (guarded by != null).
+const nullCountRego = `package atropos
+
+nulls := count([s | some s in input.inputs.v; s.value == null])
+
+finite := count([s | some s in input.inputs.v; s.value != null; s.value > 0])
+
+mutations contains {"op": "delete_rule", "service": "checkout", "name": sprintf("nulls-%d-finite-%d-scalar-%v", [nulls, finite, input.inputs.s])}
+`
+
+func TestEvaluateOnce_NonFiniteSamplesAreNull(t *testing.T) {
+	dec := &fakeDecisions{}
+	th := newTestHarness(nil, nil, &fakeMutator{}, dec, nil)
+	th.h.deps.Providers = Providers{
+		"prometheus": VectorProvider{Querier: fakeQuerier{samples: nonFiniteSamples()}},
+		"loki":       VectorProvider{Querier: fakeQuerier{samples: []promql.Sample{{Labels: map[string]string{}, Value: math.NaN()}}}},
+	}
+	p := withRego(hotPolicy(), nullCountRego)
+	p.Inputs = []model.PolicyInput{
+		{Name: "v", Source: "prometheus", Query: "q", Kind: "vector"},
+		{Name: "s", Source: "loki", Query: "q", Kind: "scalar"},
+	}
+	ev, err := th.h.EvaluateOnce(context.Background(), p, false)
+	if err != nil || ev.Error != "" {
+		t.Fatalf("evaluation error = %q / %v, want none (non-finite samples are null, not an error)", ev.Error, err)
+	}
+	if len(ev.Mutations) != 1 || ev.Mutations[0].Name != "nulls-3-finite-1-scalar-null" {
+		t.Fatalf("mutations = %+v, want the policy to see three null samples, one finite and a null scalar", ev.Mutations)
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("the evaluation must encode as JSON (the API answers it): %v", err)
+	}
+	if n := strings.Count(string(raw), `"value":null`); n != 3 {
+		t.Errorf("evaluation JSON has %d null sample values, want 3: %s", n, raw)
+	}
+	if len(dec.records) != 1 || dec.records[0].InputDigest != ev.InputDigest || ev.InputDigest != inputDigest(ev.Inputs) ||
+		strings.Contains(ev.InputDigest, "unencodable") {
+		t.Errorf("recorded digest %v, evaluation digest %q: want the same digest over the null representation", dec.records, ev.InputDigest)
 	}
 }

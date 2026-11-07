@@ -22,6 +22,7 @@ func TestDecodeVector(t *testing.T) {
 		{"empty vector", `{"status":"success","data":{"resultType":"vector","result":[]}}`, []Sample{}, ""},
 		{"scalar", `{"status":"success","data":{"resultType":"scalar","result":[1700000000,"3"]}}`, []Sample{{Labels: map[string]string{}, Value: 3}}, ""},
 		{"streams", `{"status":"success","data":{"resultType":"streams","result":[]}}`, nil, `resultType "streams"`},
+		{"matrix", `{"status":"success","data":{"resultType":"matrix","result":[]}}`, nil, `unsupported resultType "matrix" (metric queries only)`},
 		{"error status", `{"status":"error","errorType":"bad_data","error":"parse error at 1"}`, nil, "bad_data"},
 		{"not json", `<html>`, nil, "decode"},
 	}

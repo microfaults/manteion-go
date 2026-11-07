@@ -3,6 +3,7 @@ package opaharness
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"manteion-go/internal/model"
 	"manteion-go/internal/promql"
@@ -31,9 +32,16 @@ type VectorQuerier interface {
 // series yields its value as a float64, and several series are an error: the
 // query must aggregate to one series or declare kind "vector".
 //
-// Kind "vector" yields every sample as []promql.Sample (JSON
+// Kind "vector" yields every sample as []InputSample (JSON
 // [{"metric": {...}, "value": v}, ...]); no series yields an empty, non-nil
 // slice (JSON []).
+//
+// A non-finite value (NaN, +Inf or -Inf: Prometheus answers an error ratio
+// with no traffic as NaN) is JSON null: a vector sample's "value" is null, a
+// scalar whose single sample is non-finite is null. JSON has no encoding for
+// them, so the input document, the input digest and the stored decision all
+// see this same representation, and nothing errors; a policy guards with
+// s.value != null.
 //
 // A querier error is returned wrapped, so errors.Is sees it.
 type VectorProvider struct {
@@ -54,16 +62,34 @@ func (p VectorProvider) Fetch(ctx context.Context, in model.PolicyInput) (any, e
 		case 0:
 			return nil, nil
 		case 1:
-			return samples[0].Value, nil
+			if v := samples[0].Value; finite(v) {
+				return v, nil
+			}
+			return nil, nil
 		default:
 			return nil, fmt.Errorf("scalar input %q returned %d series; aggregate the query or use kind \"vector\"", in.Name, n)
 		}
 	case model.InputKindVector:
-		if samples == nil {
-			samples = []promql.Sample{}
+		out := make([]InputSample, 0, len(samples))
+		for _, s := range samples {
+			is := InputSample{Labels: s.Labels}
+			if finite(s.Value) {
+				v := s.Value
+				is.Value = &v
+			}
+			out = append(out, is)
 		}
-		return samples, nil
+		return out, nil
 	default:
-		return nil, fmt.Errorf("input %q: unknown kind %q", in.Name, in.Kind)
+		return nil, fmt.Errorf("unknown kind %q", in.Kind)
 	}
 }
+
+// InputSample is one sample of a vector input as the policy sees it: Value
+// is nil (JSON null) when the sample is NaN or infinite.
+type InputSample struct {
+	Labels map[string]string `json:"metric"`
+	Value  *float64          `json:"value"`
+}
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }

@@ -81,6 +81,12 @@ The document a policy sees as `input`:
   vector.
 - `inputs.<name>`, kind `vector`: `[{"metric": {...labels}, "value": v}, ...]`,
   and `[]` when there are no series.
+- A sample whose value is NaN or ±Inf (Prometheus answers an error ratio
+  with no traffic as NaN) reaches the policy as `null`: a vector sample's
+  `value` is `null`, and a scalar whose single series is non-finite is
+  `null`. Nothing errors, and the input digest and the stored decision see
+  the same `null`. Guard vector samples with `s.value != null`, for example
+  `some s in input.inputs.per_route; s.value != null; s.value > 0.05`.
 - `rules`: every rule whose `service` is in scope, in the order the rule
   repository lists them (priority).
 - `instances`: every registered instance of the scope services, whatever its
@@ -304,5 +310,13 @@ anything, so a wrong URL degrades the policy instead of crashing manteion.
 - The evaluator is sandboxed: `http.send`, `net.lookup_ip_addr` and
   `opa.runtime` are refused at compile time, builtin errors are strict, and
   each evaluation (and each compile) runs under a 5 s timeout.
+- Trust model: policies are operator-authored, and the sandbox is not a
+  boundary against a hostile author. It blocks the network and process
+  inspection (the denied builtins above are every builtin in OPA v1.19.1
+  that performs I/O; `TestSandbox_PinsNondeterministicBuiltins` fails an OPA
+  upgrade that adds a nondeterministic builtin until it is classified), and
+  it bounds evaluation time (the timeout), not memory: `net.cidr_expand` of a
+  wide prefix or a large comprehension can still allocate heavily within the
+  5 s.
 - Compositions and cache-box rules can be upserted, toggled and deleted like
   any rule, but `set_params` applies to `fault_spec` rules only.

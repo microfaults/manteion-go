@@ -363,7 +363,8 @@ func dryRunResults(ms []Mutation) []MutationResult {
 //   - now: the evaluation time, RFC 3339 with nanoseconds, UTC
 //   - now_ns: the same instant in unix nanoseconds (an exact integer)
 //   - inputs: {name: value} as the input providers returned them (a scalar is
-//     a number or null, a vector [{"metric": {...}, "value": v}, ...])
+//     a number or null, a vector [{"metric": {...}, "value": v}, ...]; a NaN
+//     or infinite value is null, see VectorProvider)
 //   - rules: every rule whose service is in the policy's scope, as model.Rule
 //     JSON, in the priority order RuleLister.List returns
 //   - services: the policy's scope services
