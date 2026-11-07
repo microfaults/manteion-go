@@ -625,3 +625,145 @@ func TestEvaluateOnce_NonFiniteSamplesAreNull(t *testing.T) {
 		t.Errorf("recorded digest %v, evaluation digest %q: want the same digest over the null representation", dec.records, ev.InputDigest)
 	}
 }
+
+// --- detached apply+record, waited shutdown ----------------------------------
+
+type ctxKey struct{}
+
+// ctxSeen is what a fake saw of the context it was called with.
+type ctxSeen struct {
+	called   bool
+	err      error // ctx.Err() when called (after the caller cancelled, for the mutator)
+	deadline time.Duration
+	value    any
+}
+
+func seeCtx(ctx context.Context) ctxSeen {
+	s := ctxSeen{called: true, err: ctx.Err(), value: ctx.Value(ctxKey{})}
+	if dl, ok := ctx.Deadline(); ok {
+		s.deadline = time.Until(dl)
+	}
+	return s
+}
+
+// ctxDecisions records like fakeDecisions and keeps the context Record saw.
+type ctxDecisions struct {
+	fakeDecisions
+	seen ctxSeen
+}
+
+func (c *ctxDecisions) Record(ctx context.Context, d *model.PolicyDecision) error {
+	c.seen = seeCtx(ctx)
+	return c.fakeDecisions.Record(ctx, d)
+}
+
+// ctxProvider answers like fakeProvider and keeps the context Fetch saw.
+type ctxProvider struct {
+	fakeProvider
+	seen *ctxSeen
+}
+
+func (c ctxProvider) Fetch(ctx context.Context, in model.PolicyInput) (any, error) {
+	*c.seen = seeCtx(ctx)
+	return c.fakeProvider.Fetch(ctx, in)
+}
+
+// blockingMutator applies like fakeMutator once release is closed. It
+// signals started on entry, cancels the caller's context first when cancel is
+// set, and keeps what its context looked like once released.
+type blockingMutator struct {
+	fakeMutator
+	started chan struct{}
+	release chan struct{}
+	cancel  context.CancelFunc
+	seen    ctxSeen
+}
+
+func (b *blockingMutator) Apply(ctx context.Context, pid string, ms []Mutation) ([]MutationResult, error) {
+	if b.cancel != nil {
+		b.cancel()
+	}
+	if b.started != nil {
+		close(b.started)
+	}
+	if b.release != nil {
+		<-b.release
+	}
+	b.seen = seeCtx(ctx)
+	return b.fakeMutator.Apply(ctx, pid, ms)
+}
+
+func TestEvaluateOnce_ApplyAndRecordSurviveCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), ctxKey{}, "caller"))
+	defer cancel()
+	dec := &ctxDecisions{}
+	var fetched ctxSeen
+	mut := &blockingMutator{cancel: cancel}
+	th := newTestHarness(nil, ctxProvider{fakeProvider: fakeProvider{values: hotValues()}, seen: &fetched}, &mut.fakeMutator, &dec.fakeDecisions, nil)
+	th.h.deps.Mutator, th.h.deps.Decisions = mut, dec
+
+	ev, err := th.h.EvaluateOnce(ctx, hotPolicy(), true)
+	if err != nil || ev.Error != "" || !ev.Changed {
+		t.Fatalf("evaluation = %+v, err %v; want the apply to complete although the caller cancelled", ev, err)
+	}
+	if fetched.err != nil || fetched.deadline != 0 || fetched.value != "caller" {
+		t.Errorf("input fetch ctx = %+v, want the caller's own context (no apply deadline)", fetched)
+	}
+	if mut.seen.err != nil || mut.seen.value != "caller" || mut.seen.deadline <= 0 || mut.seen.deadline > applyTimeout {
+		t.Errorf("apply ctx = %+v, want a live context detached from the caller's cancellation, carrying its values, bounded by %s", mut.seen, applyTimeout)
+	}
+	if !dec.seen.called || dec.seen.err != nil || dec.seen.value != "caller" || dec.seen.deadline <= 0 || dec.seen.deadline > applyTimeout {
+		t.Errorf("record ctx = %+v, want a live detached context bounded by %s", dec.seen, applyTimeout)
+	}
+	if len(dec.records) != 1 || !dec.records[0].Applied {
+		t.Errorf("records = %+v, want the applied decision recorded", dec.records)
+	}
+}
+
+func TestEvaluateOnce_DryRunRecordSurvivesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dec := &ctxDecisions{}
+	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &dec.fakeDecisions, nil)
+	th.h.deps.Decisions = dec
+	cancel()
+	if _, err := th.h.EvaluateOnce(ctx, hotPolicy(), false); err != nil {
+		t.Fatalf("EvaluateOnce: %v", err)
+	}
+	if len(dec.records) != 1 || dec.seen.err != nil || dec.seen.deadline <= 0 {
+		t.Errorf("records %d, record ctx %+v; want the dry run recorded under a live, bounded context", len(dec.records), dec.seen)
+	}
+}
+
+func TestRun_ReturnsAfterTheInFlightTick(t *testing.T) {
+	dec := &ctxDecisions{}
+	mut := &blockingMutator{started: make(chan struct{}), release: make(chan struct{})}
+	th := newTestHarness([]*model.OPAPolicy{hotPolicy()}, fakeProvider{values: hotValues()}, &mut.fakeMutator, &dec.fakeDecisions, nil)
+	th.h.deps.Mutator, th.h.deps.Decisions = mut, dec
+	th.h.resolution = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { th.h.Run(ctx); close(done) }()
+
+	select {
+	case <-mut.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the tick never reached the mutator")
+	}
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("Run returned while the tick's apply was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(mut.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after the in-flight tick finished")
+	}
+	if len(mut.calls) != 1 || len(dec.records) != 1 || !dec.records[0].Applied || dec.seen.err != nil {
+		t.Fatalf("calls %d, records %+v, record ctx %+v; want the in-flight evaluation applied and recorded under a live context",
+			len(mut.calls), dec.records, dec.seen)
+	}
+}

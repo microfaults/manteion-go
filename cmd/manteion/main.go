@@ -198,15 +198,26 @@ func main() {
 	// Policy automation. "rego" (or "on") starts the OPA harness
 	// (docs/opa-harness.md); "threshold" starts the frozen PromQL engine
 	// (docs/decisions/2026-06-policy-engine-freeze.md); "off" starts neither.
-	switch mode := envOr("MANTEION_POLICY_ENGINE", "off"); mode {
+	// harnessDone is closed once the harness loop has returned (at once when
+	// it is not started); shutdown waits for it, so an evaluation in flight
+	// at the signal still applies and records its decision.
+	policyEngineMode := envOr("MANTEION_POLICY_ENGINE", "off")
+	harnessDone := make(chan struct{})
+	switch policyEngineMode {
 	case "rego", "on":
-		go harness.Run(ctx)
+		go func() {
+			defer close(harnessDone)
+			harness.Run(ctx)
+		}()
 	case "threshold":
 		go policyEngine.Run(ctx)
 	case "off":
 		logger.Info("policy automation disabled (MANTEION_POLICY_ENGINE=off; rego|on starts the OPA harness, threshold the frozen PromQL engine)")
 	default:
-		logger.Warn("unknown MANTEION_POLICY_ENGINE value; policy automation disabled", "value", mode)
+		logger.Warn("unknown MANTEION_POLICY_ENGINE value; policy automation disabled", "value", policyEngineMode)
+	}
+	if policyEngineMode != "rego" && policyEngineMode != "on" {
+		close(harnessDone)
 	}
 
 	// Complete expired long-running fault configs (status bookkeeping +
@@ -246,6 +257,7 @@ func main() {
 			"url", "http://"+displayAddr,
 			"zeus_url", zeusURL,
 			"loki_url", lokiURL,
+			"policy_engine", policyEngineMode,
 		)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)
@@ -261,8 +273,19 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error("shutdown error", "error", err)
+	shutdownErr := httpServer.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		logger.Error("shutdown error", "error", shutdownErr)
+	}
+	// The harness loop returns after its in-flight tick (its apply and
+	// record are detached from ctx); wait for it within what is left of the
+	// shutdown budget.
+	select {
+	case <-harnessDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("opa harness: loop did not stop within the shutdown timeout")
+	}
+	if shutdownErr != nil {
 		os.Exit(1)
 	}
 

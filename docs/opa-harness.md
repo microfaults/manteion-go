@@ -145,7 +145,13 @@ evaluates, with apply, every enabled policy that is due:
 
 A policy's failure is recorded and logged, and the tick moves on to the next
 policy. Shutdown (the server's signal context) stops the loop, and a tick
-cancelled midway leaves the remaining policies unevaluated.
+cancelled midway leaves the remaining policies unevaluated. Once an
+evaluation has decided, its apply and its decision record run detached from
+the cancellation (bounded by 10 s), so the evaluation in flight at shutdown
+still applies and records what it decided; `cmd/manteion` waits for the
+loop to return within the shutdown budget and logs `opa harness: loop did
+not stop within the shutdown timeout` if it does not. The same holds for an
+API evaluation whose client goes away.
 
 ## Decision log
 

@@ -15,6 +15,19 @@ import (
 	"manteion-go/internal/model"
 )
 
+// applyTimeout bounds an evaluation's apply and decision record together,
+// which run detached from the caller's cancellation (see detached).
+const applyTimeout = 10 * time.Second
+
+// detached returns a context that carries ctx's values but not its
+// cancellation, bounded by applyTimeout. Once an evaluation has decided what
+// to apply, the apply and the decision record run under it, so a shutdown or
+// a client disconnect cannot leave rules written with no decision row (the
+// row the cooldown is restored from).
+func detached(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), applyTimeout)
+}
+
 // PolicySource lists the policies the loop evaluates (*store.OPAPolicyRepo).
 type PolicySource interface {
 	ListEnabled(ctx context.Context) ([]*model.OPAPolicy, error)
@@ -121,7 +134,11 @@ func New(d Deps) *Harness {
 func (h *Harness) now() time.Time { return h.deps.Now() }
 
 // Run ticks every resolution (1 s) until ctx is done. Ticks run on Run's
-// goroutine, one at a time, so they never overlap.
+// goroutine, one at a time, so they never overlap. A tick in flight when ctx
+// is cancelled finishes the evaluation it is in (its apply and record are
+// detached, see EvaluateOnce) and stops before the next policy; Run returns
+// only after that tick returned, so a caller waiting for Run to return knows
+// no evaluation is still writing.
 func (h *Harness) Run(ctx context.Context) {
 	h.deps.Logger.Info("opa harness: starting", "resolution", h.resolution.String())
 	t := time.NewTicker(h.resolution)
@@ -241,6 +258,11 @@ func (h *Harness) prepare(p *model.OPAPolicy) (*Prepared, error) {
 // Evaluation.Error and recorded; the returned error is only a decision-log
 // write failure ("record decision: ..."), returned with the Evaluation.
 //
+// Compiling, fetching the inputs, building the input document and evaluating
+// run under ctx; the apply and the decision record run under detached(ctx),
+// so once the evaluation has decided, a cancelled ctx (shutdown, a client
+// gone) no longer stops it from applying and recording what it decided.
+//
 // An applying evaluation that changed something moves p's schedule exactly as
 // a tick-driven one does: p is next due max(IntervalS, CooldownS) after it,
 // so an apply triggered through the API starts the cooldown the loop honours.
@@ -292,10 +314,14 @@ func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bo
 			ev.Results = append(ev.Results, refusals...)
 		}
 	}
+	// From here on the evaluation has decided: the apply and the record run
+	// detached from ctx's cancellation, bounded by applyTimeout.
+	dctx, cancel := detached(ctx)
+	defer cancel()
 	if ev.Error == "" && apply {
 		// Apply may return results together with an error (it aborted after
 		// applying some): keep them, they are what happened.
-		res, err := h.deps.Mutator.Apply(ctx, p.ID, allowed)
+		res, err := h.deps.Mutator.Apply(dctx, p.ID, allowed)
 		ev.Results = append(ev.Results, res...)
 		for _, r := range res {
 			if r.Changed() {
@@ -328,7 +354,7 @@ func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bo
 		ID: h.deps.NewID("pdec"), PolicyID: p.ID, EvaluatedAt: now, InputDigest: ev.InputDigest,
 		Mutations: raw, Applied: ev.Applied, Error: ev.Error,
 	}
-	recErr := h.deps.Decisions.Record(ctx, d)
+	recErr := h.deps.Decisions.Record(dctx, d)
 
 	attrs := []any{
 		"policy_id", p.ID, "policy", p.Name, "input_digest", ev.InputDigest,
