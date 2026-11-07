@@ -31,7 +31,7 @@ openapi:
 	swag init \
 		--v3.1 \
 		--generalInfo main.go \
-		--dir cmd/manteion,internal/api,internal/model \
+		--dir cmd/manteion,internal/api,internal/model,internal/opaharness \
 		--output docs \
 		--outputTypes yaml,json \
 		--parseDependency \

@@ -60,6 +60,25 @@ components:
           type: array
           uniqueItems: false
       type: object
+    api.Page:
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+      type: object
+    api.PageEnvelope-model_PolicyDecision:
+      properties:
+        data:
+          items:
+            $ref: '#/components/schemas/model.PolicyDecision'
+          type: array
+          uniqueItems: false
+        page:
+          $ref: '#/components/schemas/api.Page'
+      type: object
     api.SDKInstanceDetail:
       properties:
         active_rule_ids:
@@ -627,6 +646,74 @@ components:
         target:
           type: string
       type: object
+    model.OPAPolicy:
+      properties:
+        cooldown_s:
+          type: integer
+        created_at:
+          type: string
+        enabled:
+          type: boolean
+        id:
+          type: string
+        inputs:
+          items:
+            $ref: '#/components/schemas/model.PolicyInput'
+          type: array
+          uniqueItems: false
+        interval_s:
+          type: integer
+        name:
+          type: string
+        rego:
+          type: string
+        scope:
+          $ref: '#/components/schemas/model.PolicyScope'
+        updated_at:
+          type: string
+      type: object
+    model.PolicyDecision:
+      properties:
+        applied:
+          type: boolean
+        error:
+          type: string
+        evaluated_at:
+          type: string
+        id:
+          type: string
+        input_digest:
+          type: string
+        mutations:
+          description: '[]opaharness.MutationResult {op, service, name, outcome, error?,
+            rule_id?}; a dry run (applied=false) lists one outcome "dry_run" entry
+            per in-scope would-be mutation'
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        policy_id:
+          type: string
+      type: object
+    model.PolicyInput:
+      properties:
+        kind:
+          type: string
+        name:
+          type: string
+        query:
+          type: string
+        source:
+          type: string
+      type: object
+    model.PolicyScope:
+      properties:
+        services:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+      type: object
     model.Rule:
       properties:
         action:
@@ -773,6 +860,67 @@ components:
         category:
           type: string
         rule:
+          type: string
+      type: object
+    opaharness.Evaluation:
+      properties:
+        applied:
+          type: boolean
+        changed:
+          type: boolean
+        error:
+          type: string
+        evaluated_at:
+          type: string
+        input_digest:
+          type: string
+        inputs:
+          additionalProperties: {}
+          type: object
+        mutations:
+          items:
+            $ref: '#/components/schemas/opaharness.Mutation'
+          type: array
+          uniqueItems: false
+        policy_id:
+          type: string
+        results:
+          items:
+            $ref: '#/components/schemas/opaharness.MutationResult'
+          type: array
+          uniqueItems: false
+      type: object
+    opaharness.Mutation:
+      properties:
+        enabled:
+          type: boolean
+        name:
+          type: string
+        op:
+          type: string
+        params:
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        rule:
+          $ref: '#/components/schemas/model.Rule'
+        service:
+          type: string
+      type: object
+    opaharness.MutationResult:
+      properties:
+        error:
+          type: string
+        name:
+          type: string
+        op:
+          type: string
+        outcome:
+          type: string
+        rule_id:
+          type: string
+        service:
           type: string
       type: object
 info:
@@ -1217,6 +1365,335 @@ paths:
       summary: Liveness probe
       tags:
       - health
+  /opa/policies:
+    get:
+      description: Every OPA harness policy, oldest created first; [] when there are
+        none.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/model.OPAPolicy'
+                type: array
+          description: OK
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: List OPA policies
+      tags:
+      - autorules
+    post:
+      description: 'Persist a Rego (v1 syntax) policy. The module must declare
+
+        `package atropos` and define `mutations` (a set of rule mutations);
+
+        it is compiled at save time and rejected with 422 on parse, type or
+
+        unsafe-builtin (http.send) errors. inputs[] declare the telemetry
+
+        (prometheus | loki instant metric queries) exposed as input.inputs.<name>;
+
+        scope.services bounds which services'' rules the policy may mutate.
+
+        Policies are created disabled unless "enabled": true is explicit.
+
+        interval_s defaults to 30 and an input''s kind to "scalar".'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/model.OPAPolicy'
+                description: Policy definition
+                summary: policy
+        description: Policy definition
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/model.OPAPolicy'
+          description: Created
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: invalid JSON
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy name already exists
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: 'validation error, or Rego compile error (rego: ...)'
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: Create OPA policy
+      tags:
+      - autorules
+  /opa/policies/{id}:
+    delete:
+      description: Delete the policy; its decision log goes with it.
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: policy deleted
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: Delete OPA policy
+      tags:
+      - autorules
+    get:
+      description: One OPA harness policy by id.
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/model.OPAPolicy'
+          description: OK
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: Get OPA policy
+      tags:
+      - autorules
+    put:
+      description: 'Replace the policy with the path''s id (a body id is ignored).
+        The
+
+        body is validated and its Rego compiled exactly as on create (422 on
+
+        failure, the stored policy untouched). created_at is kept and
+
+        updated_at set; the response is the stored policy.'
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/model.OPAPolicy'
+                description: Policy definition
+                summary: policy
+        description: Policy definition
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/model.OPAPolicy'
+          description: OK
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: invalid JSON
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy not found
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy name already exists
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: 'validation error, or Rego compile error (rego: ...)'
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: Update OPA policy
+      tags:
+      - autorules
+  /opa/policies/{id}/decisions:
+    get:
+      description: 'The policy''s decision log, newest first (evaluated_at, then id),
+        in the
+
+        standard {data, page} envelope. One decision per evaluation, dry runs
+
+        included. Each decision''s mutations is an array of opaharness.MutationResult
+
+        ({op, service, name, outcome, error?, rule_id?}): for an applied evaluation
+
+        the scope refusals (outcome "refused") followed by the mutator''s results
+
+        (created | updated | deleted | unchanged | failed); for a dry run
+
+        (applied=false) the refusals followed by one outcome "dry_run" entry per
+
+        in-scope would-be mutation. error is set when the evaluation failed.'
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: Page size (default 20, max 200)
+        in: query
+        name: limit
+        schema:
+          type: integer
+      - description: Page offset (default 0)
+        in: query
+        name: offset
+        schema:
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.PageEnvelope-model_PolicyDecision'
+          description: OK
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: Internal Server Error
+      summary: List OPA policy decisions
+      tags:
+      - autorules
+  /opa/policies/{id}/evaluate:
+    post:
+      description: 'Evaluate the policy once against live telemetry, enabled or not.
+
+        Defaults to a dry run: the mutations are computed and scope-checked but
+
+        not applied, and results holds only the scope refusals. With
+
+        apply=true the in-scope mutations are applied through the rule
+
+        repository and results holds the refusals plus the mutator''s results;
+
+        an applying evaluation that changed something starts the policy''s
+
+        cooldown. Every evaluation is recorded in the decision log (see
+
+        /opa/policies/{id}/decisions). Compile, input, eval and apply failures
+
+        are reported in the Evaluation''s error with 200; 500 means the
+
+        decision could not be recorded. 503 when the harness is disabled
+
+        (MANTEION_POLICY_ENGINE off).'
+      parameters:
+      - description: Policy ID
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: 'apply the mutations (default false: dry run)'
+        in: query
+        name: apply
+        schema:
+          type: boolean
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/opaharness.Evaluation'
+          description: OK
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: policy not found
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: failed to record decision
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: opa harness disabled (MANTEION_POLICY_ENGINE)
+      summary: Evaluate OPA policy
+      tags:
+      - autorules
   /readyz:
     get:
       description: Returns 200 once the database is reachable, 503 otherwise.

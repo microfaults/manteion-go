@@ -15,6 +15,7 @@ import (
 
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/desired"
+	"manteion-go/internal/opaharness"
 	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
@@ -53,6 +54,9 @@ type Server struct {
 	workflows           *store.WorkflowRepo
 	workloads           *store.WorkloadRepo
 	policies            *store.PolicyRepo
+	opaPolicies         opaPolicyStore       // the *store.OPAPolicyRepo; an interface so tests can inject a fake
+	policyDecisions     policyDecisionLister // the *store.PolicyDecisionRepo; an interface so tests can inject a fake
+	opa                 opaEvaluator         // the *opaharness.Harness; nil when the policy engine is off (evaluate answers 503)
 	traces              *store.TraceRepo
 	zeus                *zeus.Client
 	generations         *desired.Generations
@@ -91,8 +95,11 @@ func NewServer(
 	cs *cachestore.Store,
 	artifacts *store.ReplayArtifactRepo,
 	policies *store.PolicyRepo,
+	opaPolicies *store.OPAPolicyRepo,
+	policyDecisions *store.PolicyDecisionRepo,
+	harness *opaharness.Harness,
 ) *Server {
-	return &Server{
+	s := &Server{
 		logger:              logger,
 		db:                  db,
 		dbPing:              db,
@@ -114,6 +121,8 @@ func NewServer(
 		workflows:           workflows,
 		workloads:           workloads,
 		policies:            policies,
+		opaPolicies:         opaPolicies,
+		policyDecisions:     policyDecisions,
 		traces:              traces,
 		zeus:                zeusClient,
 		generations:         gens,
@@ -123,6 +132,12 @@ func NewServer(
 		artifacts:           artifacts,
 		broker:              gens.Broker(),
 	}
+	// A nil *Harness would make a non-nil interface; keep s.opa nil so the
+	// evaluate handler sees the engine is off.
+	if harness != nil {
+		s.opa = harness
+	}
+	return s
 }
 
 // BeginShutdown ends every held long-poll as if its wait had elapsed, so each
@@ -280,6 +295,16 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/policies/{id}", s.handleDeletePolicy)
 	mux.HandleFunc("PATCH /api/v1/policies/{id}/enable", s.handleEnablePolicy)
 	mux.HandleFunc("PATCH /api/v1/policies/{id}/disable", s.handleDisablePolicy)
+
+	// OPA harness: Rego policies over live telemetry that mutate rules
+	// (docs/opa-harness.md). evaluate defaults to a dry run (?apply=false).
+	mux.HandleFunc("POST /api/v1/opa/policies", s.handleCreateOPAPolicy)
+	mux.HandleFunc("GET /api/v1/opa/policies", s.handleListOPAPolicies)
+	mux.HandleFunc("GET /api/v1/opa/policies/{id}", s.handleGetOPAPolicy)
+	mux.HandleFunc("PUT /api/v1/opa/policies/{id}", s.handleUpdateOPAPolicy)
+	mux.HandleFunc("DELETE /api/v1/opa/policies/{id}", s.handleDeleteOPAPolicy)
+	mux.HandleFunc("GET /api/v1/opa/policies/{id}/decisions", s.handleListOPADecisions)
+	mux.HandleFunc("POST /api/v1/opa/policies/{id}/evaluate", s.handleEvaluateOPAPolicy)
 
 	// SDK registration, polling & status reports
 	mux.HandleFunc("POST /api/v1/sdk/register", s.handleRegister)

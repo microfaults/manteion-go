@@ -141,7 +141,7 @@ type PolicyDecision struct {
 	PolicyID    string          `json:"policy_id"`
 	EvaluatedAt time.Time       `json:"evaluated_at"`
 	InputDigest string          `json:"input_digest"`
-	Mutations   json.RawMessage `json:"mutations"`
+	Mutations   json.RawMessage `json:"mutations"` // []opaharness.MutationResult {op, service, name, outcome, error?, rule_id?}; a dry run (applied=false) lists one outcome "dry_run" entry per in-scope would-be mutation
 	Applied     bool            `json:"applied"`
 	Error       string          `json:"error,omitempty"`
 }

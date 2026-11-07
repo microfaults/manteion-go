@@ -153,6 +153,9 @@ func main() {
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
 		zeusClient, gens, mat, orch, cs, artifactRepo, policyRepo,
+		// The OPA harness is wired in a later change; until then the
+		// evaluate endpoint answers 503 and CRUD and the decision log work.
+		store.NewOPAPolicyRepo(database), store.NewPolicyDecisionRepo(database), nil,
 	)
 
 	httpServer := &http.Server{

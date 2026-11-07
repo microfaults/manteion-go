@@ -114,7 +114,7 @@ func TestBumpGeneration(t *testing.T) {
 // object handed to NewServer reaches a connected subscriber.
 func TestNewServer_SSEStreamsGenerationBumps(t *testing.T) {
 	gens := desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker())
-	s := NewServer(discardLogger(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, gens, nil, nil, nil, nil, nil)
+	s := NewServer(discardLogger(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, gens, nil, nil, nil, nil, nil, nil, nil, nil)
 	srv := httptest.NewServer(http.HandlerFunc(s.handleSSEEvents))
 	defer srv.Close()
 
@@ -189,7 +189,7 @@ func newGenEnv(t *testing.T) *genEnv {
 	faultConfigs, experiments := store.NewFaultConfigRepo(database), store.NewExperimentRepo(database)
 	mat := &desired.Materializer{Generations: gens, Rules: rules, FaultConfigs: faultConfigs, CacheBox: experiments, Specs: faults}
 	s := NewServer(discardLogger(), database, rules, faults, faults, faultConfigs, store.NewSDKRepo(database), experiments,
-		nil, nil, nil, nil, nil, gens, mat, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, gens, mat, nil, nil, nil, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	s.routes(mux)
 	return &genEnv{t: t, ctx: ctx, db: database, gens: gens, s: s, mux: mux, tag: id.New("g")}
