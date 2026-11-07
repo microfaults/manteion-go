@@ -27,4 +27,8 @@ for the engine's scan). Revisit when the orchestrator FSM port lands.
 enabled rule of the service, each through `RuleRepo.Update`, which bumps the
 service's desired-state generation in the same transaction; nothing is pushed
 to `/admin/rules` any more (`internal/atrocontrol`'s push paths are gone). The
-engine stays opt-in (`MANTEION_POLICY_ENGINE=on`).
+engine stays opt-in (`MANTEION_POLICY_ENGINE=on`). Unlike the old push, which
+was a transient override the next poll undid, `clear_rules` is persistent: it
+disables every enabled rule of the service in the database, phase-attached
+rules of a running experiment included, and they stay disabled until someone
+enables them again.

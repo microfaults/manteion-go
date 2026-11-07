@@ -804,7 +804,7 @@
                         "type": "string"
                     },
                     "enabled": {
-                        "description": "Enabled gates serving on every channel (poll predicate AND phase-start\npush). Deliberately zero-value FALSE: a create that omits it yields a\ndisabled rule, which is what makes the create\u2192attach\u2192enable experiment\nflow ordering-safe. Do not add default-true anywhere in the create path.",
+                        "description": "Enabled gates serving: only an enabled rule is served, through the\ndesired-state document its service's instances poll (a phase-attached\none while its phase runs). Deliberately zero-value FALSE: a create that\nomits it yields a disabled rule, which is what makes the\ncreate\u2192attach\u2192enable experiment flow ordering-safe. Do not add\ndefault-true anywhere in the create path.",
                         "type": "boolean"
                     },
                     "id": {

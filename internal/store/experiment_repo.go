@@ -492,7 +492,9 @@ func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, er
 // first phase that freezes a service, that choice feeds the materialized
 // document whose ETag hashes it, and a tie left to the scan follows physical
 // position, which every UPDATE and the choice of plan change. Small in
-// practice: at most one running phase per active experiment.
+// practice: the scheduler runs an experiment's phases one at a time, though
+// an operator can start any pending phase directly, so an experiment can have
+// several running at once.
 func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, experiment_id, name, position, status, frozen_services,

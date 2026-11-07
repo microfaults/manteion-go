@@ -19,10 +19,12 @@ type Rule struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	Service string `json:"service"`
-	// Enabled gates serving on every channel (poll predicate AND phase-start
-	// push). Deliberately zero-value FALSE: a create that omits it yields a
-	// disabled rule, which is what makes the create→attach→enable experiment
-	// flow ordering-safe. Do not add default-true anywhere in the create path.
+	// Enabled gates serving: only an enabled rule is served, through the
+	// desired-state document its service's instances poll (a phase-attached
+	// one while its phase runs). Deliberately zero-value FALSE: a create that
+	// omits it yields a disabled rule, which is what makes the
+	// create→attach→enable experiment flow ordering-safe. Do not add
+	// default-true anywhere in the create path.
 	Enabled     bool          `json:"enabled"`
 	Priority    int           `json:"priority"`
 	Match       MatchCriteria `json:"match"`

@@ -6,14 +6,9 @@ import (
 	"net/http"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
-	"manteion-go/internal/ruleconv"
 )
 
-func (c *Client) PostRules(ctx context.Context, addr string, rules []ruleconv.CompiledRule) error {
-	_, err := c.doExpectStatus(ctx, http.MethodPost, addr+"/admin/rules", rules, http.StatusNoContent)
-	return err
-}
-
+// GetRules reads the rules an SDK instance has installed (GET /admin/rules).
 func (c *Client) GetRules(ctx context.Context, addr string) ([]atroposdk.StaticRule, error) {
 	url := addr + "/admin/rules"
 	data, err := c.doExpectStatus(ctx, http.MethodGet, url, nil, http.StatusOK)

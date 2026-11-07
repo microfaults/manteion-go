@@ -23,10 +23,6 @@ func WithTimeout(d time.Duration) CallOption {
 	return func(o *callOpts) { o.timeout = d }
 }
 
-func WithConcurrency(n int) CallOption {
-	return func(o *callOpts) { o.concurrency = n }
-}
-
 func WithInstanceFilter(f InstanceFilter) CallOption {
 	return func(o *callOpts) { o.filter = f }
 }
