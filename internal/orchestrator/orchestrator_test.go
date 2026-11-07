@@ -265,8 +265,8 @@ type fakeZeus struct {
 	// /attacks/{id} (kind "run" or "attack") before the stop applies:
 	// something that lands while a teardown is stopping a phase's load. A
 	// stop for a driver the fake did not know when the request arrived stays
-	// a no-op, as on a zeus that answers it 404, even if the driver is
-	// accepted while the hook runs.
+	// a no-op (an attack's is answered 404, as zeus does), even if the driver
+	// is accepted while the hook runs.
 	stopHook func(kind, id string)
 }
 
@@ -403,8 +403,13 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 		if stop != nil {
 			stop("attack", r.PathValue("id"))
 		}
+		if !known {
+			// zeus answers a stop of an attack it does not know with 404.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		f.mu.Lock()
-		if a, ok := f.attacks[r.PathValue("id")]; ok && known {
+		if a, ok := f.attacks[r.PathValue("id")]; ok {
 			a.status = "stopped"
 		}
 		f.mu.Unlock()

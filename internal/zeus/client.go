@@ -295,10 +295,11 @@ func (c *Client) StopAttack(ctx context.Context, attackID string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("zeus: stop attack %q: status %d", attackID, resp.StatusCode)
+		raw, _ := io.ReadAll(resp.Body)
+		return &ResponseError{Op: fmt.Sprintf("stop attack %q", attackID), Status: resp.StatusCode, Body: string(raw)}
 	}
+	io.Copy(io.Discard, resp.Body)
 	return nil
 }
 

@@ -108,8 +108,9 @@ func (o *Orchestrator) holdsClaimLocked(phaseID string, claim claimToken) bool {
 }
 
 // writeClaimed runs write, a short DB write an entry makes on its phase (a
-// driver handle on a workflow row, the phase's audit-trail events), under the phase's transition lock and
-// only while claim is still the phase's current one. It reports whether write
+// driver handle on a workflow row, the phase's audit-trail events), under the
+// phase's transition lock and only while claim is still the phase's current
+// one. It reports whether write
 // ran, and write's error. A claim ends, and a newer one starts, only under
 // that lock, so a write made here lands before the claim ends (a pause, which
 // reads the rows after its CAS, finds the handle and stops its driver) and
@@ -168,7 +169,7 @@ func (o *Orchestrator) endClaimSnapshot(ctx context.Context, phaseID string, cla
 	o.cancelPoller(phaseID)
 	pws, lerr := o.experiments.ListPhaseWorkflows(ctx, phaseID)
 	if lerr != nil {
-		o.logger.Warn("orchestrator: teardown: list workflows failed; the load is left to the next sweep",
+		o.logger.Warn("orchestrator: teardown: list workflows failed; the phase's load runs until a later teardown stops it (a pause: the phase's terminal transition)",
 			"phase_id", phaseID, "error", lerr)
 		return true, nil, nil
 	}

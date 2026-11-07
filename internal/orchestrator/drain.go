@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"manteion-go/internal/model"
@@ -27,8 +28,8 @@ type drainTarget struct {
 // instance's report; and persists the outcome.
 func (o *Orchestrator) runDrainBarrier(ctx context.Context, p *model.ExperimentPhase, pws []model.PhaseWorkflow) {
 	o.cancelPoller(p.ID)
-	o.stopZeusAttacks(ctx, pws)
-	o.stopPhaseRuns(ctx, pws)
+	o.stopZeusAttacks(ctx, p.ID, pws, nil, slog.LevelWarn)
+	o.stopPhaseRuns(ctx, p.ID, pws, nil)
 	targets, _ := o.bumpDesired(ctx, p) // a failed bump is logged per service
 	o.awaitConvergedNonFatal(ctx, p, targets, "drain")
 

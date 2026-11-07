@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -108,10 +110,10 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 			fmt.Sprintf("orchestrator: phase %q is not running", phaseID))
 	}
 
-	o.stopZeusAttacks(ctx, pws)
+	o.stopZeusAttacks(ctx, phaseID, pws, nil, slog.LevelWarn)
 	// k6 runs aren't resumable; pause kills them and resume re-launches
 	// (StartPhase fresh=false re-runs startPhaseRuns), matching attacks.
-	o.stopPhaseRuns(ctx, pws)
+	o.stopPhaseRuns(ctx, phaseID, pws, nil)
 	// The phase left 'running' at the CAS above, so its rules and cache-box
 	// role are already out of the materialized documents; the bump wakes the
 	// held long-polls to fetch them. After the load stops, as in endPhase (M1).
@@ -523,8 +525,8 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	// All of this is idempotent or read-only — the recording-phase drain
 	// barrier already stopped the load — so a caller that then loses the CAS
 	// has changed nothing; only the winner records the verdict.
-	o.stopZeusAttacks(ctx, pws)
-	o.stopPhaseRuns(ctx, pws)
+	stoppedAttacks := o.stopZeusAttacks(ctx, phaseID, pws, nil, slog.LevelWarn)
+	stoppedRuns := o.stopPhaseRuns(ctx, phaseID, pws, nil)
 	var pull *fidelityPull
 	if status == "completed" && len(p.FrozenServices) > 0 {
 		pull = o.pullFidelity(ctx, p)
@@ -549,14 +551,14 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	// recorded a driver or its poller after the snapshot above, while this
 	// call stopped the load and pulled the fidelity snapshots; the CAS ended
 	// that claim, and the rows read in its critical section (final) name
-	// every driver recorded before it — the poller was cancelled there too. Every
-	// driver they name is stopped, not only the new ones: a handle is
-	// recorded before zeus accepts its driver (an attack's id), so the stop
-	// above can have reached zeus before the driver existed. Stopping a
-	// stopped driver is a no-op.
+	// every driver recorded before it — the poller was cancelled there too. A
+	// driver the stop above confirmed stopped is skipped; every other one is
+	// stopped, a new handle or not: a handle is recorded before zeus accepts
+	// its driver (an attack's id), so the stop above can have reached zeus
+	// before the driver existed, which zeus answers 404 (logged at Debug here).
 	if final != nil {
-		o.stopZeusAttacks(ctx, final)
-		o.stopPhaseRuns(ctx, final)
+		o.stopZeusAttacks(ctx, phaseID, final, stoppedAttacks, slog.LevelDebug)
+		o.stopPhaseRuns(ctx, phaseID, final, stoppedRuns)
 		pws = final
 	}
 
@@ -874,39 +876,58 @@ func runDatasetID(row, fallback string) string {
 	return fallback
 }
 
-// stopPhaseRuns best-effort stops every workflow run recorded on the phase.
-func (o *Orchestrator) stopPhaseRuns(ctx context.Context, pws []model.PhaseWorkflow) {
+// stopPhaseRuns best-effort stops every workflow run recorded on the phase,
+// except those in skip, and returns the ids it stopped. A failed stop is
+// logged with the run and phase ids (StopRun already treats an unknown or
+// finished run as stopped).
+func (o *Orchestrator) stopPhaseRuns(ctx context.Context, phaseID string, pws []model.PhaseWorkflow, skip map[string]bool) map[string]bool {
+	stopped := map[string]bool{}
 	if o.zeusClient == nil {
-		return
+		return stopped
 	}
 	for _, pw := range pws {
-		if pw.ZeusRunID == "" {
+		if pw.ZeusRunID == "" || skip[pw.ZeusRunID] || stopped[pw.ZeusRunID] {
 			continue
 		}
 		if err := o.zeusClient.StopRun(ctx, pw.ZeusRunID); err != nil {
 			o.logger.Warn("orchestrator: stop zeus run failed",
-				"attack_id", pw.ZeusRunID, "error", err)
+				"phase_id", phaseID, "run_id", pw.ZeusRunID, "error", err)
+			continue
 		}
+		stopped[pw.ZeusRunID] = true
 	}
+	return stopped
 }
 
-// stopZeusAttacks stops each of the phase's running zeus attacks. Best-effort:
-// a stop error (e.g. an already-finished attack) is logged, not fatal. Safe to
-// call more than once (the drain barrier stops attacks before the gate; the
-// terminal teardown calls it again).
-func (o *Orchestrator) stopZeusAttacks(ctx context.Context, pws []model.PhaseWorkflow) {
+// stopZeusAttacks stops each of the phase's zeus attacks, except those in
+// skip, and returns the ids zeus confirmed stopped. Best-effort: a stop error
+// is logged with the attack and phase ids, not fatal. Safe to call more than
+// once (the drain barrier stops attacks before the gate; the terminal teardown
+// calls it again). gone is the level for a 404 or 409 from zeus (an attack it
+// does not know, or one already over): Warn on a first stop, Debug on the
+// post-terminal sweep, where an attack the first stop missed is expected.
+func (o *Orchestrator) stopZeusAttacks(ctx context.Context, phaseID string, pws []model.PhaseWorkflow, skip map[string]bool, gone slog.Level) map[string]bool {
+	stopped := map[string]bool{}
 	if o.zeusClient == nil {
-		return
+		return stopped
 	}
 	for _, pw := range pws {
-		if pw.ZeusAttackID == "" {
+		if pw.ZeusAttackID == "" || skip[pw.ZeusAttackID] || stopped[pw.ZeusAttackID] {
 			continue
 		}
 		if err := o.zeusClient.StopAttack(ctx, pw.ZeusAttackID); err != nil {
-			o.logger.Warn("orchestrator: zeus attack stop failed",
-				"attack_id", pw.ZeusAttackID, "error", err)
+			level := slog.LevelWarn
+			var re *zeus.ResponseError
+			if errors.As(err, &re) && (re.Status == http.StatusNotFound || re.Status == http.StatusConflict) {
+				level = gone
+			}
+			o.logger.Log(ctx, level, "orchestrator: zeus attack stop failed",
+				"phase_id", phaseID, "attack_id", pw.ZeusAttackID, "error", err)
+			continue
 		}
+		stopped[pw.ZeusAttackID] = true
 	}
+	return stopped
 }
 
 // =========================================================================

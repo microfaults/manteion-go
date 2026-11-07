@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"maps"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,5 +142,38 @@ func TestStopPhase_DuringAnEntrysAttackStart_LeavesNoLoadRunning(t *testing.T) {
 	}
 	if got := getPhase(t, ph.ID); got.Status != "skipped" {
 		t.Errorf("phase = %s, want skipped (the stop's)", got.Status)
+	}
+}
+
+// The post-terminal sweep skips a driver the pre-transition teardown already
+// stopped: on a plain stop, with no entry in flight, zeus is asked to stop each
+// run and each attack exactly once.
+func TestStopPhase_SweepSkipsTheDriversAlreadyStopped(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	_, phases := mkExperiment(t, 1)
+	ph := phases[0]
+	attachAttackWorkflow(t, ph.ID, model.PhaseWorkflow{VUs: 1, DurationSec: 30, TargetURL: "http://target.invalid/"}) // a run and an attack
+	t.Cleanup(func() { o.cancelPoller(ph.ID) })
+	if err := o.StartPhase(ctx, ph.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	var mu sync.Mutex
+	stops := map[string]int{}
+	fz.onStop(func(kind, id string) {
+		mu.Lock()
+		defer mu.Unlock()
+		stops[kind+" "+id]++
+	})
+	if err := o.StopPhase(ctx, ph.ID, "skipped"); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	run, attack := rowHandles(t, ph.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	want := map[string]int{"run " + run: 1, "attack " + attack: 1}
+	if !maps.Equal(stops, want) {
+		t.Fatalf("stops = %v, want each driver stopped once: %v", stops, want)
 	}
 }
