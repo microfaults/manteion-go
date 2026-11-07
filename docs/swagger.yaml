@@ -73,6 +73,16 @@ components:
           uniqueItems: false
         address:
           type: string
+        applied_generation:
+          description: 'AppliedGeneration is the generation the last stored status
+            report was
+
+            applied at, written with its replay-set state from the same report: it
+
+            says which generation that state belongs to (the convergence barrier
+
+            counts a frozen service''s replay set only when it is at the target).'
+          type: integer
         capabilities:
           description: 'Capabilities lists the fault categories the host executes
 
@@ -667,6 +677,16 @@ components:
       properties:
         address:
           type: string
+        applied_generation:
+          description: 'AppliedGeneration is the generation the last stored status
+            report was
+
+            applied at, written with its replay-set state from the same report: it
+
+            says which generation that state belongs to (the convergence barrier
+
+            counts a frozen service''s replay set only when it is at the target).'
+          type: integer
         capabilities:
           description: 'Capabilities lists the fault categories the host executes
 
@@ -1707,13 +1727,21 @@ paths:
 
         id and state (an absent replay_set means the instance holds none and
 
-        clears them) on the instance row, and raises observed_generation to
+        clears them) on the instance row, together with applied_generation, the
+
+        generation the report was applied at, so the row says which generation its
+
+        replay-set state belongs to. It raises observed_generation to
 
         applied_generation, never lowering it (the poll records the version the
 
-        instance holds and is its authoritative writer). GET /sdk/instances
+        instance holds and is its authoritative writer). A report applied below
 
-        exposes them and the orchestrator''s convergence barrier reads them.'
+        the stored applied_generation is a stale snapshot (a delayed older report):
+
+        it is dropped with 200 and nothing is written. GET /sdk/instances exposes
+
+        the columns and the orchestrator''s convergence barrier reads them.'
       requestBody:
         content:
           application/json:
@@ -1726,6 +1754,13 @@ paths:
         description: applied-state report
         required: true
       responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+          description: 'stale report dropped: applied_generation is below the stored
+            one; nothing written'
         '204':
           description: stored
         '400':

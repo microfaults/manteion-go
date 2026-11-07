@@ -35,7 +35,7 @@ END`
 // computed from poll staleness, not stored. scanInstance scans in this order.
 var selectColumns = fmt.Sprintf(
 	`id, service, version, address, poll_interval_ms, routes, registered_at, last_poll_at,
-	 host_kind, capabilities, observed_generation, observed_etag, observed_unsupported, observed_errors,
+	 host_kind, capabilities, observed_generation, applied_generation, observed_etag, observed_unsupported, observed_errors,
 	 replay_set_id, replay_set_state, observed_at, %s AS status`,
 	statusExpr,
 )
@@ -85,6 +85,7 @@ func (r *SDKRepo) Register(ctx context.Context, inst *model.SDKInstance) error {
 			host_kind = EXCLUDED.host_kind,
 			capabilities = EXCLUDED.capabilities,
 			observed_generation = 0,
+			applied_generation = 0,
 			observed_etag = '',
 			observed_unsupported = NULL,
 			observed_errors = NULL,
@@ -127,7 +128,7 @@ func scanInstance(scanner interface {
 	)
 	if err := scanner.Scan(&inst.ID, &inst.Service, &inst.Version, &inst.Address,
 		&inst.PollIntervalMs, &routesRaw, &inst.RegisteredAt, &inst.LastPollAt,
-		&inst.Host, &capsRaw, &inst.ObservedGeneration, &inst.ObservedEtag, &unsupportedRaw, &errorsRaw,
+		&inst.Host, &capsRaw, &inst.ObservedGeneration, &inst.AppliedGeneration, &inst.ObservedEtag, &unsupportedRaw, &errorsRaw,
 		&inst.ReplaySetID, &inst.ReplaySetState, &observedAt, &inst.Status); err != nil {
 		return nil, err
 	}
@@ -253,6 +254,13 @@ func (r *SDKRepo) RecordPoll(ctx context.Context, id string, observedGeneration 
 // moves forward here: the poll (RecordPoll) is its authoritative writer, and a
 // report built before the instance adopted a newer generation from a 304 but
 // processed after its next poll must not set it back. Register still resets it.
+//
+// applied_generation is written from the report's AppliedGeneration in the same
+// statement as the replay-set columns, so the row always says which generation
+// its replay-set state belongs to. A report applied below the stored
+// applied_generation is a stale snapshot (a delayed older report arriving after
+// a newer one): nothing is written and the error is ErrStaleStatus. A report at
+// the stored generation is taken (fetching -> committed within one apply).
 func (r *SDKRepo) RecordStatus(ctx context.Context, id string, st model.ObservedStatus) error {
 	unsupported, err := jsonbOrNull(st.Unsupported)
 	if err != nil {
@@ -268,16 +276,30 @@ func (r *SDKRepo) RecordStatus(ctx context.Context, id string, st model.Observed
 	}
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE sdk_instances SET
-			observed_generation = GREATEST(observed_generation, $2), observed_etag = $3,
-			observed_unsupported = $4, observed_errors = $5,
+			observed_generation = GREATEST(observed_generation, $2), applied_generation = $2,
+			observed_etag = $3, observed_unsupported = $4, observed_errors = $5,
 			replay_set_id = $6, replay_set_state = $7,
 			observed_at = now()
-		WHERE id = $1`,
+		WHERE id = $1 AND applied_generation <= $2`,
 		id, st.AppliedGeneration, st.Etag, unsupported, errs, replayID, replayState)
 	if err != nil {
 		return fmt.Errorf("record status: %w", err)
 	}
-	return affectedOrNotFound(res)
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("record status: rows affected: %w", err)
+	} else if n > 0 {
+		return nil
+	}
+	// No row written: the instance is unknown, or the report is stale.
+	var stored uint64
+	err = r.db.QueryRowContext(ctx, `SELECT applied_generation FROM sdk_instances WHERE id = $1`, id).Scan(&stored)
+	if err == sql.ErrNoRows {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("record status: read applied generation: %w", err)
+	}
+	return fmt.Errorf("%w: applied_generation %d is below the stored %d", ErrStaleStatus, st.AppliedGeneration, stored)
 }
 
 // jsonbOrNull encodes a list for a nullable JSONB column: an empty (or nil)

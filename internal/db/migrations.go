@@ -114,6 +114,7 @@ var migrations = []migration{
 	{11, "experiments + experiment_phases: failure_reason (why a failed row failed)", migration11},
 	{12, "sdk_instances: host/capabilities + observed state; service_generations (desired-state v1)", migration12},
 	{13, "replay_artifacts: content-addressed replay sets per (phase, service) (desired-state v1)", migration13},
+	{14, "sdk_instances: applied_generation (the generation the stored status report was applied at)", migration14},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -707,4 +708,16 @@ CREATE TABLE IF NOT EXISTS replay_artifacts (
     PRIMARY KEY (phase_id, service)
 );
 CREATE INDEX IF NOT EXISTS idx_replay_artifacts_id ON replay_artifacts(id);
+`
+
+// migration14 records the generation an instance's last stored status report
+// was applied at. The report writes it together with its replay-set id and
+// state, so the pair says which generation that state belongs to: artifact ids
+// are content hashes that recur across phases off one baseline, and a
+// committed state from an older generation is no evidence the instance holds
+// the set under the new pair. A report applied below the stored value is a
+// stale snapshot and writes nothing. Register resets it to 0 with the rest of
+// the observed state. IF NOT EXISTS keeps the step re-runnable.
+const migration14 = `
+ALTER TABLE sdk_instances ADD COLUMN IF NOT EXISTS applied_generation BIGINT NOT NULL DEFAULT 0;
 `

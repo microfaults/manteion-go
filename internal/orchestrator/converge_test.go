@@ -229,6 +229,78 @@ func TestWaitConverged_ReplaySetMustBeTheAssignedOneCommitted(t *testing.T) {
 	}
 }
 
+// The replay-set columns count for a frozen service only once the instance
+// reported them applied at the target generation (applied_generation, migration
+// 14). Artifact ids are content hashes that recur across phases off one
+// baseline, so a committed state stored under an older generation is no
+// evidence the instance holds the set under the new pair: the poll alone
+// (observed_generation at the target) does not pass the barrier, a delayed
+// older committed report arriving after the fetching one is dropped (the row
+// stays at the target, fetching), and an older failed report is not the fast
+// path. A report applied at the target, committed, passes.
+func TestWaitConverged_ReplaySetEvidenceIsAppliedAtTheTarget(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	svc := id.New("svc-applied")
+	const art = "sha256:dddd"
+	prev := bumpService(t, o, svc)
+	target := bumpService(t, o, svc)
+	targets, artifacts := map[string]uint64{svc: target}, map[string]string{svc: art}
+	report := func(inst string, applied uint64, state string) error {
+		return testSDKRepo.RecordStatus(ctx, inst, model.ObservedStatus{AppliedGeneration: applied,
+			ReplaySet: &model.ReplaySetStatus{ID: art, State: state}})
+	}
+	lags := func(step, want string) {
+		t.Helper()
+		err := o.waitConverged(ctx, targets, artifacts, 200*time.Millisecond, nil)
+		if err == nil || !strings.Contains(err.Error(), "still lagging") || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want a lagging timeout with %q", step, err, want)
+		}
+	}
+
+	// The set committed under the previous phase; the fetching report for the
+	// new one was lost, and the instance's poll reports the target.
+	held := registerSDK(t, svc, "http://held.invalid")
+	if err := report(held, prev, "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testSDKRepo.RecordPoll(ctx, held, target); err != nil {
+		t.Fatal(err)
+	}
+	lags("committed applied at the previous generation", fmt.Sprintf("applied=%d target=%d", prev, target))
+
+	// A failed report from the previous generation is not the fast path.
+	if err := report(held, prev, "failed"); err != nil {
+		t.Fatal(err)
+	}
+	lags("failed applied at the previous generation", fmt.Sprintf("applied=%d target=%d", prev, target))
+
+	// fetching at the target, then the delayed committed report of the previous
+	// generation: dropped, the row stays (target, fetching).
+	if err := report(held, target, "fetching"); err != nil {
+		t.Fatal(err)
+	}
+	if err := report(held, prev, "committed"); !errors.Is(err, store.ErrStaleStatus) {
+		t.Fatalf("the delayed older report = %v, want store.ErrStaleStatus", err)
+	}
+	got, err := testSDKRepo.Get(ctx, held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppliedGeneration != target || got.ReplaySetState != "fetching" {
+		t.Errorf("row = applied %d %s, want (%d, fetching)", got.AppliedGeneration, got.ReplaySetState, target)
+	}
+	lags("fetching at the target after a stale committed", "replay_set="+art+"/fetching")
+
+	// The ordinary path: committed, applied at the target.
+	if err := report(held, target, "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.waitConverged(ctx, targets, artifacts, 5*time.Second, nil); err != nil {
+		t.Fatalf("committed at the target: waitConverged = %v, want nil", err)
+	}
+}
+
 // seedBaseline completes a baseline with n recorded entries for service.
 func seedBaseline(t *testing.T, o *Orchestrator, expID, service string, n int) *model.ExperimentPhase {
 	t.Helper()

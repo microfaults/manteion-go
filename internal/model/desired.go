@@ -35,8 +35,10 @@ func ValidReplaySetState(s string) bool {
 // snapshot of what the instance holds, so each field but AppliedGeneration
 // replaces the stored one: empty Unsupported and Errors clear, and an absent
 // (nil) ReplaySet means the instance holds none and clears the stored id/state.
-// AppliedGeneration only raises the stored observed generation, whose
-// authoritative writer is the poll.
+// AppliedGeneration is stored as the row's applied generation, beside the
+// replay-set state it describes, and only raises the stored observed
+// generation, whose authoritative writer is the poll. A report applied below
+// the stored applied generation is stale and writes nothing.
 type ObservedStatus struct {
 	AppliedGeneration uint64
 	Etag              string

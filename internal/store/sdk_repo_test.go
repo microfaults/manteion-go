@@ -47,7 +47,7 @@ func TestSDKRepo_ObservedStateRoundTrip(t *testing.T) {
 		t.Fatalf("record status: %v", err)
 	}
 	got, _ = repo.Get(ctx, inst.ID)
-	if got.ObservedGeneration != 7 || got.ObservedEtag != "7-abcdef0123456789" || got.ObservedAt == nil ||
+	if got.ObservedGeneration != 7 || got.AppliedGeneration != 7 || got.ObservedEtag != "7-abcdef0123456789" || got.ObservedAt == nil ||
 		len(got.ObservedUnsupported) != 1 || got.ObservedUnsupported[0].Category != "resource" ||
 		len(got.ObservedErrors) != 1 || got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "fetching" {
 		t.Errorf("after status: %+v", got)
@@ -81,7 +81,7 @@ func TestSDKRepo_ObservedStateRoundTrip(t *testing.T) {
 	}
 	got, _ = repo.Get(ctx, inst.ID)
 	if got.ReplaySetID != "" || got.ReplaySetState != "" || len(got.ObservedUnsupported) != 0 || len(got.ObservedErrors) != 0 ||
-		got.ObservedGeneration != 8 || got.ObservedEtag != "" {
+		got.ObservedGeneration != 8 || got.AppliedGeneration != 8 || got.ObservedEtag != "" {
 		t.Errorf("after second status: %+v", got)
 	}
 
@@ -91,7 +91,7 @@ func TestSDKRepo_ObservedStateRoundTrip(t *testing.T) {
 		t.Fatalf("re-register: %v", err)
 	}
 	got, _ = repo.Get(ctx, inst.ID)
-	if got.Capabilities != nil || got.ObservedGeneration != 0 || got.ObservedEtag != "" || got.ReplaySetID != "" || got.ObservedAt != nil {
+	if got.Capabilities != nil || got.ObservedGeneration != 0 || got.AppliedGeneration != 0 || got.ObservedEtag != "" || got.ReplaySetID != "" || got.ObservedAt != nil {
 		t.Errorf("after re-register: %+v", got)
 	}
 	// ForService and List share the scanner.
@@ -181,7 +181,7 @@ func TestSDKRepo_ReRegisterResetsObservedState(t *testing.T) {
 	if got.Host != "sidecar" || len(got.Capabilities) != 2 || got.Capabilities[0] != "network" {
 		t.Errorf("re-register host/capabilities = %q/%v, want sidecar/[network resource]", got.Host, got.Capabilities)
 	}
-	if got.ObservedGeneration != 0 || got.ObservedEtag != "" || got.ObservedUnsupported != nil || got.ObservedErrors != nil ||
+	if got.ObservedGeneration != 0 || got.AppliedGeneration != 0 || got.ObservedEtag != "" || got.ObservedUnsupported != nil || got.ObservedErrors != nil ||
 		got.ReplaySetID != "" || got.ReplaySetState != "" || got.ObservedAt != nil {
 		t.Errorf("re-register left observed state behind: %+v", got)
 	}
@@ -287,4 +287,54 @@ func TestSDKRepo_StatusNeverLowersTheObservedGeneration(t *testing.T) {
 	observed("re-registered", 0)
 	status(model.ObservedStatus{AppliedGeneration: 2})
 	observed("a status at 2 after re-registering", 2)
+}
+
+// TestSDKRepo_StaleStatusReportIsDropped pins applied_generation (migration
+// 14): every report stores the generation it was applied at together with its
+// replay-set columns, and a report applied at a generation below the stored
+// one is a stale snapshot that writes nothing and answers ErrStaleStatus. The
+// case it guards: a fetching report applied at N lands, then a delayed
+// committed report applied at N-1 (a set held under the previous phase, the
+// same content-hash id) arrives; last write wins would leave the row saying
+// committed while the instance still re-stages the set for N. A report at the
+// stored generation is still taken (fetching -> committed within one apply).
+func TestSDKRepo_StaleStatusReportIsDropped(t *testing.T) {
+	conn := testutil.TestDB(t)
+	ctx := context.Background()
+	repo := NewSDKRepo(conn)
+
+	inst := &model.SDKInstance{ID: "inst-stale", Service: "cartservice", Address: "10.0.0.6:9090"}
+	if err := repo.Register(ctx, inst); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := repo.RecordPoll(ctx, inst.ID, 5); err != nil {
+		t.Fatalf("record poll: %v", err)
+	}
+	if err := repo.RecordStatus(ctx, inst.ID, model.ObservedStatus{AppliedGeneration: 5, Etag: "5-new",
+		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}}); err != nil {
+		t.Fatalf("record status at 5: %v", err)
+	}
+	before, _ := repo.Get(ctx, inst.ID)
+
+	err := repo.RecordStatus(ctx, inst.ID, model.ObservedStatus{AppliedGeneration: 4, Etag: "4-old",
+		Errors: []string{"old"}, ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"}})
+	if !errors.Is(err, ErrStaleStatus) {
+		t.Fatalf("a report applied at 4 after one at 5 = %v, want ErrStaleStatus", err)
+	}
+	got, _ := repo.Get(ctx, inst.ID)
+	if got.AppliedGeneration != 5 || got.ReplaySetID != "sha256:aa" || got.ReplaySetState != "fetching" ||
+		got.ObservedEtag != "5-new" || len(got.ObservedErrors) != 0 || !got.ObservedAt.Equal(*before.ObservedAt) {
+		t.Errorf("the stale report wrote something: %+v, was %+v", got, before)
+	}
+
+	if err := repo.RecordStatus(ctx, inst.ID, model.ObservedStatus{AppliedGeneration: 5, Etag: "5-new",
+		ReplaySet: &model.ReplaySetStatus{ID: "sha256:aa", State: "committed"}}); err != nil {
+		t.Fatalf("a report at the stored generation: %v", err)
+	}
+	if got, _ := repo.Get(ctx, inst.ID); got.AppliedGeneration != 5 || got.ReplaySetState != "committed" {
+		t.Errorf("after the commit at 5: %+v, want (5, committed)", got)
+	}
+	if err := repo.RecordStatus(ctx, "inst-missing", model.ObservedStatus{AppliedGeneration: 1}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RecordStatus on an unknown instance = %v, want ErrNotFound, not stale", err)
+	}
 }

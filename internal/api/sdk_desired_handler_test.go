@@ -32,7 +32,8 @@ import (
 // It mirrors store.SDKRepo's contract: Register validates, stores an empty
 // capability list as absent (NULL) and clears the observed state; a poll sets
 // the observed generation; a status report is a full snapshot that only
-// raises it. Timestamps are not modelled.
+// raises it, and one applied below the stored applied generation is dropped as
+// stale. Timestamps are not modelled.
 type fakeRegistry struct {
 	mu    sync.Mutex
 	byID  map[string]*model.SDKInstance
@@ -79,7 +80,7 @@ func (f *fakeRegistry) Register(_ context.Context, inst *model.SDKInstance) erro
 	if len(cp.Capabilities) == 0 {
 		cp.Capabilities = nil
 	}
-	cp.ObservedGeneration, cp.ObservedEtag, cp.ReplaySetID, cp.ReplaySetState = 0, "", "", ""
+	cp.ObservedGeneration, cp.AppliedGeneration, cp.ObservedEtag, cp.ReplaySetID, cp.ReplaySetState = 0, 0, "", "", ""
 	cp.ObservedUnsupported, cp.ObservedErrors, cp.ObservedAt = nil, nil, nil
 	f.byID[inst.ID] = &cp
 	return nil
@@ -107,6 +108,10 @@ func (f *fakeRegistry) RecordStatus(_ context.Context, id string, st model.Obser
 	if !ok {
 		return store.ErrNotFound
 	}
+	if st.AppliedGeneration < i.AppliedGeneration {
+		return store.ErrStaleStatus // a stale snapshot writes nothing
+	}
+	i.AppliedGeneration = st.AppliedGeneration
 	i.ObservedGeneration, i.ObservedEtag = max(i.ObservedGeneration, st.AppliedGeneration), st.Etag
 	i.ObservedUnsupported, i.ObservedErrors = st.Unsupported, st.Errors
 	i.ReplaySetID, i.ReplaySetState = "", "" // a report without replay_set holds none
@@ -1534,7 +1539,7 @@ func TestHandleSDKStatus_AbsentListsClear(t *testing.T) {
 		{"empty lists", head + `,"unsupported":[],"errors":[]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 1, Etag: "1-a",
+			if w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 2, Etag: "1-a",
 				Unsupported: []atroposdk.UnsupportedRule{{Rule: "cpu-quota", Category: "resource"}}, Errors: []string{"boom"}}); w.Code != http.StatusNoContent {
 				t.Fatalf("seed report: status = %d body = %s", w.Code, w.Body.String())
 			}
@@ -1546,6 +1551,35 @@ func TestHandleSDKStatus_AbsentListsClear(t *testing.T) {
 				t.Errorf("stored = %+v, want generation 2 with both lists cleared", got)
 			}
 		})
+	}
+}
+
+// A report applied at a generation below the stored one is a stale snapshot:
+// it is dropped (200, logged at Debug, nothing written), so a delayed older
+// report cannot overwrite a newer one's replay-set state. The SDK treats any
+// 2xx as delivered, so it does not re-send it.
+func TestHandleSDKStatus_StaleReportIsDropped(t *testing.T) {
+	ctx := context.Background()
+	fx := newDesiredFixture(&model.SDKInstance{ID: "cart-1", Service: "cartservice"})
+	s := fx.server()
+	var logs bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 5, Etag: "5-new",
+		ReplaySet: &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "fetching"}}); w.Code != http.StatusNoContent {
+		t.Fatalf("seed report: status = %d body = %s", w.Code, w.Body.String())
+	}
+	stored, _ := fx.reg.Get(ctx, "cart-1")
+
+	w := postStatus(t, s, atroposdk.StatusReport{InstanceID: "cart-1", Service: "cartservice", AppliedGeneration: 4, Etag: "4-old",
+		Errors: []string{"old"}, ReplaySet: &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "committed"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("stale report: status = %d body = %s, want 200", w.Code, w.Body.String())
+	}
+	if got, _ := fx.reg.Get(ctx, "cart-1"); !reflect.DeepEqual(got, stored) {
+		t.Errorf("the stale report changed the stored one: %+v, was %+v", got, stored)
+	}
+	if got := logs.String(); !strings.Contains(got, `level=DEBUG msg="sdk status: stale report dropped" instance_id=cart-1`) {
+		t.Errorf("logs = %q, want the drop logged at Debug against the instance", got)
 	}
 }
 
@@ -1668,6 +1702,19 @@ func TestHandleSDKStatus_DB(t *testing.T) {
 	if got, _ := detail(); got.ObservedGeneration != 4 || got.ObservedEtag != "4-def" || len(got.ObservedUnsupported) != 0 ||
 		len(got.ObservedErrors) != 0 || got.ReplaySetID != "" || got.ReplaySetState != "" {
 		t.Errorf("after the null-lists report: %+v, want nothing observed but generation 4", got)
+	}
+
+	// A report applied below the stored generation is stale: 200, nothing written.
+	if w := report(func(r *atroposdk.StatusReport) {
+		r.AppliedGeneration, r.Etag = 3, "3-abc"
+		r.ReplaySet = &atroposdk.ReplaySetStatus{ID: "sha256:aa", State: "committed"}
+	}); w.Code != http.StatusOK {
+		t.Fatalf("stale report: status = %d body = %s, want 200", w.Code, w.Body.String())
+	}
+	if got, keys := detail(); got.AppliedGeneration != 4 || got.ObservedEtag != "4-def" || got.ReplaySetID != "" {
+		t.Errorf("after the stale report: %+v, want the generation-4 snapshot kept", got)
+	} else if _, ok := keys["applied_generation"]; !ok {
+		t.Errorf("instance detail lacks %q", "applied_generation")
 	}
 
 	// The BIGINT's maximum is stored; one more is refused before pgx sees it.

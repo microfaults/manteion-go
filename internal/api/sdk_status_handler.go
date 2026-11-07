@@ -19,14 +19,19 @@ import (
 // @Description  of what the instance holds and replaces the previous one: it stores
 // @Description  etag, unsupported rules and errors (empty lists clear) and the replay-set
 // @Description  id and state (an absent replay_set means the instance holds none and
-// @Description  clears them) on the instance row, and raises observed_generation to
+// @Description  clears them) on the instance row, together with applied_generation, the
+// @Description  generation the report was applied at, so the row says which generation its
+// @Description  replay-set state belongs to. It raises observed_generation to
 // @Description  applied_generation, never lowering it (the poll records the version the
-// @Description  instance holds and is its authoritative writer). GET /sdk/instances
-// @Description  exposes them and the orchestrator's convergence barrier reads them.
+// @Description  instance holds and is its authoritative writer). A report applied below
+// @Description  the stored applied_generation is a stale snapshot (a delayed older report):
+// @Description  it is dropped with 200 and nothing is written. GET /sdk/instances exposes
+// @Description  the columns and the orchestrator's convergence barrier reads them.
 // @Tags         sdk
 // @Accept       json
 // @Produce      json
 // @Param        report  body  atroposdk.StatusReport  true  "applied-state report"
+// @Success      200  "stale report dropped: applied_generation is below the stored one; nothing written"
 // @Success      204  "stored"
 // @Failure      400  {object}  api.ErrorResponse  "invalid JSON, missing instance_id or service, applied_generation above 9223372036854775807, or unknown replay_set.state"
 // @Failure      404  {object}  api.ErrorResponse  "unknown instance"
@@ -60,6 +65,11 @@ func (s *Server) handleSDKStatus(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "instance not found")
+	case errors.Is(err, store.ErrStaleStatus):
+		// A delayed older snapshot: the stored one is newer. Answer 2xx so the
+		// SDK does not re-send it.
+		s.logger.DebugContext(r.Context(), "sdk status: stale report dropped", "instance_id", rep.InstanceID, "error", err)
+		w.WriteHeader(http.StatusOK)
 	case err != nil:
 		s.logger.Error("sdk status: record failed", "instance_id", rep.InstanceID, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to record status")

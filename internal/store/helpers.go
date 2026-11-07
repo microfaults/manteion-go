@@ -21,6 +21,12 @@ var ErrNotFound = errors.New("store: not found")
 // unique constraint (Postgres 23505); handlers map it to 409.
 var ErrConflict = errors.New("store: conflict")
 
+// ErrStaleStatus is returned by SDKRepo.RecordStatus for a status report
+// applied at a generation below the one the stored report was applied at: a
+// stale snapshot, dropped without writing anything. The status handler
+// answers it 200 (the SDK must not re-send it).
+var ErrStaleStatus = errors.New("store: stale status report")
+
 // ErrValidation tags a write refused because the value itself is invalid —
 // a model.Validate failure, an unknown workflow/rule id (foreign key) — as
 // opposed to a state or uniqueness conflict; handlers map it to 422. The

@@ -23,7 +23,12 @@ const (
 // waitConverged is the convergence barrier (desired-state contract §4). It
 // blocks until every alive instance of each service in targets reports
 // observed_generation >= the service's target and, for a service in artifacts
-// (a frozen one), holds that artifact committed. observed_generation is
+// (a frozen one), holds that artifact committed in a status report applied at
+// the target or later (applied_generation >= target): artifact ids are content
+// hashes that recur across phases, so a replay-set state stored from an older
+// generation's report is no evidence the set is held under the new pair, and
+// the status store drops a report older than the stored one, so a delayed
+// older committed cannot overwrite a newer fetching. observed_generation is
 // compared with >=, never ==: it can lag one poll, and a later bump can carry
 // an instance past the target. The fleet is re-read on every tick, so an
 // instance that registers, recovers or falls behind meanwhile counts from the
@@ -40,10 +45,11 @@ const (
 // frozen service with no target (its bump failed, which is never "nothing to
 // wait for") or with no alive instance to hold its replay set (INV-4), an
 // alive instance of a frozen service whose host has no cache-box, and an
-// instance reporting the assigned set failed. That last one is an optimization
-// only: the SDK can fold a failed report into a later fetching one and retries
-// a failed pull on its own timer, so the timeout stays the guarantee. On
-// timeout the error lists every lagging instance.
+// instance reporting the assigned set failed in a report applied at the target
+// or later (a failure from an older generation is not evidence). That last one
+// is an optimization only: the SDK can fold a failed report into a later
+// fetching one and retries a failed pull on its own timer, so the timeout stays
+// the guarantee. On timeout the error lists every lagging instance.
 //
 // holds, when non-nil, is asked before each look whether the wait still has a
 // reason: an entry's wait passes entryHolds, so a pause, a stop or a newer
@@ -123,6 +129,12 @@ func (o *Orchestrator) laggingInstances(ctx context.Context, targets map[string]
 					inst.ID, svc, strings.Join(inst.Capabilities, ","))
 			case inst.ObservedGeneration < target:
 				lagging = append(lagging, withErrors(fmt.Sprintf("%s(%s): observed=%d target=%d", inst.ID, svc, inst.ObservedGeneration, target), inst))
+			case frozen && inst.AppliedGeneration < target:
+				// The replay-set columns belong to an older generation's report:
+				// ids recur across phases, so a committed (or failed) set from
+				// then is no evidence about the set under this phase's pair.
+				lagging = append(lagging, withErrors(fmt.Sprintf("%s(%s): applied=%d target=%d replay_set=%s",
+					inst.ID, svc, inst.AppliedGeneration, target, replaySetOf(inst)), inst))
 			case frozen && inst.ReplaySetID == artifact && inst.ReplaySetState == "failed":
 				return nil, nil, fmt.Errorf("%s(%s): replay set %s failed: %s", inst.ID, svc, artifact, observedErrors(inst))
 			case frozen && (inst.ReplaySetID != artifact || inst.ReplaySetState != "committed"):

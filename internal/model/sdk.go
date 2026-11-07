@@ -57,7 +57,12 @@ type SDKInstance struct {
 	// Observed state (desired-state protocol v1): what the instance last told
 	// us it holds. ObservedGeneration comes from the poll's version param and
 	// the status report; the rest only from POST /api/v1/sdk/status.
-	ObservedGeneration  uint64            `json:"observed_generation"`
+	ObservedGeneration uint64 `json:"observed_generation"`
+	// AppliedGeneration is the generation the last stored status report was
+	// applied at, written with its replay-set state from the same report: it
+	// says which generation that state belongs to (the convergence barrier
+	// counts a frozen service's replay set only when it is at the target).
+	AppliedGeneration   uint64            `json:"applied_generation"`
 	ObservedEtag        string            `json:"observed_etag,omitempty"`
 	ObservedUnsupported []UnsupportedRule `json:"observed_unsupported,omitempty"`
 	ObservedErrors      []string          `json:"observed_errors,omitempty"`
