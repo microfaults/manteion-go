@@ -247,7 +247,7 @@ func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 // phases is still one row, under the first of them in the order running phases
 // are considered everywhere else (newest-started, a missing start time last,
 // then id: ListRunningPhases), so it names the phase the synthesized cache-box
-// rule names. The join is LIMIT 1 per rule for that reason; it must never
+// rule names when the attached running phases involve its service. The join is LIMIT 1 per rule for that reason; it must never
 // multiply rows, which would deliver the rule once per phase.
 func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `

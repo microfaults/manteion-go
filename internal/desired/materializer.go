@@ -17,7 +17,10 @@ import (
 // function of them: the real repositories satisfy them, and tests pass fakes.
 
 // RuleSource returns the rules a service should currently enforce (enabled,
-// phase-aware), in the order the SDK evaluates them.
+// phase-aware), in the order the SDK evaluates them, each with its served pair
+// (model.Rule.ServedPhaseID/ServedExperimentID: the running phase it is served
+// through, empty for a rule attached to no phase), which the compiler turns
+// into a cache-box rule's context.
 type RuleSource interface {
 	ForService(ctx context.Context, service string) ([]*model.Rule, error)
 }

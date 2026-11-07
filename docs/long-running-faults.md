@@ -52,9 +52,8 @@ is desired), and the SDK reconciles against them. Two consequences worth knowing
   `active_faults` are the service's active fault configs, filtered by the
   instance's capabilities. The register response emits `active_faults`
   (plural) instead of the legacy singular `active_fault`, which the old SDK
-  ignored. Experiment faults held in the in-memory intent tracker are no longer
-  served.
+  ignored. Experiment faults once held in an in-memory intent tracker (removed
+  with the push paths) are not served.
 - `freeze_cfg` is derived from the database: the running phase that freezes
-  the service (and `replay_set` from the artifact assigned to it), not from the
-  in-memory intent tracker, so a manteion restart while a service is frozen
-  does not lose it.
+  the service (and `replay_set` from the artifact assigned to it), so a
+  manteion restart while a service is frozen does not lose it.

@@ -37,21 +37,21 @@ type phaseReader interface {
 // epoch; it decodes as 0 and they keep the old (experiment, phase, instance,
 // batch_seq) key.
 type ingestEnvelope struct {
-	Service      string                        `json:"service"`
-	Instance     string                        `json:"instance"`
+	Service      string                        `json:"service" example:"cartservice"`
+	Instance     string                        `json:"instance" example:"cartservice-7d9f-abcde"`
 	ExperimentID string                        `json:"experiment_id"`
 	PhaseID      string                        `json:"phase_id"`
-	BatchSeq     int                           `json:"batch_seq"`
-	Epoch        int64                         `json:"epoch,omitempty"`
+	BatchSeq     int                           `json:"batch_seq" example:"1"`                         // 1-based, monotonic within one epoch
+	Epoch        int64                         `json:"epoch,omitempty" example:"1793836800000000000"` // the instance's start time, unix nanoseconds; absent = 0 (old clients)
 	Entries      []atroposdk.CacheBoxWireEntry `json:"entries"`
-}
+} //	@name	CacheIngestEnvelope
 
 // ingestResult is the ingest response body (wire spec §W2): the number of
 // entries newly accepted and whether the batch was a duplicate.
 type ingestResult struct {
 	Accepted  int  `json:"accepted"`
 	Duplicate bool `json:"duplicate"`
-}
+} //	@name	CacheIngestResult
 
 // isActiveRecordingPair reports whether the phase still accepts recorded pushes:
 // it persists cache and is either actively recording (running) or draining. The
@@ -65,6 +65,25 @@ func isActiveRecordingPair(p *model.ExperimentPhase) bool {
 // them under the (experiment_id, phase_id) pair. The push is accepted only when
 // that pair names an actively recording phase (INV-5); retried batches (same
 // epoch and batch_seq) are deduped so received counts stay exact (INV-7).
+//
+// @Summary      Ingest recorded cache-box entries
+// @Description  A batch of entries an SDK instance recorded for an (experiment_id, phase_id)
+// @Description  pair, accepted only while that pair names a phase that persists its cache
+// @Description  and is running or draining. Deduped on (experiment, phase, instance, epoch,
+// @Description  batch_seq): epoch is the instance's start time in unix nanoseconds, so a
+// @Description  restarted instance, starting batch_seq over at 1, never collides with its
+// @Description  previous process's batches; a retried batch answers duplicate=true and
+// @Description  accepts nothing. A body without epoch is epoch 0.
+// @Tags         cache
+// @Accept       json
+// @Produce      json
+// @Param        body  body      api.ingestEnvelope  true  "the batch"
+// @Success      200   {object}  api.ingestResult    "entries accepted; duplicate for a retried batch"
+// @Failure      400   {object}  api.ErrorResponse   "malformed JSON, or service, experiment_id or phase_id missing"
+// @Failure      404   {object}  api.ErrorResponse   "phase not found"
+// @Failure      409   {object}  api.ErrorResponse   "phase_not_recording: the pair names no phase recording now"
+// @Failure      500   {object}  api.ErrorResponse   "phase lookup or write failed"
+// @Router       /cache/ingest [post]
 func (s *Server) handleCacheIngest(w http.ResponseWriter, r *http.Request) {
 	var env ingestEnvelope
 	defer r.Body.Close()

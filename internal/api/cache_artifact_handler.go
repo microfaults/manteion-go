@@ -48,7 +48,7 @@ var artifactIDRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // @Success      200  {string}  binary  "the artifact; headers ETag, Content-Length"
 // @Success      206  {string}  binary  "the requested byte range; headers ETag, Content-Range"
 // @Success      304  "unchanged; the artifact is immutable"
-// @Failure      404  {object}  api.ErrorResponse  "unknown artifact (an id that is not sha256: and 64 lowercase hex digits is unknown too)"
+// @Failure      404  {object}  api.ErrorResponse  "unknown artifact (an id that is not `sha256:` followed by 64 lowercase hex digits is treated as unknown)"
 // @Failure      416  "range not satisfiable"
 // @Failure      500  {object}  api.ErrorResponse  "artifact lookup failed, or its file is unavailable"
 // @Router       /cache/artifacts/{id} [get]

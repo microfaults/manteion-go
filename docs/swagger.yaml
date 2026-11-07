@@ -1,5 +1,39 @@
 components:
   schemas:
+    CacheIngestEnvelope:
+      properties:
+        batch_seq:
+          description: 1-based, monotonic within one epoch
+          example: 1
+          type: integer
+        entries:
+          items:
+            $ref: '#/components/schemas/atropos.CacheBoxWireEntry'
+          type: array
+          uniqueItems: false
+        epoch:
+          description: the instance's start time, unix nanoseconds; absent = 0 (old
+            clients)
+          example: 1793836800000000000
+          type: integer
+        experiment_id:
+          type: string
+        instance:
+          example: cartservice-7d9f-abcde
+          type: string
+        phase_id:
+          type: string
+        service:
+          example: cartservice
+          type: string
+      type: object
+    CacheIngestResult:
+      properties:
+        accepted:
+          type: integer
+        duplicate:
+          type: boolean
+      type: object
     api.ErrorResponse:
       properties:
         error:
@@ -131,6 +165,36 @@ components:
           type: integer
         phase_id:
           type: string
+        strategy_version:
+          type: integer
+      type: object
+    atropos.CacheBoxWireEntry:
+      properties:
+        body:
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        header:
+          additionalProperties:
+            items:
+              type: string
+            type: array
+          type: object
+        key:
+          type: string
+        key_strategy:
+          type: string
+        observed_latency_us:
+          type: integer
+        recorded_at:
+          type: string
+        request_meta:
+          $ref: '#/components/schemas/cachebox.RequestMeta'
+        response_body_sha256:
+          type: string
+        status_code:
+          type: integer
         strategy_version:
           type: integer
       type: object
@@ -427,6 +491,15 @@ components:
         category:
           type: string
         rule:
+          type: string
+      type: object
+    cachebox.RequestMeta:
+      properties:
+        host:
+          type: string
+        method:
+          type: string
+        path:
           type: string
       type: object
     model.CacheBoxRuleConfig:
@@ -732,8 +805,8 @@ paths:
             application/x-ndjson:
               schema:
                 $ref: '#/components/schemas/api.ErrorResponse'
-          description: 'unknown artifact (an id that is not sha256: and 64 lowercase
-            hex digits is unknown too)'
+          description: unknown artifact (an id that is not `sha256:` followed by 64
+            lowercase hex digits is treated as unknown)
         '416':
           description: range not satisfiable
         '500':
@@ -743,6 +816,67 @@ paths:
                 $ref: '#/components/schemas/api.ErrorResponse'
           description: artifact lookup failed, or its file is unavailable
       summary: Fetch a replay-set artifact
+      tags:
+      - cache
+  /cache/ingest:
+    post:
+      description: 'A batch of entries an SDK instance recorded for an (experiment_id,
+        phase_id)
+
+        pair, accepted only while that pair names a phase that persists its cache
+
+        and is running or draining. Deduped on (experiment, phase, instance, epoch,
+
+        batch_seq): epoch is the instance''s start time in unix nanoseconds, so a
+
+        restarted instance, starting batch_seq over at 1, never collides with its
+
+        previous process''s batches; a retried batch answers duplicate=true and
+
+        accepts nothing. A body without epoch is epoch 0.'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/CacheIngestEnvelope'
+                description: the batch
+                summary: body
+        description: the batch
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheIngestResult'
+          description: entries accepted; duplicate for a retried batch
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: malformed JSON, or service, experiment_id or phase_id missing
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: phase not found
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: 'phase_not_recording: the pair names no phase recording now'
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api.ErrorResponse'
+          description: phase lookup or write failed
+      summary: Ingest recorded cache-box entries
       tags:
       - cache
   /faults/catalog:

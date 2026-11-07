@@ -13,7 +13,7 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 
 - `@Summary` — one-line imperative ("Create rule", "List workflows")
 - `@Description` — one paragraph; UI renders this as JSDoc
-- `@Tags` — one of: `rules`, `autorules`, `faults`, `sdk`, `experiments`, `workflows`, `zeus-proxy`, `health`, `admin`
+- `@Tags` — one of: `rules`, `autorules`, `faults`, `sdk`, `experiments`, `workflows`, `zeus-proxy`, `health`, `admin`, `cache`
 - `@Produce json` (or `text/event-stream` for SSE)
 - `@Accept json` (for routes that take a body)
 - `@Success` and `@Failure` for every documented status code
@@ -67,3 +67,6 @@ know not to over-trust the 4xx/5xx breakdown until the handler is fixed.
   `@Produce` to every response, so the 400 and 500 error responses render as
   `text/event-stream` although the handler writes them as JSON
   (`api.ErrorResponse`) before any stream starts.
+- `GET /cache/artifacts/{id}`: the same single-`@Produce` rule makes the JSON
+  error bodies (`api.ErrorResponse` on 404 and 500) render as
+  `application/x-ndjson`, the artifact's own type.

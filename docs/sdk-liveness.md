@@ -47,6 +47,39 @@ probing.
 Status is never persisted — it is a SQL expression over `last_poll_at` and
 `poll_interval_ms`.
 
+## Observed state (desired-state v1)
+
+Beside liveness, every instance row carries what the instance last told
+manteion it holds, exposed on `GET /api/v1/sdk/instances` and
+`GET /api/v1/sdk/instances/{id}`:
+
+| Field | Written by |
+|-------|------------|
+| `observed_generation` | every poll, from its `version` (the generation the instance holds); a status report never lowers it |
+| `observed_etag`, `observed_unsupported`, `observed_errors`, `replay_set_id`, `replay_set_state`, `observed_at` | `POST /api/v1/sdk/status`, a full snapshot after every apply and on each replay-set state change (`fetching`, `committed`, `failed`) |
+
+A (re-)registration resets all of them (`observed_generation` back to 0), so
+the convergence barrier waits for a freshly registered instance's first poll.
+
+The orchestrator's convergence barrier reads them. A phase entry or resume
+bumps the generation of each service the phase touches and waits, up to
+`MANTEION_CONVERGE_TIMEOUT` (default 30 s, at most 1 h), until every `alive`
+instance of those services has `observed_generation` at or above its bump and,
+on a frozen service, reports the assigned replay set `committed`. The timeout
+fails the entry (a resume goes back to `paused`), naming each lagging instance
+with its last reported errors; a phase start and a resume (of a phase or an
+experiment) answer 504 `not_converged` with the `lagging` and `suspect`
+lists. Only `alive` instances
+are waited on: a `stale` one is named as suspect and not waited on, so a pod
+that stopped polling (an old pod of a Deployment roll that never deregistered)
+cannot hold an entry up. A frozen service with no `alive` instance, a replay
+set an instance reports `failed`, and an instance of a frozen service whose
+host advertises no cache-box fail the entry at once. Exit and drain wait the
+same bound and only log.
+
+The computed `status` is unchanged by any of this: liveness stays the
+poll-arrival heartbeat above.
+
 ## Reaper (opt-in)
 
 A background reaper deletes instances that have been dead for more than 10
