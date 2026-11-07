@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"slices"
 	"time"
 
 	"manteion-go/internal/id"
@@ -26,9 +27,14 @@ type RuleStore interface {
 
 // SpecStore is the slice of the fault repository set_params writes through.
 // UpdateSpec runs the fault catalog's strict params validation.
+// ListCompositions and GetComposition let set_params find the compositions
+// that use a spec: ListCompositions names them (without members, as the
+// store answers it) and GetComposition loads each one's members.
 type SpecStore interface {
 	GetSpec(ctx context.Context, id string) (*model.FaultSpec, error)
 	UpdateSpec(ctx context.Context, spec *model.FaultSpec) error
+	ListCompositions(ctx context.Context) ([]*model.FaultComposition, error)
+	GetComposition(ctx context.Context, id string) (*model.FaultComposition, error)
 }
 
 var (
@@ -181,11 +187,18 @@ func (m *RuleMutator) deleteRule(ctx context.Context, res *MutationResult, exist
 }
 
 // setParams replaces the params of the rule's fault spec, then re-saves the
-// rule so its service's generation bumps and pollers recompile the spec.
-// Refusals and failures, none of which write:
+// rule so its service's generation bumps and pollers recompile the spec. It
+// is a two-step write, not a transaction: UpdateSpec first, then the rule's
+// Update for the generation bump. A failure between them (the rule's Update
+// failing) reports OutcomeFailed with the spec already changed and no bump;
+// instances pick the new params up at the service's next generation.
+// Refusals and failures before the first write, none of which write:
 //   - absent rule, or a rule whose action is not fault_spec: OutcomeFailed;
 //   - a spec another rule also references: OutcomeRefused (mutating it would
 //     change rules the policy did not name);
+//   - a spec any composition uses, directly or through a child composition:
+//     OutcomeRefused (a composition's rules, of any service, would change);
+//   - listing or loading the compositions fails: OutcomeFailed;
 //   - params the fault catalog rejects (UpdateSpec): OutcomeFailed.
 //
 // Params equal to the stored ones as JSON (whitespace ignored) are
@@ -217,6 +230,16 @@ func (m *RuleMutator) setParams(ctx context.Context, res *MutationResult, mut Mu
 		res.Error = fmt.Sprintf("fault spec %s is shared by %d rules; give the rule a dedicated spec", specID, users)
 		return
 	}
+	comp, err := m.compositionUsing(ctx, specID)
+	if err != nil {
+		fail(res, err)
+		return
+	}
+	if comp != "" {
+		res.Outcome = OutcomeRefused
+		res.Error = fmt.Sprintf("fault spec %s is used by composition %s; give the rule a dedicated spec", specID, comp)
+		return
+	}
 	if jsonEqual(spec.Params, mut.Params) {
 		res.Outcome = OutcomeUnchanged
 		return
@@ -233,6 +256,66 @@ func (m *RuleMutator) setParams(ctx context.Context, res *MutationResult, mut Mu
 		return
 	}
 	res.Outcome = OutcomeUpdated
+}
+
+// compositionUsing returns the id of the first composition, in id order,
+// whose members reference specID directly or through a child composition
+// (followed recursively; a cycle is not followed twice), or "" when none
+// does.
+func (m *RuleMutator) compositionUsing(ctx context.Context, specID string) (string, error) {
+	listed, err := m.specs.ListCompositions(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list compositions: %w", err)
+	}
+	ids := make([]string, 0, len(listed))
+	for _, c := range listed {
+		ids = append(ids, c.ID)
+	}
+	slices.Sort(ids)
+	loaded := map[string]*model.FaultComposition{}
+	load := func(id string) (*model.FaultComposition, error) {
+		if c, ok := loaded[id]; ok {
+			return c, nil
+		}
+		c, err := m.specs.GetComposition(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get composition %s: %w", id, err)
+		}
+		loaded[id] = c
+		return c, nil
+	}
+	var uses func(id string, visiting map[string]bool) (bool, error)
+	uses = func(id string, visiting map[string]bool) (bool, error) {
+		if visiting[id] {
+			return false, nil
+		}
+		visiting[id] = true
+		c, err := load(id)
+		if err != nil {
+			return false, err
+		}
+		for _, mem := range c.Members {
+			if mem.FaultSpecID == specID {
+				return true, nil
+			}
+			if mem.ChildCompositionID != "" {
+				if ok, err := uses(mem.ChildCompositionID, visiting); ok || err != nil {
+					return ok, err
+				}
+			}
+		}
+		return false, nil
+	}
+	for _, id := range ids {
+		ok, err := uses(id, map[string]bool{})
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return id, nil
+		}
+	}
+	return "", nil
 }
 
 func fail(res *MutationResult, err error) {

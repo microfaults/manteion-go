@@ -107,7 +107,7 @@ skipped.
 |---|---|---|
 | `upsert_rule` | `rule`: full `model.Rule` JSON | Creates the rule keyed by `rule.service` + `rule.name`, or updates it in place when it differs. Server-owned `id`, `created_at` and `updated_at` are ignored: an update keeps the stored id and creation time. Top-level `service`/`name`, when given, must equal the rule's. The rule must pass the same `Validate` as rule CRUD. |
 | `set_enabled` | `service`, `name`, `enabled` | Sets the rule's `enabled` flag. An absent rule is `failed`. |
-| `set_params` | `service`, `name`, `params` (a JSON object) | Replaces the params of the fault spec the rule references, validated by the fault catalog, then re-saves the rule so its generation bumps and pollers recompile. Only for `fault_spec` rules (anything else, or an absent rule, is `failed`), and only when no other rule references that spec (a shared spec is `refused`). |
+| `set_params` | `service`, `name`, `params` (a JSON object) | Replaces the params of the fault spec the rule references, validated by the fault catalog, then re-saves the rule so its generation bumps and pollers recompile. Only for `fault_spec` rules (anything else, or an absent rule, is `failed`), and only when no other rule and no composition (directly or through a child composition) references that spec (a shared spec is `refused`). The two writes are not one transaction: if the rule's re-save fails after the spec update, the result is `failed`, the spec keeps its new params and the generation is not bumped. |
 | `delete_rule` | `service`, `name` | Deletes the rule. An absent rule is `unchanged`. |
 
 Each mutation gets one result, `{op, service, name, outcome, error?, rule_id?}`:
@@ -118,7 +118,7 @@ Each mutation gets one result, `{op, service, name, outcome, error?, rule_id?}`:
 | `updated` | the rule (or, for `set_params`, its spec) was written |
 | `deleted` | `delete_rule` removed the rule |
 | `unchanged` | the store already holds the desired state; nothing was written |
-| `refused` | never reached the store: malformed (unknown op, missing fields, `params` not an object, an `upsert_rule` whose top-level key disagrees with its rule), a service outside `scope.services`, or a `set_params` on a shared spec |
+| `refused` | never reached the store: malformed (unknown op, missing fields, `params` not an object, an `upsert_rule` whose top-level key disagrees with its rule), a service outside `scope.services`, or a `set_params` on a spec another rule or a composition uses |
 | `failed` | the store or validation rejected it (absent rule, invalid rule, catalog-rejected params, a write error); the next mutation still runs |
 | `dry_run` | decision log only: an in-scope mutation of a dry run, evaluated but not applied |
 

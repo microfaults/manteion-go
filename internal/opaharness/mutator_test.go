@@ -71,8 +71,33 @@ func (f *fakeRules) get(service, name string) *model.Rule {
 }
 
 type fakeSpecs struct {
-	specs   map[string]*model.FaultSpec
-	updates int
+	specs        map[string]*model.FaultSpec
+	compositions []*model.FaultComposition // with members; ListCompositions strips them like the store
+	updates      int
+	updateErr    error
+}
+
+// ListCompositions mirrors (*store.FaultRepo).ListCompositions: members are
+// not loaded.
+func (f *fakeSpecs) ListCompositions(_ context.Context) ([]*model.FaultComposition, error) {
+	out := make([]*model.FaultComposition, 0, len(f.compositions))
+	for _, c := range f.compositions {
+		cp := *c
+		cp.Members = nil
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+func (f *fakeSpecs) GetComposition(_ context.Context, id string) (*model.FaultComposition, error) {
+	for _, c := range f.compositions {
+		if c.ID == id {
+			cp := *c
+			cp.Members = append([]model.FaultCompositionMember(nil), c.Members...)
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
 }
 
 func (f *fakeSpecs) GetSpec(_ context.Context, id string) (*model.FaultSpec, error) {
@@ -84,6 +109,9 @@ func (f *fakeSpecs) GetSpec(_ context.Context, id string) (*model.FaultSpec, err
 }
 
 func (f *fakeSpecs) UpdateSpec(_ context.Context, s *model.FaultSpec) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
 	if err := s.Validate(); err != nil {
 		return err
 	}
@@ -255,5 +283,54 @@ func TestRuleMutator_AppliesInOrderAndContinuesAfterFailure(t *testing.T) {
 	)
 	if res[0].Outcome != OutcomeFailed || res[1].Outcome != OutcomeCreated || res[2].Outcome != OutcomeUpdated {
 		t.Fatalf("outcomes = %s %s %s, want failed created updated", res[0].Outcome, res[1].Outcome, res[2].Outcome)
+	}
+}
+
+func TestRuleMutator_SetParamsRefusesSpecUsedByComposition(t *testing.T) {
+	setParams := Mutation{Op: OpSetParams, Service: "checkout", Name: "checkout-egress-latency", Params: json.RawMessage(`{"delay":"900ms"}`)}
+	comp := func(id string, members ...model.FaultCompositionMember) *model.FaultComposition {
+		return &model.FaultComposition{ID: id, Name: id, ExecutionMode: "parallel", Members: members}
+	}
+	tests := []struct {
+		name         string
+		compositions []*model.FaultComposition
+		wantOutcome  string
+		wantError    string
+	}{
+		{"a composition uses the spec", []*model.FaultComposition{
+			comp("comp-z-other", model.FaultCompositionMember{FaultSpecID: "spec-cpu"}),
+			comp("comp-b-direct", model.FaultCompositionMember{FaultSpecID: "spec-cpu"}, model.FaultCompositionMember{FaultSpecID: "spec-lat"}),
+		}, OutcomeRefused, "fault spec spec-lat is used by composition comp-b-direct; give the rule a dedicated spec"},
+		{"a nested composition uses the spec", []*model.FaultComposition{
+			comp("comp-b-inner", model.FaultCompositionMember{FaultSpecID: "spec-lat"}),
+			comp("comp-a-outer", model.FaultCompositionMember{ChildCompositionID: "comp-b-inner"}),
+		}, OutcomeRefused, "fault spec spec-lat is used by composition comp-a-outer; give the rule a dedicated spec"},
+		{"a composition cycle not using the spec", []*model.FaultComposition{
+			comp("comp-a", model.FaultCompositionMember{ChildCompositionID: "comp-b"}),
+			comp("comp-b", model.FaultCompositionMember{ChildCompositionID: "comp-a"}, model.FaultCompositionMember{FaultSpecID: "spec-cpu"}),
+		}, OutcomeUpdated, ""},
+		{"no composition uses the spec", []*model.FaultComposition{
+			comp("comp-other", model.FaultCompositionMember{FaultSpecID: "spec-cpu"}),
+		}, OutcomeUpdated, ""},
+		{"no compositions", nil, OutcomeUpdated, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := desiredRule()
+			existing.ID = "rule-1"
+			rules := &fakeRules{rules: []*model.Rule{existing}}
+			specs := &fakeSpecs{specs: map[string]*model.FaultSpec{"spec-lat": latencySpec("spec-lat")}, compositions: tc.compositions}
+			res := apply(t, newTestMutator(rules, specs), setParams)
+			if res[0].Outcome != tc.wantOutcome || res[0].Error != tc.wantError {
+				t.Fatalf("result = %+v, want outcome %q error %q", res[0], tc.wantOutcome, tc.wantError)
+			}
+			if tc.wantOutcome == OutcomeRefused {
+				if specs.updates != 0 || rules.updates != 0 || string(specs.specs["spec-lat"].Params) != `{"delay":"200ms"}` {
+					t.Errorf("refused set_params wrote: spec updates %d, rule updates %d, params %s", specs.updates, rules.updates, specs.specs["spec-lat"].Params)
+				}
+			} else if specs.updates != 1 || rules.updates != 1 {
+				t.Errorf("set_params: spec updates %d, rule updates %d, want 1 and 1", specs.updates, rules.updates)
+			}
+		})
 	}
 }
