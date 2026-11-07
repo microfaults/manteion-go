@@ -1110,6 +1110,10 @@
                     "changed": {
                         "type": "boolean"
                     },
+                    "decision_error": {
+                        "description": "DecisionError is set when recording the decision failed.",
+                        "type": "string"
+                    },
                     "error": {
                         "type": "string"
                     },
@@ -2242,7 +2246,7 @@
         },
         "/opa/policies/{id}/evaluate": {
             "post": {
-                "description": "Evaluate the policy once against live telemetry, enabled or not.\nDefaults to a dry run: the mutations are computed and scope-checked but\nnot applied, and results holds only the scope refusals. With\napply=true the in-scope mutations are applied through the rule\nrepository and results holds the refusals plus the mutator's results;\nan applying evaluation that changed something starts the policy's\ncooldown. Every evaluation is recorded in the decision log (see\n/opa/policies/{id}/decisions). Compile, input, eval and apply failures\nare reported in the Evaluation's error with 200; 500 means the\ndecision could not be recorded. 503 when the harness is disabled\n(MANTEION_POLICY_ENGINE off).",
+                "description": "Evaluate the policy once against live telemetry, enabled or not.\nDefaults to a dry run: the mutations are computed and scope-checked but\nnot applied, and results holds only the scope refusals. With\napply=true the in-scope mutations are applied through the rule\nrepository and results holds the refusals plus the mutator's results;\nan applying evaluation that changed something starts the policy's\ncooldown. Every evaluation is recorded in the decision log (see\n/opa/policies/{id}/decisions). Compile, input, eval and apply failures\nare reported in the Evaluation's error with 200; a decision that could\nnot be recorded is reported in decision_error, also with 200 (the\nresults, an apply included, happened). MANTEION_POLICY_ENGINE gates only\nthe harness loop, not this endpoint; 503 only when the server was built\nwithout a harness.",
                 "parameters": [
                     {
                         "description": "Policy ID",
@@ -2283,16 +2287,6 @@
                         },
                         "description": "policy not found"
                     },
-                    "500": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/api.ErrorResponse"
-                                }
-                            }
-                        },
-                        "description": "failed to record decision"
-                    },
                     "503": {
                         "content": {
                             "application/json": {
@@ -2301,7 +2295,7 @@
                                 }
                             }
                         },
-                        "description": "opa harness disabled (MANTEION_POLICY_ENGINE)"
+                        "description": "opa harness unavailable (server built without one)"
                     }
                 },
                 "summary": "Evaluate OPA policy",

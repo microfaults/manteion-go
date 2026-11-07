@@ -56,7 +56,7 @@ type Server struct {
 	policies            *store.PolicyRepo
 	opaPolicies         opaPolicyStore       // the *store.OPAPolicyRepo; an interface so tests can inject a fake
 	policyDecisions     policyDecisionLister // the *store.PolicyDecisionRepo; an interface so tests can inject a fake
-	opa                 opaEvaluator         // the *opaharness.Harness; nil when the policy engine is off (evaluate answers 503)
+	opa                 opaEvaluator         // the *opaharness.Harness; nil only when the server was built without one (evaluate answers 503)
 	traces              *store.TraceRepo
 	zeus                *zeus.Client
 	generations         *desired.Generations

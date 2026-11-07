@@ -384,14 +384,14 @@ func TestHandleEvaluateOPAPolicy(t *testing.T) {
 	}
 }
 
-// TestHandleOPAWithoutHarness: with the policy engine off (no harness) the
+// TestHandleOPAWithoutHarness: on a server built without a harness the
 // evaluate endpoint answers 503 and CRUD and the decision log still work.
 func TestHandleOPAWithoutHarness(t *testing.T) {
 	dec := &fakeDecisionLister{byPolicy: map[string][]*model.PolicyDecision{}}
 	s := &Server{opaPolicies: newFakeOPAPolicies(opaTestPolicy()), policyDecisions: dec, logger: discardLogger()}
 
 	w := serveOPA(t, s, http.MethodPost, "/api/v1/opa/policies/opa-1/evaluate", "")
-	if w.Code != http.StatusServiceUnavailable || errorOf(t, w) != "opa harness disabled (MANTEION_POLICY_ENGINE)" {
+	if w.Code != http.StatusServiceUnavailable || errorOf(t, w) != "opa harness unavailable (server built without one)" {
 		t.Errorf("evaluate without a harness: %d %s", w.Code, w.Body.String())
 	}
 	if w := serveOPA(t, s, http.MethodGet, "/api/v1/opa/policies/opa-1", ""); w.Code != http.StatusOK {

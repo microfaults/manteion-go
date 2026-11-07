@@ -5,7 +5,8 @@
 The policy engine (`internal/policy`) — a 10s promql evaluation loop with
 in-memory cooldowns that fires `push_rules`/`clear_rules` actions via
 atrocontrol — is **disabled by default**. `cmd/manteion` starts the
-goroutine only when `MANTEION_POLICY_ENGINE=on`.
+goroutine only when `MANTEION_POLICY_ENGINE=threshold`; since 2026-11, `=on`
+(like `=rego`) starts the OPA harness instead (`docs/opa-harness.md`).
 
 Why frozen rather than deleted:
 
@@ -27,7 +28,8 @@ for the engine's scan). Revisit when the orchestrator FSM port lands.
 enabled rule of the service, each through `RuleRepo.Update`, which bumps the
 service's desired-state generation in the same transaction; nothing is pushed
 to `/admin/rules` any more (`internal/atrocontrol`'s push paths are gone). The
-engine stays opt-in (`MANTEION_POLICY_ENGINE=on`). Unlike the old push, which
+engine stays opt-in (`MANTEION_POLICY_ENGINE=threshold`; `=on` now starts the
+OPA harness). Unlike the old push, which
 was a transient override the next poll undid, `clear_rules` is persistent: it
 disables every enabled rule of the service in the database, phase-attached
 rules of a running experiment included, and they stay disabled until someone

@@ -1,8 +1,9 @@
 // OPA harness endpoints: CRUD over the Rego policies the harness evaluates,
 // their decision log, and a one-shot evaluate that defaults to a dry run.
-// The harness itself (internal/opaharness) runs only when the policy engine
-// is on; without it the evaluate endpoint answers 503 and the rest still
-// works.
+// cmd/manteion always constructs the harness (internal/opaharness), so
+// evaluate works whatever MANTEION_POLICY_ENGINE says (that variable gates
+// only the harness loop); evaluate answers 503 only when the server was built
+// without a harness, and the rest still works then.
 package api
 
 import (
@@ -37,8 +38,9 @@ type opaEvaluator interface {
 	EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) *opaharness.Evaluation
 }
 
-// errOPAHarnessDisabled is the 503 message of evaluate without a harness.
-const errOPAHarnessDisabled = "opa harness disabled (MANTEION_POLICY_ENGINE)"
+// errOPAHarnessUnavailable is the 503 message of evaluate on a server built
+// without a harness.
+const errOPAHarnessUnavailable = "opa harness unavailable (server built without one)"
 
 // checkOPAPolicy validates p (applying its defaults in place) and compiles
 // its Rego. It writes the 422 and returns false when either fails.
@@ -289,7 +291,7 @@ func (s *Server) handleListOPADecisions(w http.ResponseWriter, r *http.Request) 
 // evaluation is recorded in the decision log (a dry run's decision lists its
 // would-be mutations as "dry_run" results); a decision that could not be
 // recorded is reported in decision_error with 200, since the results (an
-// apply included) happened. Without a harness (policy engine off) it answers
+// apply included) happened. On a server built without a harness it answers
 // 503.
 //
 // @Summary      Evaluate OPA policy
@@ -303,19 +305,20 @@ func (s *Server) handleListOPADecisions(w http.ResponseWriter, r *http.Request) 
 // @Description  /opa/policies/{id}/decisions). Compile, input, eval and apply failures
 // @Description  are reported in the Evaluation's error with 200; a decision that could
 // @Description  not be recorded is reported in decision_error, also with 200 (the
-// @Description  results, an apply included, happened). 503 when the harness is disabled
-// @Description  (MANTEION_POLICY_ENGINE off).
+// @Description  results, an apply included, happened). MANTEION_POLICY_ENGINE gates only
+// @Description  the harness loop, not this endpoint; 503 only when the server was built
+// @Description  without a harness.
 // @Tags         autorules
 // @Produce      json
 // @Param        id     path      string  true   "Policy ID"
 // @Param        apply  query     bool    false  "apply the mutations (default false: dry run)"
 // @Success      200    {object}  opaharness.Evaluation
 // @Failure      404    {object}  api.ErrorResponse  "policy not found"
-// @Failure      503    {object}  api.ErrorResponse  "opa harness disabled (MANTEION_POLICY_ENGINE)"
+// @Failure      503    {object}  api.ErrorResponse  "opa harness unavailable (server built without one)"
 // @Router       /opa/policies/{id}/evaluate [post]
 func (s *Server) handleEvaluateOPAPolicy(w http.ResponseWriter, r *http.Request) {
 	if s.opa == nil {
-		writeError(w, http.StatusServiceUnavailable, errOPAHarnessDisabled)
+		writeError(w, http.StatusServiceUnavailable, errOPAHarnessUnavailable)
 		return
 	}
 	p := s.getOPAPolicy(w, r)

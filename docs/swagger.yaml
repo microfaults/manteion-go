@@ -868,6 +868,9 @@ components:
           type: boolean
         changed:
           type: boolean
+        decision_error:
+          description: DecisionError is set when recording the decision failed.
+          type: string
         error:
           type: string
         evaluated_at:
@@ -1649,11 +1652,15 @@ paths:
 
         /opa/policies/{id}/decisions). Compile, input, eval and apply failures
 
-        are reported in the Evaluation''s error with 200; 500 means the
+        are reported in the Evaluation''s error with 200; a decision that could
 
-        decision could not be recorded. 503 when the harness is disabled
+        not be recorded is reported in decision_error, also with 200 (the
 
-        (MANTEION_POLICY_ENGINE off).'
+        results, an apply included, happened). MANTEION_POLICY_ENGINE gates only
+
+        the harness loop, not this endpoint; 503 only when the server was built
+
+        without a harness.'
       parameters:
       - description: Policy ID
         in: path
@@ -1679,18 +1686,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/api.ErrorResponse'
           description: policy not found
-        '500':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/api.ErrorResponse'
-          description: failed to record decision
         '503':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/api.ErrorResponse'
-          description: opa harness disabled (MANTEION_POLICY_ENGINE)
+          description: opa harness unavailable (server built without one)
       summary: Evaluate OPA policy
       tags:
       - autorules

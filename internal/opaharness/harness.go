@@ -77,6 +77,8 @@ type Deps struct {
 // mutator ran and applied something or finished; Changed when a result
 // created, updated or deleted a rule. Error is the first compile, input,
 // input-document, eval or apply failure; the stages after it are skipped.
+// DecisionError is the decision-log write failure ("record decision: ..."):
+// the evaluation, an apply included, happened, it was only not recorded.
 type Evaluation struct {
 	PolicyID    string           `json:"policy_id"`
 	EvaluatedAt time.Time        `json:"evaluated_at"`
@@ -87,8 +89,7 @@ type Evaluation struct {
 	Applied     bool             `json:"applied"`
 	Changed     bool             `json:"changed"`
 	Error       string           `json:"error,omitempty"`
-	// DecisionError is set when the decision could not be recorded; the
-	// evaluation (and any apply) happened regardless.
+	// DecisionError is set when recording the decision failed.
 	DecisionError string `json:"decision_error,omitempty"`
 }
 
