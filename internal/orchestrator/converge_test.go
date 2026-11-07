@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -298,6 +299,63 @@ func TestWaitConverged_ReplaySetEvidenceIsAppliedAtTheTarget(t *testing.T) {
 	}
 	if err := o.waitConverged(ctx, targets, artifacts, 5*time.Second, nil); err != nil {
 		t.Fatalf("committed at the target: waitConverged = %v, want nil", err)
+	}
+}
+
+// A holds check that fails to read (a transient GetPhase error inside
+// entryHolds) is not the wait's end: it is logged at Warn and asked again on
+// the next look, and it fails the wait only if it still fails when the timeout
+// expires. errLeftRunning still ends the wait at once. While holds fails, the
+// look is skipped: a converged fleet is no reason to go on when the wait may
+// no longer be the entry's.
+func TestWaitConverged_HoldsReadErrorIsRetried(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	o.WithConvergePollInterval(10 * time.Millisecond)
+	logs := &logBuffer{}
+	o.logger = slog.New(slog.NewTextHandler(logs, nil))
+	svc := id.New("svc-holds")
+	target := bumpService(t, o, svc)
+	inst := registerSDK(t, svc, "http://converged.invalid")
+	if err := testSDKRepo.RecordPoll(ctx, inst, target); err != nil {
+		t.Fatal(err)
+	}
+	targets := map[string]uint64{svc: target}
+	readErr := errors.New("get phase: connection reset")
+
+	var calls atomic.Int32
+	flaky := func(context.Context) error {
+		if calls.Add(1) <= 2 {
+			return readErr
+		}
+		return nil
+	}
+	if err := o.waitConverged(ctx, targets, nil, 5*time.Second, flaky); err != nil {
+		t.Fatalf("a holds read that recovers: waitConverged = %v, want nil", err)
+	}
+	if n := calls.Load(); n < 3 {
+		t.Errorf("holds asked %d times, want it retried until it answered", n)
+	}
+	if got := logs.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "connection reset") {
+		t.Errorf("logs = %q, want each failed holds read logged at Warn with its cause", got)
+	}
+
+	const timeout = 200 * time.Millisecond
+	start := time.Now()
+	err := o.waitConverged(ctx, targets, nil, timeout, func(context.Context) error { return readErr })
+	if !errors.Is(err, readErr) {
+		t.Fatalf("a holds read failing past the timeout: waitConverged = %v, want it to wrap %v", err, readErr)
+	}
+	if elapsed := time.Since(start); elapsed < timeout {
+		t.Errorf("failed after %v: a holds read error is fatal only once the %v timeout expires", elapsed, timeout)
+	}
+
+	start = time.Now()
+	if err := o.waitConverged(ctx, targets, nil, 5*time.Second, func(context.Context) error { return errLeftRunning }); !errors.Is(err, errLeftRunning) {
+		t.Fatalf("errLeftRunning: waitConverged = %v, want errLeftRunning", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("errLeftRunning took %v, want the wait ended at once", elapsed)
 	}
 }
 
@@ -909,6 +967,59 @@ func TestEnterPhase_PausedWhileStartingLoad_StopsTheLoadItStarted(t *testing.T) 
 				t.Errorf("phase = %s / %q, want paused with no failure (the pause's)", got.Status, got.FailureReason)
 			}
 		})
+	}
+}
+
+// A pause that lands while an entry materializes the phase's workflows in
+// zeus ends the entry's claim before its next workflow's zeus calls: the entry
+// deletes and registers nothing further (a newer entry may be starting runs
+// on those workflows), starts no load and refuses with the paused status.
+func TestEnterPhase_PausedWhileMaterializingWorkflows_TouchesZeusNoFurther(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	_, phases := mkExperiment(t, 1)
+	ph := phases[0]
+	// Two workflows (each attach replaces the phase's list, so attach both).
+	pw := model.PhaseWorkflow{PhaseID: ph.ID, VUs: 1, DurationSec: 30, TargetURL: "http://target.invalid/"}
+	wfA, wfB := pw, pw
+	wfA.WorkflowID = attachAttackWorkflow(t, ph.ID, pw)
+	wfB.WorkflowID = attachAttackWorkflow(t, ph.ID, pw)
+	if err := testExpRepo.AttachPhaseWorkflows(ctx, ph.ID, []model.PhaseWorkflow{wfA, wfB}); err != nil {
+		t.Fatalf("attach both workflows: %v", err)
+	}
+	t.Cleanup(func() { o.cancelPoller(ph.ID) })
+	paused := make(chan error, 1)
+	var once sync.Once
+	fz.onWorkflowCall(func() { once.Do(func() { paused <- o.PausePhase(ctx, ph.ID) }) })
+
+	err := o.StartPhase(ctx, ph.ID)
+	var state *ErrInvalidState
+	if !errors.As(err, &state) || state.Current != "paused" {
+		t.Fatalf("StartPhase = %v, want an invalid-state refusal naming the paused phase", err)
+	}
+	if err := receive(t, "the pause", paused); err != nil {
+		t.Fatalf("pause during workflow materialization: %v", err)
+	}
+	pws, err := testExpRepo.ListPhaseWorkflows(ctx, ph.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pws) != 2 {
+		t.Fatalf("premise: %d phase workflows, want 2", len(pws))
+	}
+	// The first workflow is whichever ListPhaseWorkflows returns first: the
+	// pause lands inside its delete, and its register is already under way.
+	// The second one's calls must not follow.
+	want := []string{"DELETE " + pws[0].WorkflowID, "POST"}
+	if got := fz.workflowCallLog(); !slices.Equal(got, want) {
+		t.Errorf("workflow calls = %v, want %v: the entry touched zeus after its claim ended", got, want)
+	}
+	if runs, attacks := fz.driverStatuses(); len(runs) != 0 || len(attacks) != 0 {
+		t.Errorf("zeus knows runs %v and attacks %v, want no load started", runs, attacks)
+	}
+	if got := getPhase(t, ph.ID); got.Status != "paused" || got.FailureReason != "" {
+		t.Errorf("phase = %s / %q, want paused with no failure (the pause's)", got.Status, got.FailureReason)
 	}
 }
 

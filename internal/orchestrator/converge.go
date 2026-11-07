@@ -54,7 +54,10 @@ const (
 // holds, when non-nil, is asked before each look whether the wait still has a
 // reason: an entry's wait passes entryHolds, so a pause, a stop or a newer
 // entry that takes the phase ends the wait at the next look with
-// errLeftRunning instead of after the timeout. Exit and drain waits pass nil.
+// errLeftRunning instead of after the timeout. Any other holds error (its read
+// failed) is logged at Warn and asked again on the next tick, that look
+// skipped; it ends the wait only if it still fails when the timeout expires.
+// Exit and drain waits pass nil.
 func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uint64, artifacts map[string]string, timeout time.Duration, holds func(context.Context) error) error {
 	deadline := time.Now().Add(timeout)
 	interval := o.convergePollInterval
@@ -64,8 +67,28 @@ func (o *Orchestrator) waitConverged(ctx context.Context, targets map[string]uin
 	logged := map[string]bool{} // suspect instances already named in the log
 	for {
 		if holds != nil {
-			if err := holds(ctx); err != nil {
+			err := holds(ctx)
+			switch {
+			case err == nil:
+			case errors.Is(err, errLeftRunning) || ctx.Err() != nil:
 				return err
+			default:
+				// A read that failed (a transient GetPhase error) says nothing
+				// about whether the wait still holds: ask again on the next look,
+				// and skip this one, since a converged fleet is no reason to go on
+				// while the wait may no longer be the entry's.
+				o.logger.Warn("orchestrator: converge: could not check the wait still holds; retrying on the next look",
+					"error", err)
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return fmt.Errorf("converge: checking the wait still holds failed until the %v timeout expired: %w", timeout, err)
+				}
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("%w while checking the wait still holds failed: %w", ctx.Err(), err)
+				case <-time.After(min(interval, remaining)):
+				}
+				continue
 			}
 		}
 		lagging, suspect, err := o.laggingInstances(ctx, targets, artifacts)

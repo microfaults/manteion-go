@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -268,6 +269,12 @@ type fakeZeus struct {
 	// a no-op (an attack's is answered 404, as zeus does), even if the driver
 	// is accepted while the hook runs.
 	stopHook func(kind, id string)
+	// workflowCalls records each workflow materialization call ("DELETE <id>"
+	// or "POST"), in order; workflowHook, when set, runs inside each one
+	// before it is answered: something that lands while an entry materializes
+	// the phase's workflows.
+	workflowCalls []string
+	workflowHook  func()
 }
 
 // fakeReject is a canned non-2xx answer for POST .../runs.
@@ -426,9 +433,11 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 		_ = json.NewEncoder(w).Encode(a.result)
 	})
 	mux.HandleFunc("POST /api/v1/workflows", func(w http.ResponseWriter, r *http.Request) {
+		f.workflowCall("POST")
 		w.WriteHeader(http.StatusCreated)
 	})
 	mux.HandleFunc("DELETE /api/v1/workflows/{id}", func(w http.ResponseWriter, r *http.Request) {
+		f.workflowCall("DELETE " + r.PathValue("id"))
 		w.WriteHeader(http.StatusNoContent)
 	})
 
@@ -508,6 +517,33 @@ func (f *fakeZeus) runDataset(runID string) (string, bool) {
 	defer f.mu.Unlock()
 	ds, ok := f.runDatasets[runID]
 	return ds, ok
+}
+
+// workflowCall records one workflow materialization call and runs the
+// workflow hook, outside the fake's lock.
+func (f *fakeZeus) workflowCall(call string) {
+	f.mu.Lock()
+	f.workflowCalls = append(f.workflowCalls, call)
+	hook := f.workflowHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+// onWorkflowCall makes fn run inside every workflow DELETE and POST before it
+// is answered (workflowHook).
+func (f *fakeZeus) onWorkflowCall(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.workflowHook = fn
+}
+
+// workflowCallLog returns the workflow materialization calls made so far.
+func (f *fakeZeus) workflowCallLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.workflowCalls)
 }
 
 // onRunStart makes fn run inside every POST .../runs before the run is

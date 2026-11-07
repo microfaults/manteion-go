@@ -232,8 +232,12 @@ func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhas
 	// place, a resume after a started phase records nothing new.
 	o.recordAuditTrail(ctx, p, claim)
 
-	if err := o.materializePhaseWorkflows(ctx, p.ID); err != nil {
+	claimEnded, err := o.materializePhaseWorkflows(ctx, p.ID, claim)
+	if err != nil {
 		return fail(fmt.Errorf("orchestrator: materialize workflows: %w", err))
+	}
+	if claimEnded {
+		return o.abandonLoad(ctx, p, driverStart{}, driverStart{})
 	}
 
 	// A phase workflow drives load two ways, both scoped to (experiment, phase):
@@ -344,9 +348,11 @@ func (o *Orchestrator) leftRunning(ctx context.Context, p *model.ExperimentPhase
 // abandonLoad ends an entry whose claim ended while it started load: a pause
 // or a stop took the phase after the post-gate check, and its teardown may
 // have read the phase's drivers before this entry recorded them. The entry
-// stops the runs and attacks it started, by the handles zeus knows them by,
-// on a context its caller cannot cancel, and refuses with the status the phase
-// is in now, like leftRunning. It recorded no poller (spawnPollerClaimed).
+// stops the runs and attacks it started, if any (the claim can end before the
+// first one: while it materializes workflows, or at its first handle write),
+// by the handles zeus knows them by, on a context its caller cannot cancel,
+// and refuses with the status the phase is in now, like leftRunning. It
+// recorded no poller (spawnPollerClaimed).
 func (o *Orchestrator) abandonLoad(ctx context.Context, p *model.ExperimentPhase, runs, atks driverStart) error {
 	ctx = context.WithoutCancel(ctx)
 	for _, runID := range runs.handles {
@@ -362,10 +368,10 @@ func (o *Orchestrator) abandonLoad(ctx context.Context, p *model.ExperimentPhase
 		}
 	}
 	status := o.phaseStatus(ctx, p.ID)
-	o.logger.Warn("orchestrator: phase left running while its entry started load; that load was stopped",
+	o.logger.Warn("orchestrator: phase left running while its entry started load; it stopped the load it had started, if any",
 		"phase_id", p.ID, "status", status, "runs", len(runs.handles), "attacks", len(atks.handles))
 	return invalidState("phase", p.ID, status, "running",
-		fmt.Sprintf("orchestrator: phase %q left running while its entry started load (now %s); the load it started was stopped", p.ID, status))
+		fmt.Sprintf("orchestrator: phase %q left running while its entry started load (now %s); it stopped the load it had started, if any", p.ID, status))
 }
 
 // failEntry fails the phase an entry holds, recording err as the reason, and
@@ -642,18 +648,25 @@ func driverStartFailure(kind, driverID, workflowID string, err error) string {
 // phase into zeus: best-effort delete of any stale copy under the same id
 // (covers renames, where overwrite-by-name would miss), then register with
 // overwrite. Zeus's in-memory store is a cache of manteion's workflows table.
-func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID string) error {
+// Before each workflow's zeus calls it checks that the entry still holds
+// claim, and reports claimEnded (touching zeus no further) once it does not,
+// like the handle writes: a superseded entry must not delete or re-register a
+// workflow the newer entry may be starting runs on.
+func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID string, claim claimToken) (claimEnded bool, err error) {
 	if o.zeusClient == nil {
-		return nil
+		return false, nil
 	}
 	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
 	if err != nil {
-		return fmt.Errorf("list phase workflows: %w", err)
+		return false, fmt.Errorf("list phase workflows: %w", err)
 	}
 	for _, pw := range pws {
 		wf, err := o.workflows.Get(ctx, pw.WorkflowID)
 		if err != nil {
-			return fmt.Errorf("load workflow %q: %w", pw.WorkflowID, err)
+			return false, fmt.Errorf("load workflow %q: %w", pw.WorkflowID, err)
+		}
+		if !o.holdsClaim(phaseID, claim) {
+			return true, nil
 		}
 		if err := o.zeusClient.DeleteWorkflow(ctx, wf.ID); err != nil {
 			o.logger.Warn("orchestrator: stale zeus workflow delete failed; proceeding",
@@ -665,13 +678,13 @@ func (o *Orchestrator) materializePhaseWorkflows(ctx context.Context, phaseID st
 		// StartRun(wf.ID) miss. The DSL is otherwise opaque to manteion.
 		doc, err := withDocID(wf.DSL, wf.ID)
 		if err != nil {
-			return fmt.Errorf("stamp workflow id %q: %w", wf.ID, err)
+			return false, fmt.Errorf("stamp workflow id %q: %w", wf.ID, err)
 		}
 		if err := o.zeusClient.RegisterWorkflow(ctx, doc); err != nil {
-			return zeusError(fmt.Sprintf("register workflow %q in zeus", wf.ID), err)
+			return false, zeusError(fmt.Sprintf("register workflow %q in zeus", wf.ID), err)
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // withDocID sets the top-level "id" field of a JSON DSL document to id,

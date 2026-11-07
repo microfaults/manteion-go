@@ -95,6 +95,34 @@ func TestExperimentCreate_RejectsStrategyDisagreement(t *testing.T) {
 	}
 }
 
+// A freeze-vs-freeze disagreement names both phases, so the operator knows
+// which two to reconcile.
+func TestValidateCacheBoxStrategyAgreement_NamesBothPhases(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		a, b   CacheBoxConfig
+		phrase string
+	}{
+		{"strategy", CacheBoxConfig{Service: "cart", KeyStrategy: "exact"}, CacheBoxConfig{Service: "cart", KeyStrategy: "canonical_v2"}, "strategy disagreement"},
+		{"key_headers", CacheBoxConfig{Service: "cart", KeyHeaders: []string{"X-Tenant"}}, CacheBoxConfig{Service: "cart", KeyHeaders: []string{"X-Region"}}, "key_headers disagreement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateCacheBoxStrategyAgreement([]ExperimentPhase{
+				{Name: "iso-one", FrozenServices: []CacheBoxConfig{tc.a}},
+				{Name: "iso-two", FrozenServices: []CacheBoxConfig{tc.b}},
+			})
+			if err == nil {
+				t.Fatal("expected a disagreement")
+			}
+			for _, want := range []string{tc.phrase, `"cart"`, `phase "iso-one"`, `phase "iso-two"`} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // A user-authored cache-box rule attached to an experiment's phases keys with
 // its own key_strategy and no key headers (it compiles with the served
 // phase's context, ruleconv), so it must agree with the frozen-service config

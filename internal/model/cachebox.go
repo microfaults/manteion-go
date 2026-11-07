@@ -109,7 +109,7 @@ func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase, rules ...*Rule)
 	type keying struct {
 		strategy string
 		headers  []string
-		phase    string // the first phase (by name) that freezes the service
+		phase    string // the phase that freezes the service, identified by its name, taken from the first phase in iteration order
 	}
 	seen := make(map[string]keying)
 	for _, p := range phases {
@@ -126,13 +126,13 @@ func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase, rules ...*Rule)
 			}
 			if prev.strategy != k.strategy {
 				return fmt.Errorf(
-					"cachebox strategy disagreement for service %q: %q vs %q (all phases touching a service must agree)",
-					fs.Service, prev.strategy, k.strategy)
+					"cachebox strategy disagreement for service %q: phase %q keys with %q, phase %q with %q (all phases touching a service must agree)",
+					fs.Service, prev.phase, prev.strategy, k.phase, k.strategy)
 			}
 			if !slices.Equal(prev.headers, k.headers) {
 				return fmt.Errorf(
-					"cachebox key_headers disagreement for service %q: %v vs %v",
-					fs.Service, prev.headers, k.headers)
+					"cachebox key_headers disagreement for service %q: phase %q keys with %v, phase %q with %v",
+					fs.Service, prev.phase, prev.headers, k.phase, k.headers)
 			}
 		}
 	}
