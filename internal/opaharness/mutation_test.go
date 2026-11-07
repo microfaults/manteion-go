@@ -62,7 +62,7 @@ func TestEnforceScope_KeepsOrderAndSplits(t *testing.T) {
 }
 
 func TestMutationResult_Changed(t *testing.T) {
-	for outcome, want := range map[string]bool{OutcomeCreated: true, OutcomeUpdated: true, OutcomeDeleted: true, OutcomeUnchanged: false, OutcomeRefused: false, OutcomeFailed: false} {
+	for outcome, want := range map[string]bool{OutcomeCreated: true, OutcomeUpdated: true, OutcomeDeleted: true, OutcomeUnchanged: false, OutcomeRefused: false, OutcomeFailed: false, OutcomeDryRun: false} {
 		if got := (MutationResult{Outcome: outcome}).Changed(); got != want {
 			t.Errorf("Changed(%s) = %v, want %v", outcome, got, want)
 		}

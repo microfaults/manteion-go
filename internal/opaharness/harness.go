@@ -212,8 +212,9 @@ func (h *Harness) prepare(p *model.OPAPolicy) (*Prepared, error) {
 // document, evaluate, refuse out-of-scope mutations and, when apply is true,
 // hand the rest to the Mutator. With apply false (a dry run) the Mutator is
 // never called. Every evaluation, dry runs included, is recorded as one
-// decision: applied=false and the would-be mutations for a dry run, the
-// results otherwise. Compile, input, eval and apply failures are reported in
+// decision whose mutations column is a []MutationResult: for a dry run
+// (applied=false) the refusals plus one OutcomeDryRun result per in-scope
+// would-be mutation, otherwise the refusals plus the mutator's results. Compile, input, eval and apply failures are reported in
 // Evaluation.Error and recorded; the returned error is only a decision-log
 // write failure ("record decision: ..."), returned with the Evaluation.
 func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) (*Evaluation, error) {
@@ -280,9 +281,13 @@ func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bo
 		}
 	}
 
-	recorded := any(ev.Results)
+	// The decision's mutations column is always []MutationResult. A dry run
+	// records its refusals followed by one OutcomeDryRun result per in-scope
+	// would-be mutation; ev.Results keeps only the refusals (nothing was
+	// applied) and ev.Mutations the raw would-be mutations.
+	recorded := ev.Results
 	if !apply {
-		recorded = ev.Mutations
+		recorded = append(append([]MutationResult{}, ev.Results...), dryRunResults(allowed)...)
 	}
 	raw, err := json.Marshal(recorded)
 	if err != nil {
@@ -310,6 +315,16 @@ func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bo
 		return ev, fmt.Errorf("record decision: %w", recErr)
 	}
 	return ev, nil
+}
+
+// dryRunResults reports each would-be mutation as OutcomeDryRun.
+func dryRunResults(ms []Mutation) []MutationResult {
+	out := make([]MutationResult, 0, len(ms))
+	for _, m := range ms {
+		svc, name := m.Key()
+		out = append(out, MutationResult{Op: m.Op, Service: svc, Name: name, Outcome: OutcomeDryRun})
+	}
+	return out
 }
 
 // inputDocument is the Rego input document, the contract policy authors

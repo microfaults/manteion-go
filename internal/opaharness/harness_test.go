@@ -435,12 +435,23 @@ func TestInputDigest_ByteStable(t *testing.T) {
 
 func TestEvaluateOnce_DryRunRecordsWouldBeMutations(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	if _, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), false); err != nil {
+	ev, err := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), outOfScopeRego), false)
+	if err != nil {
 		t.Fatalf("EvaluateOnce: %v", err)
 	}
-	var recorded []Mutation
-	if err := json.Unmarshal(th.dec.records[0].Mutations, &recorded); err != nil || len(recorded) != 1 || recorded[0].Op != OpUpsertRule {
-		t.Fatalf("dry-run decision mutations = %s (%v), want the would-be upsert", th.dec.records[0].Mutations, err)
+	if len(th.mut.calls) != 0 || len(ev.Mutations) != 2 {
+		t.Fatalf("dry run: calls %d, mutations %+v", len(th.mut.calls), ev.Mutations)
+	}
+	d := th.dec.records[0]
+	var results []MutationResult
+	if err := json.Unmarshal(d.Mutations, &results); err != nil || len(results) != 2 || d.Applied {
+		t.Fatalf("dry-run decision = %+v (%s, %v), want two results, applied=false", d, d.Mutations, err)
+	}
+	if r := results[0]; r.Outcome != OutcomeRefused || r.Service != "frontend" {
+		t.Errorf("results[0] = %+v, want the frontend refusal", r)
+	}
+	if r := results[1]; r.Outcome != OutcomeDryRun || r.Op != OpDeleteRule || r.Service != "checkout" || r.Name != "y" || r.Changed() {
+		t.Errorf("results[1] = %+v, want the checkout delete as dry_run", r)
 	}
 }
 

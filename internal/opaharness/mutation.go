@@ -19,7 +19,7 @@ const (
 
 // Mutation outcomes. OutcomeRefused means the mutation never reached the
 // store (out of scope or malformed); OutcomeFailed means the store rejected
-// it.
+// it; OutcomeDryRun means evaluated but not applied — a dry run.
 const (
 	OutcomeCreated   = "created"
 	OutcomeUpdated   = "updated"
@@ -27,6 +27,7 @@ const (
 	OutcomeUnchanged = "unchanged"
 	OutcomeRefused   = "refused"
 	OutcomeFailed    = "failed"
+	OutcomeDryRun    = "dry_run"
 )
 
 // Mutation is one rule change a policy asks for. upsert_rule carries the
