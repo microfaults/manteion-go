@@ -18,20 +18,28 @@ type logger interface {
 	Error(msg string, args ...any)
 }
 
+// Controller reads the SDK fleet: instance status over the admin endpoints
+// (StatusByService), W6 fidelity snapshots (FetchFidelity) and the live
+// registered instances of a service (InstancesForService). It pushes nothing:
+// rules, faults, the freeze and replay sets reach the instances through the
+// desired state they poll (internal/desired).
 type Controller struct {
-	tx        *atropos.Client
-	preloadTx *atropos.Client // dedicated long-timeout transport for staged preload (MANT-1)
-	resolver  InstanceResolver
-	intent    *IntentTracker
-	logger    logger
-	defaults  controllerOpts
+	tx       *atropos.Client
+	resolver InstanceResolver
+	logger   logger
+	defaults controllerOpts
+}
+
+// target is one instance a status read addresses.
+type target struct {
+	instanceID string
+	address    string
 }
 
 func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption) *Controller {
 	c := &Controller{
 		tx:       tx,
 		resolver: resolver,
-		intent:   newIntentTracker(),
 		logger:   slog.Default(),
 		defaults: controllerOpts{
 			timeout:     2 * time.Second,
@@ -45,17 +53,8 @@ func New(tx *atropos.Client, resolver InstanceResolver, opts ...ControllerOption
 	if c.defaults.logger != nil {
 		c.logger = c.defaults.logger
 	}
-	c.preloadTx = c.defaults.preloadTx
-	if c.preloadTx == nil {
-		c.preloadTx = tx // fall back to the command transport if no dedicated one is set
-	}
 	return c
 }
-
-// IntentReader returns the controller's intent tracker: what the push paths
-// last recorded per service. The desired-state materializer no longer reads it
-// (freeze_cfg comes from the frozen phase); plan 2 deletes it with the pushes.
-func (c *Controller) IntentReader() *IntentTracker { return c.intent }
 
 func (c *Controller) resolveCallOpts(opts []CallOption) callOpts {
 	cfg := callOpts{
@@ -111,37 +110,4 @@ func (c *Controller) FetchFidelity(ctx context.Context, addr, experimentID, phas
 	opCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return c.tx.GetCacheBoxFidelity(opCtx, addr, experimentID, phaseID)
-}
-
-func (c *Controller) resolveInstance(ctx context.Context, instanceID string) (*model.SDKInstance, error) {
-	inst, err := c.resolver.ForInstance(ctx, instanceID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve instance %q: %w", instanceID, err)
-	}
-	return inst, nil
-}
-
-func (c *Controller) logFanout(action, service, runID string, result FanoutResult) {
-	c.logger.Info("atrocontrol.fanout",
-		"action", action,
-		"service", service,
-		"run_id", runID,
-		"targeted", len(result.Targeted),
-		"ok", len(result.OK),
-		"failed", len(result.Failed),
-		"duration_ms", result.Duration.Milliseconds(),
-	)
-	// Name the culprits: counts alone made client-side failures (e.g. an
-	// unparseable registered address) undiagnosable from logs.
-	const maxLogged = 3
-	for i, f := range result.Failed {
-		if i == maxLogged {
-			c.logger.Warn("atrocontrol.fanout: further failures elided",
-				"action", action, "service", service, "elided", len(result.Failed)-maxLogged)
-			break
-		}
-		c.logger.Warn("atrocontrol.fanout: target failed",
-			"action", action, "service", service, "run_id", runID,
-			"instance", f.InstanceID, "address", f.Address, "error", f.Err)
-	}
 }

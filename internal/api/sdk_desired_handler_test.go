@@ -456,9 +456,15 @@ func TestHandleRegister_MaterializeFailureIsDegraded201(t *testing.T) {
 	for k, v := range raw {
 		got[k] = string(v)
 	}
-	want := map[string]string{"status": `"registered"`, "version": `0`, "etag": `""`, "rules": `null`, "active_faults": `null`}
+	// The etag is absent or empty: the SDK's RegisterResponse omits an empty
+	// one, and the contract reads the two alike.
+	if etag, ok := got["etag"]; ok && etag != `""` {
+		t.Errorf("degraded etag = %s, want it absent or empty", etag)
+	}
+	delete(got, "etag")
+	want := map[string]string{"status": `"registered"`, "version": `0`, "rules": `null`, "active_faults": `null`}
 	if !maps.Equal(got, want) {
-		t.Errorf("degraded body = %s, want exactly %v (no freeze_cfg or replay_set)", w.Body.String(), want)
+		t.Errorf("degraded body = %s, want exactly %v plus an absent or empty etag (no freeze_cfg or replay_set)", w.Body.String(), want)
 	}
 	if _, err := fx.reg.Get(context.Background(), "cart-1"); err != nil {
 		t.Error("registration must be persisted even when materialization fails")

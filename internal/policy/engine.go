@@ -2,24 +2,22 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
-	"manteion-go/internal/atrocontrol"
 	"manteion-go/internal/conditions"
 	"manteion-go/internal/model"
 	"manteion-go/internal/promql"
-	"manteion-go/internal/ruleconv"
-	"manteion-go/internal/store"
 )
 
 const defaultTickInterval = 10 * time.Second
 
 // Effect represents an action the engine wants the caller to apply.
-// The engine decides what should happen; the caller (orchestrator loop)
-// is responsible for executing effects via atrocontrol.
+// The engine decides what should happen; the caller is responsible for
+// executing effects (through rule CRUD, as the engine's own loop does).
 type Effect struct {
 	ActionType string // "push_rules" or "clear_rules"
 	Service    string
@@ -43,14 +41,22 @@ type policyLister interface {
 	ListEnabled(ctx context.Context) ([]*model.PolicyRule, error)
 }
 
+// ruleStore is the subset of store.RuleRepo the engine acts through: rule
+// CRUD, whose Update bumps the service's desired-state generation in the same
+// transaction, so an enabled or disabled rule reaches the service's instances
+// on their next poll.
+type ruleStore interface {
+	Get(ctx context.Context, id string) (*model.Rule, error)
+	Update(ctx context.Context, rule *model.Rule) error
+	EnabledForService(ctx context.Context, service string) ([]*model.Rule, error)
+}
+
 type Engine struct {
-	policies   policyLister
-	rules      *store.RuleRepo
-	faults     *store.FaultRepo
-	controller *atrocontrol.Controller
-	prom       *promql.Client
-	logger     *slog.Logger
-	interval   time.Duration
+	policies policyLister
+	rules    ruleStore
+	prom     *promql.Client
+	logger   *slog.Logger
+	interval time.Duration
 
 	mu          sync.Mutex
 	lastFiredAt map[string]time.Time // rule ID → last fire time
@@ -58,17 +64,13 @@ type Engine struct {
 
 func New(
 	policies policyLister,
-	rules *store.RuleRepo,
-	faults *store.FaultRepo,
-	controller *atrocontrol.Controller,
+	rules ruleStore,
 	prom *promql.Client,
 	logger *slog.Logger,
 ) *Engine {
 	return &Engine{
 		policies:    policies,
 		rules:       rules,
-		faults:      faults,
-		controller:  controller,
 		prom:        prom,
 		logger:      logger,
 		interval:    defaultTickInterval,
@@ -203,14 +205,14 @@ func (e *Engine) executeAction(ctx context.Context, rule *model.PolicyRule) erro
 		if rule.Action.PushRules == nil {
 			return fmt.Errorf("policy engine: rule %q: push_rules config is nil", rule.ID)
 		}
-		_, err := e.controller.PushRules(ctx, rule.Action.PushRules.Service, nil)
-		return err
+		return e.doClearRules(ctx, rule.Action.PushRules.Service)
 	case "attack", "cachebox_mode_change":
-		// Accepted by model validation but not yet wired to Zeus/atrocontrol.
+		// Accepted by model validation but not yet wired to Zeus or rule CRUD.
 		// Now that cache-box is expressible as a Rule, cachebox_mode_change
-		// could be implemented as "push a cache-box rule" — same as push_rules
-		// but constructing a cache-box rule on the fly. Deferred: operators can
-		// create cache-box rules manually and use push_rules to activate them.
+		// could be implemented as "enable a cache-box rule" — same as
+		// push_rules but constructing a cache-box rule on the fly. Deferred:
+		// operators can create cache-box rules manually and use push_rules to
+		// enable them.
 		e.logger.Info("policy engine: action type not yet implemented; rule fired but had no effect",
 			"rule_id", rule.ID,
 			"action_type", rule.Action.ActionType)
@@ -223,32 +225,43 @@ func (e *Engine) executeAction(ctx context.Context, rule *model.PolicyRule) erro
 	}
 }
 
+// doPushRules enables each listed rule through rule CRUD. Update bumps the
+// rule's service generation in the same transaction, so the instances of the
+// service apply it on their next poll; there is no push to the instances.
+// The first rule that cannot be read or updated stops the action.
 func (e *Engine) doPushRules(ctx context.Context, action *model.PushRulesAction) error {
-	compiled, err := e.loadCompiledRules(ctx, action.RuleIDs)
-	if err != nil {
-		return err
-	}
-	_, err = e.controller.PushRules(ctx, action.Service, compiled)
-	return err
-}
-
-// loadCompiledRules fetches rules by ID, resolves fault specs via ruleconv,
-// and returns CompiledRules in wire format ready for atrocontrol.PushRules.
-func (e *Engine) loadCompiledRules(ctx context.Context, ruleIDs []string) ([]ruleconv.CompiledRule, error) {
-	modelRules := make([]*model.Rule, 0, len(ruleIDs))
-	for _, id := range ruleIDs {
+	for _, id := range action.RuleIDs {
 		r, err := e.rules.Get(ctx, id)
 		if err != nil {
-			return nil, fmt.Errorf("get rule %q: %w", id, err)
+			return fmt.Errorf("get rule %q: %w", id, err)
 		}
-		modelRules = append(modelRules, r)
+		if r.Enabled {
+			continue // nothing to change, nothing to bump
+		}
+		r.Enabled = true
+		r.UpdatedAt = time.Now()
+		if err := e.rules.Update(ctx, r); err != nil {
+			return fmt.Errorf("enable rule %q: %w", id, err)
+		}
 	}
+	return nil
+}
 
-	specResolver := &ruleconv.FuncResolver{Fn: e.faults.SpecResolver(ctx)}
-	compResolver := &ruleconv.FuncCompositionResolver{Fn: e.faults.CompositionResolver(ctx)}
-	compiled, err := ruleconv.CompileRules(modelRules, specResolver, compResolver)
+// doClearRules disables every enabled rule of service through rule CRUD, each
+// Update bumping the service's generation in-tx. Every rule is attempted; the
+// failures are joined.
+func (e *Engine) doClearRules(ctx context.Context, service string) error {
+	enabled, err := e.rules.EnabledForService(ctx, service)
 	if err != nil {
-		return nil, fmt.Errorf("compile rules: %w", err)
+		return fmt.Errorf("list enabled rules of %q: %w", service, err)
 	}
-	return compiled, nil
+	var errs []error
+	for _, r := range enabled {
+		r.Enabled = false
+		r.UpdatedAt = time.Now()
+		if err := e.rules.Update(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("disable rule %q: %w", r.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }

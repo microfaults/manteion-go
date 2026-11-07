@@ -88,19 +88,16 @@ func main() {
 	// Create zeus client.
 	zeusClient := zeus.NewClient(zeusURL)
 
-	// Create atropos transport + orchestration controller. Preload rides a
-	// dedicated long-timeout transport (MANTEION_PRELOAD_TIMEOUT, default 60s)
-	// so chunked tens-of-MiB replay sets are not truncated by the 5s command
-	// client / 2s fanout — see atrocontrol.WithPreloadTransport (MANT-1).
+	// Create the atropos transport + fleet controller: instance status,
+	// fidelity pulls and the live-instance resolver. Nothing is pushed to an
+	// instance; rules, faults, the freeze and replay sets reach it through
+	// the desired state it polls (replay sets are pulled by the instance).
 	txClient := atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: 5 * time.Second}))
-	preloadTimeout := envDurationOr("MANTEION_PRELOAD_TIMEOUT", 60*time.Second)
-	preloadClient := atropos.NewClient(atropos.WithHTTPClient(&http.Client{Timeout: preloadTimeout}))
 	resolver := &atrocontrol.RepoResolver{Repo: sdkRepo}
 	controller := atrocontrol.New(txClient, resolver,
 		atrocontrol.WithDefaultTimeout(2*time.Second),
 		atrocontrol.WithDefaultConcurrency(16),
 		atrocontrol.WithLogger(logger),
-		atrocontrol.WithPreloadTransport(preloadClient),
 	)
 
 	policyRepo := store.NewPolicyRepo(database)
@@ -130,7 +127,7 @@ func main() {
 	// an empty pool map, so a data_schema workflow drives unresolved
 	// {{data.*}} traffic rather than failing.
 	orch.WithZeusDatasetID(envOr("MANTEION_ZEUS_DATASET_ID", ""))
-	policyEngine := policy.New(policyRepo, ruleRepo, faultRepo, controller, promClient, logger)
+	policyEngine := policy.New(policyRepo, ruleRepo, promClient, logger)
 
 	// Restore in-flight runs from the DB. Must run before the API server
 	// accepts requests, so callers see consistent state.
@@ -315,15 +312,4 @@ func positiveDurationEnv(key string, fallback time.Duration) (time.Duration, err
 // their own deadlines.
 func httpWriteTimeout(convergeTimeout, drainTimeout time.Duration) time.Duration {
 	return 2*convergeTimeout + drainTimeout + 30*time.Second
-}
-
-// envDurationOr parses the environment variable key as a Go duration (e.g.
-// "60s", "2m"), falling back on an unset or unparseable value.
-func envDurationOr(key string, fallback time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return fallback
 }

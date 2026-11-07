@@ -9,16 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	atroposdk "git.ucsc.edu/microfaults/atropos-go"
-	"manteion-go/internal/atrocontrol"
-	"manteion-go/internal/atropos"
-	"manteion-go/internal/atropostest"
 	"manteion-go/internal/model"
 	"manteion-go/internal/promql"
+	"manteion-go/internal/store"
 )
 
 // fakePromServer returns a Prometheus-shaped instant-query response with a fixed value.
@@ -54,56 +50,75 @@ func fakePromServerUnavailable(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// fakeSDKServer starts an atropos admin server (real SDK control surface via
-// atropos.Serve, offline) and returns its URL + a func that returns how many
-// times PostRules has been called.
-func fakeSDKServer(t *testing.T) (url string, pushCount func() int) {
-	t.Helper()
-	h := atropostest.NewHandler(t)
-	var count atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/admin/rules" {
-			count.Add(1)
-		}
-		h.ServeHTTP(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL, func() int { return int(count.Load()) }
+// fakeRuleStore is an in-memory ruleStore: rules by id, and every Update it
+// was asked to make (the rule CRUD path that bumps the service's generation
+// in the same transaction).
+type fakeRuleStore struct {
+	mu      sync.Mutex
+	rules   map[string]*model.Rule
+	updates []model.Rule
 }
 
-// buildController builds an atrocontrol.Controller targeting a single fake SDK server.
-func buildController(t *testing.T, sdkURL string, service string) *atrocontrol.Controller {
-	t.Helper()
-	resolver := &fakeResolver{
-		services: map[string][]*model.SDKInstance{
-			service: {{ID: "inst-0", Service: service, Address: sdkURL}},
-		},
+func newFakeRuleStore(rules ...*model.Rule) *fakeRuleStore {
+	f := &fakeRuleStore{rules: make(map[string]*model.Rule, len(rules))}
+	for _, r := range rules {
+		f.rules[r.ID] = r
 	}
-	tx := atropos.NewClient()
-	return atrocontrol.New(tx, resolver,
-		atrocontrol.WithDefaultTimeout(3*time.Second),
-		atrocontrol.WithDefaultConcurrency(4),
-	)
+	return f
 }
 
-// fakeResolver satisfies atrocontrol.InstanceResolver with an in-memory map.
-type fakeResolver struct {
-	services map[string][]*model.SDKInstance
+func (f *fakeRuleStore) Get(_ context.Context, id string) (*model.Rule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.rules[id]
+	if !ok {
+		return nil, fmt.Errorf("rule %q: %w", id, store.ErrNotFound)
+	}
+	cp := *r
+	return &cp, nil
 }
 
-func (f *fakeResolver) ForService(_ context.Context, service string) ([]*model.SDKInstance, error) {
-	return f.services[service], nil
+func (f *fakeRuleStore) Update(_ context.Context, rule *model.Rule) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.rules[rule.ID]; !ok {
+		return store.ErrNotFound
+	}
+	cp := *rule
+	f.rules[rule.ID] = &cp
+	f.updates = append(f.updates, cp)
+	return nil
 }
 
-func (f *fakeResolver) ForInstance(_ context.Context, id string) (*model.SDKInstance, error) {
-	for _, insts := range f.services {
-		for _, inst := range insts {
-			if inst.ID == id {
-				return inst, nil
-			}
+func (f *fakeRuleStore) EnabledForService(_ context.Context, service string) ([]*model.Rule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*model.Rule
+	for _, r := range f.rules {
+		if r.Service == service && r.Enabled {
+			cp := *r
+			out = append(out, &cp)
 		}
 	}
-	return nil, fmt.Errorf("instance %q not found", id)
+	return out, nil
+}
+
+func (f *fakeRuleStore) updateCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.updates)
+}
+
+func (f *fakeRuleStore) enabled(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rules[id].Enabled
+}
+
+// mkRule is a disabled-or-enabled rule of service.
+func mkRule(id, service string, enabled bool) *model.Rule {
+	return &model.Rule{ID: id, Name: id, Service: service, Enabled: enabled,
+		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "spec-1"}}
 }
 
 // fakePolicyRepo is a minimal in-memory PolicyRepo substitute.
@@ -124,25 +139,11 @@ func (r *fakePolicyRepo) ListEnabled(_ context.Context) ([]*model.PolicyRule, er
 	return out, nil
 }
 
-// makeEngine assembles an Engine with a single policy rule, pointing at the given Prometheus server.
-func makeEngine(
-	t *testing.T,
-	prom *promql.Client,
-	ctrl *atrocontrol.Controller,
-	policies []*model.PolicyRule,
-) *Engine {
+// makeEngine assembles an Engine over the given policies, Prometheus server
+// and rule store.
+func makeEngine(t *testing.T, prom *promql.Client, rules ruleStore, policies []*model.PolicyRule) *Engine {
 	t.Helper()
-	var repo policyLister = &fakePolicyRepo{rules: policies}
-	return &Engine{
-		policies:    repo,
-		rules:       nil, // not needed when action is clear_rules or rules slice is empty
-		faults:      nil,
-		controller:  ctrl,
-		prom:        prom,
-		logger:      noopLogger(),
-		interval:    defaultTickInterval,
-		lastFiredAt: make(map[string]time.Time),
-	}
+	return New(&fakePolicyRepo{rules: policies}, rules, prom, noopLogger())
 }
 
 func noopLogger() *slog.Logger {
@@ -151,152 +152,107 @@ func noopLogger() *slog.Logger {
 
 // --- Tests ---
 
-func TestConditionFires_AboveThreshold(t *testing.T) {
-	promSrv := fakePromServer(t, 600.0) // metric = 600, threshold = 500 → gt fires
-	sdkURL, pushCount := fakeSDKServer(t)
-	ctrl := buildController(t, sdkURL, "checkout")
-	prom := promql.NewClient(promSrv.URL)
+func clearRulesPolicy(id, service string, op string, threshold float64, cooldown time.Duration) *model.PolicyRule {
+	return &model.PolicyRule{
+		ID: id, Enabled: true,
+		Condition: model.PolicyCondition{Metric: "up", Operator: op, Threshold: threshold},
+		Action:    model.PolicyAction{ActionType: "clear_rules", PushRules: &model.PushRulesAction{Service: service}},
+		Cooldown:  cooldown,
+	}
+}
 
-	rule := &model.PolicyRule{
-		ID:      "p-1",
-		Enabled: true,
-		Condition: model.PolicyCondition{
-			Metric: "up", Operator: "gt", Threshold: 500,
-		},
-		Action: model.PolicyAction{
-			ActionType: "clear_rules",
-			PushRules:  &model.PushRulesAction{Service: "checkout"},
-		},
-		Cooldown: 0,
+// A push_rules policy whose condition fires enables each listed rule through
+// rule CRUD (Update, which bumps the service's generation in-tx): one update,
+// the rule now enabled.
+func TestConditionFires_AboveThreshold(t *testing.T) {
+	prom := promql.NewClient(fakePromServer(t, 600.0).URL) // metric = 600, threshold = 500 → gt fires
+	rules := newFakeRuleStore(mkRule("r-1", "checkout", false))
+	policy := &model.PolicyRule{
+		ID: "p-1", Enabled: true,
+		Condition: model.PolicyCondition{Metric: "up", Operator: "gt", Threshold: 500},
+		Action: model.PolicyAction{ActionType: "push_rules",
+			PushRules: &model.PushRulesAction{Service: "checkout", RuleIDs: []string{"r-1"}}},
 	}
 
-	eng := makeEngine(t, prom, ctrl, []*model.PolicyRule{rule})
-	eng.tick(context.Background())
+	makeEngine(t, prom, rules, []*model.PolicyRule{policy}).tick(context.Background())
 
-	if pushCount() != 1 {
-		t.Fatalf("expected 1 PushRules call, got %d", pushCount())
+	if n := rules.updateCount(); n != 1 {
+		t.Fatalf("expected 1 rule update, got %d", n)
+	}
+	if !rules.enabled("r-1") {
+		t.Fatal("push_rules left r-1 disabled")
 	}
 }
 
 func TestConditionDoesNotFire_BelowThreshold(t *testing.T) {
-	promSrv := fakePromServer(t, 100.0) // metric = 100, threshold = 500 → gt does not fire
-	sdkURL, pushCount := fakeSDKServer(t)
-	ctrl := buildController(t, sdkURL, "checkout")
-	prom := promql.NewClient(promSrv.URL)
+	prom := promql.NewClient(fakePromServer(t, 100.0).URL) // metric = 100, threshold = 500 → gt does not fire
+	rules := newFakeRuleStore(mkRule("r-1", "checkout", true))
 
-	rule := &model.PolicyRule{
-		ID:      "p-2",
-		Enabled: true,
-		Condition: model.PolicyCondition{
-			Metric: "up", Operator: "gt", Threshold: 500,
-		},
-		Action: model.PolicyAction{
-			ActionType: "clear_rules",
-			PushRules:  &model.PushRulesAction{Service: "checkout"},
-		},
-		Cooldown: 0,
-	}
+	makeEngine(t, prom, rules, []*model.PolicyRule{clearRulesPolicy("p-2", "checkout", "gt", 500, 0)}).tick(context.Background())
 
-	eng := makeEngine(t, prom, ctrl, []*model.PolicyRule{rule})
-	eng.tick(context.Background())
-
-	if pushCount() != 0 {
-		t.Fatalf("expected 0 PushRules calls, got %d", pushCount())
+	if n := rules.updateCount(); n != 0 {
+		t.Fatalf("expected 0 rule updates, got %d", n)
 	}
 }
 
 func TestCooldownPreventDoubleFire(t *testing.T) {
-	promSrv := fakePromServer(t, 1.0) // always fires (eq 1)
-	sdkURL, pushCount := fakeSDKServer(t)
-	ctrl := buildController(t, sdkURL, "checkout")
-	prom := promql.NewClient(promSrv.URL)
-
-	rule := &model.PolicyRule{
-		ID:      "p-3",
-		Enabled: true,
-		Condition: model.PolicyCondition{
-			Metric: "up", Operator: "eq", Threshold: 1,
-		},
-		Action: model.PolicyAction{
-			ActionType: "clear_rules",
-			PushRules:  &model.PushRulesAction{Service: "checkout"},
-		},
+	prom := promql.NewClient(fakePromServer(t, 1.0).URL) // always fires (eq 1)
+	rules := newFakeRuleStore(mkRule("r-1", "checkout", false))
+	policy := &model.PolicyRule{
+		ID: "p-3", Enabled: true,
+		Condition: model.PolicyCondition{Metric: "up", Operator: "eq", Threshold: 1},
+		Action: model.PolicyAction{ActionType: "push_rules",
+			PushRules: &model.PushRulesAction{Service: "checkout", RuleIDs: []string{"r-1"}}},
 		Cooldown: 10 * time.Minute, // long cooldown
 	}
 
-	eng := makeEngine(t, prom, ctrl, []*model.PolicyRule{rule})
+	eng := makeEngine(t, prom, rules, []*model.PolicyRule{policy})
 	eng.tick(context.Background()) // fires
 	eng.tick(context.Background()) // blocked by cooldown
 	eng.tick(context.Background()) // blocked by cooldown
 
-	if pushCount() != 1 {
-		t.Fatalf("expected exactly 1 PushRules call due to cooldown, got %d", pushCount())
+	if n := rules.updateCount(); n != 1 {
+		t.Fatalf("expected exactly 1 rule update due to cooldown, got %d", n)
 	}
 }
 
-func TestClearRulesAction_CallsPushRulesWithNil(t *testing.T) {
-	promSrv := fakePromServer(t, 1.0)
-	sdkURL, _ := fakeSDKServer(t)
-	ctrl := buildController(t, sdkURL, "svc")
-	prom := promql.NewClient(promSrv.URL)
+// clear_rules disables every enabled rule of the service through rule CRUD;
+// another service's rules and the service's disabled ones are not touched.
+func TestClearRulesAction_DisablesEveryEnabledRuleOfTheService(t *testing.T) {
+	prom := promql.NewClient(fakePromServer(t, 1.0).URL)
+	rules := newFakeRuleStore(
+		mkRule("a", "svc", true), mkRule("b", "svc", true), mkRule("off", "svc", false),
+		mkRule("other", "other-svc", true),
+	)
+	policy := clearRulesPolicy("p-4", "svc", "eq", 1, 0)
 
-	rule := &model.PolicyRule{
-		ID:      "p-4",
-		Enabled: true,
-		Condition: model.PolicyCondition{
-			Metric: "up", Operator: "eq", Threshold: 1,
-		},
-		Action: model.PolicyAction{
-			ActionType: "clear_rules",
-			PushRules:  &model.PushRulesAction{Service: "svc"},
-		},
-		Cooldown: 0,
-	}
-
-	eng := makeEngine(t, prom, ctrl, []*model.PolicyRule{rule})
-	if err := eng.evaluate(context.Background(), rule); err != nil {
+	if err := makeEngine(t, prom, rules, []*model.PolicyRule{policy}).evaluate(context.Background(), policy); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	// Verify the SDK received an empty rule set (nil → []).
-	getReq, _ := http.NewRequest(http.MethodGet, sdkURL+"/admin/rules", nil)
-	resp, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		t.Fatalf("GET /admin/rules: %v", err)
+	if n := rules.updateCount(); n != 2 {
+		t.Fatalf("expected 2 rule updates (the service's enabled rules), got %d", n)
 	}
-	defer resp.Body.Close()
-	var rules []atroposdk.StaticRule
-	json.NewDecoder(resp.Body).Decode(&rules)
-	if len(rules) != 0 {
-		t.Fatalf("expected empty rule set after clear_rules, got %d rules", len(rules))
+	for _, u := range rules.updates {
+		if u.Service != "svc" || u.Enabled {
+			t.Errorf("update %+v, want a rule of svc disabled", u)
+		}
+	}
+	for id, want := range map[string]bool{"a": false, "b": false, "off": false, "other": true} {
+		if got := rules.enabled(id); got != want {
+			t.Errorf("rule %s enabled = %v, want %v", id, got, want)
+		}
 	}
 }
 
 func TestPrometheusUnavailable_DoesNotPanic(t *testing.T) {
-	promSrv := fakePromServerUnavailable(t)
-	sdkURL, pushCount := fakeSDKServer(t)
-	ctrl := buildController(t, sdkURL, "checkout")
-	prom := promql.NewClient(promSrv.URL)
-
-	rule := &model.PolicyRule{
-		ID:      "p-5",
-		Enabled: true,
-		Condition: model.PolicyCondition{
-			Metric: "up", Operator: "gt", Threshold: 0,
-		},
-		Action: model.PolicyAction{
-			ActionType: "clear_rules",
-			PushRules:  &model.PushRulesAction{Service: "checkout"},
-		},
-		Cooldown: 0,
-	}
-
-	eng := makeEngine(t, prom, ctrl, []*model.PolicyRule{rule})
+	prom := promql.NewClient(fakePromServerUnavailable(t).URL)
+	rules := newFakeRuleStore(mkRule("r-1", "checkout", true))
 
 	// Must not panic; the tick should log a warning and skip.
-	eng.tick(context.Background())
+	makeEngine(t, prom, rules, []*model.PolicyRule{clearRulesPolicy("p-5", "checkout", "gt", 0, 0)}).tick(context.Background())
 
-	if pushCount() != 0 {
-		t.Fatalf("expected 0 PushRules calls when Prometheus is unavailable, got %d", pushCount())
+	if n := rules.updateCount(); n != 0 {
+		t.Fatalf("expected 0 rule updates when Prometheus is unavailable, got %d", n)
 	}
 }

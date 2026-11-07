@@ -18,10 +18,11 @@ import (
 // adds fails sdk_wire_test.go, whose parity tests build fully populated values
 // and pin the bytes against the SDK's own encoder and decoder.
 //
-// Two shapes stay manteion's: model.ReplaySetRef, the persistence type, whose
+// One shape stays manteion's: model.ReplaySetRef, the persistence type, whose
 // count is the BIGINT column's int64 (replaySetWire converts it at this
-// boundary), and the register answer for a service whose desired state cannot
-// be materialized (noDocumentRegister).
+// boundary). The register answer for a service whose desired state cannot be
+// materialized is the SDK's own empty RegisterResponse too (§2 Register: etag
+// absent or empty, which the SDK treats alike).
 
 // ruleSyncFrom puts a materialized document on the wire as the SDK's RuleSync
 // (desired-state protocol v1 §2). It fails only when the replay set cannot be
@@ -81,20 +82,4 @@ func observedStatusFrom(rep atroposdk.StatusReport) model.ObservedStatus {
 		st.ReplaySet = &set
 	}
 	return st
-}
-
-// noDocumentRegister is the 201 body register answers with when the instance's
-// desired state cannot be materialized (§2 Register): version 0, an empty etag,
-// null rules and active_faults, no freeze_cfg or replay_set. The SDK applies
-// nothing for a body with neither an etag nor rules. It is not an
-// atroposdk.RegisterResponse because that type tags etag omitempty, so the
-// SDK's own encoding of the empty response drops the key that the contract and
-// this handler's tests keep. TestNoDocumentRegister_IsTheSDKsEmptyRegisterResponseWithTheEtagKey
-// compares the two; once the SDK stops omitting an empty etag this type can go.
-type noDocumentRegister struct {
-	Status       string                   `json:"status"`
-	Version      uint64                   `json:"version"`
-	Etag         string                   `json:"etag"`
-	Rules        []atroposdk.CompiledRule `json:"rules"`
-	ActiveFaults []atroposdk.FaultRequest `json:"active_faults"`
 }

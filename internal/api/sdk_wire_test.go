@@ -166,13 +166,13 @@ func TestWireParity_DocumentDecodesAsTheSDKsRuleSync(t *testing.T) {
 	requireSameBytes(t, reg.Body.Bytes(), resp)
 }
 
-// The register answer for a service whose desired state cannot be materialized
-// is the contract's no-document body. The SDK decodes it as a RegisterResponse
-// holding nothing (it applies nothing for a body with neither an etag nor
-// rules), and the mirror the handler writes it with differs from the SDK's own
-// encoding of that empty response in exactly one thing: the etag key, which the
-// SDK tags omitempty and the contract (and the handler's other tests) keep.
-func TestNoDocumentRegister_IsTheSDKsEmptyRegisterResponseWithTheEtagKey(t *testing.T) {
+// The register answer for a service whose desired state cannot be
+// materialized is the contract's no-document body, written with the SDK's own
+// type: version 0, rules and active_faults null, no freeze_cfg or replay_set,
+// and the etag absent or empty (the SDK tags it omitempty and treats the two
+// alike). The SDK decodes it as a RegisterResponse holding nothing, which it
+// applies as nothing.
+func TestNoDocumentRegister_IsTheSDKsEmptyRegisterResponse(t *testing.T) {
 	fx := newDesiredFixture()
 	s := fx.server()
 	s.materializer = failingMaterializer{}
@@ -181,21 +181,23 @@ func TestNoDocumentRegister_IsTheSDKsEmptyRegisterResponseWithTheEtagKey(t *test
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
-	const contractBody = `{"status":"registered","version":0,"etag":"","rules":null,"active_faults":null}`
-	if got := strings.TrimSpace(w.Body.String()); got != contractBody {
-		t.Errorf("body = %s, want %s", got, contractBody)
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if etag, ok := got["etag"]; ok && string(etag) != `""` {
+		t.Errorf("etag = %s, want it absent or empty", etag)
+	}
+	delete(got, "etag")
+	want := map[string]json.RawMessage{"status": json.RawMessage(`"registered"`), "version": json.RawMessage(`0`),
+		"rules": json.RawMessage(`null`), "active_faults": json.RawMessage(`null`)}
+	if !maps.EqualFunc(got, want, func(a, b json.RawMessage) bool { return bytes.Equal(a, b) }) {
+		t.Errorf("body = %s, want exactly %v plus an absent or empty etag", w.Body.String(), want)
 	}
 	var resp atroposdk.RegisterResponse
 	decodeStrict(t, w.Body.Bytes(), &resp)
 	if !reflect.DeepEqual(resp, atroposdk.RegisterResponse{Status: "registered"}) {
 		t.Errorf("the SDK decodes the no-document body as %+v, want the status and nothing else", resp)
-	}
-
-	ours := marshalRawJSON(t, noDocumentRegister{Status: "registered"})
-	sdk := marshalRawJSON(t, atroposdk.RegisterResponse{Status: "registered"})
-	sdk["etag"] = json.RawMessage(`""`) // present already once the SDK drops omitempty
-	if !maps.EqualFunc(ours, sdk, func(a, b json.RawMessage) bool { return bytes.Equal(a, b) }) {
-		t.Errorf("noDocumentRegister = %v, the SDK's empty RegisterResponse plus etag = %v: the mirror has drifted", ours, sdk)
 	}
 }
 

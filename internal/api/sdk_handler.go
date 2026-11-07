@@ -68,15 +68,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		// Never fail registration on a data error: the SDK would refuse to
-		// start. Answer with no document instead — version 0, an empty etag,
-		// null rules and active_faults, no freeze_cfg or replay_set — which
+		// start. Answer with no document instead — version 0, no etag (the
+		// SDK's encoding omits an empty one; the contract reads "absent or
+		// empty"), null rules and active_faults, no freeze_cfg or replay_set — which
 		// the SDK applies as nothing, so an instance re-registering while its
 		// polls fail keeps what it has armed ([] would clear it). The poll
 		// reports the error as a 500 until the data is fixed. A document that
 		// cannot go on the wire (a replay-set count the SDK's int cannot hold)
 		// is such an error too.
 		s.logger.Error("register: materialize desired state failed", "service", inst.Service, "error", err)
-		writeJSON(w, http.StatusCreated, noDocumentRegister{Status: "registered"})
+		writeJSON(w, http.StatusCreated, atroposdk.RegisterResponse{Status: "registered"})
 		return
 	}
 	writeJSON(w, http.StatusCreated, atroposdk.RegisterResponse{Status: "registered", RuleSync: body})
