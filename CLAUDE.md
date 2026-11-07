@@ -65,7 +65,9 @@ manteion-go (Controller)
 | `internal/zeus/` | HTTP client for zeus-go/Archer REST API. |
 | `internal/api/` | HTTP server. `server.go` wires routes; one handler file per domain group. |
 | `internal/faultcatalog/` | Single source of truth for supported faults: vocabulary + typed params validation (backed by `atropos-go/faultparams`) + UI form metadata served at `GET /api/v1/faults/catalog`. |
-| `internal/id/` | Entity id minting: `{prefix}-{uuidv7}` TEXT (`exp- phase- rule- spec- comp- wf- atk- atkres- fc- policy-`). |
+| `internal/id/` | Entity id minting: `{prefix}-{uuidv7}` TEXT (`exp- phase- rule- spec- comp- wf- atk- atkres- fc- policy- opa- pdec-`). |
+| `internal/opaharness/` | OPA harness (`docs/opa-harness.md`): compiles Rego v1 policies (`package atropos`, sandboxed, 5 s timeout), evaluates `data.atropos.mutations` over `input` `{now, now_ns, inputs, rules, services, instances}` on each policy's interval, and applies the in-scope mutations (`upsert_rule`, `set_enabled`, `set_params`, `delete_rule`; idempotent) through `store.RuleRepo`, so they reach instances through the generations. Cooldown after a changing apply, read back from the decision log; every evaluation, dry runs included, is one `policy_decisions` row. Runs only with `MANTEION_POLICY_ENGINE=rego|on`. |
+| `internal/logql/` | Loki instant metric-query client (`GET /loki/api/v1/query`), returning `promql.Sample`s for harness inputs. |
 
 ### Key design choices
 
@@ -92,6 +94,7 @@ manteion-go (Controller)
 | SDK | `POST /api/v1/sdk/register` (answers with the materialized desired state), `DELETE /api/v1/sdk/register/{id}`, `GET /api/v1/sdk/instances` (rows carry `host`, `capabilities` and the observed state), `GET ./instances/{id}` (row + `active_rule_ids` + `recent_run_ids`), `POST ./instances/{id}/kill-switch` (disables every enabled rule for the instance's service, one rule-version and generation bump per rule, and cancels its active fault configs, then, when anything changed, bumps the generation once; it ends no phase, so a running phase's synthesized cache-box rule, `freeze_cfg` and `replay_set` stay; answers `disabled_rule_ids` and `cancelled_fault_config_ids`, never null), `GET /api/v1/sdk/rules` (long-poll, ETag/304), `POST /api/v1/sdk/status`, `GET /api/v1/sdk/init`, `GET /api/v1/sdk/events` (SSE `rules_changed`) |
 | Experiments | `POST/GET /api/v1/experiments`, `GET/PUT/DELETE ./{id}`, `POST ./{id}/start`, `POST ./{id}/pause`, `POST ./{id}/resume`, `POST ./{id}/cancel`, `POST ./{id}/stop?status=`, `GET ./{id}/results`; phases: `POST ./{id}/phases`, `GET/PUT/DELETE ./{id}/phases/{phaseId}`, `POST ./{id}/phases/{phaseId}/start`, `POST ./{id}/phases/{phaseId}/stop?status=`, `GET ./{id}/phases/{phaseId}/results`. PUT edits are plan-only (409 otherwise): the experiment must be `planned`, and a phase must also be `pending`; omitted body fields keep their value. |
 | Phases (run-details) | `GET /api/v1/phases`, `GET ./{phaseId}`, `GET ./{phaseId}/faults`, `POST ./{phaseId}/pause\|resume\|stop`. A "run" = a phase; live panels (steps/events/resources) are the v2 follow-on. |
+| OPA policies | `POST/GET /api/v1/opa/policies`, `GET/PUT/DELETE ./{id}`, `GET ./{id}/decisions` (paged), `POST ./{id}/evaluate?apply=true\|false` (dry run by default) |
 | Zeus proxy | `POST/GET /api/v1/zeus/workflows`, `GET/DELETE ./{id}`, `POST ./{id}/validate`, `POST/GET ./{id}/runs`; `GET /api/v1/zeus/runs`, `GET/DELETE ./{run_id}`, `GET ./{run_id}/events`, `GET ./{run_id}/stats`; `POST/GET /api/v1/zeus/datasets`, `GET/DELETE ./{id}`, `POST ./{id}/upload`, `GET ./{id}/sample` → Archer. Attacks NOT proxied (orchestrator-managed). |
 
 **Error envelope.** Every handler returns `{"error": "<message>"}` on 4xx/5xx (`api.ErrorResponse`; expctl and the UI's generic path read `error`). The experiment and phase handlers (both route groups above) add a machine-readable `code` plus code-specific fields — `internal/api/error_response.go` (`writeErrorCode`, `errorEnvelope`). Rules / faults / SDK handlers still emit the bare envelope.
@@ -116,7 +119,8 @@ Typed errors wrap with `%w` and keep their historical log text; classify with `e
 |---|---|---|
 | `MANTEION_ADDR` | `:8080` | Listen address |
 | `MANTEION_DATABASE_URL` | `postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable` | PostgreSQL DSN |
-| `MANTEION_POLICY_ENGINE` | `off` | Opt-in for the WIP-frozen policy evaluation loop (`on` to enable) |
+| `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop |
+| `MANTEION_LOKI_URL` | `http://loki:3100` | Loki base URL for harness inputs |
 | `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier bound: fatal at phase entry and resume, logged at exit and drain. Must be a positive duration of at most 1 h, as must `MANTEION_DRAIN_TIMEOUT` (startup refuses anything else); the HTTP write timeout is 2 × it + `MANTEION_DRAIN_TIMEOUT` + 30 s |
 | `MANTEION_DRAIN_TIMEOUT` | `30s` | Drain-barrier wait for every expected instance's drain report before gap classification; a positive duration of at most 1 h |
 | `ZEUS_URL` | `http://archer:8080` | Archer base URL |

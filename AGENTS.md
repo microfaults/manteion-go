@@ -52,7 +52,7 @@ This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on i
 - **Fault Rules** — Composable fault specs: atomic faults + composition trees (max depth 3, parallel or sequential). Network faults are direction-aware (upstream/downstream). Incompatibility validation at composition creation. Types in `internal/model/fault.go`.
 - **Experiments** — Each experiment has runs (baseline + isolation + combination). Experiments are described by their runs' `FrozenServices` and each cache-box's `Mode`; there is no experiment-type discriminator. Results aggregated per (run, service, workflow). ContributionResult stores delta computation. Types in `internal/model/experiment.go`.
 - **Trace Anchors** — Pointers into Jaeger/Prometheus/Tempo (time range, filters), not trace data itself. CacheBoxConfig describes frozen service state: `KeyStrategy` (`"exact"`, `"exact_with_host"`, `"exact_with_body"` — aligns with atropos SDK `cachebox.KeyStrategy` constants), `MutationPolicy`/`SafeMethods` (reproducibility metadata only, not enforced by SDK), and `SyntheticDelay`. Types in `internal/model/trace.go`.
-- **Policy** — Metric-triggered actions: launch attacks or change cache-box modes. Migrated from zeus-go Archer. Types in `internal/model/policy.go`.
+- **Policy** — Rego policies evaluated by the OPA harness against live Prometheus/Loki inputs; outputs are rule mutations applied through the rule repository (`internal/opaharness`, `docs/opa-harness.md`). The 2026-04 PromQL threshold engine (`internal/model/policy.go`, `internal/policy`) is frozen behind `MANTEION_POLICY_ENGINE=threshold`.
 
 ## HTTP API
 

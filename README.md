@@ -37,7 +37,9 @@ recording surfaces as a verdict, not as silently skewed numbers.
 | `internal/ruleconv/` | Rule → wire compilation. Wire structs (`CompiledRule`, `FaultRequest`, `DelayRequest`) are **imported from atropos-go** — one contract, two repos; the poll, register and status bodies are atropos-go's own `RuleSync`, `RegisterResponse` and `StatusReport` (`internal/api/sdk_wire.go`), so a shape drift fails the build; `model.ReplaySetRef` stays the persistence type and converts at that boundary. Cache-box rules reach an instance two ways. The orchestrator's own is **synthesized per running phase** (`SynthesizeCacheBoxRule`), never stored. A user-authored one (`action.type: cachebox`) compiles with the context (experiment, phase, key strategy) of the running phase it is served through, so what it records and replays belongs to that phase: `RuleRepo.ForService` names the phase (`model.Rule.ServedPhaseID`/`ServedExperimentID`, never on the wire: the first running phase the rule is attached to, in `ListRunningPhases` order) and the key strategy is the rule's own. A rule attached to no phase compiles without a context. It must key like the frozen-service config of its service anywhere in the experiment — the same resolved key strategy, and no `key_headers` on that config, since the rule carries none (`model.ValidateCacheBoxStrategyAgreement`): checked when it is attached (creating a plan, adding or editing a phase) and again when the experiment or a phase starts, 422 `validation` naming the rule; a phase the scheduler reaches with a disagreeing rule fails with that reason. |
 | `internal/api/` | HTTP server; one handler file per domain group. Swagger covers a subset of routes — the code is authoritative. |
 | `internal/faultcatalog/` | Fault vocabulary + typed param validation backed by `atropos-go/faultparams`. |
-| `internal/policy/` | WIP-frozen behind `MANTEION_POLICY_ENGINE=off`. Acts through rule CRUD: `push_rules` enables the listed rules, `clear_rules` disables the service's enabled ones, each update bumping the service's generation in-tx. |
+| `internal/opaharness/` | OPA harness: Rego policies over Prometheus/Loki inputs that mutate rules through the rule repo (`MANTEION_POLICY_ENGINE=rego`); see `docs/opa-harness.md`. |
+| `internal/logql/` | Loki instant metric-query client (harness inputs). |
+| `internal/policy/` | Frozen PromQL threshold loop, reachable only as `MANTEION_POLICY_ENGINE=threshold`. Acts through rule CRUD: `push_rules` enables the listed rules, `clear_rules` disables the service's enabled ones, each update bumping the service's generation in-tx. |
 
 ## Wire contracts (shared with atropos-go)
 
@@ -91,7 +93,8 @@ Fault catalog · SDK (register / instances / rules / status / init / events) · 
 run-details (`GET /api/v1/phases[/{id}[/faults]]`, `POST .../pause|resume|stop` — a "run" in the UI
 sense is a phase; start, resume, pause, cancel and stop run detached from the request, and a phase
 start or resume whose fleet does not converge is 504 `not_converged`) · Cache (ingest, drain,
-artifacts) · Zeus proxy (`/api/v1/zeus/*` — workflows, runs,
+artifacts) · OPA policies (`/api/v1/opa/policies` CRUD, `/{id}/decisions`,
+`/{id}/evaluate?apply=`) · Zeus proxy (`/api/v1/zeus/*` — workflows, runs,
 datasets pass through; attacks are orchestrator-managed, not proxied).
 
 ## Environment
@@ -102,11 +105,12 @@ datasets pass through; attacks are orchestrator-managed, not proxied).
 | `MANTEION_DATABASE_URL` | `postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable` | Postgres DSN |
 | `ZEUS_URL` | `http://archer:8080` | zeus base URL |
 | `PROMETHEUS_URL` | `http://prometheus:9090` | Prometheus instant-query client |
+| `MANTEION_LOKI_URL` | `http://loki:3100` | Loki base URL for harness inputs |
 | `CACHE_DIR` | `/var/cache/manteion` | NDJSON cache store root |
 | `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier: how long a phase entry or resume waits for every alive instance to observe its bump (and hold a frozen service's replay set committed) before failing; exit and drain wait as long and only log. Must be a positive duration of at most 1 h (startup refuses anything else). The HTTP write timeout is 2 × this + `MANTEION_DRAIN_TIMEOUT` + 30 s, so a stop that waits out a drain barrier and an exit wait still gets its answer |
 | `MANTEION_DRAIN_TIMEOUT` | `30s` | Drain-barrier wait before gap classification. Must be a positive duration of at most 1 h (startup refuses anything else) |
 | `MANTEION_ALLOW_DEGRADED_BASELINE` | `false` | Permit isolation phases over a degraded baseline recording |
-| `MANTEION_POLICY_ENGINE` | `off` | WIP-frozen policy loop |
+| `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop |
 | `MANTEION_SDK_PURGE_ENABLED` | `false` | Dead-instance purge sweep |
 
 ## SDK dependency
