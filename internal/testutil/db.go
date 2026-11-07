@@ -58,6 +58,8 @@ func truncateAll(conn *sql.DB) {
 		"experiment_phases",
 		"experiments",
 		"workflows",
+		"policy_decisions",
+		"opa_policies",
 		"policy_rules",
 		"sdk_instances",
 		"service_generations",

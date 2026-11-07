@@ -115,6 +115,7 @@ var migrations = []migration{
 	{12, "sdk_instances: host/capabilities + observed state; service_generations (desired-state v1)", migration12},
 	{13, "replay_artifacts: content-addressed replay sets per (phase, service) (desired-state v1)", migration13},
 	{14, "sdk_instances: applied_generation (the generation the stored status report was applied at)", migration14},
+	{15, "opa_policies + policy_decisions (OPA harness)", migration15},
 }
 
 // Migrate applies any pending migrations to the database.
@@ -720,4 +721,36 @@ CREATE INDEX IF NOT EXISTS idx_replay_artifacts_id ON replay_artifacts(id);
 // the observed state. IF NOT EXISTS keeps the step re-runnable.
 const migration14 = `
 ALTER TABLE sdk_instances ADD COLUMN IF NOT EXISTS applied_generation BIGINT NOT NULL DEFAULT 0;
+`
+
+// migration15 adds the OPA harness: opa_policies holds Rego policies whose
+// inputs are live telemetry and whose outputs are rule mutations;
+// policy_decisions is the decision log, one row per evaluation, pruned per
+// policy to PolicyDecisionRepo's retention. The epoch guard compares
+// max(version) with len(migrations), so the list must stay contiguous: a gap
+// makes every later start refuse the database.
+const migration15 = `
+CREATE TABLE opa_policies (
+    id          TEXT PRIMARY KEY,                   -- 'opa-<uuidv7>'
+    name        TEXT NOT NULL UNIQUE,
+    enabled     BOOLEAN NOT NULL DEFAULT false,
+    rego        TEXT NOT NULL,
+    interval_s  INT NOT NULL DEFAULT 30,
+    cooldown_s  INT NOT NULL DEFAULT 0,
+    inputs      JSONB NOT NULL DEFAULT '[]',        -- [{name, source, query, kind}]
+    scope       JSONB NOT NULL DEFAULT '{}',        -- {services: [...]}
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE policy_decisions (
+    id           TEXT PRIMARY KEY,                  -- 'pdec-<uuidv7>'
+    policy_id    TEXT NOT NULL REFERENCES opa_policies(id) ON DELETE CASCADE,
+    evaluated_at TIMESTAMPTZ NOT NULL,
+    input_digest TEXT NOT NULL DEFAULT '',
+    mutations    JSONB NOT NULL DEFAULT '[]',       -- [opaharness.MutationResult]
+    applied      BOOLEAN NOT NULL DEFAULT false,
+    error        TEXT
+);
+CREATE INDEX idx_policy_decisions_policy_time ON policy_decisions(policy_id, evaluated_at DESC);
 `
