@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 )
@@ -137,5 +138,41 @@ func TestSandbox_PinsNondeterministicBuiltins(t *testing.T) {
 		if !catalogue[name] {
 			t.Errorf("allowed builtin %q is not in OPA's catalogue: drop it from harmlessNondeterministicBuiltins", name)
 		}
+	}
+}
+
+func TestRequirePackage_NilGuard(t *testing.T) {
+	for name, m := range map[string]*ast.Module{"nil module": nil, "no package": {}} {
+		if err := requirePackage(m); err == nil || err.Error() != `policy must declare "package atropos" (got no package)` {
+			t.Errorf("%s: err = %v, want the no-package refusal", name, err)
+		}
+	}
+}
+
+// cpuBoundRego searches 20000 x 20000 pairs for a product that never occurs.
+const cpuBoundRego = `package atropos
+
+mutations contains {"op": "delete_rule", "service": "checkout", "name": "never"} if {
+	some x in numbers.range(0, 20000)
+	some y in numbers.range(0, 20000)
+	x * y == -1
+}
+`
+
+func TestPrepared_Eval_TimesOut(t *testing.T) {
+	pq, err := Compile(cpuBoundRego)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	old := evalTimeout
+	evalTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { evalTimeout = old })
+	start := time.Now()
+	_, err = pq.Eval(context.Background(), map[string]any{})
+	if err == nil || !(strings.Contains(err.Error(), "deadline") || strings.Contains(err.Error(), "cancel")) {
+		t.Fatalf("Eval err = %v, want the evaluation stopped by its deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Eval took %s, want it stopped near the 50ms timeout", elapsed)
 	}
 }

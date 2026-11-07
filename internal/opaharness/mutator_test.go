@@ -3,6 +3,7 @@ package opaharness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -14,9 +15,16 @@ import (
 type fakeRules struct {
 	rules                     []*model.Rule
 	creates, updates, deletes int
+	lists                     int
+	listErrAfter              int   // List fails once it has answered this many times (0: never)
+	createErr                 error // the next Create fails with it, once
 }
 
 func (f *fakeRules) List(_ context.Context) ([]*model.Rule, error) {
+	if f.listErrAfter > 0 && f.lists >= f.listErrAfter {
+		return nil, errors.New("db down")
+	}
+	f.lists++
 	out := make([]*model.Rule, 0, len(f.rules))
 	for _, r := range f.rules {
 		cp := *r
@@ -26,6 +34,10 @@ func (f *fakeRules) List(_ context.Context) ([]*model.Rule, error) {
 }
 
 func (f *fakeRules) Create(_ context.Context, r *model.Rule) error {
+	if err := f.createErr; err != nil {
+		f.createErr = nil
+		return err
+	}
 	if err := r.Validate(); err != nil {
 		return err
 	}
@@ -332,5 +344,48 @@ func TestRuleMutator_SetParamsRefusesSpecUsedByComposition(t *testing.T) {
 				t.Errorf("set_params: spec updates %d, rule updates %d, want 1 and 1", specs.updates, rules.updates)
 			}
 		})
+	}
+}
+
+func TestRuleMutator_ListErrorReturnsGatheredResults(t *testing.T) {
+	rules := &fakeRules{listErrAfter: 1}
+	m := newTestMutator(rules, &fakeSpecs{})
+	other := desiredRule()
+	other.Name = "second"
+	res, err := m.Apply(context.Background(), "opa-1", []Mutation{
+		{Op: OpUpsertRule, Rule: desiredRule()},
+		{Op: OpUpsertRule, Rule: other},
+	})
+	if err == nil || err.Error() != "list rules: db down" {
+		t.Fatalf("err = %v, want %q", err, "list rules: db down")
+	}
+	if len(res) != 1 || res[0].Outcome != OutcomeCreated || res[0].Name != "checkout-egress-latency" || rules.creates != 1 {
+		t.Fatalf("results = %+v (creates %d), want the first mutation's result only, the run aborted before the second", res, rules.creates)
+	}
+}
+
+func TestRuleMutator_StoreWriteErrorFailsAndContinues(t *testing.T) {
+	rules := &fakeRules{createErr: errors.New("insert rule: connection reset")}
+	specs := &fakeSpecs{specs: map[string]*model.FaultSpec{"spec-lat": latencySpec("spec-lat")}, updateErr: errors.New("update spec: connection reset")}
+	m := newTestMutator(rules, specs)
+	other := desiredRule()
+	other.Name = "second"
+	res := apply(t, m,
+		Mutation{Op: OpUpsertRule, Rule: desiredRule()},                                                           // Create fails
+		Mutation{Op: OpUpsertRule, Rule: other},                                                                   // still applied
+		Mutation{Op: OpSetParams, Service: "checkout", Name: "second", Params: json.RawMessage(`{"delay":"1s"}`)}, // UpdateSpec fails
+		Mutation{Op: OpDeleteRule, Service: "checkout", Name: "second"},                                           // still applied
+	)
+	if res[0].Outcome != OutcomeFailed || res[0].Error != "insert rule: connection reset" {
+		t.Errorf("results[0] = %+v, want failed with the store's error", res[0])
+	}
+	if res[1].Outcome != OutcomeCreated || rules.creates != 1 {
+		t.Errorf("results[1] = %+v (creates %d), want the next mutation created", res[1], rules.creates)
+	}
+	if res[2].Outcome != OutcomeFailed || res[2].Error != "update spec: connection reset" || rules.updates != 0 {
+		t.Errorf("results[2] = %+v (rule updates %d), want failed with the spec store's error and no rule re-save", res[2], rules.updates)
+	}
+	if res[3].Outcome != OutcomeDeleted || rules.deletes != 1 || rules.get("checkout", "second") != nil {
+		t.Errorf("results[3] = %+v, want the delete after the failure applied", res[3])
 	}
 }

@@ -21,8 +21,11 @@ const (
 	policyFilename = "policy.rego"
 	policyPackage  = "data.atropos"
 	mutationsQuery = "data.atropos.mutations"
-	evalTimeout    = 5 * time.Second
 )
+
+// evalTimeout bounds each compile and each evaluation. It is a variable only
+// so a test can shorten it.
+var evalTimeout = 5 * time.Second
 
 // unsafeBuiltins are refused at compile time: a policy must never reach the
 // network or inspect the process from inside the evaluator. Against OPA
@@ -71,11 +74,8 @@ func Compile(src string) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	if m == nil || m.Package == nil {
-		return nil, fmt.Errorf("policy must declare \"package atropos\" (got no package)")
-	}
-	if got := m.Package.Path.String(); got != policyPackage {
-		return nil, fmt.Errorf("policy must declare \"package atropos\" (got %s)", got)
+	if err := requirePackage(m); err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), evalTimeout)
 	defer cancel()
@@ -89,6 +89,19 @@ func Compile(src string) (*Prepared, error) {
 		return nil, err
 	}
 	return &Prepared{pq: pq, hash: SourceHash(src)}, nil
+}
+
+// requirePackage checks that m declares "package atropos". A nil module or
+// one without a package (which ast.ParseModule does not return today) is
+// refused as "got no package".
+func requirePackage(m *ast.Module) error {
+	if m == nil || m.Package == nil {
+		return fmt.Errorf("policy must declare \"package atropos\" (got no package)")
+	}
+	if got := m.Package.Path.String(); got != policyPackage {
+		return fmt.Errorf("policy must declare \"package atropos\" (got %s)", got)
+	}
+	return nil
 }
 
 // Eval evaluates the policy against input under evalTimeout and decodes
