@@ -22,6 +22,9 @@ import (
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/db"
 	"manteion-go/internal/desired"
+	"manteion-go/internal/logql"
+	"manteion-go/internal/model"
+	"manteion-go/internal/opaharness"
 	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/policy"
 	"manteion-go/internal/promql"
@@ -49,6 +52,7 @@ func main() {
 		"postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable")
 	zeusURL := envOr("ZEUS_URL", "http://archer:8080")
 	prometheusURL := envOr("PROMETHEUS_URL", "http://prometheus:9090")
+	lokiURL := envOr("MANTEION_LOKI_URL", "http://loki:3100")
 	cacheDir := envOr("CACHE_DIR", "/var/cache/manteion")
 	// The convergence and drain barrier bounds (orchestrator setup below), which
 	// also size the HTTP write timeout: startup refuses a value that is not a
@@ -129,6 +133,25 @@ func main() {
 	orch.WithZeusDatasetID(envOr("MANTEION_ZEUS_DATASET_ID", ""))
 	policyEngine := policy.New(policyRepo, ruleRepo, promClient, logger)
 
+	// OPA harness (docs/opa-harness.md): Rego policies over Prometheus/Loki
+	// inputs whose outputs are rule mutations applied through ruleRepo, so
+	// they reach instances by the same path as PUT /api/v1/rules/{id}. Always
+	// constructed (the API's dry-run evaluate uses it); only Run is gated.
+	opaPolicyRepo := store.NewOPAPolicyRepo(database)
+	policyDecisionRepo := store.NewPolicyDecisionRepo(database)
+	harness := opaharness.New(opaharness.Deps{
+		Policies:  opaPolicyRepo,
+		Decisions: policyDecisionRepo,
+		Rules:     ruleRepo,
+		Instances: sdkRepo,
+		Providers: opaharness.Providers{
+			model.InputSourcePrometheus: opaharness.VectorProvider{Querier: promClient},
+			model.InputSourceLoki:       opaharness.VectorProvider{Querier: logql.NewClient(lokiURL)},
+		},
+		Mutator: opaharness.NewRuleMutator(ruleRepo, faultRepo),
+		Logger:  logger,
+	})
+
 	// Restore in-flight runs from the DB. Must run before the API server
 	// accepts requests, so callers see consistent state.
 	if err := orch.Recover(ctx); err != nil {
@@ -153,9 +176,7 @@ func main() {
 		ruleRepo, faultRepo, faultRepo, faultConfigRepo, sdkRepo,
 		experimentRepo, phaseFaultEventRepo, workflowRepo, workloadRepo, traceRepo,
 		zeusClient, gens, mat, orch, cs, artifactRepo, policyRepo,
-		// The OPA harness is wired in a later change; until then the
-		// evaluate endpoint answers 503 and CRUD and the decision log work.
-		store.NewOPAPolicyRepo(database), store.NewPolicyDecisionRepo(database), nil,
+		opaPolicyRepo, policyDecisionRepo, harness,
 	)
 
 	httpServer := &http.Server{
@@ -174,13 +195,18 @@ func main() {
 	// held polls answer at once as if their wait had elapsed and streams end.
 	httpServer.RegisterOnShutdown(srv.BeginShutdown)
 
-	// Policy engine is WIP-frozen (deprecated until the phase-aware rebuild):
-	// schema and CRUD endpoints stay, the evaluation loop is opt-in.
-	// See docs/decisions/2026-06-policy-engine-freeze.md.
-	if envOr("MANTEION_POLICY_ENGINE", "off") == "on" {
+	// Policy automation. "rego" (or "on") starts the OPA harness
+	// (docs/opa-harness.md); "threshold" starts the frozen PromQL engine
+	// (docs/decisions/2026-06-policy-engine-freeze.md); "off" starts neither.
+	switch mode := envOr("MANTEION_POLICY_ENGINE", "off"); mode {
+	case "rego", "on":
+		go harness.Run(ctx)
+	case "threshold":
 		go policyEngine.Run(ctx)
-	} else {
-		logger.Info("policy engine disabled (deprecated WIP; set MANTEION_POLICY_ENGINE=on to enable)")
+	case "off":
+		logger.Info("policy automation disabled (MANTEION_POLICY_ENGINE=off; rego|on starts the OPA harness, threshold the frozen PromQL engine)")
+	default:
+		logger.Warn("unknown MANTEION_POLICY_ENGINE value; policy automation disabled", "value", mode)
 	}
 
 	// Complete expired long-running fault configs (status bookkeeping +
@@ -219,6 +245,7 @@ func main() {
 		logger.Info("manteion starting",
 			"url", "http://"+displayAddr,
 			"zeus_url", zeusURL,
+			"loki_url", lokiURL,
 		)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)
