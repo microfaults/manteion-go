@@ -260,6 +260,11 @@ func (o *Orchestrator) StartExperiment(ctx context.Context, experimentID string)
 	if err := o.checkServiceOverlap(ctx, experimentID); err != nil {
 		return err
 	}
+	// Every user-authored cache-box rule keys like its service's freeze
+	// (MANT-4(d)); refused before the claim, so the experiment stays planned.
+	if err := o.checkCacheBoxRuleAgreement(ctx, experimentID); err != nil {
+		return err
+	}
 
 	// Atomically claim planned → running so two concurrent starts can't both
 	// walk the scheduler believing they own the kickoff.
@@ -525,6 +530,13 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 			// and the cascade above collapses the rest.
 			o.logger.Error("orchestrator: advance: start phase failed",
 				"experiment_id", experimentID, "phase_id", p.ID, "error", err)
+			if errors.Is(err, ErrValidation) {
+				// Refused before its claim (a cache-box rule edited since it
+				// was attached), the phase is still pending: fail it with the
+				// refusal, or nothing would ever start it and the experiment
+				// would wait on it forever.
+				o.failPhase(ctx, p.ID, failureReason(err), "pending")
+			}
 		}
 		return
 	}

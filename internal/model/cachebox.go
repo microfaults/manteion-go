@@ -98,7 +98,14 @@ func normalizeKeyHeaders(headers []string) []string {
 // on (key_strategy, key_headers) — record and replay of that service must
 // derive keys identically (INV-2). Empty key_strategy resolves to the default
 // before comparison; key_headers are compared case- and order-insensitively.
-func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase) error {
+//
+// rules are the user-authored rules attached to those phases. A cache-box rule
+// among them compiles with the context of the running phase it is served
+// through, keyed by its own key_strategy and no key headers (ruleconv), so it
+// must agree with its service's frozen-service config the same way: the same
+// resolved strategy, and no key_headers on the config. A rule whose service no
+// phase freezes, and a rule of another type, are not constrained.
+func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase, rules ...*Rule) error {
 	type keying struct {
 		strategy string
 		headers  []string
@@ -125,6 +132,25 @@ func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase) error {
 					"cachebox key_headers disagreement for service %q: %v vs %v",
 					fs.Service, prev.headers, k.headers)
 			}
+		}
+	}
+	for _, r := range rules {
+		if r == nil || r.Action.Type != "cachebox" || r.Action.CacheBox == nil {
+			continue
+		}
+		cfg, ok := seen[r.Service]
+		if !ok {
+			continue
+		}
+		if strat := ResolveKeyStrategy(r.Action.CacheBox.KeyStrategy); strat != cfg.strategy {
+			return fmt.Errorf(
+				"cachebox rule %q for service %q keys with %q, but the experiment's frozen-service config for %q keys with %q (a cache-box rule must key like its service's freeze)",
+				r.ID, r.Service, strat, r.Service, cfg.strategy)
+		}
+		if len(cfg.headers) > 0 {
+			return fmt.Errorf(
+				"cachebox rule %q for service %q keys with no key_headers, but the experiment's frozen-service config for %q keys with %v (a cache-box rule must key like its service's freeze)",
+				r.ID, r.Service, r.Service, cfg.headers)
 		}
 	}
 	return nil

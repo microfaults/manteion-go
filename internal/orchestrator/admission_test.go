@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	atroposdk "git.ucsc.edu/microfaults/atropos-go"
 
@@ -89,3 +90,49 @@ func TestExperimentStart_RejectsOverlappingServices(t *testing.T) {
 // staging slot -- so shared-service concurrency silently serves one
 // experiment the other's data. Overlap admission is unconditional; see
 // TestExperimentStart_RejectsOverlappingServices.)
+
+// A cache-box rule edited after the experiment started can disagree with its
+// service's freeze by the time the scheduler reaches the phase it is attached
+// to. That phase's start is refused before its claim, so the scheduler fails
+// the still-pending phase with the refusal as its reason — otherwise nothing
+// would ever start it — and the cascade fails the experiment.
+func TestAdvanceExperiment_CacheBoxRuleDisagreementFailsThePendingPhase(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "")
+	exp := mkExp(t)
+	svc := id.New("svc-cbagree")
+	frozenPhasePending(t, exp.ID, svc, "exact", 1)
+	base := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: exp.ID, Name: "base", Position: 0, Status: "pending"}
+	if err := testExpRepo.CreatePhase(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	r := &model.Rule{
+		ID: id.New("rule"), Name: "cb-agree", Service: svc, Mode: "inline",
+		Action:    model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: "canonical_v2"}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := testRuleRepo.Create(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testDB.Exec("DELETE FROM phase_rules WHERE rule_id = $1", r.ID)
+		_, _ = testDB.Exec("DELETE FROM rules WHERE id = $1", r.ID)
+	})
+	if err := testExpRepo.AttachPhaseRules(ctx, base.ID, []string{r.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := testExpRepo.TransitionExperiment(ctx, exp.ID, "running", "planned"); err != nil || !ok {
+		t.Fatalf("mark experiment running: %v %v", ok, err)
+	}
+
+	o.advanceExperiment(ctx, exp.ID)
+
+	got := getPhase(t, base.ID)
+	if got.Status != "failed" || !strings.Contains(got.FailureReason, `keys with "canonical_v2"`) {
+		t.Fatalf("phase = %s / %q, want failed with the agreement refusal as its reason", got.Status, got.FailureReason)
+	}
+	waitFor(t, "the cascade fails the experiment", 5*time.Second, func() bool {
+		e, err := testExpRepo.Get(ctx, exp.ID)
+		return err == nil && e.Status == "failed"
+	})
+}

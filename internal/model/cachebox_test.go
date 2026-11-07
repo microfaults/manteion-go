@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestKeyStrategyResolveAndVersion(t *testing.T) {
 	if got := ResolveKeyStrategy(""); got != "canonical_v2" {
@@ -87,6 +90,50 @@ func TestExperimentCreate_RejectsStrategyDisagreement(t *testing.T) {
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// A user-authored cache-box rule attached to an experiment's phases keys with
+// its own key_strategy and no key headers (it compiles with the served
+// phase's context, ruleconv), so it must agree with the frozen-service config
+// of its service: the same resolved strategy and no key_headers. A rule whose
+// service no phase freezes, and a rule that is not a cache-box rule, are not
+// constrained.
+func TestValidateCacheBoxStrategyAgreement_UserCacheBoxRules(t *testing.T) {
+	frozen := func(svc, strat string, headers ...string) []ExperimentPhase {
+		return []ExperimentPhase{{FrozenServices: []CacheBoxConfig{{Service: svc, Mode: "replay", KeyStrategy: strat, KeyHeaders: headers}}}}
+	}
+	cbRule := func(name, svc, strat string) *Rule {
+		return &Rule{ID: name, Name: name, Service: svc, Action: RuleAction{Type: "cachebox",
+			CacheBox: &CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: strat}}}
+	}
+	tests := []struct {
+		name    string
+		phases  []ExperimentPhase
+		rules   []*Rule
+		wantErr string
+	}{
+		{"same strategy agrees", frozen("cart", "exact"), []*Rule{cbRule("r1", "cart", "exact")}, ""},
+		{"the default resolves before comparison", frozen("cart", ""), []*Rule{cbRule("r1", "cart", "canonical_v2")}, ""},
+		{"strategy mismatch", frozen("cart", "canonical_v2"), []*Rule{cbRule("r1", "cart", "exact")},
+			`cachebox rule "r1" for service "cart" keys with "exact", but the experiment's frozen-service config for "cart" keys with "canonical_v2"`},
+		{"key headers on the frozen config", frozen("cart", "exact", "X-Tenant"), []*Rule{cbRule("r1", "cart", "exact")},
+			`cachebox rule "r1" for service "cart" keys with no key_headers, but the experiment's frozen-service config for "cart" keys with [x-tenant]`},
+		{"a service no phase freezes is not constrained", frozen("cart", "canonical_v2"), []*Rule{cbRule("r1", "checkout", "exact")}, ""},
+		{"a fault rule is not constrained", frozen("cart", "canonical_v2"),
+			[]*Rule{{ID: "f1", Name: "f1", Service: "cart", Action: RuleAction{Type: "fault_spec", FaultSpecID: "spec-1"}}}, ""},
+		{"no rules", frozen("cart", "exact"), nil, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateCacheBoxStrategyAgreement(tc.phases, tc.rules...)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}

@@ -367,3 +367,49 @@ func TestHandleStartPhase_ZeusUnreachable(t *testing.T) {
 		t.Errorf("phase status=%v err=%v, want failed (the enter sequence finalizes it)", got, err)
 	}
 }
+
+// A cache-box rule can be edited after it was attached, so starting an
+// experiment or one of its phases checks the agreement again: a rule that no
+// longer keys like its service's freeze is refused 422 validation, naming the
+// rule, and the experiment stays planned, the phase pending.
+func TestCacheBoxRuleAgreement_Start(t *testing.T) {
+	e := newEditTestEnv(t)
+	exp := e.experiment("planned")
+	base := e.phase(exp, "base", 0)
+	e.phase(exp, "iso", 1, model.CacheBoxConfig{Service: "cart", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"})
+	ruleID := e.cacheBoxRule("cart", "exact")
+	if err := e.exp.AttachPhaseRules(e.ctx, base.ID, []string{ruleID}); err != nil {
+		t.Fatalf("attach rules: %v", err)
+	}
+	// The rule is edited after the attach: it now keys with canonical_v2.
+	rules := store.NewRuleRepo(e.db, nil)
+	r, err := rules.Get(e.ctx, ruleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Action.CacheBox.KeyStrategy = "canonical_v2"
+	if err := rules.Update(e.ctx, r); err != nil {
+		t.Fatalf("edit rule: %v", err)
+	}
+	wantRefusal := func(t *testing.T, w *httptest.ResponseRecorder) {
+		t.Helper()
+		msg, _ := decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")["error"].(string)
+		for _, want := range []string{ruleID, `keys with "canonical_v2"`, `keys with "exact"`} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error = %q, want it to contain %q", msg, want)
+			}
+		}
+	}
+
+	w := e.do(e.s.handleStartExperiment, http.MethodPost, "/api/v1/experiments/"+exp.ID+"/start", "", map[string]string{"id": exp.ID})
+	wantRefusal(t, w)
+	if got, _ := e.exp.Get(e.ctx, exp.ID); got.Status != "planned" {
+		t.Errorf("experiment = %s after the refused start, want planned", got.Status)
+	}
+
+	w = e.do(e.s.handleStartPhase, http.MethodPost, "/api/v1/phases/"+base.ID+"/start", "", map[string]string{"phaseId": base.ID})
+	wantRefusal(t, w)
+	if got, _ := e.exp.GetPhase(e.ctx, base.ID); got.Status != "pending" {
+		t.Errorf("phase = %s after the refused start, want pending", got.Status)
+	}
+}

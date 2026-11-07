@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+
+	"manteion-go/internal/model"
 )
 
 // experimentServiceSet is the set of services an experiment touches: the union,
@@ -60,6 +62,39 @@ func (o *Orchestrator) checkServiceOverlap(ctx context.Context, experimentID str
 			sort.Strings(shared)
 			return &ErrServiceOverlap{ExperimentID: experimentID, RunningExperimentID: rid, Services: shared}
 		}
+	}
+	return nil
+}
+
+// checkCacheBoxRuleAgreement refuses, ErrValidation, to start an experiment
+// or one of its phases while a user-authored cache-box rule attached to any of
+// its phases does not key like the frozen-service config of its service
+// (model.ValidateCacheBoxStrategyAgreement): the attach checked it, but a rule
+// can be edited after it was attached. The check is experiment-wide because a
+// baseline records every service the experiment freezes.
+func (o *Orchestrator) checkCacheBoxRuleAgreement(ctx context.Context, experimentID string) error {
+	phases, err := o.experiments.ListPhasesForExperiment(ctx, experimentID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: cache-box rule agreement: list phases: %w", err)
+	}
+	keying := make([]model.ExperimentPhase, 0, len(phases))
+	var rules []*model.Rule
+	for _, p := range phases {
+		keying = append(keying, model.ExperimentPhase{FrozenServices: p.FrozenServices})
+		prs, err := o.experiments.ListPhaseRules(ctx, p.ID)
+		if err != nil {
+			return fmt.Errorf("orchestrator: cache-box rule agreement: list rules of phase %q: %w", p.ID, err)
+		}
+		for _, pr := range prs {
+			r, err := o.rules.Get(ctx, pr.RuleID)
+			if err != nil {
+				return fmt.Errorf("orchestrator: cache-box rule agreement: load rule %q: %w", pr.RuleID, err)
+			}
+			rules = append(rules, r)
+		}
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(keying, rules...); err != nil {
+		return validationError(fmt.Errorf("orchestrator: %w", err))
 	}
 	return nil
 }

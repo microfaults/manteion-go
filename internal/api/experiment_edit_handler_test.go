@@ -50,7 +50,7 @@ func newEditTestEnv(t *testing.T) *editTestEnv {
 	expRepo := store.NewExperimentRepo(database)
 	return &editTestEnv{
 		t: t, ctx: ctx, db: database, exp: expRepo,
-		s: &Server{experiments: expRepo, logger: discardLogger(), orch: newTestOrch(t, database, "")},
+		s: &Server{experiments: expRepo, rules: store.NewRuleRepo(database, nil), logger: discardLogger(), orch: newTestOrch(t, database, "")},
 	}
 }
 
@@ -419,6 +419,110 @@ func TestHandleUpdatePhase(t *testing.T) {
 		}
 		if stored.Name != "free" || stored.Position != 1 {
 			t.Errorf("conflicting edit was persisted: %+v", stored)
+		}
+	})
+}
+
+// cacheBoxRule seeds a user-authored cache-box rule for service keyed with
+// strategy.
+func (e *editTestEnv) cacheBoxRule(service, strategy string) string {
+	e.t.Helper()
+	r := &model.Rule{
+		ID: id.New("rule"), Name: "edit-cb-rule", Service: service, Mode: "inline",
+		Action:    model.RuleAction{Type: "cachebox", CacheBox: &model.CacheBoxRuleConfig{Mode: "passthrough", KeyStrategy: strategy}},
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := store.NewRuleRepo(e.db, nil).Create(e.ctx, r); err != nil {
+		e.t.Fatalf("create rule: %v", err)
+	}
+	e.t.Cleanup(func() {
+		_, _ = e.db.Exec("DELETE FROM phase_rules WHERE rule_id = $1", r.ID)
+		_, _ = e.db.Exec("DELETE FROM rules WHERE id = $1", r.ID)
+	})
+	return r.ID
+}
+
+// A user-authored cache-box rule attached to a phase keys with its own
+// key_strategy and no key headers, so every attach — creating the plan,
+// adding a phase, editing one — refuses it, 422 validation naming the rule,
+// when it does not key like its service's frozen-service config anywhere in
+// the experiment, and writes nothing. A matching rule attaches.
+func TestCacheBoxRuleAgreement_Attach(t *testing.T) {
+	e := newEditTestEnv(t)
+	cartExact := model.CacheBoxConfig{Service: "cart", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}
+	const frozenCart = `"frozen_services":[{"service":"cart","mode":"replay","key_strategy":"exact","mutation_policy":"deny"}]`
+	wantRefusal := func(t *testing.T, w *httptest.ResponseRecorder, ruleID string) {
+		t.Helper()
+		msg, _ := decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")["error"].(string)
+		for _, want := range []string{ruleID, `keys with "canonical_v2"`, `keys with "exact"`} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error = %q, want it to contain %q", msg, want)
+			}
+		}
+	}
+
+	t.Run("create experiment", func(t *testing.T) {
+		bad := e.cacheBoxRule("cart", "canonical_v2")
+		expID := id.New("exp")
+		t.Cleanup(func() { _, _ = e.db.Exec("DELETE FROM experiments WHERE id = $1", expID) })
+		body := fmt.Sprintf(`{"id":%q,"name":"cb-agree-%s","phases":[
+			{"name":"iso","position":1,%s},
+			{"name":"base","position":0,"persist_cache":true,"rule_ids":[%q]}]}`, expID, id.New("n"), frozenCart, bad)
+		w := e.do(e.s.handleCreateExperiment, http.MethodPost, "/api/v1/experiments", body, nil)
+		wantRefusal(t, w, bad)
+		if _, err := e.exp.Get(e.ctx, expID); err == nil {
+			t.Error("the refused plan was written")
+		}
+
+		good := e.cacheBoxRule("cart", "exact")
+		body = fmt.Sprintf(`{"id":%q,"name":"cb-agree-%s","phases":[
+			{"name":"iso","position":1,%s},
+			{"name":"base","position":0,"persist_cache":true,"rule_ids":[%q]}]}`, expID, id.New("n"), frozenCart, good)
+		if w := e.do(e.s.handleCreateExperiment, http.MethodPost, "/api/v1/experiments", body, nil); w.Code != http.StatusCreated {
+			t.Fatalf("matching rule: status=%d body=%s, want 201", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("add phase", func(t *testing.T) {
+		exp := e.experiment("planned")
+		e.phase(exp, "iso", 0, cartExact)
+		bad := e.cacheBoxRule("cart", "canonical_v2")
+		url, pv := "/api/v1/experiments/"+exp.ID+"/phases", map[string]string{"id": exp.ID}
+		w := e.do(e.s.handleCreatePhase, http.MethodPost, url, fmt.Sprintf(`{"name":"base","rule_ids":[%q]}`, bad), pv)
+		wantRefusal(t, w, bad)
+		if phases, _ := e.exp.ListPhasesForExperiment(e.ctx, exp.ID); len(phases) != 1 {
+			t.Errorf("phases = %d after the refusal, want the one seeded", len(phases))
+		}
+		// A rule for a service nothing freezes is not constrained.
+		free := e.cacheBoxRule("checkout", "canonical_v2")
+		if w := e.do(e.s.handleCreatePhase, http.MethodPost, url, fmt.Sprintf(`{"name":"base","rule_ids":[%q]}`, free), pv); w.Code != http.StatusCreated {
+			t.Fatalf("unconstrained rule: status=%d body=%s, want 201", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("update phase", func(t *testing.T) {
+		exp := e.experiment("planned")
+		base := e.phase(exp, "base", 0)
+		bad := e.cacheBoxRule("cart", "canonical_v2")
+		if err := e.exp.AttachPhaseRules(e.ctx, base.ID, []string{bad}); err != nil {
+			t.Fatalf("attach rules: %v", err)
+		}
+		iso := e.phase(exp, "iso", 1)
+		// Freezing cart in a sibling phase makes the attached rule disagree.
+		url, pv := "/api/v1/experiments/"+exp.ID+"/phases/"+iso.ID, map[string]string{"id": exp.ID, "phaseId": iso.ID}
+		w := e.do(e.s.handleUpdatePhase, http.MethodPut, url, "{"+frozenCart+"}", pv)
+		wantRefusal(t, w, bad)
+		if stored, _ := e.exp.GetPhase(e.ctx, iso.ID); len(stored.FrozenServices) != 0 {
+			t.Errorf("frozen_services = %+v after the refusal, want none", stored.FrozenServices)
+		}
+		// Replacing the rule set of the phase being edited is checked too.
+		url, pv = "/api/v1/experiments/"+exp.ID+"/phases/"+base.ID, map[string]string{"id": exp.ID, "phaseId": base.ID}
+		e.phase(exp, "iso-2", 2, cartExact)
+		w = e.do(e.s.handleUpdatePhase, http.MethodPut, url, fmt.Sprintf(`{"rule_ids":[%q]}`, bad), pv)
+		wantRefusal(t, w, bad)
+		good := e.cacheBoxRule("cart", "exact")
+		if w := e.do(e.s.handleUpdatePhase, http.MethodPut, url, fmt.Sprintf(`{"rule_ids":[%q]}`, good), pv); w.Code != http.StatusOK {
+			t.Fatalf("matching rule set: status=%d body=%s, want 200", w.Code, w.Body.String())
 		}
 	})
 }

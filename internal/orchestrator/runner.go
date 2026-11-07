@@ -43,6 +43,15 @@ func (o *Orchestrator) StartPhase(ctx context.Context, phaseID string) error {
 			fmt.Sprintf("orchestrator: phase %q not startable from status %q", phaseID, p.Status))
 	}
 
+	// A fresh start is refused while a user-authored cache-box rule of the
+	// experiment does not key like its service's freeze (MANT-4(d)); the phase
+	// stays pending. A resume re-enters what its fresh start already checked.
+	if fresh {
+		if err := o.checkCacheBoxRuleAgreement(ctx, p.ExperimentID); err != nil {
+			return err
+		}
+	}
+
 	claim, claimed, err := o.claimRunning(phaseID, func() (bool, error) {
 		return o.experiments.TransitionPhase(ctx, phaseID, "running", p.Status)
 	})

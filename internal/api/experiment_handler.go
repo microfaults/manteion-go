@@ -210,6 +210,13 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ctx := r.Context()
+	var planRules []string
+	for _, ph := range req.Phases {
+		planRules = append(planRules, ph.RuleIDs...)
+	}
+	if !s.checkCacheBoxRuleAgreement(ctx, w, phasesForCheck, planRules) {
+		return
+	}
 	if err := s.experiments.Create(ctx, exp); err != nil {
 		s.logger.Error("create experiment failed", "error", err)
 		writeMappedError(w, err)
@@ -456,6 +463,14 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 		FrozenServices: req.FrozenServices,
 		PersistCache:   req.PersistCache,
 	}
+	// The rules it attaches must key like the experiment's freezes, with this
+	// phase's own frozen services among them (MANT-4(d)).
+	if len(req.RuleIDs) > 0 {
+		phasesForCheck, ruleIDs, ok := s.experimentKeying(ctx, w, expID, phase, req.RuleIDs)
+		if !ok || !s.checkCacheBoxRuleAgreement(ctx, w, phasesForCheck, ruleIDs) {
+			return
+		}
+	}
 	// A missing parent surfaces from the insert as ErrNotFound.
 	if err := s.experiments.CreatePhase(ctx, phase); err != nil {
 		writeErrorFor(w, err, "experiment", err.Error())
@@ -538,6 +553,14 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 		writeValidation(w, err.Error())
 		return
 	}
+	// Every rule the experiment attaches, this phase's as edited, must key like
+	// the experiment's freezes as edited.
+	{
+		phasesForCheck, ruleIDs, ok := s.experimentKeying(ctx, w, expID, phase, req.RuleIDs)
+		if !ok || !s.checkCacheBoxRuleAgreement(ctx, w, phasesForCheck, ruleIDs) {
+			return
+		}
+	}
 
 	edit := store.PhaseEdit{Workflows: req.Workflows, RuleIDs: req.RuleIDs}
 	if err := s.experiments.UpdatePhase(ctx, phase, edit); err != nil {
@@ -545,6 +568,68 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.composePhaseDetail(ctx, phase))
+}
+
+// experimentKeying collects what the cache-box rule agreement is checked over
+// when phase (new or edited) is attached to expID: the frozen-service configs
+// of every phase of the experiment, phase's own substituted, and the ids of
+// every rule the experiment attaches — phase's are ruleIDs when the request
+// names them (nil keeps the attached ones). ok is false once a 500 has been
+// written.
+func (s *Server) experimentKeying(ctx context.Context, w http.ResponseWriter, expID string, phase *model.ExperimentPhase, ruleIDs []string) ([]model.ExperimentPhase, []string, bool) {
+	siblings, err := s.experiments.ListPhasesForExperiment(ctx, expID)
+	if err != nil {
+		s.logger.Error("list phases failed", "error", err, "experiment_id", expID)
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to list phases", nil)
+		return nil, nil, false
+	}
+	phases := []model.ExperimentPhase{{FrozenServices: phase.FrozenServices}}
+	ids := append([]string(nil), ruleIDs...)
+	for _, p := range siblings {
+		if p.ID == phase.ID && ruleIDs != nil {
+			continue
+		}
+		if p.ID != phase.ID {
+			phases = append(phases, model.ExperimentPhase{FrozenServices: p.FrozenServices})
+		}
+		prs, err := s.experiments.ListPhaseRules(ctx, p.ID)
+		if err != nil {
+			s.logger.Error("list phase rules failed", "error", err, "phase_id", p.ID)
+			writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to list phase rules", nil)
+			return nil, nil, false
+		}
+		for _, pr := range prs {
+			ids = append(ids, pr.RuleID)
+		}
+	}
+	return phases, ids, true
+}
+
+// checkCacheBoxRuleAgreement refuses, 422 validation, a plan whose
+// user-authored cache-box rules (among ruleIDs) do not key like the
+// frozen-service config of their service in phases
+// (model.ValidateCacheBoxStrategyAgreement). An id that names no rule is
+// skipped: the attach itself refuses it. ok is false once a response has been
+// written.
+func (s *Server) checkCacheBoxRuleAgreement(ctx context.Context, w http.ResponseWriter, phases []model.ExperimentPhase, ruleIDs []string) bool {
+	rules := make([]*model.Rule, 0, len(ruleIDs))
+	for _, id := range ruleIDs {
+		r, err := s.rules.Get(ctx, id)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			s.logger.Error("load rule failed", "error", err, "rule_id", id)
+			writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to load rule", nil)
+			return false
+		}
+		rules = append(rules, r)
+	}
+	if err := model.ValidateCacheBoxStrategyAgreement(phases, rules...); err != nil {
+		writeValidation(w, err.Error())
+		return false
+	}
+	return true
 }
 
 // editablePhase loads phaseID under expID and writes the refusal when it is
