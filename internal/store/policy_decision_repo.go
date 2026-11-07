@@ -14,10 +14,24 @@ import (
 // per policy unless WithRetention says otherwise.
 const DefaultDecisionRetention = 1000
 
+// decisionChangedPredicate is the SQL condition of a decision that applied a
+// change: applied, with a mutation whose outcome is created, updated or
+// deleted (a mutations value that is not a JSON array counts as no change).
+// The newest row matching it is the cooldown witness: LastChangeAt reads it
+// and Record's prune never deletes it, both through this one fragment so they
+// cannot drift.
+const decisionChangedPredicate = `applied AND EXISTS (
+	SELECT 1 FROM jsonb_array_elements(
+		CASE WHEN jsonb_typeof(mutations) = 'array' THEN mutations ELSE '[]'::jsonb END) m
+	WHERE m->>'outcome' IN ('created', 'updated', 'deleted'))`
+
 // PolicyDecisionRepo persists the OPA harness decision log (policy_decisions,
 // migration 15). Retention is per policy: every Record prunes the policy's
-// log to the newest keep rows (by evaluated_at, then id). Rows go with their
-// policy (ON DELETE CASCADE).
+// log to the newest keep rows (by evaluated_at, then id), plus the cooldown
+// witness (the newest decision matching decisionChangedPredicate) when it is
+// older than those, so a restart keeps the cooldown however many unchanged
+// or dry-run evaluations followed the last change. Rows go with their policy
+// (ON DELETE CASCADE).
 type PolicyDecisionRepo struct {
 	db   *sql.DB
 	keep int
@@ -41,7 +55,8 @@ func (r *PolicyDecisionRepo) WithRetention(keep int) *PolicyDecisionRepo {
 }
 
 // Record inserts d and, in the same transaction, prunes d.PolicyID's log to
-// the retention. A nil Mutations is stored as []; an empty Error as NULL.
+// the retention, never deleting the cooldown witness. A nil Mutations is
+// stored as []; an empty Error as NULL.
 func (r *PolicyDecisionRepo) Record(ctx context.Context, d *model.PolicyDecision) error {
 	mutations := []byte(d.Mutations)
 	if mutations == nil {
@@ -62,7 +77,10 @@ func (r *PolicyDecisionRepo) Record(ctx context.Context, d *model.PolicyDecision
 			DELETE FROM policy_decisions
 			WHERE policy_id = $1 AND id NOT IN (
 				SELECT id FROM policy_decisions WHERE policy_id = $1
-				ORDER BY evaluated_at DESC, id DESC LIMIT $2)`,
+				ORDER BY evaluated_at DESC, id DESC LIMIT $2)
+			AND id NOT IN (
+				SELECT id FROM policy_decisions WHERE policy_id = $1 AND `+decisionChangedPredicate+`
+				ORDER BY evaluated_at DESC, id DESC LIMIT 1)`,
 			d.PolicyID, r.keep,
 		); err != nil {
 			return fmt.Errorf("prune policy decisions for %s: %w", d.PolicyID, err)
@@ -118,19 +136,16 @@ func (r *PolicyDecisionRepo) List(ctx context.Context, policyID string, p Page) 
 	return out, total, nil
 }
 
-// LastChangeAt returns the evaluated_at of policyID's newest applied decision
-// that changed something (a mutation whose outcome is created, updated or
-// deleted): the cooldown witness. ok is false when there is none. A
-// mutations value that is not a JSON array counts as no change.
+// LastChangeAt returns the evaluated_at of policyID's newest decision
+// matching decisionChangedPredicate (applied, with a created, updated or
+// deleted mutation): the cooldown witness, which Record's prune keeps. ok is
+// false when there is none.
 func (r *PolicyDecisionRepo) LastChangeAt(ctx context.Context, policyID string) (time.Time, bool, error) {
 	var at time.Time
 	err := r.db.QueryRowContext(ctx, `
 		SELECT evaluated_at FROM policy_decisions
-		WHERE policy_id = $1 AND applied AND EXISTS (
-			SELECT 1 FROM jsonb_array_elements(
-				CASE WHEN jsonb_typeof(mutations) = 'array' THEN mutations ELSE '[]'::jsonb END) m
-			WHERE m->>'outcome' IN ('created', 'updated', 'deleted'))
-		ORDER BY evaluated_at DESC LIMIT 1`, policyID).Scan(&at)
+		WHERE policy_id = $1 AND `+decisionChangedPredicate+`
+		ORDER BY evaluated_at DESC, id DESC LIMIT 1`, policyID).Scan(&at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return time.Time{}, false, nil
 	}

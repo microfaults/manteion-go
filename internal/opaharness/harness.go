@@ -87,6 +87,9 @@ type Evaluation struct {
 	Applied     bool             `json:"applied"`
 	Changed     bool             `json:"changed"`
 	Error       string           `json:"error,omitempty"`
+	// DecisionError is set when the decision could not be recorded; the
+	// evaluation (and any apply) happened regardless.
+	DecisionError string `json:"decision_error,omitempty"`
 }
 
 // Harness evaluates the enabled OPA policies on their intervals, applies
@@ -103,7 +106,11 @@ type Harness struct {
 	// stateMu guards nextAt. EvaluateOnce may run outside a tick (the API)
 	// and moves a policy's schedule when it applies a change, so it takes
 	// stateMu, never mu; tick holds stateMu only around its nextAt reads and
-	// writes, never across an evaluation.
+	// writes, never across an evaluation. nextAt only moves forward
+	// (setNextAt keeps the later time), so a tick finishing after a
+	// concurrent API apply cannot shorten the cooldown that apply started; a
+	// consequence is that a shortened interval_s or cooldown_s takes effect
+	// once the wait already scheduled lapses.
 	stateMu sync.Mutex
 	nextAt  map[string]time.Time
 
@@ -198,12 +205,9 @@ func (h *Harness) tick(ctx context.Context, now time.Time) {
 				continue
 			}
 		}
-		ev, err := h.EvaluateOnce(ctx, p, true)
-		if err != nil {
-			log.ErrorContext(ctx, "opa harness: evaluation", "policy_id", p.ID, "error", err)
-		}
+		ev := h.EvaluateOnce(ctx, p, true)
 		wait := interval
-		if ev != nil && ev.Changed && cooldown > wait {
+		if ev.Changed && cooldown > wait {
 			wait = cooldown
 		}
 		h.setNextAt(p.ID, now.Add(wait))
@@ -224,10 +228,13 @@ func (h *Harness) tick(ctx context.Context, now time.Time) {
 	h.prepMu.Unlock()
 }
 
-// setNextAt records when policy id is next due.
+// setNextAt records when policy id is next due, keeping the time already
+// held when it is the later one.
 func (h *Harness) setNextAt(id string, at time.Time) {
 	h.stateMu.Lock()
-	h.nextAt[id] = at
+	if held, ok := h.nextAt[id]; !ok || at.After(held) {
+		h.nextAt[id] = at
+	}
 	h.stateMu.Unlock()
 }
 
@@ -254,9 +261,13 @@ func (h *Harness) prepare(p *model.OPAPolicy) (*Prepared, error) {
 // never called. Every evaluation, dry runs included, is recorded as one
 // decision whose mutations column is a []MutationResult: for a dry run
 // (applied=false) the refusals plus one OutcomeDryRun result per in-scope
-// would-be mutation, otherwise the refusals plus the mutator's results. Compile, input, eval and apply failures are reported in
-// Evaluation.Error and recorded; the returned error is only a decision-log
-// write failure ("record decision: ..."), returned with the Evaluation.
+// would-be mutation, otherwise the refusals plus the mutator's results.
+//
+// EvaluateOnce never fails as a call: compile, input, input-document, eval
+// and apply failures are reported in Evaluation.Error and recorded, and a
+// decision that cannot be recorded is reported in Evaluation.DecisionError
+// ("record decision: ...", logged at Error) with everything else kept, since
+// an apply that already happened must still reach the caller.
 //
 // Compiling, fetching the inputs, building the input document and evaluating
 // run under ctx; the apply and the decision record run under detached(ctx),
@@ -266,7 +277,7 @@ func (h *Harness) prepare(p *model.OPAPolicy) (*Prepared, error) {
 // An applying evaluation that changed something moves p's schedule exactly as
 // a tick-driven one does: p is next due max(IntervalS, CooldownS) after it,
 // so an apply triggered through the API starts the cooldown the loop honours.
-func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) (*Evaluation, error) {
+func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) *Evaluation {
 	start := time.Now()
 	now := h.now()
 	ev := &Evaluation{
@@ -367,10 +378,10 @@ func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bo
 		h.deps.Logger.InfoContext(ctx, "opa harness: policy evaluated", attrs...)
 	}
 	if recErr != nil {
+		ev.DecisionError = "record decision: " + recErr.Error()
 		h.deps.Logger.ErrorContext(ctx, "opa harness: record decision", "policy_id", p.ID, "error", recErr)
-		return ev, fmt.Errorf("record decision: %w", recErr)
 	}
-	return ev, nil
+	return ev
 }
 
 // dryRunResults reports each would-be mutation as OutcomeDryRun.

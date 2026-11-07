@@ -129,19 +129,15 @@ func (f *fakeDecisionLister) List(_ context.Context, policyID string, p store.Pa
 
 type fakeEvaluator struct {
 	ev       *opaharness.Evaluation
-	err      error
 	calls    int
 	gotID    string
 	gotApply bool
 }
 
-func (f *fakeEvaluator) EvaluateOnce(_ context.Context, p *model.OPAPolicy, apply bool) (*opaharness.Evaluation, error) {
+func (f *fakeEvaluator) EvaluateOnce(_ context.Context, p *model.OPAPolicy, apply bool) *opaharness.Evaluation {
 	f.calls++
 	f.gotID, f.gotApply = p.ID, apply
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.ev, nil
+	return f.ev
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +348,6 @@ func TestHandleEvaluateOPAPolicy(t *testing.T) {
 		{"apply=false", "opa-1", "?apply=false", &fakeEvaluator{ev: ev}, http.StatusOK, false},
 		{"apply=true", "opa-1", "?apply=true", &fakeEvaluator{ev: ev}, http.StatusOK, true},
 		{"unknown policy → 404", "nope", "", &fakeEvaluator{ev: ev}, http.StatusNotFound, false},
-		{"decision log failure → 500", "opa-1", "", &fakeEvaluator{err: errors.New("record decision: db down")}, http.StatusInternalServerError, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -409,5 +404,60 @@ func TestHandleOPAWithoutHarness(t *testing.T) {
 	// not a non-nil interface holding a nil pointer.
 	if ns := NewServer(discardLogger(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, desired.NewGenerations(desired.NewMemoryStore(), desired.NewBroker()), nil, nil, nil, nil, nil, nil, nil, nil); ns.opa != nil {
 		t.Errorf("NewServer(nil harness).opa = %#v, want nil", ns.opa)
+	}
+}
+
+// failingDecisionLog is an opaharness.DecisionLog whose Record always fails.
+type failingDecisionLog struct{}
+
+func (failingDecisionLog) Record(context.Context, *model.PolicyDecision) error {
+	return errors.New("db down")
+}
+
+func (failingDecisionLog) LastChangeAt(context.Context, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
+
+type emptyRuleLister struct{}
+
+func (emptyRuleLister) List(context.Context) ([]*model.Rule, error) { return nil, nil }
+
+type emptyInstanceLister struct{}
+
+func (emptyInstanceLister) ForService(context.Context, string) ([]*model.SDKInstance, error) {
+	return nil, nil
+}
+
+type fixedProvider float64
+
+func (f fixedProvider) Fetch(context.Context, model.PolicyInput) (any, error) { return float64(f), nil }
+
+// TestHandleEvaluateOPAPolicy_DecisionLogFailure: a real harness whose
+// decision log cannot record answers 200 with the evaluation's results and
+// decision_error set, not 500.
+func TestHandleEvaluateOPAPolicy_DecisionLogFailure(t *testing.T) {
+	p := opaTestPolicy()
+	p.Rego = "package atropos\n\nmutations contains {\"op\": \"delete_rule\", \"service\": \"frontend\", \"name\": \"x\"} if input.inputs.p99 > 1\n"
+	h := opaharness.New(opaharness.Deps{
+		Decisions: failingDecisionLog{},
+		Rules:     emptyRuleLister{},
+		Instances: emptyInstanceLister{},
+		Providers: opaharness.Providers{"prometheus": fixedProvider(1300)},
+		Logger:    discardLogger(),
+	})
+	s := &Server{opaPolicies: newFakeOPAPolicies(p), policyDecisions: &fakeDecisionLister{}, opa: h, logger: discardLogger()}
+	w := serveOPA(t, s, http.MethodPost, "/api/v1/opa/policies/opa-1/evaluate", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", w.Code, w.Body.String())
+	}
+	var ev opaharness.Evaluation
+	if err := json.Unmarshal(w.Body.Bytes(), &ev); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, w.Body.String())
+	}
+	if ev.DecisionError != "record decision: db down" || ev.Error != "" {
+		t.Errorf("decision_error %q error %q, want decision_error %q", ev.DecisionError, ev.Error, "record decision: db down")
+	}
+	if len(ev.Mutations) != 1 || len(ev.Results) != 1 || ev.Results[0].Outcome != opaharness.OutcomeRefused {
+		t.Errorf("mutations %+v results %+v, want the out-of-scope delete and its refusal", ev.Mutations, ev.Results)
 	}
 }

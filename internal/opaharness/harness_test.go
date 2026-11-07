@@ -203,10 +203,7 @@ func (th *testHarness) tickAt(d time.Duration) {
 
 func TestEvaluateOnce_AppliesAndRecords(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
-	if err != nil {
-		t.Fatalf("EvaluateOnce: %v", err)
-	}
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
 	if len(th.mut.calls) != 1 || len(th.mut.calls[0]) != 1 {
 		t.Fatalf("mutator calls = %+v, want one call with one mutation", th.mut.calls)
 	}
@@ -236,10 +233,7 @@ func TestEvaluateOnce_AppliesAndRecords(t *testing.T) {
 
 func TestEvaluateOnce_DryRunDoesNotApply(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
-	if err != nil {
-		t.Fatalf("EvaluateOnce: %v", err)
-	}
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
 	if len(th.mut.calls) != 0 || ev.Applied || ev.Changed || len(ev.Mutations) != 1 || len(ev.Results) != 0 {
 		t.Errorf("dry run: calls %d, evaluation %+v; want the proposed mutation, nothing applied", len(th.mut.calls), ev)
 	}
@@ -252,7 +246,7 @@ func TestEvaluateOnce_ColdDisablesExistingRule(t *testing.T) {
 	existing := &model.Rule{ID: "rule-1", Name: "checkout-egress-latency", Service: "checkout", Enabled: true, Mode: "inline",
 		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "spec-egress-latency-200ms"}}
 	th := newTestHarness(nil, fakeProvider{values: coldValues()}, &fakeMutator{outcome: OutcomeUpdated}, &fakeDecisions{}, []*model.Rule{existing})
-	ev, _ := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
 	if len(ev.Mutations) != 1 || ev.Mutations[0].Op != OpSetEnabled || ev.Mutations[0].Enabled == nil || *ev.Mutations[0].Enabled {
 		t.Fatalf("mutations = %+v, want set_enabled false", ev.Mutations)
 	}
@@ -260,10 +254,7 @@ func TestEvaluateOnce_ColdDisablesExistingRule(t *testing.T) {
 
 func TestEvaluateOnce_InputErrorSkipsEval(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{err: errors.New("loki returned status 502")}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
-	if err != nil {
-		t.Fatalf("EvaluateOnce: %v", err)
-	}
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
 	if !strings.Contains(ev.Error, "input decisions") || !strings.Contains(ev.Error, "502") || len(th.mut.calls) != 0 || ev.Applied {
 		t.Errorf("evaluation = %+v, calls %d; want an input error and no apply", ev, len(th.mut.calls))
 	}
@@ -274,7 +265,7 @@ func TestEvaluateOnce_InputErrorSkipsEval(t *testing.T) {
 
 func TestEvaluateOnce_RefusesOutOfScope(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev, _ := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), outOfScopeRego), true)
+	ev := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), outOfScopeRego), true)
 	if len(th.mut.calls) != 1 || len(th.mut.calls[0]) != 1 || th.mut.calls[0][0].Name != "y" {
 		t.Fatalf("mutator received %+v, want only the checkout mutation", th.mut.calls)
 	}
@@ -301,7 +292,7 @@ func TestEvaluateOnce_InputDocumentShape(t *testing.T) {
 		{ID: "rule-2", Name: "fe-rule", Service: "frontend", Enabled: true, Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "s"}},
 	}
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{outcome: OutcomeDeleted}, &fakeDecisions{}, rules)
-	ev, _ := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), shapeRego), true)
+	ev := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), shapeRego), true)
 	if ev.Error != "" || len(ev.Mutations) != 1 || ev.Mutations[0].Name != "old-rule" {
 		t.Fatalf("evaluation = %+v; want exactly one delete for the in-scope rule (frontend's must not be in input.rules)", ev)
 	}
@@ -309,16 +300,20 @@ func TestEvaluateOnce_InputDocumentShape(t *testing.T) {
 
 func TestEvaluateOnce_CompileErrorIsRecorded(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev, err := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), "package atropos\nmutations contains x if { x := }"), true)
-	if err != nil || !strings.Contains(ev.Error, "compile") || len(th.mut.calls) != 0 || len(th.dec.records) != 1 {
-		t.Fatalf("evaluation = %+v, err %v, calls %d, records %d", ev, err, len(th.mut.calls), len(th.dec.records))
+	ev := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), "package atropos\nmutations contains x if { x := }"), true)
+	if !strings.Contains(ev.Error, "compile") || len(th.mut.calls) != 0 || len(th.dec.records) != 1 {
+		t.Fatalf("evaluation = %+v, calls %d, records %d", ev, len(th.mut.calls), len(th.dec.records))
 	}
 }
 
-func TestEvaluateOnce_RecordFailureIsReturned(t *testing.T) {
+func TestEvaluateOnce_RecordFailureIsReported(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{recordErr: errors.New("db down")}, nil)
-	if _, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), true); err == nil || !strings.Contains(err.Error(), "record decision") {
-		t.Fatalf("err = %v, want the decision-log failure", err)
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
+	if ev.DecisionError != "record decision: db down" || ev.Error != "" {
+		t.Errorf("decision_error %q error %q, want decision_error %q and no evaluation error", ev.DecisionError, ev.Error, "record decision: db down")
+	}
+	if !ev.Applied || !ev.Changed || len(ev.Results) != 1 || ev.Results[0].Outcome != OutcomeCreated || len(th.mut.calls) != 1 {
+		t.Errorf("evaluation = %+v, want the applied results kept (they happened)", ev)
 	}
 }
 
@@ -427,8 +422,8 @@ func TestInputDigest_ByteStable(t *testing.T) {
 	}
 	// Two evaluations with equal values record the same digest.
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev1, _ := th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
-	ev2, _ := th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
+	ev1 := th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
+	ev2 := th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
 	if ev1.InputDigest != ev2.InputDigest {
 		t.Errorf("digests differ across runs: %s vs %s", ev1.InputDigest, ev2.InputDigest)
 	}
@@ -436,10 +431,7 @@ func TestInputDigest_ByteStable(t *testing.T) {
 
 func TestEvaluateOnce_DryRunRecordsWouldBeMutations(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
-	ev, err := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), outOfScopeRego), false)
-	if err != nil {
-		t.Fatalf("EvaluateOnce: %v", err)
-	}
+	ev := th.h.EvaluateOnce(context.Background(), withRego(hotPolicy(), outOfScopeRego), false)
 	if len(th.mut.calls) != 0 || len(ev.Mutations) != 2 {
 		t.Fatalf("dry run: calls %d, mutations %+v", len(th.mut.calls), ev.Mutations)
 	}
@@ -469,10 +461,7 @@ func TestEvaluateOnce_PartialApplyKeepsResults(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
 	pm := &partialMutator{}
 	th.h.deps.Mutator = pm
-	ev, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
-	if err != nil {
-		t.Fatalf("EvaluateOnce: %v", err)
-	}
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
 	if !strings.Contains(ev.Error, "apply: list rules") || len(ev.Results) != 1 || !ev.Changed || !ev.Applied {
 		t.Fatalf("evaluation = %+v, want the partial result kept with the apply error", ev)
 	}
@@ -487,9 +476,9 @@ func TestEvaluateOnce_UnknownSourceIsRecorded(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
 	p := hotPolicy()
 	p.Inputs[0].Source = "graphite"
-	ev, err := th.h.EvaluateOnce(context.Background(), p, true)
-	if err != nil || !strings.Contains(ev.Error, `no provider for source "graphite"`) || len(th.mut.calls) != 0 || len(th.dec.records) != 1 {
-		t.Fatalf("evaluation = %+v, err %v", ev, err)
+	ev := th.h.EvaluateOnce(context.Background(), p, true)
+	if !strings.Contains(ev.Error, `no provider for source "graphite"`) || len(th.mut.calls) != 0 || len(th.dec.records) != 1 {
+		t.Fatalf("evaluation = %+v", ev)
 	}
 }
 
@@ -528,16 +517,14 @@ func TestRun_ReturnsOnContextDone(t *testing.T) {
 func TestEvaluateOnce_APIApplyMovesCooldown(t *testing.T) {
 	th := newTestHarness([]*model.OPAPolicy{hotPolicy()}, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
 	// A dry run through the API changes nothing and leaves the schedule alone.
-	if _, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), false); err != nil {
-		t.Fatalf("dry run: %v", err)
-	}
+	th.h.EvaluateOnce(context.Background(), hotPolicy(), false)
 	if len(th.h.nextAt) != 0 {
 		t.Fatalf("dry run moved the schedule: %v", th.h.nextAt)
 	}
 	// An applying evaluation through the API that changes rules starts the cooldown.
-	ev, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
-	if err != nil || !ev.Changed {
-		t.Fatalf("apply: ev %+v err %v, want a change", ev, err)
+	ev := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
+	if !ev.Changed {
+		t.Fatalf("apply: ev %+v, want a change", ev)
 	}
 	for _, step := range []struct {
 		at        time.Duration
@@ -606,9 +593,9 @@ func TestEvaluateOnce_NonFiniteSamplesAreNull(t *testing.T) {
 		{Name: "v", Source: "prometheus", Query: "q", Kind: "vector"},
 		{Name: "s", Source: "loki", Query: "q", Kind: "scalar"},
 	}
-	ev, err := th.h.EvaluateOnce(context.Background(), p, false)
-	if err != nil || ev.Error != "" {
-		t.Fatalf("evaluation error = %q / %v, want none (non-finite samples are null, not an error)", ev.Error, err)
+	ev := th.h.EvaluateOnce(context.Background(), p, false)
+	if ev.Error != "" || ev.DecisionError != "" {
+		t.Fatalf("evaluation error = %q / %q, want none (non-finite samples are null, not an error)", ev.Error, ev.DecisionError)
 	}
 	if len(ev.Mutations) != 1 || ev.Mutations[0].Name != "nulls-3-finite-1-scalar-null" {
 		t.Fatalf("mutations = %+v, want the policy to see three null samples, one finite and a null scalar", ev.Mutations)
@@ -702,9 +689,9 @@ func TestEvaluateOnce_ApplyAndRecordSurviveCancellation(t *testing.T) {
 	th := newTestHarness(nil, ctxProvider{fakeProvider: fakeProvider{values: hotValues()}, seen: &fetched}, &mut.fakeMutator, &dec.fakeDecisions, nil)
 	th.h.deps.Mutator, th.h.deps.Decisions = mut, dec
 
-	ev, err := th.h.EvaluateOnce(ctx, hotPolicy(), true)
-	if err != nil || ev.Error != "" || !ev.Changed {
-		t.Fatalf("evaluation = %+v, err %v; want the apply to complete although the caller cancelled", ev, err)
+	ev := th.h.EvaluateOnce(ctx, hotPolicy(), true)
+	if ev.Error != "" || ev.DecisionError != "" || !ev.Changed {
+		t.Fatalf("evaluation = %+v; want the apply to complete although the caller cancelled", ev)
 	}
 	if fetched.err != nil || fetched.deadline != 0 || fetched.value != "caller" {
 		t.Errorf("input fetch ctx = %+v, want the caller's own context (no apply deadline)", fetched)
@@ -726,9 +713,7 @@ func TestEvaluateOnce_DryRunRecordSurvivesCancellation(t *testing.T) {
 	th := newTestHarness(nil, fakeProvider{values: hotValues()}, &fakeMutator{}, &dec.fakeDecisions, nil)
 	th.h.deps.Decisions = dec
 	cancel()
-	if _, err := th.h.EvaluateOnce(ctx, hotPolicy(), false); err != nil {
-		t.Fatalf("EvaluateOnce: %v", err)
-	}
+	th.h.EvaluateOnce(ctx, hotPolicy(), false)
 	if len(dec.records) != 1 || dec.seen.err != nil || dec.seen.deadline <= 0 {
 		t.Errorf("records %d, record ctx %+v; want the dry run recorded under a live, bounded context", len(dec.records), dec.seen)
 	}
@@ -765,5 +750,65 @@ func TestRun_ReturnsAfterTheInFlightTick(t *testing.T) {
 	if len(mut.calls) != 1 || len(dec.records) != 1 || !dec.records[0].Applied || dec.seen.err != nil {
 		t.Fatalf("calls %d, records %+v, record ctx %+v; want the in-flight evaluation applied and recorded under a live context",
 			len(mut.calls), dec.records, dec.seen)
+	}
+}
+
+// --- monotonic nextAt --------------------------------------------------------
+
+// apiDuringTickMutator answers its first Apply (the tick's) with unchanged,
+// after running an applying API evaluation of the same policy that changes
+// something: the API's cooldown lands while the tick is in flight.
+type apiDuringTickMutator struct {
+	h     *Harness
+	p     *model.OPAPolicy
+	calls int
+}
+
+func (a *apiDuringTickMutator) Apply(ctx context.Context, _ string, ms []Mutation) ([]MutationResult, error) {
+	a.calls++
+	outcome := OutcomeCreated
+	if a.calls == 1 {
+		a.h.EvaluateOnce(ctx, a.p, true)
+		outcome = OutcomeUnchanged
+	}
+	out := make([]MutationResult, 0, len(ms))
+	for _, m := range ms {
+		svc, name := m.Key()
+		out = append(out, MutationResult{Op: m.Op, Service: svc, Name: name, Outcome: outcome})
+	}
+	return out, nil
+}
+
+func TestTick_KeepsALaterNextAtFromAConcurrentAPIApply(t *testing.T) {
+	p := hotPolicy() // interval 10 s, cooldown 60 s
+	th := newTestHarness([]*model.OPAPolicy{p}, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
+	mut := &apiDuringTickMutator{h: th.h, p: p}
+	th.h.deps.Mutator = mut
+
+	th.tickAt(0) // the tick computes +10 s (unchanged); the API apply inside it set +60 s
+	if got := th.h.nextAt[p.ID]; !got.Equal(t0.Add(60 * time.Second)) {
+		t.Fatalf("nextAt = %v, want %v: the tick's nearer time must not overwrite the API apply's cooldown", got, t0.Add(60*time.Second))
+	}
+	th.tickAt(10 * time.Second)
+	th.tickAt(59 * time.Second)
+	if mut.calls != 2 {
+		t.Fatalf("mutator calls = %d before the cooldown lapsed, want 2 (the tick and the API apply)", mut.calls)
+	}
+	th.tickAt(60 * time.Second)
+	if mut.calls != 3 {
+		t.Fatalf("mutator calls = %d at +60s, want 3 (due once the cooldown lapsed)", mut.calls)
+	}
+}
+
+func TestSetNextAt_KeepsTheLaterTime(t *testing.T) {
+	h := New(Deps{})
+	h.setNextAt("p", t0.Add(time.Minute))
+	h.setNextAt("p", t0.Add(time.Second))
+	if got := h.nextAt["p"]; !got.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("nextAt = %v, want the later %v", got, t0.Add(time.Minute))
+	}
+	h.setNextAt("p", t0.Add(2*time.Minute))
+	if got := h.nextAt["p"]; !got.Equal(t0.Add(2 * time.Minute)) {
+		t.Fatalf("nextAt = %v, want it moved forward to %v", got, t0.Add(2*time.Minute))
 	}
 }

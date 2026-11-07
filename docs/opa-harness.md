@@ -141,7 +141,12 @@ evaluates, with apply, every enabled policy that is due:
   is enabled), it reads the newest applied decision that changed something
   from the decision log (`LastChangeAt`). If that decision plus `cooldown_s`
   is still in the future, the policy waits until then. The cooldown therefore
-  survives a restart.
+  survives a restart; the decision log's retention never prunes that
+  decision.
+- A policy's next due time only moves forward: an evaluation finishing
+  after a concurrent API apply keeps the later time that apply set. So a
+  shortened `interval_s` or `cooldown_s` takes effect once the wait already
+  scheduled lapses.
 
 A policy's failure is recorded and logged, and the tick moves on to the next
 policy. Shutdown (the server's signal context) stops the loop, and a tick
@@ -169,7 +174,9 @@ included.
 | `error` | the first compile, input, input-document, eval or apply failure; the later stages are skipped |
 
 Retention is the newest 1000 decisions per policy, pruned in the same
-transaction as each insert; deleting a policy deletes its log.
+transaction as each insert, plus the newest applied decision that changed
+something (the cooldown witness `LastChangeAt` reads) when it is older than
+those; deleting a policy deletes its log.
 `GET /api/v1/opa/policies/{id}/decisions` pages it newest first.
 
 Each evaluation also logs one slog line, `opa harness: policy evaluated`, with
@@ -195,13 +202,15 @@ evaluation, failures included in `error`:
 ```json
 {"policy_id": "opa-…", "evaluated_at": "…", "inputs": {"p99": 1300}, "input_digest": "…",
  "mutations": [ /* what the policy emitted */ ], "results": [ /* see below */ ],
- "applied": false, "changed": false, "error": "…"}
+ "applied": false, "changed": false, "error": "…", "decision_error": "…"}
 ```
 
 On a dry run `results` holds only the scope refusals, since nothing was
 applied; the decision it records lists the would-be mutations as `dry_run`.
-With `apply=true`, `results` holds the refusals and the mutator's results. A
-500 means the decision could not be recorded. `cmd/manteion` always
+With `apply=true`, `results` holds the refusals and the mutator's results.
+When the decision cannot be recorded the answer is still 200, with
+`decision_error` set (`record decision: …`, also logged at Error): the
+evaluation, an apply included, happened, and the caller sees its results. `cmd/manteion` always
 constructs the harness, so evaluate works with `apply=true` too whatever
 `MANTEION_POLICY_ENGINE` says; that variable gates only the loop. (The
 handler answers 503 only when built without a harness.)

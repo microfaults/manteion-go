@@ -34,7 +34,7 @@ type policyDecisionLister interface {
 
 // opaEvaluator evaluates one policy on demand (*opaharness.Harness).
 type opaEvaluator interface {
-	EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) (*opaharness.Evaluation, error)
+	EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) *opaharness.Evaluation
 }
 
 // errOPAHarnessDisabled is the 503 message of evaluate without a harness.
@@ -287,8 +287,10 @@ func (s *Server) handleListOPADecisions(w http.ResponseWriter, r *http.Request) 
 // results — on a dry run only the scope refusals (nothing was applied), on
 // ?apply=true the refusals plus the mutator's results. Either way the
 // evaluation is recorded in the decision log (a dry run's decision lists its
-// would-be mutations as "dry_run" results). Without a harness (policy engine
-// off) it answers 503.
+// would-be mutations as "dry_run" results); a decision that could not be
+// recorded is reported in decision_error with 200, since the results (an
+// apply included) happened. Without a harness (policy engine off) it answers
+// 503.
 //
 // @Summary      Evaluate OPA policy
 // @Description  Evaluate the policy once against live telemetry, enabled or not.
@@ -299,8 +301,9 @@ func (s *Server) handleListOPADecisions(w http.ResponseWriter, r *http.Request) 
 // @Description  an applying evaluation that changed something starts the policy's
 // @Description  cooldown. Every evaluation is recorded in the decision log (see
 // @Description  /opa/policies/{id}/decisions). Compile, input, eval and apply failures
-// @Description  are reported in the Evaluation's error with 200; 500 means the
-// @Description  decision could not be recorded. 503 when the harness is disabled
+// @Description  are reported in the Evaluation's error with 200; a decision that could
+// @Description  not be recorded is reported in decision_error, also with 200 (the
+// @Description  results, an apply included, happened). 503 when the harness is disabled
 // @Description  (MANTEION_POLICY_ENGINE off).
 // @Tags         autorules
 // @Produce      json
@@ -308,7 +311,6 @@ func (s *Server) handleListOPADecisions(w http.ResponseWriter, r *http.Request) 
 // @Param        apply  query     bool    false  "apply the mutations (default false: dry run)"
 // @Success      200    {object}  opaharness.Evaluation
 // @Failure      404    {object}  api.ErrorResponse  "policy not found"
-// @Failure      500    {object}  api.ErrorResponse  "failed to record decision"
 // @Failure      503    {object}  api.ErrorResponse  "opa harness disabled (MANTEION_POLICY_ENGINE)"
 // @Router       /opa/policies/{id}/evaluate [post]
 func (s *Server) handleEvaluateOPAPolicy(w http.ResponseWriter, r *http.Request) {
@@ -321,11 +323,5 @@ func (s *Server) handleEvaluateOPAPolicy(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	apply := r.URL.Query().Get("apply") == "true"
-	ev, err := s.opa.EvaluateOnce(r.Context(), p, apply)
-	if err != nil {
-		s.logger.Error("evaluate opa policy failed", "id", p.ID, "apply", apply, "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to record decision")
-		return
-	}
-	writeJSON(w, http.StatusOK, ev)
+	writeJSON(w, http.StatusOK, s.opa.EvaluateOnce(r.Context(), p, apply))
 }

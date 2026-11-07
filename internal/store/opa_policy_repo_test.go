@@ -93,6 +93,59 @@ func TestOPAPolicyRepo_RoundTripAndDecisions(t *testing.T) {
 		t.Errorf("LastChangeAt = %v, want %v (the only applied+changed row)", last, want)
 	}
 
+	// The prune keeps the cooldown witness: two more decisions that change
+	// nothing (a dry run and an applied "unchanged") push pdec-1, the only
+	// applied change, out of the newest two, yet it stays and LastChangeAt
+	// still answers it.
+	for i, m := range []struct {
+		applied   bool
+		mutations string
+	}{
+		{false, `[{"op":"upsert_rule","service":"checkout","name":"r","outcome":"dry_run"}]`},
+		{true, `[{"op":"upsert_rule","service":"checkout","name":"r","outcome":"unchanged"}]`},
+	} {
+		d := &model.PolicyDecision{
+			ID: fmt.Sprintf("pdec-%s-%d", tag, 3+i), PolicyID: p.ID,
+			EvaluatedAt: base.Add(time.Duration(3+i) * time.Second), InputDigest: "abc",
+			Applied: m.applied, Mutations: json.RawMessage(m.mutations),
+		}
+		if err := decisions.Record(ctx, d); err != nil {
+			t.Fatalf("record %d: %v", 3+i, err)
+		}
+	}
+	ids := func() []string {
+		t.Helper()
+		list, _, err := decisions.List(ctx, p.ID, Page{Limit: 10})
+		if err != nil {
+			t.Fatalf("list decisions: %v", err)
+		}
+		out := make([]string, 0, len(list))
+		for _, d := range list {
+			out = append(out, d.ID)
+		}
+		return out
+	}
+	if got, want := ids(), []string{"pdec-" + tag + "-4", "pdec-" + tag + "-3", "pdec-" + tag + "-1"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("after two unchanged decisions: ids %v, want %v (the newest two plus the cooldown witness)", got, want)
+	}
+	if last, ok, err := decisions.LastChangeAt(ctx, p.ID); err != nil || !ok || !last.Equal(base.Add(time.Second)) {
+		t.Errorf("LastChangeAt = %v ok=%v err=%v, want %v (the witness survived the prune)", last, ok, err, base.Add(time.Second))
+	}
+	// A newer applied change becomes the witness; the old one is then pruned
+	// like any other row.
+	if err := decisions.Record(ctx, &model.PolicyDecision{
+		ID: fmt.Sprintf("pdec-%s-5", tag), PolicyID: p.ID, EvaluatedAt: base.Add(5 * time.Second), InputDigest: "abc", Applied: true,
+		Mutations: json.RawMessage(`[{"op":"delete_rule","service":"checkout","name":"r","outcome":"deleted"}]`),
+	}); err != nil {
+		t.Fatalf("record 5: %v", err)
+	}
+	if got, want := ids(), []string{"pdec-" + tag + "-5", "pdec-" + tag + "-4"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("after a newer change: ids %v, want %v (the old witness pruned)", got, want)
+	}
+	if last, ok, err := decisions.LastChangeAt(ctx, p.ID); err != nil || !ok || !last.Equal(base.Add(5*time.Second)) {
+		t.Errorf("LastChangeAt = %v ok=%v err=%v, want %v (the new witness)", last, ok, err, base.Add(5*time.Second))
+	}
+
 	if err := policies.Delete(ctx, p.ID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
