@@ -184,6 +184,29 @@ func TestConditionFires_AboveThreshold(t *testing.T) {
 	}
 }
 
+// push_rules acts on the service the policy names: a listed rule of another
+// service is refused and left disabled, and the rest of the list is enabled.
+func TestPushRules_RefusesARuleOfAnotherService(t *testing.T) {
+	prom := promql.NewClient(fakePromServer(t, 1.0).URL)
+	rules := newFakeRuleStore(mkRule("mine", "checkout", false), mkRule("theirs", "cart", false))
+	policy := &model.PolicyRule{
+		ID: "p-6", Enabled: true,
+		Condition: model.PolicyCondition{Metric: "up", Operator: "eq", Threshold: 1},
+		Action: model.PolicyAction{ActionType: "push_rules",
+			PushRules: &model.PushRulesAction{Service: "checkout", RuleIDs: []string{"theirs", "mine"}}},
+	}
+
+	if err := makeEngine(t, prom, rules, []*model.PolicyRule{policy}).evaluate(context.Background(), policy); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if n := rules.updateCount(); n != 1 {
+		t.Fatalf("expected 1 rule update (the policy's own service), got %d", n)
+	}
+	if !rules.enabled("mine") || rules.enabled("theirs") {
+		t.Fatalf("mine enabled = %v, theirs enabled = %v; want true, false", rules.enabled("mine"), rules.enabled("theirs"))
+	}
+}
+
 func TestConditionDoesNotFire_BelowThreshold(t *testing.T) {
 	prom := promql.NewClient(fakePromServer(t, 100.0).URL) // metric = 100, threshold = 500 → gt does not fire
 	rules := newFakeRuleStore(mkRule("r-1", "checkout", true))

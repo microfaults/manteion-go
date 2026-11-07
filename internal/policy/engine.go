@@ -228,12 +228,19 @@ func (e *Engine) executeAction(ctx context.Context, rule *model.PolicyRule) erro
 // doPushRules enables each listed rule through rule CRUD. Update bumps the
 // rule's service generation in the same transaction, so the instances of the
 // service apply it on their next poll; there is no push to the instances.
-// The first rule that cannot be read or updated stops the action.
+// The policy names the service it acts on, so a listed rule of another
+// service is refused (logged, left as it is) and the action goes on with the
+// rest. The first rule that cannot be read or updated stops the action.
 func (e *Engine) doPushRules(ctx context.Context, action *model.PushRulesAction) error {
 	for _, id := range action.RuleIDs {
 		r, err := e.rules.Get(ctx, id)
 		if err != nil {
 			return fmt.Errorf("get rule %q: %w", id, err)
+		}
+		if r.Service != action.Service {
+			e.logger.Warn("policy engine: push_rules: rule belongs to another service; not enabled",
+				"rule_id", id, "rule_service", r.Service, "policy_service", action.Service)
+			continue
 		}
 		if r.Enabled {
 			continue // nothing to change, nothing to bump

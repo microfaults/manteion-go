@@ -99,7 +99,9 @@ type PolicyAction struct {
 	PushRules      *PushRulesAction  `json:"push_rules,omitempty"`
 }
 
-// PushRulesAction identifies which rules to push to which service.
+// PushRulesAction names a service and, for push_rules, the rules of that
+// service the policy engine enables through rule CRUD (clear_rules disables
+// every enabled rule of the service; RuleIDs is unused).
 type PushRulesAction struct {
 	Service string   `json:"service"`
 	RuleIDs []string `json:"rule_ids"`
