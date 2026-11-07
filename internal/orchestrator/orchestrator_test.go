@@ -931,7 +931,7 @@ func TestRecover_EntryInterruptedBeforeLoadFails(t *testing.T) {
 
 	waitFor(t, "experiment A failed", 10*time.Second, func() bool { return getExp(t, expA.ID).Status == "failed" })
 	got := getPhase(t, phasesA[0].ID)
-	if got.Status != "failed" || got.FailureReason != "entry interrupted by a manteion restart; start the phase again" {
+	if got.Status != "failed" || got.FailureReason != "entry interrupted by a manteion restart; create a new phase to retry" {
 		t.Errorf("A phase 0 = %s (%q), want failed with the restart reason", got.Status, got.FailureReason)
 	}
 	if got := getPhase(t, phasesA[1].ID); got.Status != "skipped" {

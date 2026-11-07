@@ -659,9 +659,8 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 // driver. That phase never started its load, so completing it would run the
 // verdict and harvest over no traffic and advance the scheduler; it is failed
 // through the normal path instead (nothing to stop; the exit bump makes the
-// instances drop the phase's inputs). Its reason asks the operator to start the
-// phase again; a failed phase is terminal, so that means a new phase or
-// experiment with the same plan.
+// instances drop the phase's inputs). A failed phase is terminal, so its
+// reason asks the operator to create a new phase to retry.
 func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) {
 	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
 	if err != nil {
@@ -751,7 +750,7 @@ func (o *Orchestrator) recoverDrainingPhase(phaseID string) {
 
 // recoverInterruptedEntryReason is the failure reason of a running phase that
 // recovery finds with configured load but no driver handle recorded.
-const recoverInterruptedEntryReason = "entry interrupted by a manteion restart; start the phase again"
+const recoverInterruptedEntryReason = "entry interrupted by a manteion restart; create a new phase to retry"
 
 const reconcileRetries = 3
 
