@@ -861,6 +861,53 @@ func TestRecover(t *testing.T) {
 	}
 }
 
+// Recover tells a rules-only running phase (nothing configured to start) from
+// one with configured load but no recorded driver handle: an entry interrupted
+// by the restart, during its convergence wait or before zeus took its first
+// driver. The first is auto-completed as before; the second never started its
+// load, so completing it would run a verdict and harvest over no traffic and
+// advance the scheduler: it is failed instead, naming the restart.
+func TestRecover_EntryInterruptedBeforeLoadFails(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "") // no zeus: the cases are decided before any reconcile
+	running := func(exp *model.Experiment, ph *model.ExperimentPhase) {
+		t.Helper()
+		if err := testExpRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+			t.Fatal(err)
+		}
+		if err := testExpRepo.UpdatePhaseStatus(ctx, ph.ID, "running"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Interrupted: a configured workflow, no zeus handle recorded.
+	expA, phasesA := mkExperiment(t, 2)
+	attachAttackWorkflow(t, phasesA[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1, TargetURL: "http://frontend:8080/"})
+	running(expA, phasesA[0])
+
+	// Rules-only: nothing configured to start.
+	expB, phasesB := mkExperiment(t, 1)
+	running(expB, phasesB[0])
+
+	if err := o.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	waitFor(t, "experiment A failed", 10*time.Second, func() bool { return getExp(t, expA.ID).Status == "failed" })
+	got := getPhase(t, phasesA[0].ID)
+	if got.Status != "failed" || got.FailureReason != "entry interrupted by a manteion restart; start the phase again" {
+		t.Errorf("A phase 0 = %s (%q), want failed with the restart reason", got.Status, got.FailureReason)
+	}
+	if got := getPhase(t, phasesA[1].ID); got.Status != "skipped" {
+		t.Errorf("A phase 1 status %q, want skipped", got.Status)
+	}
+
+	waitFor(t, "experiment B completed", 10*time.Second, func() bool { return getExp(t, expB.ID).Status == "completed" })
+	if got := getPhase(t, phasesB[0].ID); got.Status != "completed" {
+		t.Errorf("B phase 0 status %q, want completed (a rules-only phase auto-completes)", got.Status)
+	}
+}
+
 func TestPhaseFaultEventsAuditTrail(t *testing.T) {
 	ctx := context.Background()
 	o := newOrch(t, "") // no zeus → driver-less phases auto-complete

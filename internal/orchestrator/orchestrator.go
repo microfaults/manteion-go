@@ -652,8 +652,14 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 
 // recoverRunningPhase reattaches to a phase that was running when the
 // process died: reconcile its persisted attack IDs against zeus and either
-// fail it (all lost), respawn its poller (survivors), or auto-complete it
-// (no attacks were ever configured — a driver-less phase).
+// fail it (all lost), respawn its poller (survivors), auto-complete it
+// (nothing was configured to start — a rules-only phase), or fail it when load
+// was configured but no driver handle was recorded: an entry interrupted by
+// the restart, during its convergence wait or before zeus accepted its first
+// driver. That phase never started its load, so completing it would run the
+// verdict and harvest over no traffic and advance the scheduler; it is failed
+// through the normal path instead (nothing to stop; the exit bump makes the
+// instances drop the phase's inputs), and the operator starts it again.
 func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) {
 	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
 	if err != nil {
@@ -679,6 +685,15 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string) 
 		}
 	}
 
+	if drivers == 0 && len(pws) > 0 {
+		o.logger.Warn("orchestrator: recover: phase has configured load but no driver handle; its entry was interrupted, failing it",
+			"phase_id", phaseID, "workflows", len(pws))
+		// On a background context like the auto-complete below: the exit bump's
+		// wait needs the fleet to poll, and Recover returns before the API
+		// server accepts requests.
+		go o.failPhase(context.Background(), phaseID, recoverInterruptedEntryReason, "running")
+		return
+	}
 	if drivers == 0 {
 		if o.autoComplete {
 			o.logger.Info("orchestrator: recover: phase has no load drivers; auto-completing",
@@ -731,6 +746,10 @@ func (o *Orchestrator) recoverDrainingPhase(phaseID string) {
 		"phase_id", phaseID)
 	go o.finishPhase(context.Background(), phaseID, "completed", "draining")
 }
+
+// recoverInterruptedEntryReason is the failure reason of a running phase that
+// recovery finds with configured load but no driver handle recorded.
+const recoverInterruptedEntryReason = "entry interrupted by a manteion restart; start the phase again"
 
 const reconcileRetries = 3
 
