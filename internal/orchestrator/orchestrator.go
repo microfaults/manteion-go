@@ -528,6 +528,14 @@ func (o *Orchestrator) advanceExperiment(ctx context.Context, experimentID strin
 			// StartPhase finalizes the phase as failed on enter-sequence
 			// errors; the resulting finishPhase re-advances asynchronously
 			// and the cascade above collapses the rest.
+			if errors.Is(err, errAgreementUnchecked) {
+				// A transient read failure before the claim decides nothing:
+				// the phase stays pending, and the next advance or a recovery
+				// checks again. Not a failure of the phase.
+				o.logger.Warn("orchestrator: advance: cache-box rule agreement could not be checked; phase left pending",
+					"experiment_id", experimentID, "phase_id", p.ID, "error", err)
+				return
+			}
 			o.logger.Error("orchestrator: advance: start phase failed",
 				"experiment_id", experimentID, "phase_id", p.ID, "error", err)
 			if errors.Is(err, ErrValidation) {

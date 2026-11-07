@@ -202,7 +202,7 @@ func (s *Server) handleCreateExperiment(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		phases[i] = phase
-		phasesForCheck[i] = model.ExperimentPhase{FrozenServices: ph.FrozenServices}
+		phasesForCheck[i] = model.ExperimentPhase{Name: ph.Name, FrozenServices: ph.FrozenServices}
 	}
 	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
 		writeValidation(w, err.Error())
@@ -463,9 +463,11 @@ func (s *Server) handleCreatePhase(w http.ResponseWriter, r *http.Request) {
 		FrozenServices: req.FrozenServices,
 		PersistCache:   req.PersistCache,
 	}
-	// The rules it attaches must key like the experiment's freezes, with this
-	// phase's own frozen services among them (MANT-4(d)).
-	if len(req.RuleIDs) > 0 {
+	// Every rule the experiment attaches, this phase's included, must key like
+	// the experiment's freezes with this phase's own frozen services among them,
+	// and those freezes must agree with the siblings' (MANT-4(d)): a phase that
+	// only freezes a service a sibling's cache-box rule covers is checked too.
+	{
 		phasesForCheck, ruleIDs, ok := s.experimentKeying(ctx, w, expID, phase, req.RuleIDs)
 		if !ok || !s.checkCacheBoxRuleAgreement(ctx, w, phasesForCheck, ruleIDs) {
 			return
@@ -547,7 +549,7 @@ func (s *Server) handleUpdatePhase(w http.ResponseWriter, r *http.Request) {
 		if p.ID == phase.ID {
 			p = phase
 		}
-		phasesForCheck = append(phasesForCheck, model.ExperimentPhase{FrozenServices: p.FrozenServices})
+		phasesForCheck = append(phasesForCheck, model.ExperimentPhase{Name: p.Name, FrozenServices: p.FrozenServices})
 	}
 	if err := model.ValidateCacheBoxStrategyAgreement(phasesForCheck); err != nil {
 		writeValidation(w, err.Error())
@@ -583,14 +585,14 @@ func (s *Server) experimentKeying(ctx context.Context, w http.ResponseWriter, ex
 		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to list phases", nil)
 		return nil, nil, false
 	}
-	phases := []model.ExperimentPhase{{FrozenServices: phase.FrozenServices}}
+	phases := []model.ExperimentPhase{{Name: phase.Name, FrozenServices: phase.FrozenServices}}
 	ids := append([]string(nil), ruleIDs...)
 	for _, p := range siblings {
 		if p.ID == phase.ID && ruleIDs != nil {
 			continue
 		}
 		if p.ID != phase.ID {
-			phases = append(phases, model.ExperimentPhase{FrozenServices: p.FrozenServices})
+			phases = append(phases, model.ExperimentPhase{Name: p.Name, FrozenServices: p.FrozenServices})
 		}
 		prs, err := s.experiments.ListPhaseRules(ctx, p.ID)
 		if err != nil {

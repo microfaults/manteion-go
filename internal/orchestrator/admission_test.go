@@ -128,7 +128,7 @@ func TestAdvanceExperiment_CacheBoxRuleDisagreementFailsThePendingPhase(t *testi
 	o.advanceExperiment(ctx, exp.ID)
 
 	got := getPhase(t, base.ID)
-	if got.Status != "failed" || !strings.Contains(got.FailureReason, `keys with "canonical_v2"`) {
+	if got.Status != "failed" || !strings.Contains(got.FailureReason, `keys with "canonical_v2", but phase "iso-1" freezes`) {
 		t.Fatalf("phase = %s / %q, want failed with the agreement refusal as its reason", got.Status, got.FailureReason)
 	}
 	waitFor(t, "the cascade fails the experiment", 5*time.Second, func() bool {

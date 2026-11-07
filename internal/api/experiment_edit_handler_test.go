@@ -454,7 +454,7 @@ func TestCacheBoxRuleAgreement_Attach(t *testing.T) {
 	wantRefusal := func(t *testing.T, w *httptest.ResponseRecorder, ruleID string) {
 		t.Helper()
 		msg, _ := decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")["error"].(string)
-		for _, want := range []string{ruleID, `keys with "canonical_v2"`, `keys with "exact"`} {
+		for _, want := range []string{ruleID, `"edit-cb-rule"`, `keys with "canonical_v2"`, `keying with "exact"`, `phase "`} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("error = %q, want it to contain %q", msg, want)
 			}
@@ -498,6 +498,28 @@ func TestCacheBoxRuleAgreement_Attach(t *testing.T) {
 		if w := e.do(e.s.handleCreatePhase, http.MethodPost, url, fmt.Sprintf(`{"name":"base","rule_ids":[%q]}`, free), pv); w.Code != http.StatusCreated {
 			t.Fatalf("unconstrained rule: status=%d body=%s, want 201", w.Code, w.Body.String())
 		}
+	})
+
+	t.Run("add phase with a freeze only", func(t *testing.T) {
+		// The new phase attaches no rule; it freezes a service a sibling's
+		// cache-box rule covers with another strategy.
+		exp := e.experiment("planned")
+		base := e.phase(exp, "base", 0)
+		bad := e.cacheBoxRule("cart", "canonical_v2")
+		if err := e.exp.AttachPhaseRules(e.ctx, base.ID, []string{bad}); err != nil {
+			t.Fatalf("attach rules: %v", err)
+		}
+		url, pv := "/api/v1/experiments/"+exp.ID+"/phases", map[string]string{"id": exp.ID}
+		w := e.do(e.s.handleCreatePhase, http.MethodPost, url, `{"name":"iso",`+frozenCart+`}`, pv)
+		wantRefusal(t, w, bad)
+		if phases, _ := e.exp.ListPhasesForExperiment(e.ctx, exp.ID); len(phases) != 1 {
+			t.Errorf("phases = %d after the refusal, want the one seeded", len(phases))
+		}
+		// A freeze that disagrees with a sibling's freeze is refused as well.
+		e.phase(exp, "iso-a", 1, model.CacheBoxConfig{Service: "checkout", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"})
+		w = e.do(e.s.handleCreatePhase, http.MethodPost, url,
+			`{"name":"iso-b","frozen_services":[{"service":"checkout","mode":"replay","key_strategy":"canonical_v2","mutation_policy":"deny"}]}`, pv)
+		decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")
 	})
 
 	t.Run("update phase", func(t *testing.T) {

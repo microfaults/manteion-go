@@ -394,7 +394,7 @@ func TestCacheBoxRuleAgreement_Start(t *testing.T) {
 	wantRefusal := func(t *testing.T, w *httptest.ResponseRecorder) {
 		t.Helper()
 		msg, _ := decodeErrBody(t, w, http.StatusUnprocessableEntity, "validation")["error"].(string)
-		for _, want := range []string{ruleID, `keys with "canonical_v2"`, `keys with "exact"`} {
+		for _, want := range []string{ruleID, `"edit-cb-rule"`, `keys with "canonical_v2"`, `phase "iso" freezes "cart" keying with "exact"`} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("error = %q, want it to contain %q", msg, want)
 			}

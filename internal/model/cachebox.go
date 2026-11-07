@@ -109,6 +109,7 @@ func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase, rules ...*Rule)
 	type keying struct {
 		strategy string
 		headers  []string
+		phase    string // the first phase (by name) that freezes the service
 	}
 	seen := make(map[string]keying)
 	for _, p := range phases {
@@ -116,6 +117,7 @@ func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase, rules ...*Rule)
 			k := keying{
 				strategy: ResolveKeyStrategy(fs.KeyStrategy),
 				headers:  normalizeKeyHeaders(fs.KeyHeaders),
+				phase:    p.Name,
 			}
 			prev, ok := seen[fs.Service]
 			if !ok {
@@ -144,13 +146,13 @@ func ValidateCacheBoxStrategyAgreement(phases []ExperimentPhase, rules ...*Rule)
 		}
 		if strat := ResolveKeyStrategy(r.Action.CacheBox.KeyStrategy); strat != cfg.strategy {
 			return fmt.Errorf(
-				"cachebox rule %q for service %q keys with %q, but the experiment's frozen-service config for %q keys with %q (a cache-box rule must key like its service's freeze)",
-				r.ID, r.Service, strat, r.Service, cfg.strategy)
+				"cachebox rule %q (%s) for service %q keys with %q, but phase %q freezes %q keying with %q (a cache-box rule must key like its service's freeze)",
+				r.Name, r.ID, r.Service, strat, cfg.phase, r.Service, cfg.strategy)
 		}
 		if len(cfg.headers) > 0 {
 			return fmt.Errorf(
-				"cachebox rule %q for service %q keys with no key_headers, but the experiment's frozen-service config for %q keys with %v (a cache-box rule must key like its service's freeze)",
-				r.ID, r.Service, r.Service, cfg.headers)
+				"cachebox rule %q (%s) for service %q keys with no key_headers, but phase %q freezes %q keying with key_headers %v (a cache-box rule must key like its service's freeze)",
+				r.Name, r.ID, r.Service, cfg.phase, r.Service, cfg.headers)
 		}
 	}
 	return nil
