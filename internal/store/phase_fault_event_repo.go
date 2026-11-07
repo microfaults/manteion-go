@@ -54,6 +54,18 @@ func (r *PhaseFaultEventRepo) EndOpenForPhase(ctx context.Context, phaseID strin
 	return nil
 }
 
+// HasOpenForPhase reports whether the phase has an event not yet ended.
+func (r *PhaseFaultEventRepo) HasOpenForPhase(ctx context.Context, phaseID string) (bool, error) {
+	var open bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM phase_fault_events
+		WHERE phase_id = $1 AND ended_at IS NULL)`, phaseID).Scan(&open)
+	if err != nil {
+		return false, fmt.Errorf("check open phase_fault_events: %w", err)
+	}
+	return open, nil
+}
+
 // ListForPhase returns the phase's events in apply order.
 func (r *PhaseFaultEventRepo) ListForPhase(ctx context.Context, phaseID string) ([]*model.PhaseFaultEvent, error) {
 	rows, err := r.db.QueryContext(ctx, `

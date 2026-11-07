@@ -13,7 +13,8 @@
 //     the side effects that must happen once — verdict, generation bump,
 //     harvest, rollup — exactly once; the idempotent teardown (poller, zeus
 //     load) and the read-only fidelity pull run just before the CAS, while the
-//     phase still holds its status.
+//     phase still holds its status, and the winner sweeps the load again after
+//     it (claims.go).
 //
 // Experiment-level pause is DERIVED state: the experiment_status enum has no
 // 'paused' label (phase_status does, deliberately). PauseExperiment pauses

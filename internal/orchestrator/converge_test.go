@@ -716,6 +716,16 @@ func TestEnterPhase_PauseAndResumeDuringTheWait_OnlyTheNewEntryStartsLoad(t *tes
 	if n := fz.runCount(); n != 1 {
 		t.Fatalf("zeus started %d run(s), want 1: only the entry holding the phase's claim starts load", n)
 	}
+	// The resume superseded a fresh entry that never recorded the phase's
+	// audit trail, so the resume, which starts the load, records it: one open
+	// rule event for the phase's one rule.
+	evs, err := store.NewPhaseFaultEventRepo(testDB).ListForPhase(ctx, ph.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].Source != "rule" || evs[0].EndedAt != nil {
+		t.Fatalf("phase fault events = %+v, want one open rule event recorded by the entry that started the load", evs)
+	}
 }
 
 // A stop that lands while an entry waits for its fleet ends the wait at the

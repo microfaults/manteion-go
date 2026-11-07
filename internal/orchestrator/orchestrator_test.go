@@ -261,6 +261,13 @@ type fakeZeus struct {
 	// while an entry is starting its load.
 	runStartHook    func()
 	attackStartHook func()
+	// stopHook, when set, runs inside DELETE /runs/{id} and DELETE
+	// /attacks/{id} (kind "run" or "attack") before the stop applies:
+	// something that lands while a teardown is stopping a phase's load. A
+	// stop for a driver the fake did not know when the request arrived stays
+	// a no-op, as on a zeus that answers it 404, even if the driver is
+	// accepted while the hook runs.
+	stopHook func(kind, id string)
 }
 
 // fakeReject is a canned non-2xx answer for POST .../runs.
@@ -343,7 +350,14 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 	})
 	mux.HandleFunc("DELETE /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
-		if _, ok := f.runs[r.PathValue("run_id")]; ok {
+		stop := f.stopHook
+		_, known := f.runs[r.PathValue("run_id")]
+		f.mu.Unlock()
+		if stop != nil {
+			stop("run", r.PathValue("run_id"))
+		}
+		f.mu.Lock()
+		if _, ok := f.runs[r.PathValue("run_id")]; ok && known {
 			f.runs[r.PathValue("run_id")] = "stopped"
 		}
 		f.mu.Unlock()
@@ -383,7 +397,14 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 	})
 	mux.HandleFunc("DELETE /api/v1/attacks/{id}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
-		if a, ok := f.attacks[r.PathValue("id")]; ok {
+		stop := f.stopHook
+		_, known := f.attacks[r.PathValue("id")]
+		f.mu.Unlock()
+		if stop != nil {
+			stop("attack", r.PathValue("id"))
+		}
+		f.mu.Lock()
+		if a, ok := f.attacks[r.PathValue("id")]; ok && known {
 			a.status = "stopped"
 		}
 		f.mu.Unlock()
@@ -498,6 +519,14 @@ func (f *fakeZeus) onAttackStart(fn func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attackStartHook = fn
+}
+
+// onStop makes fn run inside every DELETE of a run or an attack before the
+// stop applies (stopHook).
+func (f *fakeZeus) onStop(fn func(kind, id string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopHook = fn
 }
 
 // driverStatuses reports the status of every run and every attack the fake
@@ -1033,6 +1062,13 @@ func TestRunDrivenPhase_CompletesOnRunAndAttack(t *testing.T) {
 			return false
 		}
 		return pws[0].ZeusRunID != "" && pws[0].ZeusAttackID != ""
+	})
+	// The attack id is persisted before zeus accepts the attack, so the row can
+	// name it while the fake does not know it yet: completeAll would then
+	// complete nothing, the attack would stay running, and the phase would
+	// never complete. Wait until the fake holds it.
+	waitFor(t, "zeus accepted phase 1's attack", 5*time.Second, func() bool {
+		return fz.attackCount() == 1
 	})
 
 	// Completing only the attack must NOT finish the phase -- the run is still

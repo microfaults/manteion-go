@@ -1,7 +1,11 @@
 package orchestrator
 
 import (
+	"context"
+	"slices"
 	"sync"
+
+	"manteion-go/internal/model"
 )
 
 // Phase claims. A phase entry (a fresh start or a resume) holds a claim on its
@@ -27,7 +31,19 @@ import (
 // workflow rows take the same lock (writeClaimed), so none can land after the
 // claim that made it ended: the entry that holds the phase next never finds
 // its handles overwritten by an entry whose claim ended. The lock is held for
-// one CAS or one handle write, never longer.
+// one CAS (with a teardown's row read, below), one handle write or one entry's
+// audit-trail inserts, never across a zeus call.
+//
+// A transition that tears the phase's load down (a pause, a drain, a terminal
+// transition) cancels the poller and reads the phase's workflow rows inside
+// the same critical section as its CAS (endClaimSnapshot), and stops the
+// drivers that one snapshot names after the lock is released: no zeus call
+// runs under the lock, and no newer claim's handles can be in the snapshot,
+// since a newer claim starts only with a CAS that takes the lock after it. A
+// terminal transition also takes a snapshot before its CAS, for the teardown
+// that has to precede its verdict (snapshotForEnd), and its winner sweeps
+// again after the CAS from the second snapshot, so a driver or a poller that
+// an entry still holding its claim recorded between the two is stopped too.
 
 // claimToken identifies one claim on a phase; zero is no claim.
 type claimToken uint64
@@ -91,8 +107,8 @@ func (o *Orchestrator) holdsClaimLocked(phaseID string, claim claimToken) bool {
 	return ok && cur == claim
 }
 
-// writeClaimed runs write, one single-row write an entry makes on its phase
-// (a driver handle on a workflow row), under the phase's transition lock and
+// writeClaimed runs write, a short DB write an entry makes on its phase (a
+// driver handle on a workflow row, the phase's audit-trail events), under the phase's transition lock and
 // only while claim is still the phase's current one. It reports whether write
 // ran, and write's error. A claim ends, and a newer one starts, only under
 // that lock, so a write made here lands before the claim ends (a pause, which
@@ -127,4 +143,66 @@ func (o *Orchestrator) endClaim(phaseID string, claim claimToken, cas func() (bo
 		o.mu.Unlock()
 	}
 	return done, err
+}
+
+// endClaimSnapshot is endClaim for a transition that tears the phase's load
+// down: when cas makes its transition, the phase's poller is cancelled and
+// its workflow rows are read in the same critical section, before any newer
+// claim can record a handle or a poller. It returns whether cas made its
+// transition and the rows read (nil when the read failed, which is logged):
+// the drivers the caller stops, outside the lock.
+func (o *Orchestrator) endClaimSnapshot(ctx context.Context, phaseID string, claim claimToken, cas func() (bool, error)) (bool, []model.PhaseWorkflow, error) {
+	lk := o.phaseLock(phaseID)
+	lk.Lock()
+	defer lk.Unlock()
+	if claim != 0 && !o.holdsClaim(phaseID, claim) {
+		return false, nil, nil
+	}
+	done, err := cas()
+	if err != nil || !done {
+		return done, nil, err
+	}
+	o.mu.Lock()
+	delete(o.claims, phaseID)
+	o.mu.Unlock()
+	o.cancelPoller(phaseID)
+	pws, lerr := o.experiments.ListPhaseWorkflows(ctx, phaseID)
+	if lerr != nil {
+		o.logger.Warn("orchestrator: teardown: list workflows failed; the load is left to the next sweep",
+			"phase_id", phaseID, "error", lerr)
+		return true, nil, nil
+	}
+	return true, pws, nil
+}
+
+// snapshotForEnd is the first half of a terminal transition's teardown, taken
+// under the phase's transition lock: it reads the phase and, when its status
+// is one of from (and a non-zero claim is still the phase's current one),
+// cancels the poller and reads the workflow rows whose drivers the caller
+// stops before its CAS. ok is false, with nothing touched, when the phase is
+// not the caller's to end; a read failure is logged and also reports false.
+func (o *Orchestrator) snapshotForEnd(ctx context.Context, phaseID string, claim claimToken, from []string) (*model.ExperimentPhase, []model.PhaseWorkflow, bool) {
+	lk := o.phaseLock(phaseID)
+	lk.Lock()
+	defer lk.Unlock()
+	if claim != 0 && !o.holdsClaim(phaseID, claim) {
+		return nil, nil, false // the entry's claim ended: the phase is someone else's
+	}
+	p, err := o.experiments.GetPhase(ctx, phaseID)
+	if err != nil {
+		o.logger.Error("orchestrator: finish phase: get phase failed",
+			"phase_id", phaseID, "error", err)
+		return nil, nil, false
+	}
+	if !slices.Contains(from, p.Status) {
+		return nil, nil, false // not in an allowed source state: nothing to end, nothing touched
+	}
+	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
+	if err != nil {
+		o.logger.Error("orchestrator: finish phase: list workflows failed",
+			"phase_id", phaseID, "error", err)
+		return nil, nil, false
+	}
+	o.cancelPoller(phaseID)
+	return p, pws, true
 }

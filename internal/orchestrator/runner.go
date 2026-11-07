@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -80,8 +79,11 @@ func (o *Orchestrator) phaseStatus(ctx context.Context, phaseID string) string {
 // instances pull the phase's replay set again).
 func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 	// The pause ends the claim of an entry still waiting for its fleet: from
-	// here on that entry leaves the phase alone (claims.go).
-	paused, err := o.endClaim(phaseID, 0, func() (bool, error) {
+	// here on that entry leaves the phase alone (claims.go). The poller is
+	// cancelled and the drivers to stop are read inside the pause's critical
+	// section, so a resume that lands while the pause is still stopping them
+	// keeps its own load and poller.
+	paused, pws, err := o.endClaimSnapshot(ctx, phaseID, 0, func() (bool, error) {
 		return o.experiments.TransitionPhase(ctx, phaseID, "paused", "running")
 	})
 	if err != nil {
@@ -97,13 +99,10 @@ func (o *Orchestrator) PausePhase(ctx context.Context, phaseID string) error {
 			fmt.Sprintf("orchestrator: phase %q is not running", phaseID))
 	}
 
-	o.cancelPoller(phaseID)
-	o.stopPhaseAttacks(ctx, phaseID)
+	o.stopZeusAttacks(ctx, pws)
 	// k6 runs aren't resumable; pause kills them and resume re-launches
 	// (StartPhase fresh=false re-runs startPhaseRuns), matching attacks.
-	if pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID); err == nil {
-		o.stopPhaseRuns(ctx, pws)
-	}
+	o.stopPhaseRuns(ctx, pws)
 	// The phase left 'running' at the CAS above, so its rules and cache-box
 	// role are already out of the materialized documents; the bump wakes the
 	// held long-polls to fetch them. After the load stops, as in endPhase (M1).
@@ -216,10 +215,11 @@ func (o *Orchestrator) enterClaimed(ctx context.Context, p *model.ExperimentPhas
 	o.logger.Info("orchestrator: fleet converged on phase entry",
 		"phase_id", p.ID, "services", len(targets), "frozen", len(artifacts), "fresh", fresh)
 
-	if fresh {
-		o.recordFreezeEvents(ctx, p)
-		o.recordRuleEvents(ctx, p)
-	}
+	// The audit trail is recorded by whichever entry starts the load, unless
+	// an earlier entry of this phase already recorded it: a resume that
+	// superseded a fresh entry before its load records it in that entry's
+	// place, a resume after a started phase records nothing new.
+	o.recordAuditTrail(ctx, p, claim)
 
 	if err := o.materializePhaseWorkflows(ctx, p.ID); err != nil {
 		return fail(fmt.Errorf("orchestrator: materialize workflows: %w", err))
@@ -446,7 +446,9 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 // snapshots of a completed frozen phase — idempotent or read-only steps that
 // must happen while the phase still holds its status. ONLY the caller that
 // wins the transition runs the side effects that must happen once: record the
-// verdict, bump the phase's services off its desired state (their rules and
+// verdict, sweep the load again (the poller and every driver the rows name at
+// the CAS, which an entry may have recorded after the first teardown), bump
+// the phase's services off its desired state (their rules and
 // freeze leave every document) and wait non-fatally for the fleet, harvest
 // once for "completed", recompute the experiment rollup, and re-walk the
 // scheduler. A phase outside `from` is left untouched, and a loser changes
@@ -461,24 +463,12 @@ func (o *Orchestrator) endPhase(ctx context.Context, phaseID, status, reason str
 // happens unless the claim is still the phase's current one, checked before
 // any side effect and again, under the phase's transition lock, at the CAS.
 func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, reason string, claim claimToken, from ...string) bool {
-	if claim != 0 && !o.holdsClaim(phaseID, claim) {
-		return false // the entry's claim ended: the phase is someone else's
-	}
-	// Snapshot phase + workflows (frozen services, attack IDs) before the flip.
-	p, err := o.experiments.GetPhase(ctx, phaseID)
-	if err != nil {
-		o.logger.Error("orchestrator: finish phase: get phase failed",
-			"phase_id", phaseID, "error", err)
+	// Snapshot phase + workflows (frozen services, driver handles) before the
+	// flip, under the phase's transition lock, and cancel the poller there: it
+	// would read the stopped load as a natural end and race this finish.
+	p, pws, ok := o.snapshotForEnd(ctx, phaseID, claim, from)
+	if !ok {
 		return false
-	}
-	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
-	if err != nil {
-		o.logger.Error("orchestrator: finish phase: list workflows failed",
-			"phase_id", phaseID, "error", err)
-		return false
-	}
-	if !slices.Contains(from, p.Status) {
-		return false // not in an allowed source state: nothing to end, nothing touched
 	}
 
 	// A recording (persist_cache) phase completes through the drain barrier
@@ -487,7 +477,7 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	// winner-only discipline holds across BOTH hops. A failed/cancelled/skipped
 	// recording phase skips the barrier (it never drains).
 	if status == "completed" && p.PersistCache {
-		won, err := o.endClaim(phaseID, claim, func() (bool, error) {
+		won, dpws, err := o.endClaimSnapshot(ctx, phaseID, claim, func() (bool, error) {
 			return o.experiments.TransitionPhase(ctx, phaseID, "draining", from...)
 		})
 		if err != nil {
@@ -497,6 +487,9 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 		}
 		if !won {
 			return false // lost the race / not in an allowed source state
+		}
+		if dpws != nil {
+			pws = dpws // the drain stops what the rows name at its CAS
 		}
 		o.runDrainBarrier(ctx, p, pws)
 		from = []string{"draining"} // now complete from draining
@@ -521,7 +514,6 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	// All of this is idempotent or read-only — the recording-phase drain
 	// barrier already stopped the load — so a caller that then loses the CAS
 	// has changed nothing; only the winner records the verdict.
-	o.cancelPoller(phaseID)
 	o.stopZeusAttacks(ctx, pws)
 	o.stopPhaseRuns(ctx, pws)
 	var pull *fidelityPull
@@ -529,7 +521,7 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 		pull = o.pullFidelity(ctx, p)
 	}
 
-	transitioned, err := o.endClaim(phaseID, claim, func() (bool, error) {
+	transitioned, final, err := o.endClaimSnapshot(ctx, phaseID, claim, func() (bool, error) {
 		if status == "failed" {
 			return o.experiments.FailPhase(ctx, phaseID, reason, from...)
 		}
@@ -542,6 +534,21 @@ func (o *Orchestrator) endPhaseClaimed(ctx context.Context, phaseID, status, rea
 	}
 	if !transitioned {
 		return false // lost the race
+	}
+
+	// The post-terminal sweep. An entry still holding its claim may have
+	// recorded a driver or its poller after the snapshot above, while this
+	// call stopped the load and pulled the fidelity snapshots; the CAS ended
+	// that claim, and the rows read in its critical section (final) name
+	// every driver recorded before it — the poller was cancelled there too. Every
+	// driver they name is stopped, not only the new ones: a handle is
+	// recorded before zeus accepts its driver (an attack's id), so the stop
+	// above can have reached zeus before the driver existed. Stopping a
+	// stopped driver is a no-op.
+	if final != nil {
+		o.stopZeusAttacks(ctx, final)
+		o.stopPhaseRuns(ctx, final)
+		pws = final
 	}
 
 	// The verdict (INV-6), from the snapshots pulled above; harvest carries the
@@ -874,28 +881,6 @@ func (o *Orchestrator) stopPhaseRuns(ctx context.Context, pws []model.PhaseWorkf
 	}
 }
 
-// stopPhaseAttacks best-effort stops every attack recorded on the phase.
-func (o *Orchestrator) stopPhaseAttacks(ctx context.Context, phaseID string) {
-	if o.zeusClient == nil {
-		return
-	}
-	pws, err := o.experiments.ListPhaseWorkflows(ctx, phaseID)
-	if err != nil {
-		o.logger.Warn("orchestrator: stop attacks: list workflows failed",
-			"phase_id", phaseID, "error", err)
-		return
-	}
-	for _, pw := range pws {
-		if pw.ZeusAttackID == "" {
-			continue
-		}
-		if err := o.zeusClient.StopAttack(ctx, pw.ZeusAttackID); err != nil {
-			o.logger.Warn("orchestrator: stop zeus attack failed",
-				"phase_id", phaseID, "attack_id", pw.ZeusAttackID, "error", err)
-		}
-	}
-}
-
 // stopZeusAttacks stops each of the phase's running zeus attacks. Best-effort:
 // a stop error (e.g. an already-finished attack) is logged, not fatal. Safe to
 // call more than once (the drain barrier stops attacks before the gate; the
@@ -1145,34 +1130,67 @@ func (o *Orchestrator) bumpDesired(ctx context.Context, p *model.ExperimentPhase
 // Fault-event audit trail
 // =========================================================================
 
-// recordFreezeEvents opens a cachebox fault event per frozen service.
-func (o *Orchestrator) recordFreezeEvents(ctx context.Context, p *model.ExperimentPhase) {
+// recordAuditTrail opens the phase's fault events — one cachebox event per
+// frozen service, one rule event per phase rule — for the entry holding claim,
+// which is about to start the phase's load, unless the phase already has open
+// events: the events stay open from the entry that first started the load to
+// the terminal transition, across a pause and its resume. The check and the
+// inserts run under the phase's transition lock while the claim holds
+// (writeClaimed), so of two entries that both reach their load (a pause and a
+// resume landing between an entry's post-gate check and here) exactly one
+// records. Failures are logged; the audit trail never fails an entry.
+func (o *Orchestrator) recordAuditTrail(ctx context.Context, p *model.ExperimentPhase, claim claimToken) {
 	if o.faultEvents == nil {
 		return
 	}
-	for _, fs := range p.FrozenServices {
-		detail, _ := json.Marshal(map[string]string{"mode": fs.Mode, "key_strategy": fs.KeyStrategy, "mutation_policy": fs.MutationPolicy})
-		ev := &model.PhaseFaultEvent{
-			ID: id.New("fevt"), PhaseID: p.ID, Source: "cachebox", Service: fs.Service,
-			Kind: "cachebox:" + fs.Mode, Detail: detail, StartedAt: time.Now(),
+	evs := append(o.freezeEvents(p), o.ruleEvents(ctx, p)...)
+	if len(evs) == 0 {
+		return
+	}
+	_, err := o.writeClaimed(p.ID, claim, func() error {
+		open, err := o.faultEvents.HasOpenForPhase(ctx, p.ID)
+		if err != nil {
+			return err
 		}
-		if err := o.faultEvents.Create(ctx, ev); err != nil {
-			o.logger.Warn("orchestrator: record cachebox event failed",
-				"phase_id", p.ID, "service", fs.Service, "error", err)
+		if open {
+			return nil // an earlier entry of this phase recorded the trail
 		}
+		for _, ev := range evs {
+			if err := o.faultEvents.Create(ctx, ev); err != nil {
+				o.logger.Warn("orchestrator: record fault event failed",
+					"phase_id", p.ID, "source", ev.Source, "service", ev.Service, "error", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		o.logger.Warn("orchestrator: record fault events: check for open events failed",
+			"phase_id", p.ID, "error", err)
 	}
 }
 
-// recordRuleEvents opens a rule fault event per phase rule.
-func (o *Orchestrator) recordRuleEvents(ctx context.Context, p *model.ExperimentPhase) {
-	if o.faultEvents == nil {
-		return
+// freezeEvents builds a cachebox fault event per frozen service.
+func (o *Orchestrator) freezeEvents(p *model.ExperimentPhase) []*model.PhaseFaultEvent {
+	evs := make([]*model.PhaseFaultEvent, 0, len(p.FrozenServices))
+	for _, fs := range p.FrozenServices {
+		detail, _ := json.Marshal(map[string]string{"mode": fs.Mode, "key_strategy": fs.KeyStrategy, "mutation_policy": fs.MutationPolicy})
+		evs = append(evs, &model.PhaseFaultEvent{
+			ID: id.New("fevt"), PhaseID: p.ID, Source: "cachebox", Service: fs.Service,
+			Kind: "cachebox:" + fs.Mode, Detail: detail, StartedAt: time.Now(),
+		})
 	}
+	return evs
+}
+
+// ruleEvents builds a rule fault event per phase rule; a rule that cannot be
+// read is logged and left out.
+func (o *Orchestrator) ruleEvents(ctx context.Context, p *model.ExperimentPhase) []*model.PhaseFaultEvent {
 	prs, err := o.experiments.ListPhaseRules(ctx, p.ID)
 	if err != nil {
 		o.logger.Warn("orchestrator: record rule events: list rules failed", "phase_id", p.ID, "error", err)
-		return
+		return nil
 	}
+	evs := make([]*model.PhaseFaultEvent, 0, len(prs))
 	for _, pr := range prs {
 		r, err := o.rules.Get(ctx, pr.RuleID)
 		if err != nil {
@@ -1180,15 +1198,12 @@ func (o *Orchestrator) recordRuleEvents(ctx context.Context, p *model.Experiment
 				"phase_id", p.ID, "rule_id", pr.RuleID, "error", err)
 			continue
 		}
-		ev := &model.PhaseFaultEvent{
+		evs = append(evs, &model.PhaseFaultEvent{
 			ID: id.New("fevt"), PhaseID: p.ID, Source: "rule", Service: r.Service,
 			Kind: o.ruleKind(ctx, r), StartedAt: time.Now(),
-		}
-		if err := o.faultEvents.Create(ctx, ev); err != nil {
-			o.logger.Warn("orchestrator: record rule event failed",
-				"phase_id", p.ID, "rule_id", r.ID, "error", err)
-		}
+		})
 	}
+	return evs
 }
 
 // ruleKind derives "category:fault_type" from a rule's fault spec; falls back
