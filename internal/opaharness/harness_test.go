@@ -521,3 +521,61 @@ func TestRun_ReturnsOnContextDone(t *testing.T) {
 		t.Fatal("Run did not return after ctx was cancelled")
 	}
 }
+
+// --- carries: API-driven cooldown, shutdown mid-tick -------------------------
+
+func TestEvaluateOnce_APIApplyMovesCooldown(t *testing.T) {
+	th := newTestHarness([]*model.OPAPolicy{hotPolicy()}, fakeProvider{values: hotValues()}, &fakeMutator{}, &fakeDecisions{}, nil)
+	// A dry run through the API changes nothing and leaves the schedule alone.
+	if _, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), false); err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(th.h.nextAt) != 0 {
+		t.Fatalf("dry run moved the schedule: %v", th.h.nextAt)
+	}
+	// An applying evaluation through the API that changes rules starts the cooldown.
+	ev, err := th.h.EvaluateOnce(context.Background(), hotPolicy(), true)
+	if err != nil || !ev.Changed {
+		t.Fatalf("apply: ev %+v err %v, want a change", ev, err)
+	}
+	for _, step := range []struct {
+		at        time.Duration
+		wantEvals int
+	}{
+		{10 * time.Second, 1}, // interval elapsed, the API apply's cooldown has not
+		{59 * time.Second, 1},
+		{60 * time.Second, 2}, // cooldown elapsed
+	} {
+		th.tickAt(step.at)
+		if got := len(th.mut.calls); got != step.wantEvals {
+			t.Fatalf("at +%s: evaluations = %d, want %d", step.at, got, step.wantEvals)
+		}
+	}
+}
+
+// cancellingMutator cancels the tick's context on its first Apply.
+type cancellingMutator struct {
+	fakeMutator
+	cancel context.CancelFunc
+}
+
+func (c *cancellingMutator) Apply(ctx context.Context, pid string, ms []Mutation) ([]MutationResult, error) {
+	res, err := c.fakeMutator.Apply(ctx, pid, ms)
+	c.cancel()
+	return res, err
+}
+
+func TestTick_StopsOnCancelledContext(t *testing.T) {
+	second := hotPolicy()
+	second.ID, second.Name = "opa-hot-2", "checkout-hot-2"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mut := &cancellingMutator{cancel: cancel}
+	dec := &fakeDecisions{}
+	th := newTestHarness([]*model.OPAPolicy{hotPolicy(), second}, fakeProvider{values: hotValues()}, &mut.fakeMutator, dec, nil)
+	th.h.deps.Mutator = mut
+	th.h.tick(ctx, t0)
+	if len(mut.calls) != 1 || len(dec.records) != 1 || dec.records[0].PolicyID != "opa-hot" {
+		t.Fatalf("calls %d records %d, want only the first policy evaluated before the shutdown", len(mut.calls), len(dec.records))
+	}
+}

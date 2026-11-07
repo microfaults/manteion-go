@@ -84,9 +84,15 @@ type Harness struct {
 	deps       Deps
 	resolution time.Duration
 
-	// mu serialises ticks and guards nextAt.
-	mu     sync.Mutex
-	nextAt map[string]time.Time
+	// mu serialises ticks.
+	mu sync.Mutex
+
+	// stateMu guards nextAt. EvaluateOnce may run outside a tick (the API)
+	// and moves a policy's schedule when it applies a change, so it takes
+	// stateMu, never mu; tick holds stateMu only around its nextAt reads and
+	// writes, never across an evaluation.
+	stateMu sync.Mutex
+	nextAt  map[string]time.Time
 
 	// prepMu guards prepared; EvaluateOnce may run outside a tick (the API).
 	prepMu   sync.Mutex
@@ -137,7 +143,9 @@ func (h *Harness) Run(ctx context.Context) {
 // CooldownS after it when that evaluation changed something and the cooldown
 // is the longer. A policy's failure is recorded and logged and the tick moves
 // on to the next one. Policies no longer listed drop their schedule and
-// compiled query.
+// compiled query. A ctx cancelled mid-tick (shutdown) stops the tick before
+// the next policy: the remaining ones are not evaluated against a cancelled
+// context, and no state is pruned from the partial pass.
 func (h *Harness) tick(ctx context.Context, now time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -149,10 +157,16 @@ func (h *Harness) tick(ctx context.Context, now time.Time) {
 	}
 	seen := make(map[string]bool, len(policies))
 	for _, p := range policies {
+		if ctx.Err() != nil {
+			return
+		}
 		seen[p.ID] = true
 		interval := time.Duration(p.IntervalS) * time.Second
 		cooldown := time.Duration(p.CooldownS) * time.Second
-		if next, known := h.nextAt[p.ID]; known {
+		h.stateMu.Lock()
+		next, known := h.nextAt[p.ID]
+		h.stateMu.Unlock()
+		if known {
 			if now.Before(next) {
 				continue
 			}
@@ -163,7 +177,7 @@ func (h *Harness) tick(ctx context.Context, now time.Time) {
 				found = false
 			}
 			if found && cooldown > 0 && now.Before(last.Add(cooldown)) {
-				h.nextAt[p.ID] = last.Add(cooldown)
+				h.setNextAt(p.ID, last.Add(cooldown))
 				continue
 			}
 		}
@@ -175,13 +189,15 @@ func (h *Harness) tick(ctx context.Context, now time.Time) {
 		if ev != nil && ev.Changed && cooldown > wait {
 			wait = cooldown
 		}
-		h.nextAt[p.ID] = now.Add(wait)
+		h.setNextAt(p.ID, now.Add(wait))
 	}
+	h.stateMu.Lock()
 	for pid := range h.nextAt {
 		if !seen[pid] {
 			delete(h.nextAt, pid)
 		}
 	}
+	h.stateMu.Unlock()
 	h.prepMu.Lock()
 	for pid := range h.prepared {
 		if !seen[pid] {
@@ -189,6 +205,13 @@ func (h *Harness) tick(ctx context.Context, now time.Time) {
 		}
 	}
 	h.prepMu.Unlock()
+}
+
+// setNextAt records when policy id is next due.
+func (h *Harness) setNextAt(id string, at time.Time) {
+	h.stateMu.Lock()
+	h.nextAt[id] = at
+	h.stateMu.Unlock()
 }
 
 // prepare returns p's compiled query, compiling it when it is not cached or
@@ -217,6 +240,10 @@ func (h *Harness) prepare(p *model.OPAPolicy) (*Prepared, error) {
 // would-be mutation, otherwise the refusals plus the mutator's results. Compile, input, eval and apply failures are reported in
 // Evaluation.Error and recorded; the returned error is only a decision-log
 // write failure ("record decision: ..."), returned with the Evaluation.
+//
+// An applying evaluation that changed something moves p's schedule exactly as
+// a tick-driven one does: p is next due max(IntervalS, CooldownS) after it,
+// so an apply triggered through the API starts the cooldown the loop honours.
 func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bool) (*Evaluation, error) {
 	start := time.Now()
 	now := h.now()
@@ -278,6 +305,9 @@ func (h *Harness) EvaluateOnce(ctx context.Context, p *model.OPAPolicy, apply bo
 		ev.Applied = err == nil || len(res) > 0
 		if err != nil {
 			ev.Error = "apply: " + err.Error()
+		}
+		if ev.Changed {
+			h.setNextAt(p.ID, now.Add(max(time.Duration(p.IntervalS), time.Duration(p.CooldownS))*time.Second))
 		}
 	}
 
