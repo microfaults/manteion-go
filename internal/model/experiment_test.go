@@ -75,6 +75,14 @@ func TestExperimentPhase_Validate(t *testing.T) {
 		{"invalid cachebox mode", func(p *ExperimentPhase) {
 			p.FrozenServices = []CacheBoxConfig{{Service: "x", Mode: "bogus", KeyStrategy: "exact", MutationPolicy: "deny"}}
 		}, true},
+		{"persist_cache alone", func(p *ExperimentPhase) { p.PersistCache = true }, false},
+		// The verdict of a phase that freezes services is pulled after its
+		// drain, by when the drain has thawed them: record in one phase,
+		// freeze in a later one.
+		{"persist_cache with frozen services", func(p *ExperimentPhase) {
+			p.PersistCache = true
+			p.FrozenServices = []CacheBoxConfig{{Service: "productcatalog", Mode: "replay", KeyStrategy: "exact", MutationPolicy: "deny"}}
+		}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -223,6 +223,8 @@ func TestExperimentHandlers_RequestErrors(t *testing.T) {
 			`{"name":"x","phases":[{"name":"p","workflows":[{"workflow_id":"wf","vus":1,"duration_sec":0}]}]}`, nil, 422, "validation", "duration_sec must be > 0"},
 		{"create experiment: bad mutation_policy", s.handleCreateExperiment, http.MethodPost, "/api/v1/experiments",
 			`{"name":"x","phases":[{"name":"p","frozen_services":[{"service":"cart","mode":"replay","key_strategy":"exact","mutation_policy":"maybe"}]}]}`, nil, 422, "validation", "mutation_policy"},
+		{"create experiment: persist_cache with frozen services", s.handleCreateExperiment, http.MethodPost, "/api/v1/experiments",
+			`{"name":"x","phases":[{"name":"p","persist_cache":true,"frozen_services":[{"service":"cart","mode":"replay","key_strategy":"exact","mutation_policy":"deny"}]}]}`, nil, 422, "validation", "cannot both persist_cache and freeze services"},
 		{"update experiment: malformed JSON", s.handleUpdateExperiment, http.MethodPut, "/api/v1/experiments/exp-1", `{`, expPV, 400, "bad_json", ""},
 		{"update experiment: empty name", s.handleUpdateExperiment, http.MethodPut, "/api/v1/experiments/exp-1", `{"name":""}`, expPV, 422, "validation", "name may not be empty"},
 		{"create phase: malformed JSON", s.handleCreatePhase, http.MethodPost, "/api/v1/experiments/exp-1/phases", `[`, expPV, 400, "bad_json", ""},

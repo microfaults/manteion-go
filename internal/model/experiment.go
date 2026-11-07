@@ -125,6 +125,13 @@ func (p *ExperimentPhase) Validate() error {
 			return fmt.Errorf("experiment phase: frozen_services[%d]: %w", i, err)
 		}
 	}
+	// A recording phase ends through the drain path, which takes it out of
+	// the running set (thawing its frozen services) before the fidelity
+	// verdict is pulled: frozen instances would report the replay set gone
+	// and the verdict would read preload_incomplete.
+	if p.PersistCache && len(p.FrozenServices) > 0 {
+		return errors.New("experiment phase: a phase cannot both persist_cache and freeze services: record in one phase, freeze in a later one")
+	}
 	return nil
 }
 

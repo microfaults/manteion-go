@@ -281,7 +281,7 @@ func TestHandleUpdatePhase(t *testing.T) {
 		}
 
 		url, pv := target(exp.ID, ph.ID)
-		body := fmt.Sprintf(`{"name":"iso-cart","position":3,"persist_cache":true,
+		body := fmt.Sprintf(`{"name":"iso-cart","position":3,
 			"frozen_services":[{"service":"cart","mode":"replay","key_strategy":"exact","mutation_policy":"deny"}],
 			"workflows":[{"workflow_id":%q,"vus":7,"duration_sec":30}],
 			"rule_ids":[%q]}`, wfB, ruleB)
@@ -290,8 +290,8 @@ func TestHandleUpdatePhase(t *testing.T) {
 			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 		}
 		got := decodePhase(t, w)
-		if got.ID != ph.ID || got.Name != "iso-cart" || got.Position != 3 || !got.PersistCache || got.Status != "pending" {
-			t.Errorf("phase row = %+v, want iso-cart/3/persist_cache/pending", got.ExperimentPhase)
+		if got.ID != ph.ID || got.Name != "iso-cart" || got.Position != 3 || got.PersistCache || got.Status != "pending" {
+			t.Errorf("phase row = %+v, want iso-cart/3/pending", got.ExperimentPhase)
 		}
 		if len(got.FrozenServices) != 1 || got.FrozenServices[0].Service != "cart" {
 			t.Errorf("frozen_services = %+v, want [cart]", got.FrozenServices)
@@ -309,9 +309,15 @@ func TestHandleUpdatePhase(t *testing.T) {
 			t.Fatalf("rename-only: status=%d body=%s", w.Code, w.Body.String())
 		}
 		got = decodePhase(t, w)
-		if got.Name != "iso-cart-2" || got.Position != 3 || !got.PersistCache || len(got.Workflows) != 1 || len(got.RuleIDs) != 1 {
+		if got.Name != "iso-cart-2" || got.Position != 3 || len(got.FrozenServices) != 1 || len(got.Workflows) != 1 || len(got.RuleIDs) != 1 {
 			t.Errorf("rename-only edit must leave everything else untouched: %+v workflows=%d rules=%d",
 				got.ExperimentPhase, len(got.Workflows), len(got.RuleIDs))
+		}
+		// persist_cache on a phase that keeps its frozen services is refused:
+		// the edit is validated merged with the stored row.
+		w = e.do(e.s.handleUpdatePhase, http.MethodPut, url, `{"persist_cache":true}`, pv)
+		if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "cannot both persist_cache and freeze services") {
+			t.Fatalf("persist_cache on a frozen phase: status=%d body=%s, want 422", w.Code, w.Body.String())
 		}
 		w = e.do(e.s.handleUpdatePhase, http.MethodPut, url, `{"workflows":[],"rule_ids":[]}`, pv)
 		if w.Code != http.StatusOK {
