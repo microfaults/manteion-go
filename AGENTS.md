@@ -44,7 +44,7 @@ go run ./cmd/manteion
 manteion compiles against a different atropos-go depending on how it is built. Check which one before trusting a fault-catalog or wire behaviour.
 
 - Local `go build` / `go test`: the untracked, gitignored `go.work` replaces atropos with `faults-lab/worktrees/atropos-pin`.
-- Docker and skaffold: `go.mod`'s `replace => ../atropos-go`, which from this tree is `worktrees/atropos-go`, a symlink to `worktrees/atropos-beds-pin`. The Dockerfile and `skaffold.yaml` also assume the repo directory is named `manteion-go` beside `atropos-go` (`COPY manteion-go/`, `dockerfile: manteion-go/Dockerfile`), which is not true for this worktree. An image build from here has not been verified.
+- Docker and skaffold: `go.mod`'s `replace => ../atropos-go`, which from this tree is `worktrees/atropos-go`, a symlink to `worktrees/atropos-beds-pin`. The Dockerfile and `skaffold.yaml` also assume the repo directory is named `manteion-go` beside `atropos-go` (`COPY manteion-go/`, `dockerfile: manteion-go/Dockerfile`), which is not true for this worktree. The lab image is therefore built from a staging directory made by `service-beds/scripts/lab-up.sh`: `git archive` copies of manteion-go and atropos-go as `manteion-go/` and `atropos-go/`, with modules vendored from a local file GOPROXY, cross-built for linux/amd64.
 - CI clones atropos-go `develop`, a third version.
 - The fault catalog validates through atropos `faultparams`, so `network/packet_loss` and `mechanism: netem` are accepted by a beds-pin build and rejected (422) by a `go.work` build.
 - The README's "SDK dependency" section (atropos required by tag, no replace, `GOPRIVATE`) is wrong; `go.mod` has the replace.
@@ -72,7 +72,7 @@ manteion compiles against a different atropos-go depending on how it is built. C
 - `readJSON` ignores unknown fields and `MatchCriteria.Validate` is never called, so typos in request bodies are dropped silently. The UI's `match_ast` is dropped the same way.
 - `docs/design/DESIGN-CALLS-cachebox-2026-07-30.md` in the knowledge base reads D4, D6 and D8 as adopted; none is implemented as written. Nothing marks a recording degraded on `Recover` (D4); degraded baselines are allowed only by the env var `MANTEION_ALLOW_DEGRADED_BASELINE`, not a per-run flag (D6); admission refuses overlapping service footprints, not a second experiment per mesh (D8).
 - OPA harness (`MANTEION_POLICY_ENGINE=rego`): a policy cannot act while Prometheus or Loki is down, so a "safety brake" policy fails static. Its input has no experiment or phase state and mutations are only scope-checked by service, so a policy can toggle phase-attached rules mid-phase. The example queries in `docs/opa-harness.md` never match (wrong service name, log body and span name).
-- Stale targets: `kubernetes-manifests/manteion.yaml` sets `ZEUS_URL` and `MANTEION_ZEUS_DATASET_ID` to the retired VM2; every `tools/expctl/examples/*.yaml` targets the retired VM1, and `tools/expctl/README.md` port-forwards on vm1. `exp3-latwave.yaml` fails with 422 after creating its specs and rules, leaving them behind.
+- Stale targets: every `tools/expctl/examples/*.yaml` targets the retired VM1, and `tools/expctl/README.md` port-forwards on vm1. `exp3-latwave.yaml` fails with 422 after creating its specs and rules, leaving them behind.
 
 ## Conventions
 

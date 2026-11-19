@@ -1,15 +1,10 @@
----
-# PostgreSQL Secret
-apiVersion: v1
-kind: Secret
-metadata:
-  name: manteion-postgres
-type: Opaque
-stringData:
-  POSTGRES_USER: manteion
-  POSTGRES_PASSWORD: manteion
-  POSTGRES_DB: manteion
-  DATABASE_URL: "postgres://manteion:manteion@manteion-postgres:5432/manteion?sslmode=disable"
+# Secret manteion-postgres is not committed. It is created on the box by
+# service-beds/scripts/lab-pg-secret.sh and holds four keys, read by the
+# StatefulSet below and by the manteion Deployment:
+#   POSTGRES_USER=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
+#   POSTGRES_PASSWORD=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
+#   POSTGRES_DB=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
+#   DATABASE_URL=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
 ---
 # PostgreSQL StatefulSet
 apiVersion: apps/v1
@@ -48,7 +43,7 @@ spec:
               cpu: 100m
               memory: 256Mi
             limits:
-              cpu: 500m
+              cpu: 300m
               memory: 512Mi
   volumeClaimTemplates:
     - metadata:

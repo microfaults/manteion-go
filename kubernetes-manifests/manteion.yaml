@@ -6,6 +6,8 @@ metadata:
     app: manteion
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: manteion
@@ -23,9 +25,21 @@ spec:
         - name: cache
           persistentVolumeClaim:
             claimName: manteion-cache
+      initContainers:
+        - name: wait-postgres
+          image: postgres:17-alpine
+          command: ["sh", "-c", "until pg_isready -h manteion-postgres -p 5432 -t 2; do sleep 2; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
       containers:
         - name: manteion
           image: manteion
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
               protocol: TCP
@@ -36,16 +50,14 @@ spec:
             - name: MANTEION_ADDR
               value: ":8080"
             - name: ZEUS_URL
-              value: "https://2262-cse115b-02.be.ucsc.edu/zeus"
+              value: "http://zeus:8080"
+            - name: PROMETHEUS_URL
+              value: "http://prometheus:9090"
             - name: MANTEION_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: manteion-postgres
                   key: DATABASE_URL
-            # Binds workflow runs to a zeus dataset; without it zeus stages an
-            # empty pool map and drives unresolved {{data.*}} traffic.
-            - name: MANTEION_ZEUS_DATASET_ID
-              value: "6ce88928f949a773"
           livenessProbe:
             httpGet:
               path: /healthz
