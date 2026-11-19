@@ -1,114 +1,91 @@
-## Project Intention
+# manteion-go
 
-Manteion is the central coordination controller for the atropos ecosystem. It turns atropos from a per-service fault injection library into a distributed platform by providing centralized rule management, zeus-go workflow orchestration, cache-box experiment coordination, and SDK startup dependency enforcement.
+Control plane of faults-lab (Go, Postgres). It stores rules, fault specs and experiments, serves every atropos SDK instance a desired-state document that the instance long-polls, runs experiment phases (freeze services, replay recordings, drive load through zeus), and records a fidelity verdict per frozen phase.
 
-## Ecosystem
+## Workspace
 
-- **atropos-go** — Fault injection + OTel instrumentation SDK embedded in each service. Core interface: `Evaluator.Evaluate(ctx, Request) *Decision`. Three fault categories: inline (error/hang/latency), network (blackhole/drip/latency/retransmit_delay/rst/throttle), resource (cpu/disk/io/memory). Always-on tracing with `atropos.*` span attributes.
-- **zeus-go** — Load generation platform. Archer REST API orchestrates k6 workloads (broad traffic) and vegeta attacks (precision endpoint loads). After policy migration to manteion, Archer is a pure execution engine.
-- **service-beds** — Go HTTP recreations of Google's Online Boutique (13 services) with OTel + atropos instrumentation. Deployed via Skaffold/Kubernetes.
-- **manteion-go** (this repo) — Sits between SDKs (atropos-go) and load gen (zeus-go). Serves evaluator rules and cache-box state to SDK instances as a desired-state document they poll. Orchestrates experiments. Owns policy evaluation.
+<!-- Shared by the AGENTS.md of all five faults-lab repos; keep the copies in sync. Last verified 2026-11-16. -->
+Five sibling git repos are checked out side by side in one workspace folder, written `faults-lab/` below (the folder itself is not a repo):
 
-## Research Context
+- `atropos-go`: Go SDK embedded in each service (faults, cache-box record/replay, OTel), plus the `atroposd` sidecar and the `atropos-agent` node agent.
+- `manteion-go`: control plane in Go with Postgres. Holds rules and experiments and runs experiment phases.
+- `zeus-go`: load generator. Runs k6 workflows and vegeta attacks when manteion asks.
+- `service-beds`: the measured system, a Go port of Google's Online Boutique with atropos embedded.
+- `manteion-ui`: React operator console for manteion.
 
-This project is part of the UCSC Faults Lab (Peter Alvaro's group) research on interventional performance attribution for microservices. See `atropos-go/VISION.md` for the full research vision.
+zeus sends load to the bed. Each bed service embeds atropos, and every atropos instance long-polls manteion for its desired state; manteion never pushes rules. manteion calls zeus to start and stop load, and dials instance addresses only to read status and cache-box fidelity. The UI calls manteion's API (and, today, Prometheus directly).
 
-**The problem:** When microservice workflows overlap on shared services, tail latency conflates three causally distinct phenomena — intrinsic per-service cost, application-level contention (queue/connection pool competition), and infrastructure-level coupling (CFS throttling, LLC evictions, veth queueing). These interact nonlinearly because shared services are queueing systems. Observational tools (Jaeger, Zipkin) cannot separate them. Chaos engineering tests binary correctness, not performance decomposition.
+Default checkouts lag by months. Before reading code, run `git worktree list` and `git branch -a --sort=-committerdate` and work in the newest tree. On 2026-11-16 those were: atropos-go `feat/atroposd` in `atropos-go/.claude/worktrees/elated-shannon-771fa0`; manteion-go and service-beds `feat/atropos-daemon` in `worktrees/manteion-atropos-daemon` and `worktrees/service-beds-atropos-daemon`; zeus-go `develop` in its main checkout; manteion-ui `mock-mode` in `manteion-ui/.claude/worktrees/mock-mode`. None of them was merged yet.
 
-**Cache-box:** The core research primitive. Freeze a service at its SDK boundary to replay cached responses — zero CPU, zero queueing, but call graph structure preserved. Methodologically the dual of LDFI: LDFI asks "which faults break correctness?" by removing components; cache-box asks "which services cause latency?" by removing contention. Three modes: passthrough (record), replay (instant cached response), replay-with-delay (cached response + synthetic latency from observed distribution).
+The lab is a single-node k3s on a home-LAN box at `10.0.0.250` (manteion, Postgres, the Go bed, Prometheus, an OTel collector agent). The owner's Mac runs zeus, the gateway collector, Tempo, Loki and Grafana. The UCSC VMs (vm1, vm2, `2262-cse115b-0*.be.ucsc.edu`) are retired, so docs, manifests and scripts that name them describe history. The box is unreachable off that LAN: run `nc -z -G 5 10.0.0.250 22` before any deploy step, and check on the host what is actually deployed.
 
-**Experiment protocol (manteion orchestrates this):**
-1. Baseline run — all services live, measure cross-workflow interference
-2. N isolation runs — freeze one shared service each via cache-box
-3. Combination runs — freeze pairs to detect interaction effects
-4. Compute: `delta_service = baseline_latency - isolated_latency`
-5. Interaction detection: `delta_combined - sum(delta_individual)` — nonzero means superadditive interference
+The cross-repo knowledge base is `faults-lab/docs` (not under git). `research/` is still valid background. `ONBOARDING-TLDR.md`, `STATUS-2026-08-19.md`, `design/DESIGN-CALLS-cachebox-2026-07-30.md` and the generated `api/` pages predate the pull-based desired-state protocol and the new host; read them as history.
 
-**Manteion's role in the roadmap:** Phase 2 of the atropos vision. Phase 1 (cache-box core in atropos-go SDK) provides the primitive. Manteion serves mode changes and rules to SDK instances, coordinates experiment enrollment, and provides the central control plane. Phase 3 (analysis integration) builds automated latency decomposition on top.
+Remotes: `github` (github.com/microfaults, public) is the primary remote; `origin` (git.ucsc.edu) is legacy.
 
-**Key references:** LDFI, Coz (causal profiling), 3MileBeach (tracing + fault injection with baggage), Filibuster (boundary instrumentation), ShapleyIQ (game-theoretic attribution — observational, not interventional).
+## Commands
 
-**Target venues:** ACM SoCC, USENIX ATC, ICPE.
+```bash
+make verify          # go build, gofmt -l (fails on output), go vet, go test
+go test -race ./...
+make integration     # MANTEION_INTEGRATION=1 MANTEION_TEST_DB=1 go test -count=1 -timeout 300s -p 1 ./...
+make openapi-local   # regenerate docs/swagger.{yaml,json} on this Mac
+go run ./cmd/manteion
+```
 
-## Architecture
+- Plain `go test ./...` passes while skipping every database-backed test. Store and orchestrator suites need `MANTEION_INTEGRATION=1`; many api and orchestrator tests also need `MANTEION_TEST_DB=1`. `make integration` sets both. CI's `go-integration` job sets only `MANTEION_INTEGRATION`, so the `MANTEION_TEST_DB` tests skip there too.
+- The DB tests need Postgres: `colima start`, then `docker compose up -d postgres` (postgres:18-alpine on 5432). The default DSN is `postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable`; set `MANTEION_DATABASE_URL` to use another. If another worktree's compose holds 5432, run a separate `postgres:18-alpine` on `127.0.0.1:55432` and point `MANTEION_DATABASE_URL` at it. Keep `-p 1`: the suites share one database and truncate every table between tests. Remove the container and volume afterwards.
+- OpenAPI: use `make openapi-local`, then `git diff --exit-code -- docs/swagger.yaml docs/swagger.json` (that diff is what CI's `openapi-check` fails on). Plain `make openapi` fails here because swag v2.0.0-rc5 cannot parse Go 1.27's standard library and `go.work` declares go 1.27; `openapi-local` runs under go.mod's go1.25.5 through a temporary copy of `go.work`. Needs `swag` v2.0.0-rc5 and python3 with PyYAML (install notes in the Makefile header).
+- The experiment and phase handlers carry no swag annotations, so the spec does not cover them; the code is the reference.
+- `go run ./cmd/manteion` listens on `:9090` (`MANTEION_ADDR`). The Kubernetes manifest sets `:8080`, which is why other repos say `manteion:8080`.
 
-- REST API using stdlib `net/http` with Go 1.22+ method-path routing (`mux.HandleFunc("METHOD /path", handler)`)
-- PostgreSQL-backed persistence via pgx/v5 (`internal/db/` for connection management and migrations, `internal/store/` for domain repositories)
-- HTTP proxy to zeus-go Archer for workload/attack operations
-- Desired-state SDK polling (`internal/desired/`): a per-service generation bumped with every input change, a materialized document per instance with a content ETag, and a long-polling `GET /api/v1/sdk/rules` that answers 304 Not Modified when `If-None-Match` names the current ETag. Plan-1 exceptions move the ETag's content hash but not the generation (a non-held poll sees them at once, a held one when its wait elapses or the next bump arrives, so within one wait): a fault config's time-based expiry, before the reaper's bump (`docs/long-running-faults.md`); fault-spec edits; attaching or detaching a phase's rules (`AttachPhaseRules` on experiment and phase create, `UpdatePhase` on a phase edit); and phase or experiment deletion (cascading to `phase_rules`)
-- No pushes to SDK instances (desired-state plan 2): everything an instance applies, rules, fault configs, `freeze_cfg` and `replay_set`, is in the document it polls. Phase entry assigns the replay-set artifacts, bumps each service once and waits up to `MANTEION_CONVERGE_TIMEOUT` for every alive instance to converge (on a frozen service, the assigned set committed in a status report applied at the bump); exit records the fidelity verdict, then bumps. The opt-in policy engine edits rules through the rule repository (`push_rules` enables the listed rules of the policy's service, `clear_rules` disables its enabled ones), and each edit bumps the generation, so instances pick it up through the desired-state path; there is no `/admin/rules` push. Cache ingest dedupes on `(experiment, phase, instance, epoch, batch_seq)`, so a restarted SDK instance never collides with its previous process's batches; a client that sends no `epoch` keeps the old key.
-- Docker-compose for local development (postgres:17-alpine)
+## How this tree resolves atropos
 
-### Storage
+manteion compiles against a different atropos-go depending on how it is built. Check which one before trusting a fault-catalog or wire behaviour.
 
-- PostgreSQL for all persistent state: rules, fault specs/compositions, experiments, results, workloads, trace anchors, policy rules
-- Schema managed by embedded migrations in `internal/db/migrations.go`
-- Per-service generation counters (`service_generations`) and the document's content ETag drive the 304/long-poll decision; the single-row `rule_version` counter only backs the SDK readiness probe (`/api/v1/sdk/init`)
-- TODO: in-memory caching layer for hot-path polling (materialized documents per generation); SDK instances may move to in-memory store (ephemeral, high-frequency writes)
+- Local `go build` / `go test`: the untracked, gitignored `go.work` replaces atropos with `faults-lab/worktrees/atropos-pin`.
+- Docker and skaffold: `go.mod`'s `replace => ../atropos-go`, which from this tree is `worktrees/atropos-go`, a symlink to `worktrees/atropos-beds-pin`. The Dockerfile and `skaffold.yaml` also assume the repo directory is named `manteion-go` beside `atropos-go` (`COPY manteion-go/`, `dockerfile: manteion-go/Dockerfile`), which is not true for this worktree. An image build from here has not been verified.
+- CI clones atropos-go `develop`, a third version.
+- The fault catalog validates through atropos `faultparams`, so `network/packet_loss` and `mechanism: netem` are accepted by a beds-pin build and rejected (422) by a `go.work` build.
+- The README's "SDK dependency" section (atropos required by tag, no replace, `GOPRIVATE`) is wrong; `go.mod` has the replace.
 
-## Key Domains
+## Where the code misleads
 
-- **Workloads & Attacks** — k6 workloads (Flow + Persona) with vegeta sub-attacks. Types in `internal/model/workload.go`.
-- **Fault Rules** — Composable fault specs: atomic faults + composition trees (max depth 3, parallel or sequential). Network faults are direction-aware (upstream/downstream). Incompatibility validation at composition creation. Types in `internal/model/fault.go`.
-- **Experiments** — Each experiment has runs (baseline + isolation + combination). Experiments are described by their runs' `FrozenServices` and each cache-box's `Mode`; there is no experiment-type discriminator. Results aggregated per (run, service, workflow). ContributionResult stores delta computation. Types in `internal/model/experiment.go`.
-- **Trace Anchors** — Pointers into Jaeger/Prometheus/Tempo (time range, filters), not trace data itself. CacheBoxConfig describes frozen service state: `KeyStrategy` (`"exact"`, `"exact_with_host"`, `"exact_with_body"` — aligns with atropos SDK `cachebox.KeyStrategy` constants), `MutationPolicy`/`SafeMethods` (reproducibility metadata only, not enforced by SDK), and `SyntheticDelay`. Types in `internal/model/trace.go`.
-- **Policy** — Rego policies evaluated by the OPA harness against live Prometheus/Loki inputs; outputs are rule mutations applied through the rule repository (`internal/opaharness`, `docs/opa-harness.md`). The 2026-04 PromQL threshold engine (`internal/model/policy.go`, `internal/policy`) is frozen behind `MANTEION_POLICY_ENGINE=threshold`.
+- Nothing is pushed to SDK instances. Rules, fault configs, `freeze_cfg` and replay sets reach them only through the polled document. `internal/atropos` is read-only (`GetRules`, `GetFault`, `GetCacheBoxStats`, `GetCacheBoxFidelity`); README line 35 still says write methods exist. `docs/2026-06-wiring-audit.md` and `docs/architecture-diagram.html` still draw pushes.
+- Desired state keys on phase status only, never on experiment status. If a cancel or stop fails partway (a crash after the experiment's terminal CAS, or a `finishPhase` error), the phase stays `running` under a cancelled experiment and its rules, freeze and replay set are served indefinitely. `Recover` only scans running experiments, so nothing revisits it. "Cancel tears down rules and freezes" holds only on the happy path.
+- An interrupted resume is completed, not failed. Pause leaves the old zeus handles on `phase_workflows`; if manteion restarts during a resume's convergence wait, `Recover` sees a running phase with drivers and completes it over pre-pause traffic. The "entry interrupted by a manteion restart" guard only catches fresh entries.
+- The phase-level API bypasses the experiment state machine and admission. `POST /experiments/{id}/phases` adds phases to running or finished experiments, and `POST .../phases/{phaseId}/start` never checks the experiment's status or service overlap. Admission itself is check-then-act without a lock and passes when its reads fail.
+- `DELETE` on an experiment or phase works in any status and tears nothing down: zeus load keeps running, the poller ticks until its safety-net deadline (at least 30 min), and there is no exit bump, verdict or harvest.
+- Fault configs are not phase-scoped. `fault_configs.phase_id` is only a tag; a config with `duration_ms: 0` outlives its phase and experiment, and a config fired at a frozen service bypasses admission and the verdict.
+- The kill switch (`POST /sdk/instances/{id}/kill-switch`) acts on the whole service, not the instance. It disables rules permanently (there is no un-kill) and cancels fault configs, but leaves a running phase, its load, its cache-box rule and freeze in place, and the OPA harness can re-enable rules on its next tick.
+- Pausing a recording (`persist_cache`) phase loses records: the SDK's pause-triggered flush is answered `409 phase_not_recording`, which the SDK treats as terminal. The final drain then likely reports the baseline degraded.
+- A frozen phase is set `running` before its replay-set artifact exists, so an instance polling in that window gets `freeze_cfg` without a replay set and fails closed (synthetic 503s).
+- Convergence means "observed the generation", not "applied it". `observed_errors` and `unsupported` do not block, and `internal/desired/capabilities.go` drops the `netem` capability and filters by category only. A phase whose fault no instance can execute still converges and is recorded as a fault phase.
+- Experiment start answers 202 even when the first phase failed to converge, after blocking up to `MANTEION_CONVERGE_TIMEOUT` (30 s). Only resume and phase start return `504 not_converged`. Experiment pause, resume and cancel wait behind an in-flight entry because they take the same per-experiment lock.
+- Verdicts exist only for completed frozen phases. They check replay misses, uncommitted preload, degraded baseline, missing telemetry and collision rate; there is no dropped-iteration check, and `INVALID` is stored without refusing anything.
+- `error_rate` in `phase_workflow_results` is `requests_dropped / requests_sent`, i.e. k6 dropped iterations (`internal/orchestrator/harvest.go`). A phase with half its requests failing with 5xx records about 0. HTTP failures are only in `raw_metrics`.
+- zeus forgets runs when it restarts. The poller treats the resulting `GET /runs/{id}` 404 as transient, so the phase hangs until `max(30 min, duration + 5 min)` and fails with a misleading "safety-net deadline" reason. Stopped runs get no zeus stats snapshot, so no `phase_workflow_results` row is written.
+- The zeus events proxy shares the zeus client's 30 s total timeout and copies without flushing, so `/api/v1/zeus/runs/{id}/events` is cut at 30 s and arrives buffered.
+- State lost on restart: cache-store dedup and received counts, collision stats, claims, pollers. SDK retries after a restart can append duplicate batches; the drain gate then usually times out as degraded. A crash after a phase's terminal CAS loses its verdict, harvest and fault-event closing for good. `Recover` reads at most 200 running experiments.
+- Some document changes do not bump the generation: a fault config's time-based expiry (until the reaper's bump), a fault-spec edit, attaching or detaching phase rules, and deleting a phase or experiment. Held polls see them only when their wait ends, within one wait.
+- An enabled rule attached to no phase is live immediately. Rules are created disabled; `tools/expctl` creates them disabled, attaches them, then enables them.
+- `readJSON` ignores unknown fields and `MatchCriteria.Validate` is never called, so typos in request bodies are dropped silently. The UI's `match_ast` is dropped the same way.
+- `docs/design/DESIGN-CALLS-cachebox-2026-07-30.md` in the knowledge base reads D4, D6 and D8 as adopted; none is implemented as written. Nothing marks a recording degraded on `Recover` (D4); degraded baselines are allowed only by the env var `MANTEION_ALLOW_DEGRADED_BASELINE`, not a per-run flag (D6); admission refuses overlapping service footprints, not a second experiment per mesh (D8).
+- OPA harness (`MANTEION_POLICY_ENGINE=rego`): a policy cannot act while Prometheus or Loki is down, so a "safety brake" policy fails static. Its input has no experiment or phase state and mutations are only scope-checked by service, so a policy can toggle phase-attached rules mid-phase. The example queries in `docs/opa-harness.md` never match (wrong service name, log body and span name).
+- Stale targets: `kubernetes-manifests/manteion.yaml` sets `ZEUS_URL` and `MANTEION_ZEUS_DATASET_ID` to the retired VM2; every `tools/expctl/examples/*.yaml` targets the retired VM1, and `tools/expctl/README.md` port-forwards on vm1. `exp3-latwave.yaml` fails with 422 after creating its specs and rules, leaving them behind.
 
-## HTTP API
+## Conventions
 
-All routes live on the main API mux (see `internal/api/server.go`). Responses are JSON; errors use `{"error": "..."}`. Successful creates return 201; lists return `[]` (never `null`) on empty; not-found returns 404 via `errors.Is(err, store.ErrNotFound)`.
+- Schema epoch 2: migrations in `internal/db/migrations.go` are append-only, and `Migrate` refuses a database whose history it does not recognize. Resetting means dropping the database.
+- PG enums: `internal/store/enum_parity_test.go` pins the Postgres labels to `model.EnumValues`; a new enum value needs a migration and the model change together.
+- Handler tests are DB-gated because `Server.experiments` is a concrete `*store.ExperimentRepo` with no fake. `experiment_phases_position_unique` is DEFERRABLE, so its violations surface at `Commit()`.
+- Classify errors with `errors.As` / `errors.Is` on the typed errors, never by parsing the `error` string.
+- When landing `feat/atropos-daemon`, bring in the fix "stop counting k6 dropped iterations as request errors": it exists only on git.ucsc.edu `origin/develop`, not on this branch or on GitHub's `develop`.
+- Commits use conventional-commit subjects with a scope (`fix(orchestrator): ...`); one commit per request, files staged by name. PR titles use `[manteion-go] <Title>`. The owner manages branches and merges, so do not push or open pull or merge requests unless asked; when asked to push, use `github`.
+- `docs/` describes current reality only. Specs and plans from brainstorming stay local under `docs/superpowers/`, which is not gitignored in this repo (one older spec is tracked): do not commit new files there. `docs/plans/` holds executed plans, kept as history.
 
-### Fault Specs & Compositions
+## Read these
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST   | `/api/v1/faults/specs` | Create a fault spec |
-| GET    | `/api/v1/faults/specs` | List all fault specs |
-| GET    | `/api/v1/faults/specs/{id}` | Get a fault spec |
-| DELETE | `/api/v1/faults/specs/{id}` | Delete a fault spec |
-| POST   | `/api/v1/faults/compositions` | Create a composition (runs full `model.ValidateComposition` — depth ≤ 3, network-direction rules, incompatibilities) |
-| GET    | `/api/v1/faults/compositions` | List compositions |
-| GET    | `/api/v1/faults/compositions/{id}` | Get a composition |
-| DELETE | `/api/v1/faults/compositions/{id}` | Delete a composition |
-
-Create-spec: server assigns `id` if absent (`spec-…`) and always overwrites `created_at`. Validation failures return 400 (`Warn` log); store/DB failures return 500 (`Error` log).
-
-Create-composition: same server-authoritative id/timestamp treatment. The handler resolves `FaultSpecID`/`FaultCompositionID` references against the store before `ValidateComposition`, so dangling references surface as 400 validation errors — not 500s.
-
-## Code Style
-
-- Go 1.25. External deps: pgx/v5 for PostgreSQL. Minimize further deps.
-- Follow zeus-go patterns: `Server` struct with `Handler()`, `routes()`, JSON helpers (`writeJSON`, `writeError`, `readJSON`)
-- String IDs for foreign keys, no ORM
-- `json.RawMessage` for opaque/extensible fields (fault config, k6 steps, query hints)
-- `Validate() error` methods on domain types
-- Table-driven tests
-
-## PR Instructions
-
-- Title format: `[manteion-go] <Title>`
-- Run `go build ./...` and `go vet ./...` before committing
-- Run `go fmt` on changed files
-
-## Reference Files
-
-Plans:
-- `docs/plans/2026-03-30-scaffolding.md` — API scaffolding (project structure, routes, types, implementation order). Note: storage layer superseded by postgres in baac8c5.
-- `docs/plans/2026-03-30-relational-schemas.md` — Full data model (5 schema domains, fault incompatibility tables, design decisions)
-- `docs/plans/2026-04-01-sdk-liveness-reaper.md` — SDK liveness detection and instance reaper design (not yet implemented)
-
-Implementation:
-- `internal/db/migrations.go` — Schema DDL and migration runner
-- `internal/store/` — PostgreSQL-backed domain repositories (rule_repo, fault_repo, sdk_repo, experiment_repo, workload_repo, policy_repo, trace_repo)
-- `internal/store/helpers.go` — Shared repo utilities (transactions, JSONB marshalling, NULL conversions)
-- `internal/model/composition_validate.go` — Composition depth, direction, and incompatibility validation
-- `docker-compose.yml` — Local development database (postgres:17-alpine)
-
-Companion repos (patterns to follow):
-- `zeus-go/internal/api/server.go` — Server struct, routes, JSON helpers
-- `zeus-go/internal/workload/registry.go` — In-memory store with sync.RWMutex
-- `zeus-go/cmd/archer/main.go` — Entry point, wiring, graceful shutdown
-- `zeus-go/docs/workflow-dsl-v2.md` — Workflow DSL v2 spec (persona-key references in tree nodes)
-- `atropos-go/internal/evaluator/evaluator.go` — Evaluator interface (what manteion rules configure)
-- `atropos-go/internal/fault/` — Fault type implementations (what FaultSpec maps to)
-- `atropos-go/VISION.md` — Full research vision, problem statement, roadmap phases
+- `README.md`: packages, wire contracts, environment table (mostly current; its SDK-dependency and VM1 deploy notes are not).
+- `docs/long-running-faults.md` and `docs/decisions/` (policy-engine freeze, OPA harness, no multitenancy).
+- The SDK contract: `atropos-go` worktree `docs/plans/2026-10-30-desired-state-protocol.md`.
