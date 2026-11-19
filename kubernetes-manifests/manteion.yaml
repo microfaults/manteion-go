@@ -58,6 +58,14 @@ spec:
                 secretKeyRef:
                   name: manteion-postgres
                   key: DATABASE_URL
+          # First boot runs the migrations before /healthz answers; liveness
+          # waits until the startup probe passes (up to 2 s x 60 = 120 s).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /healthz

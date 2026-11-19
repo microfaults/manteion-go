@@ -1,10 +1,11 @@
-# Secret manteion-postgres is not committed. It is created on the box by
+# Secret manteion-postgres is not committed. It is created once on the box by
 # service-beds/scripts/lab-pg-secret.sh and holds four keys, read by the
-# StatefulSet below and by the manteion Deployment:
-#   POSTGRES_USER=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
-#   POSTGRES_PASSWORD=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
-#   POSTGRES_DB=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
-#   DATABASE_URL=<generated on the box by service-beds/scripts/lab-pg-secret.sh>
+# StatefulSet below and by the manteion Deployment. Only the password is
+# generated; user and database are fixed:
+#   POSTGRES_USER=manteion
+#   POSTGRES_PASSWORD=<generated on the box>
+#   POSTGRES_DB=manteion
+#   DATABASE_URL=postgres://manteion:<password>@manteion-postgres:5432/manteion?sslmode=disable
 ---
 # PostgreSQL StatefulSet
 apiVersion: apps/v1
@@ -35,7 +36,7 @@ spec:
               mountPath: /var/lib/postgresql/data
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "manteion"]
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"']
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:

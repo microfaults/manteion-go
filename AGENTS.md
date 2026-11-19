@@ -4,7 +4,7 @@ Control plane of faults-lab (Go, Postgres). It stores rules, fault specs and exp
 
 ## Workspace
 
-<!-- Shared by the AGENTS.md of all five faults-lab repos; keep the copies in sync. Last verified 2026-11-16. -->
+<!-- Shared by the AGENTS.md of all five faults-lab repos; keep the copies in sync. Last verified 2026-11-18. -->
 Five sibling git repos are checked out side by side in one workspace folder, written `faults-lab/` below (the folder itself is not a repo):
 
 - `atropos-go`: Go SDK embedded in each service (faults, cache-box record/replay, OTel), plus the `atroposd` sidecar and the `atropos-agent` node agent.
@@ -17,7 +17,7 @@ zeus sends load to the bed. Each bed service embeds atropos, and every atropos i
 
 Default checkouts lag by months. Before reading code, run `git worktree list` and `git branch -a --sort=-committerdate` and work in the newest tree. On 2026-11-16 those were: atropos-go `feat/atroposd` in `atropos-go/.claude/worktrees/elated-shannon-771fa0`; manteion-go and service-beds `feat/atropos-daemon` in `worktrees/manteion-atropos-daemon` and `worktrees/service-beds-atropos-daemon`; zeus-go `develop` in its main checkout; manteion-ui `mock-mode` in `manteion-ui/.claude/worktrees/mock-mode`. None of them was merged yet.
 
-The lab is a single-node k3s on a home-LAN box at `10.0.0.250` (manteion, Postgres, the Go bed, Prometheus, an OTel collector agent). The owner's Mac runs zeus, the gateway collector, Tempo, Loki and Grafana. The UCSC VMs (vm1, vm2, `2262-cse115b-0*.be.ucsc.edu`) are retired, so docs, manifests and scripts that name them describe history. The box is unreachable off that LAN: run `nc -z -G 5 10.0.0.250 22` before any deploy step, and check on the host what is actually deployed.
+The lab is a single-node k3s on a home-LAN box at `10.0.0.250`. Since 2026-11-18 the lab runs there in namespace `faults-lab`: manteion with Postgres, zeus, the lean Go bed (service-beds overlay `demo`), Prometheus and an OTel collector agent, deployed only with service-beds' `scripts/lab-up.sh`. zeus runs in the cluster, not on the owner's Mac; Tempo, Loki and Grafana are not deployed. ssh works as a normal user (`<user>@10.0.0.250`, key auth) with no sudo, and kubectl works for that user. The box also runs the owner's unrelated services; leave everything outside `faults-lab` alone. The UCSC VMs (vm1, vm2, `2262-cse115b-0*.be.ucsc.edu`) are retired, so docs, manifests and scripts that name them describe history. The box is unreachable off that LAN: run `nc -z -G 5 10.0.0.250 22` before any deploy step, and check on the host what is actually deployed.
 
 The cross-repo knowledge base is `faults-lab/docs` (not under git). `research/` is still valid background. `ONBOARDING-TLDR.md`, `STATUS-2026-08-19.md`, `design/DESIGN-CALLS-cachebox-2026-07-30.md` and the generated `api/` pages predate the pull-based desired-state protocol and the new host; read them as history.
 
@@ -86,6 +86,6 @@ manteion compiles against a different atropos-go depending on how it is built. C
 
 ## Read these
 
-- `README.md`: packages, wire contracts, environment table (mostly current; its SDK-dependency and VM1 deploy notes are not).
+- `README.md`: packages, wire contracts, environment table (mostly current; its SDK-dependency notes are not). Deploy only through service-beds' `scripts/lab-up.sh`; skaffold and VM1 are history.
 - `docs/long-running-faults.md` and `docs/decisions/` (policy-engine freeze, OPA harness, no multitenancy).
 - The SDK contract: `atropos-go` worktree `docs/plans/2026-10-30-desired-state-protocol.md`.

@@ -1,3 +1,9 @@
+# manteion and its Postgres in namespace faults-lab. Deployed only through
+# service-beds' scripts/lab-up.sh, which builds and loads the manteion image
+# and sets its tag. A direct `kubectl apply -k` deploys the untagged image
+# `manteion`, which cannot be pulled (there is no registry), after Recreate
+# has already stopped the running pod. skaffold.yaml and the VM1 deploy are
+# history.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

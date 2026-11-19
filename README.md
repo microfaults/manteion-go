@@ -144,9 +144,12 @@ MANTEION_INTEGRATION=1 MANTEION_TEST_DB=1 go test -p 1 ./...
 go run ./cmd/manteion
 ```
 
-Deploy runs on VM1 via skaffold (`skaffold build --default-repo=localhost:5000`, k3s pulls
-`manteion:<git-sha>`). Remember the epoch guard: deploying a newer schema epoch over an old
-database requires dropping the `manteion` database first; the binary re-migrates on startup.
+Deploy: the manifests in `kubernetes-manifests/` are deployed only through service-beds'
+`scripts/lab-up.sh`, which builds the image, loads it onto the lab box and sets its tag, into
+namespace `faults-lab`. A direct `kubectl apply -k kubernetes-manifests` deploys an untagged
+image that cannot be pulled. The skaffold deploy on VM1 (`skaffold.yaml`) is history from the
+retired VMs. Remember the epoch guard: deploying a newer schema epoch over an old database
+requires dropping the `manteion` database first; the binary re-migrates on startup.
 
 ## Companion repos
 
