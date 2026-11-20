@@ -23,7 +23,9 @@ import (
 // configs and the kill switch. The demo drives an experiment only through StartExperiment and
 // CancelExperiment, and owns its rule's enabled flag.
 
-// Clock tells the time. Package code never calls time.Now itself.
+// Clock tells the time. Package code never calls time.Now itself, except
+// for a socket's write deadline, which the network poller compares with the
+// wall clock (events.go, wallDeadline).
 type Clock interface {
 	Now() time.Time
 }

@@ -23,7 +23,7 @@ import (
 	"manteion-go/internal/model"
 )
 
-// The contract's six paths (the events route is registered by the next task).
+// Paths of the contract (the events path is pathEvents, in events_test.go).
 const (
 	pathHealth = "/api/v1/demo/health"
 	pathState  = "/api/v1/demo/state"

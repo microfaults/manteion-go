@@ -40,7 +40,10 @@ type Config struct {
 	QueryTimeout time.Duration // deadline of each Prometheus query and health probe
 	Heartbeat    time.Duration // event-stream heartbeat comment interval
 	StreamMaxAge time.Duration // an event stream is closed after this long
-	HealthTTL    time.Duration // how long a health answer is cached
+	// StreamWriteTimeout bounds each write of an event stream: a client that
+	// stops reading is cut once a frame has not gone out within it.
+	StreamWriteTimeout time.Duration
+	HealthTTL          time.Duration // how long a health answer is cached
 
 	Capacity int // runs queued or running at once, the running one included
 	Retain   int // finished demo experiments kept
@@ -50,17 +53,18 @@ type Config struct {
 // DefaultConfig returns the defaults, without an edge secret.
 func DefaultConfig() Config {
 	return Config{
-		Addr:         ":8090",
-		RunCap:       5 * time.Minute,
-		StatusPoll:   time.Second,
-		SampleEvery:  2 * time.Second,
-		QueryTimeout: 1500 * time.Millisecond,
-		Heartbeat:    15 * time.Second,
-		StreamMaxAge: 10 * time.Minute,
-		HealthTTL:    5 * time.Second,
-		Capacity:     3,
-		Retain:       20,
-		Recent:       10,
+		Addr:               ":8090",
+		RunCap:             5 * time.Minute,
+		StatusPoll:         time.Second,
+		SampleEvery:        2 * time.Second,
+		QueryTimeout:       1500 * time.Millisecond,
+		Heartbeat:          15 * time.Second,
+		StreamMaxAge:       10 * time.Minute,
+		StreamWriteTimeout: 5 * time.Second,
+		HealthTTL:          5 * time.Second,
+		Capacity:           3,
+		Retain:             20,
+		Recent:             10,
 	}
 }
 
@@ -109,6 +113,7 @@ func (c Config) validate() error {
 		{"Config.QueryTimeout", c.QueryTimeout, 100 * time.Millisecond, 10 * time.Second},
 		{"Config.Heartbeat", c.Heartbeat, time.Second, 5 * time.Minute},
 		{"Config.StreamMaxAge", c.StreamMaxAge, time.Minute, time.Hour},
+		{"Config.StreamWriteTimeout", c.StreamWriteTimeout, time.Second, time.Minute},
 		{"Config.HealthTTL", c.HealthTTL, time.Second, 5 * time.Minute},
 	}
 	for _, d := range durations {

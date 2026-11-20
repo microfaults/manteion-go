@@ -30,8 +30,7 @@ const (
 	routePost   = "POST /api/v1/demo/runs"
 	routeRecent = "GET /api/v1/demo/runs/recent"
 	routeRun    = "GET /api/v1/demo/runs/{id}"
-	// The sixth, GET /api/v1/demo/runs/{id}/events, is registered by the
-	// event-stream task in Handler.
+	// The sixth, routeEvents, is in events.go.
 )
 
 // maxBodyBytes caps a request body. No route takes one: a body this small is
@@ -49,7 +48,8 @@ var errEnqueueLimited = errors.New("demo: the client enqueued less than 5 minute
 //     slash, a . or .. segment, any percent-encoding the default escaping
 //     would not produce), so ServeMux never redirects;
 //   - sets Content-Type: application/json, Cache-Control: no-store and
-//     X-Content-Type-Options: nosniff on every response, and no CORS header;
+//     X-Content-Type-Options: nosniff on every response (an event stream that
+//     starts replaces the Content-Type), and no CORS header;
 //   - turns a panic into 500 internal, with the detail in the log only;
 //   - logs one line per request: method, route pattern, status, error code,
 //     duration and a keyed hash of the client key (never the key, never a
@@ -70,8 +70,7 @@ func (d *Demo) Handler() http.Handler {
 	mux.Handle(routePost, d.only(http.MethodPost, http.HandlerFunc(d.handlePostRun)))
 	mux.Handle(routeRecent, d.read(d.handleRecent))
 	mux.Handle(routeRun, d.read(d.handleRun))
-	// The event-stream task registers the sixth route here, as a read:
-	//	mux.Handle("GET /api/v1/demo/runs/{id}/events", d.read(d.handleEvents))
+	mux.Handle(routeEvents, d.read(d.handleEvents))
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { d.writeError(w, CodeNotFound, 0) })
 	return d.serve(mux)
 }

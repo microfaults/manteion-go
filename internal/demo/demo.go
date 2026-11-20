@@ -105,9 +105,22 @@ func (c Config) withDefaults() Config {
 // store reads, each bounded by QueryTimeout.
 func (c Config) routeTimeout() time.Duration { return 4 * c.QueryTimeout }
 
-// Run works the queue, one run at a time, until ctx is done or Shutdown is
-// called (Worker.Run). Call it once, after Sweep.
-func (d *Demo) Run(ctx context.Context) { d.w.Run(ctx) }
+// Run works the queue, one run at a time (Worker.Run), and samples the live
+// metrics while a phase runs (RunSampler), until ctx is done or Shutdown is
+// called; the sampler has stopped when it returns. Call it once, after Sweep.
+func (d *Demo) Run(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w, prom, hub, cfg := d.w, d.d.Prom, d.hub, d.cfg
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		RunSampler(ctx, w, prom, hub, cfg)
+	}()
+	w.Run(ctx)
+	cancel()
+	<-sampled
+}
 
 // SwitchOffAll is the start-up switch-off (the package's SwitchOffAll): every
 // enabled demo rule off, database only. Call it before the listener starts.

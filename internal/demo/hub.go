@@ -23,8 +23,11 @@ const hubSealed = 256
 // The safe order for an event stream is: Subscribe first, then read the run's
 // view (Worker.View) for the state frame. The worker records a run's ended view
 // before it publishes the end event, so an end published before the Subscribe
-// shows in the view (and is also replayed by Subscribe), and one published
-// after it is in the channel. Nothing is missed either way.
+// shows in the view, and one published after it is in the channel. Subscribe
+// replays an end only while the hub remembers the run (its last hubSealed
+// ended runs, in this process), so a stream whose view has already ended must
+// treat that view as the end and not wait on the channel: after a restart, or
+// for an older run, no end ever comes.
 type Hub struct {
 	mu     sync.Mutex
 	subs   map[string]map[*subscription]struct{} // by run id; an entry exists only while it has subscribers

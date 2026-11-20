@@ -27,7 +27,7 @@ func TestConfigFromEnv(t *testing.T) {
 		Addr:   ":8090",
 		RunCap: 5 * time.Minute, StatusPoll: time.Second, SampleEvery: 2 * time.Second,
 		QueryTimeout: 1500 * time.Millisecond, Heartbeat: 15 * time.Second, StreamMaxAge: 10 * time.Minute,
-		HealthTTL: 5 * time.Second, Capacity: 3, Retain: 20, Recent: 10,
+		StreamWriteTimeout: 5 * time.Second, HealthTTL: 5 * time.Second, Capacity: 3, Retain: 20, Recent: 10,
 	}
 	if !cfg.EdgeSecret.Matches(goodSecret) {
 		t.Errorf("the edge secret was not kept")
@@ -159,6 +159,8 @@ func TestConfigValidate_Bounds(t *testing.T) {
 		{"Config.QueryTimeout", func(c *Config) { c.QueryTimeout = c.SampleEvery }},
 		{"Config.Heartbeat", func(c *Config) { c.Heartbeat = 10 * time.Minute }},
 		{"Config.StreamMaxAge", func(c *Config) { c.StreamMaxAge = time.Second }},
+		{"Config.StreamWriteTimeout", func(c *Config) { c.StreamWriteTimeout = 0 }},
+		{"Config.StreamWriteTimeout", func(c *Config) { c.StreamWriteTimeout = 2 * time.Minute }},
 		{"Config.HealthTTL", func(c *Config) { c.HealthTTL = 0 }},
 		{"Config.Capacity", func(c *Config) { c.Capacity = 0 }},
 		{"Config.Capacity", func(c *Config) { c.Capacity = 11 }},
