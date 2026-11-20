@@ -637,9 +637,13 @@ func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, sta
 //     advanceExperiment stalls on them.
 //   - 'paused' phases are left alone; they wait for an explicit resume.
 //
-// Finally the scheduler re-walks each experiment to cover a crash that
-// landed between phases. Recover must be called before the API server
-// starts accepting requests.
+// A shutdown (ctx ending) during a phase's driver checks leaves that phase
+// as it is. Finally the scheduler re-walks each experiment, in a goroutine, to
+// cover a crash that landed between phases. Before it returns, Recover starts
+// no phase, fails none and waits for no convergence (the only phase it changes
+// itself is a pending one of an ended experiment, marked skipped): everything
+// that waits for the fleet runs in the background. Recover must be called
+// before the API server starts accepting requests.
 func (o *Orchestrator) Recover(ctx context.Context) error {
 	// One deadline for every zeus check of a workflow run below, so that how
 	// long they hold start-up does not grow with the number of runs in flight.
@@ -705,7 +709,11 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 			}
 		}
 		// Heal a crash between phases (nothing in flight, next never started).
-		o.advanceExperiment(ctx, exp.ID)
+		// On a background context like the other recovery goroutines: starting
+		// the next phase waits for the fleet to converge on its entry bump, and
+		// the fleet cannot poll before the API server listens, so a start made
+		// here would only time out and fail a healthy experiment.
+		go o.advanceExperiment(context.Background(), exp.ID)
 	}
 	return nil
 }
@@ -778,6 +786,14 @@ func (o *Orchestrator) recoverRunningPhase(ctx context.Context, phaseID string, 
 					lost = append(lost, fmt.Sprintf("run %s for workflow %s: %v", pw.ZeusRunID, pw.WorkflowID, err))
 				}
 			}
+		}
+		if ctx.Err() != nil {
+			// A shutdown during the checks: a call it cut short says nothing
+			// about the driver, so nothing is failed, and no poller is started
+			// for a process that is stopping. The next start checks again.
+			o.logger.Info("orchestrator: recover: interrupted while checking the phase's zeus drivers; left as it is",
+				"phase_id", phaseID)
+			return
 		}
 		if len(lost) == drivers {
 			o.logger.Warn("orchestrator: recover: all zeus load drivers lost; marking phase failed",

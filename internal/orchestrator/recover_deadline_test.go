@@ -21,6 +21,15 @@ import (
 // missing the deadline. Recover also skips the pending phases of an ended
 // experiment.
 
+// endOnCleanup cancels the experiment when the test ends, so nothing the test
+// left running, paused or pending reaches later tests through the shared
+// database, where every later Recover would pick it up. An experiment that has
+// already ended is left as it is (the cancel is refused).
+func endOnCleanup(t *testing.T, o *Orchestrator, expID string) {
+	t.Helper()
+	t.Cleanup(func() { _ = o.CancelExperiment(context.Background(), expID) })
+}
+
 // droppingZeus fronts fz with a server that drops every connection (a
 // transport error, not an answer) until the returned func is called, and then
 // passes every request to fz.
@@ -64,6 +73,7 @@ func TestRecover_RunChecksShareOneDeadline(t *testing.T) {
 		r := recovered{exp.ID, phases[0].ID, fmt.Sprintf("run-deadline-%d-%s", i, exp.ID), i%2 == 0}
 		attachAttackWorkflow(t, r.phaseID, model.PhaseWorkflow{VUs: 1, DurationSec: 1, ZeusRunID: r.runID})
 		setRunning(t, r.expID, r.phaseID)
+		endOnCleanup(t, o, r.expID)
 		if r.known {
 			fz.mu.Lock()
 			fz.runs[r.runID] = "running"
@@ -131,6 +141,7 @@ func TestRecover_AllLostPhaseFailsInBackground(t *testing.T) {
 	if err := testExpRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
 		t.Fatal(err)
 	}
+	endOnCleanup(t, o, exp.ID)
 
 	start := time.Now()
 	if err := o.Recover(ctx); err != nil {
@@ -174,6 +185,7 @@ func TestRecover_SkipsPendingPhaseOfEndedExperiment(t *testing.T) {
 	if err := testExpRepo.UpdatePhaseStatus(ctx, phasesR[0].ID, "paused"); err != nil {
 		t.Fatal(err)
 	}
+	endOnCleanup(t, o, expR.ID)
 
 	if err := o.Recover(ctx); err != nil {
 		t.Fatalf("recover: %v", err)
@@ -208,6 +220,7 @@ func TestRecover_InterruptedRunCheckIsNotABudgetMiss(t *testing.T) {
 	runID := "run-interrupted-" + exp.ID
 	attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1, ZeusRunID: runID})
 	setRunning(t, exp.ID, phases[0].ID)
+	endOnCleanup(t, o, exp.ID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -247,4 +260,83 @@ func TestRecover_InterruptedRunCheckIsNotABudgetMiss(t *testing.T) {
 		t.Fatalf("cancel experiment: %v", err)
 	}
 	waitPhaseStatus(t, phases[0].ID, "skipped")
+}
+
+// manteion restarted after one phase ended and before the next started.
+// Recover's scheduler re-walk starts that next phase in the background: its
+// entry waits for the fleet to converge, which cannot happen before the API
+// server listens, so Recover must not wait with it (an entry started before
+// the listener only times out and fails a healthy experiment).
+func TestRecover_AdvancesStalledExperimentInBackground(t *testing.T) {
+	ctx := context.Background()
+	o := newOrch(t, "") // no zeus: the next phase has rules and no load
+	const converge = 2 * time.Second
+	o.WithConvergeTimeout(converge)
+
+	exp := mkExp(t)
+	first := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: exp.ID, Name: "first", Position: 0, Status: "pending"}
+	if err := testExpRepo.CreatePhase(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := testExpRepo.UpdatePhaseStatus(ctx, first.ID, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	svc := "stalled-" + id.New("svc")
+	registerSDK(t, svc, "http://stalled.invalid") // alive, never observes: an entry waits out its convergence timeout
+	next := mkPendingRulePhase(t, exp.ID, svc, 1)
+	if err := testExpRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	endOnCleanup(t, o, exp.ID)
+
+	start := time.Now()
+	if err := o.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if took := time.Since(start); took >= converge/2 {
+		t.Errorf("Recover took %s, want it not to wait out the next phase's %s entry convergence", took, converge)
+	}
+	var p *model.ExperimentPhase
+	waitFor(t, "next phase entered", 5*time.Second, func() bool {
+		p = getPhase(t, next.ID)
+		return p.Status != "pending"
+	})
+	if p.StartedAt == nil {
+		t.Errorf("next phase = %s with no started_at, want it entered", p.Status)
+	}
+}
+
+// A shutdown while Recover checks an attack-only phase's drivers cuts the
+// checks short: every call fails, which says nothing about zeus. Nothing is
+// failed; the phase stays as it was for the next start to check.
+func TestRecover_CancelDuringDriverChecksFailsNothing(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close() // every call is refused
+	o := newOrch(t, deadURL)
+
+	exp, phases := mkExperiment(t, 1)
+	attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{
+		VUs: 1, DurationSec: 1, TargetURL: "http://frontend:8080/", ZeusAttackID: "atk-shutdown-" + exp.ID,
+	})
+	setRunning(t, exp.ID, phases[0].ID)
+	endOnCleanup(t, o, exp.ID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- o.Recover(ctx) }()
+	time.Sleep(150 * time.Millisecond) // inside the attack check's retries (about 0.6 s)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Recover did not return within 3s of its context ending")
+	}
+	time.Sleep(300 * time.Millisecond) // a background fail would have landed by now
+	if p := getPhase(t, phases[0].ID); p.Status != "running" || p.FailureReason != "" {
+		t.Errorf("phase = %s/%q after a start-up cancelled during its driver checks, want running", p.Status, p.FailureReason)
+	}
+	if got := getExp(t, exp.ID).Status; got != "running" {
+		t.Errorf("experiment status %q, want running", got)
+	}
 }

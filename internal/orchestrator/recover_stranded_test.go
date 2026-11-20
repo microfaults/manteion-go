@@ -117,6 +117,7 @@ func TestRecover_RunTransportErrorKeepsPhase(t *testing.T) {
 	exp, phases := mkExperiment(t, 1)
 	attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1, ZeusRunID: "run-unreachable-" + exp.ID})
 	setRunning(t, exp.ID, phases[0].ID)
+	endOnCleanup(t, o, exp.ID) // the cancel below ends it too, unless the test stops before it
 
 	if err := o.Recover(ctx); err != nil {
 		t.Fatalf("recover: %v", err)
@@ -143,6 +144,7 @@ func TestRecover_RunNotFoundFailsPhase(t *testing.T) {
 	runID := "run-lost-" + exp.ID
 	wfID := attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1, ZeusRunID: runID})
 	setRunning(t, exp.ID, phases[0].ID)
+	endOnCleanup(t, o, exp.ID)
 
 	if err := o.Recover(ctx); err != nil {
 		t.Fatalf("recover: %v", err)
@@ -185,6 +187,7 @@ func TestRecover_RunTransportErrorThenZeusAnswers(t *testing.T) {
 			runID := "run-recover-" + exp.ID
 			attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1, ZeusRunID: runID})
 			setRunning(t, exp.ID, phases[0].ID)
+			endOnCleanup(t, o, exp.ID)
 
 			if err := o.Recover(ctx); err != nil {
 				t.Fatalf("recover: %v", err)
