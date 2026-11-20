@@ -1578,9 +1578,9 @@ func TestSweep_FailedSwitchOffLoggedOnce(t *testing.T) {
 	}
 
 	// The worker's switch goes through the same unlogged write.
-	sw := newRuleSwitch(failRuleOff{fakeRules{f}, s.RuleID}, d.Logger)
+	sw := newRuleSwitch("demo-test", failRuleOff{fakeRules{f}, s.RuleID}, d.Logger, f.clock)
 	sw.attach(context.Background(), s.RuleID)
-	if err := sw.off(context.Background()); !errors.Is(err, ErrRuleState) {
+	if err := sw.off(context.Background(), offCompleted); !errors.Is(err, ErrRuleState) {
 		t.Fatalf("ruleSwitch.off: %v; want the failure", err)
 	}
 	if strings.Contains(def.String(), s.RuleID) {

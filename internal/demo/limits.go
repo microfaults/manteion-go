@@ -39,11 +39,15 @@ const (
 // Every other client has an entry in a table of at most 10 000.
 //
 // Degraded mode, while the table is full: a client the table does not hold
-// is not refused; it is accounted to one shared overflow bucket, with the
-// same per-client limits, which every such client shares (120 reads a
-// minute between all of them, and so on). Clients the table holds keep their
-// own entries. The overflow bucket is not reachable by any key: it is a field,
-// not a table entry. The mode ends by itself as entries expire.
+// is not refused; it is accounted to one shared overflow bucket, and every
+// such client shares that bucket's limits: 120 reads a minute between all of
+// them, one enqueue every 5 minutes between all of them, and 3 open streams
+// between all of them (the 50 in all still apply). Clients the table holds
+// keep their own entries. The queue's one queued-or-running run per client is
+// not the limiter's rule: the queue keys it by the client id itself, not by
+// the bucket, so overflow clients are still told apart there. The overflow
+// bucket is not reachable by any key: it is a field, not a table entry. The
+// mode ends by itself as entries expire.
 //
 // An entry expires once it holds nothing (no read within the last minute, no
 // enqueue within the last 5 minutes, no open stream) and was last used a

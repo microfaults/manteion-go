@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -135,7 +136,9 @@ func (d *Demo) finishRequest(rec *recorder, r *http.Request, start time.Time) {
 	}
 }
 
-// logRequest writes the request's one log line.
+// logRequest writes the request's one log line: at Debug for a refusal (400,
+// 403, 404 or 429), which a flood can make by the thousand, at Info for every
+// other answer.
 func (d *Demo) logRequest(rec *recorder, r *http.Request, start time.Time) {
 	route := r.Pattern
 	if route == "" || route == "/" {
@@ -152,7 +155,12 @@ func (d *Demo) logRequest(rec *recorder, r *http.Request, start time.Time) {
 	if rec.client != "" {
 		attrs = append(attrs, "client", rec.client)
 	}
-	d.log.Info("demo: request", attrs...)
+	level := slog.LevelInfo
+	switch rec.status {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+		level = slog.LevelDebug
+	}
+	d.log.Log(r.Context(), level, "demo: request", attrs...)
 }
 
 // only answers 404 not_found to any method but method.

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"manteion-go/internal/demo"
 )
 
 // MANTEION_CONVERGE_TIMEOUT bounds the convergence barrier; zero or a
@@ -235,12 +238,15 @@ type fakeDemo struct {
 	log *callLog
 
 	mu            sync.Mutex
-	switchOffErrs []error         // returned in turn, then nil
-	switchOffLeft []time.Duration // each attempt's time to its deadline
+	switchOffErr  error           // SwitchOffAll's answer
+	switchOffHook func()          // when not nil, SwitchOffAll calls it before answering
+	switchOffLeft []time.Duration // each call's time to its context's deadline
 	sweepErr      error
 	sweepGate     chan struct{} // when not nil, Sweep waits for it to close
 	sweepLeft     time.Duration
-	ran           chan struct{} // closed by Run
+	sweepCtx      context.Context // the context Sweep was given
+	swept         chan struct{}   // closed when Sweep is called
+	ran           chan struct{}   // closed by Run
 
 	shutdownErr      error
 	shutdownTook     time.Duration
@@ -249,30 +255,33 @@ type fakeDemo struct {
 	shutdownReturned time.Time
 }
 
-func newFakeDemo(log *callLog) *fakeDemo { return &fakeDemo{log: log, ran: make(chan struct{})} }
+func newFakeDemo(log *callLog) *fakeDemo {
+	return &fakeDemo{log: log, swept: make(chan struct{}), ran: make(chan struct{})}
+}
 
 func (f *fakeDemo) SwitchOffAll(ctx context.Context) error {
 	f.log.add("SwitchOffAll")
+	if f.switchOffHook != nil {
+		f.switchOffHook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.switchOffLeft = append(f.switchOffLeft, untilDeadline(ctx))
-	if len(f.switchOffErrs) == 0 {
-		return nil
-	}
-	err := f.switchOffErrs[0]
-	f.switchOffErrs = f.switchOffErrs[1:]
-	return err
+	return f.switchOffErr
 }
 
 func (f *fakeDemo) Sweep(ctx context.Context) error {
 	f.log.add("Sweep")
-	left := untilDeadline(ctx)
+	f.mu.Lock()
+	f.sweepCtx, f.sweepLeft = ctx, untilDeadline(ctx)
+	f.mu.Unlock()
+	close(f.swept)
 	if f.sweepGate != nil {
 		<-f.sweepGate
 	}
+	f.log.add("Sweep returned")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.sweepLeft = left
 	return f.sweepErr
 }
 
@@ -313,20 +322,11 @@ func testLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(buf, nil))
 }
 
-// fastRetries is defaultDemoTimings with a short pause between switch-off
-// attempts; every deadline stays the default.
-func fastRetries() demoTimings {
-	t := defaultDemoTimings
-	t.switchOffPause = time.Millisecond
-	return t
-}
-
 // The numbers the start-up and shutdown orders run on.
 func TestDefaultDemoTimings(t *testing.T) {
 	d := defaultDemoTimings
-	if d.switchOffTimeout != 10*time.Second || d.switchOffAttempts != 3 || d.sweepTimeout != 2*time.Minute ||
-		d.shutdownTimeout != 15*time.Second {
-		t.Errorf("defaultDemoTimings = %+v, want a switch-off of 3 attempts of 10 s each, a 2 min sweep and a 15 s shutdown", d)
+	if d.sweepTimeout != 2*time.Minute || d.shutdownTimeout != 15*time.Second {
+		t.Errorf("defaultDemoTimings = %+v, want a 2 min sweep and a 15 s shutdown", d)
 	}
 	if serverShutdownBudget != 10*time.Second {
 		t.Errorf("serverShutdownBudget = %v, want 10s", serverShutdownBudget)
@@ -359,87 +359,105 @@ func waitRan(t *testing.T, f *fakeDemo) {
 	}
 }
 
-// Start-up: the switch-off comes before the listeners (the operator listener
-// serves desired state the moment it is up), the sweep after them (its
-// cancels wait on the fleet, which reaches manteion only through that
-// listener) and before the worker, under a 2-minute deadline; startDemo
-// returns with the sweep still running.
+// Start-up: the switch-off comes once, before the listeners (the operator
+// listener serves desired state the moment it is up), on the signal's
+// context with no deadline of main's (the demo package bounds it itself); the
+// sweep after the listeners (its cancels wait on the fleet, which reaches
+// manteion only through that listener), under a 2-minute deadline derived
+// from the signal's context; the worker only once the sweep has returned;
+// startDemo returns with the sweep still running.
 func TestStartDemo_Order(t *testing.T) {
 	calls := &callLog{}
 	f := newFakeDemo(calls)
 	f.sweepGate = make(chan struct{})
+	ctx, signal := context.WithCancel(context.Background())
+	defer signal()
 	var buf bytes.Buffer
-	startDemoReturns(t, context.Background(), f, fastRetries(), func() { calls.add("listen") }, testLogger(&buf))
+	startDemoReturns(t, ctx, f, defaultDemoTimings, func() { calls.add("listen") }, testLogger(&buf))
 	if got := calls.get(); len(got) < 2 || !slices.Equal(got[:2], []string{"SwitchOffAll", "listen"}) || slices.Contains(got, "Run") {
 		t.Fatalf("calls when startDemo returned = %v, want SwitchOffAll, listen, and no Run yet", got)
 	}
+	select {
+	case <-f.swept:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Sweep was never called")
+	}
+	f.mu.Lock()
+	sweepCtx, sweepLeft, offLeft := f.sweepCtx, f.sweepLeft, slices.Clone(f.switchOffLeft)
+	f.mu.Unlock()
+	if len(offLeft) != 1 || offLeft[0] != -1 {
+		t.Errorf("the switch-off's deadlines = %v away, want one call on the signal's context, without a deadline of main's", offLeft)
+	}
+	if sweepLeft <= 119*time.Second || sweepLeft > 2*time.Minute {
+		t.Errorf("the sweep's deadline was %v away, want about 2m", sweepLeft)
+	}
+	if sweepCtx.Err() != nil {
+		t.Fatalf("the sweep's context is done before the signal: %v", sweepCtx.Err())
+	}
+	// The signal, while the sweep is still running: its context ends too.
+	signal()
+	select {
+	case <-sweepCtx.Done():
+	case <-time.After(time.Second):
+		t.Error("the signal did not end the sweep's context: it is not derived from the signal's")
+	}
+	if got := calls.get(); slices.Contains(got, "Run") {
+		t.Errorf("Run started before the sweep returned: %v", got)
+	}
 	close(f.sweepGate)
 	waitRan(t, f)
-	if got, want := calls.get(), []string{"SwitchOffAll", "listen", "Sweep", "Run"}; !slices.Equal(got, want) {
+	if got, want := calls.get(), []string{"SwitchOffAll", "listen", "Sweep", "Sweep returned", "Run"}; !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if left := f.switchOffLeft[0]; left <= 9*time.Second || left > 10*time.Second {
-		t.Errorf("the switch-off's deadline was %v away, want about 10s", left)
-	}
-	if f.sweepLeft <= 119*time.Second || f.sweepLeft > 2*time.Minute {
-		t.Errorf("the sweep's deadline was %v away, want about 2m", f.sweepLeft)
 	}
 }
 
-// A failed switch-off is tried again, each attempt with a deadline of its own,
-// before the listeners start.
-func TestStartDemo_SwitchOffRetried(t *testing.T) {
-	calls := &callLog{}
-	f := newFakeDemo(calls)
-	f.switchOffErrs = []error{errors.New("db down"), errors.New("db down")}
-	var buf bytes.Buffer
-	startDemoReturns(t, context.Background(), f, fastRetries(), func() { calls.add("listen") }, testLogger(&buf))
-	waitRan(t, f)
-	if got, want := calls.get(), []string{"SwitchOffAll", "SwitchOffAll", "SwitchOffAll", "listen", "Sweep", "Run"}; !slices.Equal(got, want) {
-		t.Errorf("calls = %v, want %v", got, want)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for i, left := range f.switchOffLeft {
-		if left <= 9*time.Second || left > 10*time.Second {
-			t.Errorf("attempt %d's deadline was %v away, want about 10s of its own", i+1, left)
-		}
-	}
-}
-
-// A switch-off that still fails after three attempts is logged at error
-// level, and start-up goes on: the sweep repeats the step, and no run is
-// accepted before the sweep has run.
+// A failed switch-off is not tried again (the demo package bounds it at 30 s
+// itself, and three tries could hold start-up for 90 s on a hung database):
+// it is logged at error level, and start-up goes on: the sweep repeats the
+// step, and no run is accepted before the sweep has run.
 func TestStartDemo_SwitchOffFailureDoesNotStopStartUp(t *testing.T) {
 	calls := &callLog{}
 	f := newFakeDemo(calls)
-	f.switchOffErrs = []error{errors.New("db down 1"), errors.New("db down 2"), errors.New("db down 3"), errors.New("db down 4")}
+	f.switchOffErr = errors.New("db down")
 	var buf bytes.Buffer
-	startDemoReturns(t, context.Background(), f, fastRetries(), func() { calls.add("listen") }, testLogger(&buf))
+	startDemoReturns(t, context.Background(), f, defaultDemoTimings, func() { calls.add("listen") }, testLogger(&buf))
 	waitRan(t, f)
-	if got, want := calls.get(), []string{"SwitchOffAll", "SwitchOffAll", "SwitchOffAll", "listen", "Sweep", "Run"}; !slices.Equal(got, want) {
-		t.Errorf("calls = %v, want %v", got, want)
+	if got, want := calls.get(), []string{"SwitchOffAll", "listen", "Sweep", "Sweep returned", "Run"}; !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v: one switch-off, then the rest", got, want)
 	}
-	if out := buf.String(); !strings.Contains(out, `"level":"ERROR"`) || !strings.Contains(out, "db down 3") {
-		t.Errorf("log = %s, want an ERROR line with the last attempt's error", out)
+	if out := buf.String(); !strings.Contains(out, `"level":"ERROR"`) || !strings.Contains(out, "db down") {
+		t.Errorf("log = %s, want an ERROR line with the switch-off's error", out)
 	}
 }
 
-// A signal during start-up stops the retries; the start-up goes on and main's
-// shutdown follows.
-func TestStartDemo_SignalStopsRetries(t *testing.T) {
-	calls := &callLog{}
-	f := newFakeDemo(calls)
-	f.switchOffErrs = []error{context.Canceled, context.Canceled, context.Canceled}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	var buf bytes.Buffer
-	startDemoReturns(t, ctx, f, fastRetries(), func() { calls.add("listen") }, testLogger(&buf))
-	waitRan(t, f)
-	if got, want := calls.get(), []string{"SwitchOffAll", "listen", "Sweep", "Run"}; !slices.Equal(got, want) {
-		t.Errorf("calls = %v, want %v", got, want)
+// A signal that has come by the time the switch-off returns, before
+// startDemo or during the switch-off, stops start-up there: no listener is
+// bound and no sweep or worker starts, so a rule the switch-off left on is
+// never served; main's shutdown follows.
+func TestStartDemo_SignalDuringSwitchOff(t *testing.T) {
+	for _, during := range []bool{false, true} {
+		name := "before start-up"
+		if during {
+			name = "during the switch-off"
+		}
+		t.Run(name, func(t *testing.T) {
+			calls := &callLog{}
+			f := newFakeDemo(calls)
+			f.switchOffErr = context.Canceled
+			ctx, signal := context.WithCancel(context.Background())
+			defer signal()
+			if during {
+				f.switchOffHook = signal
+			} else {
+				signal()
+			}
+			var buf bytes.Buffer
+			startDemoReturns(t, ctx, f, defaultDemoTimings, func() { calls.add("listen") }, testLogger(&buf))
+			time.Sleep(50 * time.Millisecond) // a sweep goroutine, had one started, would have called by now
+			if got, want := calls.get(), []string{"SwitchOffAll"}; !slices.Equal(got, want) {
+				t.Errorf("calls = %v, want %v: no listen, no sweep, no Run", got, want)
+			}
+		})
 	}
 }
 
@@ -449,13 +467,75 @@ func TestStartDemo_SweepErrorStillRuns(t *testing.T) {
 	f := newFakeDemo(calls)
 	f.sweepErr = errors.New("sweep incomplete")
 	var buf bytes.Buffer
-	startDemoReturns(t, context.Background(), f, fastRetries(), func() { calls.add("listen") }, testLogger(&buf))
+	startDemoReturns(t, context.Background(), f, defaultDemoTimings, func() { calls.add("listen") }, testLogger(&buf))
 	waitRan(t, f)
-	if got, want := calls.get(), []string{"SwitchOffAll", "listen", "Sweep", "Run"}; !slices.Equal(got, want) {
+	if got, want := calls.get(), []string{"SwitchOffAll", "listen", "Sweep", "Sweep returned", "Run"}; !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
 	}
 	if out := buf.String(); !strings.Contains(out, "sweep incomplete") {
 		t.Errorf("log = %s, want the sweep's error", out)
+	}
+}
+
+// After a signal during the start-up switch-off, main's shutdown runs over
+// servers that never served: their Shutdown returns at once and cleanly, and
+// the order is unchanged.
+func TestShutdownInOrder_ServersThatNeverServed(t *testing.T) {
+	calls := &callLog{}
+	f := newFakeDemo(calls)
+	demoSrv, srv := newDemoServer("127.0.0.1:0", http.NewServeMux()), &http.Server{Addr: "127.0.0.1:0"}
+	var buf bytes.Buffer
+	began := time.Now()
+	err := shutdownInOrder(f, demoSrv, srv, defaultDemoTimings, func(context.Context) { calls.add("after") }, testLogger(&buf))
+	if err != nil {
+		t.Errorf("shutdownInOrder = %v, want nil", err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Errorf("shutdownInOrder took %v over servers that never served", took)
+	}
+	if got, want := calls.get(), []string{"demo.Shutdown", "demo.Shutdown returned", "after"}; !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
+// The one line that names demo mode's settings in force at start-up: the
+// address, the poll interval, the run cap and the queue's capacity; never the
+// edge secret, nor anything about it.
+func TestLogDemoSettings(t *testing.T) {
+	const secret = "a-secret-value-of-forty-characters-xxxxx"
+	cfg, err := demo.ConfigFromEnv(func(k string) string {
+		return map[string]string{"MANTEION_DEMO_EDGE_SECRET": secret, "MANTEION_DEMO_ADDR": ":8091"}[k]
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	logDemoSettings(testLogger(&buf), cfg, 2*time.Second)
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("%d lines, want 1:\n%s", len(lines), buf.String())
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]any{"level": "INFO", "addr": ":8091", "poll_interval": "2s", "run_cap": "5m0s", "queue_capacity": float64(3)} {
+		if m[k] != want {
+			t.Errorf("%s = %v, want %v (line %s)", k, m[k], want, lines[0])
+		}
+	}
+	// Exactly these keys: nothing about the secret, its length included.
+	keys := []string{}
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	if want := []string{"addr", "level", "msg", "poll_interval", "queue_capacity", "run_cap", "time"}; !slices.Equal(keys, want) {
+		t.Errorf("keys %v, want %v", keys, want)
+	}
+	if out := buf.String(); strings.Contains(strings.ToLower(out), "secret") || strings.Contains(out, secret) ||
+		strings.Contains(out, "redacted") {
+		t.Errorf("the settings line mentions the secret: %s", out)
 	}
 }
 

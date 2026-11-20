@@ -231,10 +231,14 @@ func Retain(ctx context.Context, d Deps, keep int) error {
 // cancelled or deleted, and neither's rule is taken for an orphan. Both are
 // read again just before each cancel and delete, so this is safe at any time,
 // not only from OnRunEnded.
+//
+// Its listing and its deletes keep the worker's run index up to date
+// (lookups.go).
 func (w *Worker) Retain(ctx context.Context) error {
 	t := newTidier(w.d, ErrRetainIncomplete, defaultTidyTimeouts)
 	t.stale = 2 * w.cfg.RunCap
 	t.spare = w.spared
+	t.runs = &w.runs
 	if t.wired() {
 		t.retain(ctx, w.cfg.Retain)
 	}
@@ -307,7 +311,7 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 			if a == nil {
 				continue
 			}
-			if err := a.sw.off(ctx); err != nil {
+			if err := a.sw.off(ctx, offShutdown); err != nil {
 				failed = append(failed, err)
 			}
 		}
@@ -378,6 +382,9 @@ type tidier struct {
 	stale time.Duration
 	// spare, when set, names the runs the pass must not touch.
 	spare func() spared
+	// runs, when set, is told of every listing of the demo's experiments and
+	// of every experiment deleted (the worker's run index, lookups.go).
+	runs *runIndex
 
 	steps   []string
 	causes  []error
@@ -739,8 +746,13 @@ func (t *tidier) listRules(ctx context.Context) ([]*model.Rule, bool) {
 
 // listExperiments returns every experiment created by manteion-demo, newest
 // first, page by page, each page with its own deadline. complete is false when
-// a page could not be read: what was read is then the newest part.
+// a page could not be read: what was read is then the newest part. The run
+// index, when the pass has one, learns the result.
 func (t *tidier) listExperiments(ctx context.Context) (exps []*model.Experiment, complete bool) {
+	if t.runs != nil {
+		epoch := t.runs.beginListing()
+		defer func() { t.runs.listed(epoch, exps, complete) }()
+	}
 	seen := map[string]bool{}
 	for page := 0; page < maxListPages; page++ {
 		cctx, cancel := context.WithTimeout(ctx, t.limit.call)
@@ -767,15 +779,39 @@ func (t *tidier) listExperiments(ctx context.Context) (exps []*model.Experiment,
 
 // switchOff switches r off: one unconditional write, detached from ctx's
 // cancellation, bounded by t.limit.off or ctx's nearer deadline; a rule that
-// no longer exists is success. A failure is logged once, here.
+// no longer exists is success. A failure is logged once, here. A rule the
+// listing showed enabled is logged at Info, "demo: rule switched off" with the
+// pass's reason, as the worker's switch logs it; one that was already off, or
+// is gone, at Debug.
 func (t *tidier) switchOff(ctx context.Context, r *model.Rule) bool {
-	if err := switchOffRule(ctx, t.d.Rules, r.ID, t.offWithin(ctx)); err != nil {
+	gone, err := switchOffRule(ctx, t.d.Rules, r.ID, t.offWithin(ctx))
+	if err != nil {
 		t.fail("disable_rule", err, "rule_id", r.ID, "rule", r.Name)
 		return false
 	}
+	attrs := []any{"rule_id", r.ID, "rule", r.Name, "reason", t.offReason()}
+	if runID, ok := strings.CutPrefix(r.Name, RunNamePrefix); ok && validRunID(runID) {
+		attrs = append([]any{"run_id", runID}, attrs...)
+	}
 	t.counted.off++
-	t.log.Info("demo: rule switched off", "rule_id", r.ID, "rule", r.Name)
+	switch {
+	case gone:
+		t.log.Debug("demo: rule already gone; nothing to switch off", attrs...)
+	case !r.Enabled:
+		t.log.Debug("demo: rule already off", attrs...)
+	default:
+		t.log.Info("demo: rule switched off", attrs...)
+	}
 	return true
+}
+
+// offReason is why the pass switches rules off: the start-up switch-off and
+// sweep, or retention.
+func (t *tidier) offReason() string {
+	if t.class == ErrRetainIncomplete {
+		return offRetention
+	}
+	return offStartUp
 }
 
 // cancel cancels e through the orchestrator. An experiment that has already
@@ -808,6 +844,9 @@ func (t *tidier) deleteExperiment(ctx context.Context, e *model.Experiment) bool
 	if err := t.d.Experiments.Delete(cctx, e.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		t.fail("delete_experiment", err, "experiment_id", e.ID, "experiment", e.Name)
 		return false
+	}
+	if runID, ok := runIDOf(e); ok && t.runs != nil {
+		t.runs.drop(runID)
 	}
 	t.counted.deletedExps++
 	t.log.Info("demo: experiment deleted", "experiment_id", e.ID, "experiment", e.Name, "status", e.Status)

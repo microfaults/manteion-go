@@ -1090,7 +1090,7 @@ func (x *harness) captureLogs() *syncBuffer {
 
 // TestWorker_FailedSwitchOffHoldsTheNextRun: the ending's switch-off fails three
 // times (on the watchdog path, the watchdog's own try is the first). It is
-// retried with backoff, each failure logged at error with the rule and the
+// retried with backoff, the first failure logged at Warn with the rule and the
 // attempt; SwitchOffPending holds meanwhile; the next run is not picked up
 // until the switch-off has landed; then it runs, and pending clears.
 func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
@@ -1160,19 +1160,22 @@ func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
 			if len(offs) != 4 || built < 0 || built < offs[3] {
 				t.Errorf("switch-offs of a at %v, run b built at %d; want 4 switch-offs, all before b", offs, built)
 			}
-			// The worker numbers its own tries; on the watchdog path the
-			// watchdog's try came first and is logged on its own.
-			workerFails := 3
-			if path == "watchdog" {
-				workerFails = 2
-				if !logLineHas(logs.String(), "level=ERROR", "watchdog could not switch", "rule_id="+ruleA) {
-					t.Error("no error log for the watchdog's failed switch-off with the rule id")
-				}
+			// The first failure is logged at Warn (on the watchdog path, the
+			// watchdog's or the ending's, whichever wrote first), and no
+			// other: the clock stands still, so no minute passes for a second
+			// one. Then the success, at Info, with the attempt that landed.
+			first := logLineHas(logs.String(), "level=WARN", "switching the run's rule off failed; retrying", "rule_id="+ruleA, "attempt=1")
+			if path == "watchdog" && !first {
+				first = logLineHas(logs.String(), "level=WARN", "watchdog could not switch", "rule_id="+ruleA, "attempt=1")
 			}
-			for attempt := 1; attempt <= workerFails; attempt++ {
-				if !logLineHas(logs.String(), "level=ERROR", "rule_id="+ruleA, fmt.Sprintf("attempt=%d", attempt)) {
-					t.Errorf("no error log for attempt %d with the rule id", attempt)
-				}
+			if !first {
+				t.Errorf("no Warn line for the first failed switch-off with the rule id:\n%s", logs)
+			}
+			if n := countLines(logs.String(), "level=WARN", "rule_id="+ruleA, "attempt="); n != 1 {
+				t.Errorf("%d Warn lines for the failed switch-offs; want 1, the first", n)
+			}
+			if n := countLines(logs.String(), "level=INFO", "rule switched off", "rule_id="+ruleA, "attempt=4"); n != 1 {
+				t.Errorf("%d Info lines for the switch-off that landed at attempt 4; want 1:\n%s", n, logs)
 			}
 			if path == "completed" {
 				_, endB := awaitEnd(t, chB)
@@ -1184,6 +1187,17 @@ func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+// countLines is how many lines of logs hold every part.
+func countLines(logs string, parts ...string) int {
+	n := 0
+	for _, line := range strings.Split(logs, "\n") {
+		if logLineHas(line, parts...) {
+			n++
+		}
+	}
+	return n
 }
 
 // logLineHas reports whether one line of logs holds every part.
@@ -1622,9 +1636,11 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 		t.Errorf("View of a well-formed unknown id: %v; want ErrRunNotFound", err)
 	}
 
-	// A database failure is unavailable, not not-found, and says nothing.
+	// A database failure is unavailable, not not-found, and says nothing. (A
+	// worker that has not read the run yet: w2 keeps the ended views it read.)
+	w3 := NewWorker(x.f.deps(), x.cfg, NewQueue(3), NewHub())
 	x.f.fail("experiments.List", errLeaky)
-	v, err := w2.View(ctx, older["failed"])
+	v, err := w3.View(ctx, older["failed"])
 	if !errors.Is(err, ErrRunUnavailable) || errors.Is(err, ErrRunNotFound) || v.RunID != "" {
 		t.Errorf("View on a database error = %+v, %v; want ErrRunUnavailable", v, err)
 	}
@@ -1633,10 +1649,16 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 	}
 	x.f.uninject("experiments.List")
 	x.f.fail("experiments.ListPhasesForExperiment", errLeaky)
-	if _, err := w2.View(ctx, older["failed"]); !errors.Is(err, ErrRunUnavailable) {
+	if _, err := w3.View(ctx, older["failed"]); !errors.Is(err, ErrRunUnavailable) {
 		t.Errorf("View when the phases cannot be read: %v; want ErrRunUnavailable", err)
 	}
 	x.f.uninject("experiments.ListPhasesForExperiment")
+	// The views w2 read stay as they were, without the database.
+	x.f.fail("experiments.List", errLeaky)
+	if v, err := w2.View(ctx, older["failed"]); err != nil || v.Status != RunFailed {
+		t.Errorf("an ended run w2 read before, the database down: %+v, %v; want its kept view", v, err)
+	}
+	x.f.uninject("experiments.List")
 
 	// Recent on a database failure: what memory has, marked partial.
 	x.f.fail("experiments.List", errLeaky)
@@ -1672,9 +1694,9 @@ func TestRuleSwitch(t *testing.T) {
 
 	t.Run("on after off is refused", func(t *testing.T) {
 		f, rule := build(t)
-		sw := newRuleSwitch(fakeRules{f}, quiet)
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
 		sw.attach(ctx, rule)
-		if err := sw.off(ctx); err != nil {
+		if err := sw.off(ctx, offCompleted); err != nil {
 			t.Fatal(err)
 		}
 		if err := sw.on(ctx); err == nil {
@@ -1687,7 +1709,7 @@ func TestRuleSwitch(t *testing.T) {
 
 	t.Run("off is idempotent and concurrent", func(t *testing.T) {
 		f, rule := build(t)
-		sw := newRuleSwitch(fakeRules{f}, quiet)
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
 		sw.attach(ctx, rule)
 		if err := sw.on(ctx); err != nil {
 			t.Fatal(err)
@@ -1697,7 +1719,7 @@ func TestRuleSwitch(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := sw.off(ctx); err != nil {
+				if err := sw.off(ctx, offCompleted); err != nil {
 					t.Error(err)
 				}
 			}()
@@ -1711,7 +1733,7 @@ func TestRuleSwitch(t *testing.T) {
 
 	t.Run("off waits for an on in flight", func(t *testing.T) {
 		f, rule := build(t)
-		sw := newRuleSwitch(fakeRules{f}, quiet)
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
 		sw.attach(ctx, rule)
 		entered, release := make(chan struct{}), make(chan struct{})
 		var enableReturned atomic.Bool
@@ -1726,7 +1748,7 @@ func TestRuleSwitch(t *testing.T) {
 		go func() { onDone <- sw.on(ctx) }()
 		<-entered
 		offDone := make(chan error, 1)
-		go func() { offDone <- sw.off(ctx) }()
+		go func() { offDone <- sw.off(ctx, offCompleted) }()
 		time.Sleep(20 * time.Millisecond)
 		close(release)
 		<-onDone
@@ -1741,8 +1763,8 @@ func TestRuleSwitch(t *testing.T) {
 
 	t.Run("a rule attached after close is switched off", func(t *testing.T) {
 		f, rule := build(t)
-		sw := newRuleSwitch(fakeRules{f}, quiet)
-		if err := sw.off(ctx); err != nil {
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
+		if err := sw.off(ctx, offCompleted); err != nil {
 			t.Fatal(err)
 		}
 		sw.attach(ctx, rule)

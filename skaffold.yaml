@@ -1,3 +1,7 @@
+# History from the retired VMs. kubernetes-manifests/manteion.yaml now turns
+# demo mode on and requires the Secret manteion-demo-edge, so it deploys only
+# through service-beds' scripts/lab-up.sh, which creates the Secret first; a
+# skaffold deploy leaves the pod in CreateContainerConfigError.
 apiVersion: skaffold/v4beta6
 kind: Config
 metadata:

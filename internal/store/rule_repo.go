@@ -239,7 +239,11 @@ func (r *RuleRepo) SetEnabled(ctx context.Context, id string, enabled bool) erro
 // by SetEnabled. ErrNotFound when no rule has the id, ErrRuleUnattached when
 // it exists but no phase links it (it is then left as it was). The phase
 // links read are key-share locked, so an experiment delete that removes them
-// either commits before (the rule is not enabled) or waits for this commit.
+// either commits before (the rule is not enabled) or waits for this commit and
+// then removes them: the rule is then enabled and attached to no phase, so
+// served to every instance of its service, until its owner switches it off.
+// The demo's worker does at its next status poll, which finds the experiment
+// gone and ends the run with its rule off.
 func (r *RuleRepo) EnableIfAttached(ctx context.Context, id string) error {
 	return r.switchEnabled(ctx, id, `
 		UPDATE rules SET enabled = true, updated_at = now()

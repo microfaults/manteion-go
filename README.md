@@ -110,9 +110,9 @@ datasets pass through; attacks are orchestrator-managed, not proxied).
 | `CACHE_DIR` | `/var/cache/manteion` | NDJSON cache store root |
 | `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier: how long a phase entry or resume waits for every alive instance to observe its bump (and hold a frozen service's replay set committed) before failing; exit and drain wait as long and only log. Must be a positive duration of at most 1 h (startup refuses anything else). The HTTP write timeout is 2 × this + `MANTEION_DRAIN_TIMEOUT` + 30 s, so a stop that waits out a drain barrier and an exit wait still gets its answer |
 | `MANTEION_DRAIN_TIMEOUT` | `30s` | Drain-barrier wait before gap classification. Must be a positive duration of at most 1 h (startup refuses anything else) |
-| `MANTEION_POLL_INTERVAL` | `15s` | How often a running phase's poller asks zeus whether its runs and attacks have ended; the phase ends at the first tick after they have. Must be a positive duration of at most 1 m (startup refuses anything else) |
+| `MANTEION_POLL_INTERVAL` | `15s` | How often a running phase's poller asks zeus whether its runs and attacks have ended; the phase ends at the first tick after they have. It applies to every experiment, the demo's and operators' alike (the lab's manifest sets `2s`). Must be a positive duration of at most 1 m (startup refuses anything else) |
 | `MANTEION_ALLOW_DEGRADED_BASELINE` | `false` | Permit isolation phases over a degraded baseline recording |
-| `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop. Demo mode refuses to start unless it is `off` |
+| `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop; any other value starts no engine (an unknown one is logged). Demo mode refuses to start beside `rego`, `on` or `threshold`, and accepts `off` or an unknown value |
 | `MANTEION_SDK_PURGE_ENABLED` | `false` | Dead-instance purge sweep |
 | `MANTEION_DEMO` | `false` | `true` starts the public demo (`internal/demo`) on a second listener with its own six routes |
 | `MANTEION_DEMO_ADDR` | `:8090` | The demo listener's address, `host:port` with a numeric port |
@@ -153,8 +153,10 @@ go run ./cmd/manteion
 Deploy: the manifests in `kubernetes-manifests/` are deployed only through service-beds'
 `scripts/lab-up.sh`, which builds the image, loads it onto the lab box and sets its tag, into
 namespace `faults-lab`. A direct `kubectl apply -k kubernetes-manifests` deploys an untagged
-image that cannot be pulled. The skaffold deploy on VM1 (`skaffold.yaml`) is history from the
-retired VMs. Remember the epoch guard: deploying a newer schema epoch over an old database
+image that cannot be pulled. The manifest also turns demo mode on and requires the Secret
+`manteion-demo-edge`, which `lab-up.sh` creates first (service-beds' `scripts/lab-demo-secret.sh`):
+a skaffold deploy or a direct apply without it leaves the pod in `CreateContainerConfigError`.
+The skaffold deploy on VM1 (`skaffold.yaml`) is history from the retired VMs. Remember the epoch guard: deploying a newer schema epoch over an old database
 requires dropping the `manteion` database first; the binary re-migrates on startup.
 
 ## Companion repos

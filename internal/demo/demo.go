@@ -144,9 +144,12 @@ func (d *Demo) SwitchOffAll(ctx context.Context) error {
 // lab must not stay closed because one clean-up step failed, and the worker's
 // guarantees (each run's rule off on every ending) do not depend on the
 // sweep; the next start's sweep tries again. Give ctx a deadline (the wiring
-// gives 2 minutes).
+// gives 2 minutes). Its listings of the demo's experiments fill the worker's
+// run index (lookups.go), as each retention pass's do afterwards.
 func (d *Demo) Sweep(ctx context.Context) error {
-	err := Sweep(ctx, d.d, d.cfg.Retain)
+	t := newTidier(d.d, ErrSweepIncomplete, defaultTidyTimeouts)
+	t.runs = &d.w.runs
+	err := t.sweep(ctx, d.cfg.Retain)
 	if err != nil {
 		d.log.Error("demo: the start-up sweep did not complete; accepting runs anyway", "error", err)
 	}

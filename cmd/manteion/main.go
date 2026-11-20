@@ -250,6 +250,7 @@ func main() {
 			Logger:      logger,
 		}, demoCfg)
 		demoServer = newDemoServer(demoCfg.Addr, dm.Handler())
+		logDemoSettings(logger, demoCfg, pollInterval)
 	}
 	// ---- end of demo mode's set-up ----
 
@@ -326,7 +327,8 @@ func main() {
 		}
 	}
 	if dm != nil {
-		// The demo's switch-off, then listen, then its sweep and worker.
+		// The demo's switch-off, then listen, then its sweep and worker; or,
+		// on a signal during the switch-off, none of them.
 		startDemo(ctx, dm, defaultDemoTimings, listen, logger)
 	} else {
 		listen()
@@ -531,20 +533,15 @@ type shutdowner interface {
 }
 
 // demoTimings bounds demo mode's steps in the start-up and shutdown orders.
+// The start-up switch-off has no entry: the demo package bounds it itself.
 type demoTimings struct {
-	switchOffTimeout  time.Duration // each attempt of the start-up switch-off
-	switchOffAttempts int
-	switchOffPause    time.Duration // between two attempts
-	sweepTimeout      time.Duration // the start-up sweep
-	shutdownTimeout   time.Duration // the demo's own shutdown, before the servers'
+	sweepTimeout    time.Duration // the start-up sweep
+	shutdownTimeout time.Duration // the demo's own shutdown, before the servers'
 }
 
 var defaultDemoTimings = demoTimings{
-	switchOffTimeout:  10 * time.Second,
-	switchOffAttempts: 3,
-	switchOffPause:    time.Second,
-	sweepTimeout:      2 * time.Minute,
-	shutdownTimeout:   15 * time.Second,
+	sweepTimeout:    2 * time.Minute,
+	shutdownTimeout: 15 * time.Second,
 }
 
 // serverShutdownBudget is how long the servers' Shutdown (in-flight requests
@@ -554,38 +551,35 @@ const serverShutdownBudget = 10 * time.Second
 // startDemo runs demo mode's start-up around listen, which starts the
 // listeners. In this order:
 //
-//  1. d.SwitchOffAll, before listen: the operator listener serves desired
+//  1. d.SwitchOffAll, once, before listen: the operator listener serves desired
 //     state to the SDKs, and a demo rule left enabled by a kill would be
-//     served the moment they can poll. It is database only. Each attempt has
-//     a deadline of its own (t.switchOffTimeout), up to t.switchOffAttempts
-//     attempts, none after ctx (the signal) is done; a final failure is
-//     logged and start-up goes on: the sweep repeats the step, and no run is
-//     accepted before the sweep has run.
-//  2. listen.
-//  3. In a goroutine, d.Sweep under a deadline of t.sweepTimeout: it cancels
-//     leftover demo experiments, and a cancel waits for the fleet to
-//     converge, which the fleet can only do by polling the operator listener.
-//     Its error is logged and does not stop the next step. Then d.Run(ctx),
-//     until ctx is done or d.Shutdown is called.
+//     served the moment they can poll. It is database only, and bounds itself:
+//     the demo package detaches it from ctx's cancellation and gives it 30 s
+//     of its own, so neither a deadline here nor the signal would cut it
+//     short, and a second try could only double a hung database's wait. A
+//     failure is logged at error level and start-up goes on: the sweep repeats
+//     the step, and no run is accepted before the sweep has run.
+//  2. If ctx (the signal) is done by the time the switch-off returns, nothing
+//     more: no listener is bound and no sweep or worker starts, so a rule the
+//     switch-off could not reach is never served; main goes straight to its
+//     shutdown (shutdownInOrder copes with servers that never served).
+//  3. listen.
+//  4. In a goroutine, d.Sweep under a deadline of t.sweepTimeout derived from
+//     ctx: it cancels leftover demo experiments, and a cancel waits for the
+//     fleet to converge, which the fleet can only do by polling the operator
+//     listener. Its error is logged and does not stop the next step. Then,
+//     once the sweep has returned, d.Run(ctx), until ctx is done or d.Shutdown
+//     is called.
 //
-// It returns once listen has returned.
+// It returns once listen has returned, or at once after step 2.
 func startDemo(ctx context.Context, d demoLifecycle, t demoTimings, listen func(), logger *slog.Logger) {
-	var err error
-	for attempt := 1; ; attempt++ {
-		actx, cancel := context.WithTimeout(ctx, t.switchOffTimeout)
-		err = d.SwitchOffAll(actx)
-		cancel()
-		if err == nil || attempt >= t.switchOffAttempts || ctx.Err() != nil {
-			break
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(t.switchOffPause):
-		}
-	}
-	if err != nil {
+	if err := d.SwitchOffAll(ctx); err != nil {
 		logger.Error("demo: the start-up switch-off failed; starting anyway: the sweep repeats it, and no run is accepted before the sweep has run",
 			"error", err)
+	}
+	if ctx.Err() != nil {
+		logger.Info("demo: the shutdown signal came during the start-up switch-off; not starting the listeners, the sweep or the worker")
+		return
 	}
 
 	listen()
@@ -601,8 +595,18 @@ func startDemo(ctx context.Context, d demoLifecycle, t demoTimings, listen func(
 	}()
 }
 
-// shutdownInOrder runs main's shutdown once the signal has come. In this
-// order:
+// logDemoSettings logs, once at start-up, demo mode's settings in force that
+// are not secret: its address, the zeus poll interval (MANTEION_POLL_INTERVAL,
+// which bounds how long a phase outlives its load), the run cap and the
+// queue's capacity. Never the edge secret, nor anything about it.
+func logDemoSettings(logger *slog.Logger, cfg demo.Config, pollInterval time.Duration) {
+	logger.Info("demo mode on", "addr", cfg.Addr, "poll_interval", pollInterval.String(),
+		"run_cap", cfg.RunCap.String(), "queue_capacity", cfg.Capacity)
+}
+
+// shutdownInOrder runs main's shutdown once the signal has come, also when
+// startDemo stopped before the listeners (a server that never served shuts
+// down at once). In this order:
 //
 //  1. When d is not nil, d.Shutdown under a context of its own,
 //     t.shutdownTimeout long (the signal's context is already done), while

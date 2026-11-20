@@ -1378,7 +1378,7 @@ func TestHealth_IdleAndAccepting(t *testing.T) {
 	x := newDemo(t, nil)
 	own := "demo-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
 	addExperiment(t, x.f, "exp-own", RunNamePrefix+own, CreatedBy, "running", testNow)
-	cur := &active{runID: own, expID: "exp-own", sw: newRuleSwitch(fakeRules{x.f}, x.d.log)}
+	cur := &active{runID: own, expID: "exp-own", sw: newRuleSwitch("demo-test", fakeRules{x.f}, x.d.log, x.f.clock)}
 	x.d.w.mu.Lock()
 	x.d.w.cur = cur
 	x.d.w.mu.Unlock()
@@ -1478,7 +1478,7 @@ func TestState_SwitchOffPending(t *testing.T) {
 	x := newDemo(t, nil)
 	a := x.postOK("a")
 	x.d.w.mu.Lock()
-	x.d.w.pending = &active{runID: "demo-ended", sw: newRuleSwitch(fakeRules{x.f}, x.d.log)}
+	x.d.w.pending = &active{runID: "demo-ended", sw: newRuleSwitch("demo-test", fakeRules{x.f}, x.d.log, x.f.clock)}
 	x.d.w.mu.Unlock()
 	want := fmt.Sprintf(`{"capacity":3,"accepting":false,"queue":[{"run_id":%q,"position":0,"status":"queued"}],"running":null}`, a)
 	if rec := x.get(pathState, "a"); rec.Body.String() != want {
@@ -1848,7 +1848,10 @@ func requestLines(t *testing.T, logs string) []map[string]any {
 // never the edge secret, never a header.
 func TestRequestLog(t *testing.T) {
 	t.Parallel()
-	x := newDemo(t, nil)
+	debug := &syncBuffer{} // refusals log at Debug
+	x := newDemo(t, func(_ *Config, d *Deps) {
+		d.Logger = slog.New(slog.NewJSONHandler(debug, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
 	ip := "203.0.113.7"
 	x.post(ip)
 	x.get(pathState, ip)
@@ -1856,7 +1859,7 @@ func TestRequestLog(t *testing.T) {
 	x.get("/api/v1/rules", ip)
 	x.get(pathState, strings.Repeat("k", 300))
 	x.serve(http.MethodPost, pathRuns, clientHeader(ip), nil)
-	logs := x.logs.String()
+	logs := debug.String()
 	lines := requestLines(t, logs)
 	if len(lines) != 6 {
 		t.Fatalf("%d request lines; want 6:\n%s", len(lines), logs)
@@ -1895,6 +1898,107 @@ func TestRequestLog(t *testing.T) {
 	for _, bad := range []string{ip, goodSecret, strings.Repeat("k", 300), HeaderEdgeSecret, HeaderClient} {
 		if strings.Contains(logs, bad) {
 			t.Errorf("the log carries %q:\n%s", bad, logs)
+		}
+	}
+}
+
+// captureHandler is a slog.Handler that keeps every record, at every level.
+// The demo's loggers never call With or WithGroup, which return the handler
+// itself.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// all returns the records kept so far.
+func (h *captureHandler) all() []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.records)
+}
+
+// attr returns the value of r's attribute key, and whether r has it.
+func attr(r slog.Record, key string) (slog.Value, bool) {
+	var (
+		v     slog.Value
+		found bool
+	)
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			v, found = a.Value.Resolve(), true
+			return false
+		}
+		return true
+	})
+	return v, found
+}
+
+// TestRequestLog_RefusalsAtDebug: a request answered 400, 403, 404 or 429 is
+// logged at Debug, so a flood of refusals costs no log volume at Info; every
+// other answer (201, 200, 503, 500) stays at Info.
+func TestRequestLog_RefusalsAtDebug(t *testing.T) {
+	t.Parallel()
+	capture := &captureHandler{}
+	x := newDemo(t, func(_ *Config, d *Deps) { d.Logger = slog.New(capture) })
+	x.post("a")                                                // 201
+	x.get(pathState, "a")                                      // 200
+	x.get("/api/v1/rules", "a")                                // 404
+	x.get(pathRun(id.New(RunIDPrefix)), "a")                   // 404, looked up
+	x.get(pathState, strings.Repeat("k", 300))                 // 400
+	x.serve(http.MethodPost, pathRuns, clientHeader("a"), nil) // 403
+	x.post("a")                                                // 429 client_has_run
+
+	x.f.fail("experiments.List", errLeaky)
+	x.get(pathRun(id.New(RunIDPrefix)), "a") // 503
+	x.f.uninject("experiments.List")
+
+	view := x.d.view
+	x.d.view = func(context.Context, string) (Run, error) { return Run{}, errLeaky }
+	x.get(pathRun(id.New(RunIDPrefix)), "a") // 500
+	x.d.view = view
+	for i := 0; i < 121; i++ {
+		x.get(pathState, "r") // the last is 429 rate_limited
+	}
+
+	levels := map[int64][]slog.Level{}
+	for _, r := range capture.all() {
+		if r.Message != "demo: request" {
+			continue
+		}
+		v, ok := attr(r, "status")
+		if !ok {
+			t.Fatalf("a request line without a status: %v", r)
+		}
+		levels[v.Int64()] = append(levels[v.Int64()], r.Level)
+	}
+	for _, tc := range []struct {
+		status int64
+		n      int
+		level  slog.Level
+	}{
+		{201, 1, slog.LevelInfo}, {200, 121, slog.LevelInfo}, {503, 1, slog.LevelInfo}, {500, 1, slog.LevelInfo},
+		{400, 1, slog.LevelDebug}, {403, 1, slog.LevelDebug}, {404, 2, slog.LevelDebug}, {429, 2, slog.LevelDebug},
+	} {
+		got := levels[tc.status]
+		if len(got) != tc.n {
+			t.Errorf("status %d: %d request lines; want %d", tc.status, len(got), tc.n)
+		}
+		for _, l := range got {
+			if l != tc.level {
+				t.Errorf("status %d logged at %s; want %s", tc.status, l, tc.level)
+			}
 		}
 	}
 }

@@ -76,7 +76,10 @@ spec:
             - name: MANTEION_DEMO_ADDR
               value: ":8090"
             # Created on the box by service-beds' scripts/lab-demo-secret.sh
-            # before the stack is applied; required.
+            # before the stack is applied; required. This Secret and demo mode
+            # make the manifest deployable only through service-beds'
+            # scripts/lab-up.sh: a skaffold deploy or a direct apply without
+            # the Secret leaves the pod in CreateContainerConfigError.
             - name: MANTEION_DEMO_EDGE_SECRET
               valueFrom:
                 secretKeyRef:
