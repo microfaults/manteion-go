@@ -212,6 +212,70 @@ func (r *RuleRepo) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// ErrRuleUnattached is EnableIfAttached's refusal: the rule exists but no
+// phase links it, and an enabled rule attached to no phase is served to every
+// instance of its service at once.
+var ErrRuleUnattached = errors.New("store: rule is attached to no phase")
+
+// SetEnabled sets the rule's enabled flag in one statement, always writing
+// (even when the flag already has that value), and bumps the rule version and
+// the rule's service generation in the same transaction, as Update does, so
+// the service's held polls are woken after the commit. ErrNotFound when no
+// rule has the id.
+func (r *RuleRepo) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	return r.switchEnabled(ctx, id, `
+		UPDATE rules SET enabled = $2, updated_at = now()
+		WHERE id = $1
+		RETURNING service`, enabled)
+}
+
+// EnableIfAttached enables the rule only if at least one phase links it, in
+// one statement; the rule version and its service's generation are bumped as
+// by SetEnabled. ErrNotFound when no rule has the id, ErrRuleUnattached when
+// it exists but no phase links it (it is then left as it was). The phase
+// links read are key-share locked, so an experiment delete that removes them
+// either commits before (the rule is not enabled) or waits for this commit.
+func (r *RuleRepo) EnableIfAttached(ctx context.Context, id string) error {
+	return r.switchEnabled(ctx, id, `
+		UPDATE rules SET enabled = true, updated_at = now()
+		WHERE id = $1
+		  AND EXISTS (SELECT 1 FROM phase_rules WHERE rule_id = $1 FOR KEY SHARE)
+		RETURNING service`)
+}
+
+// switchEnabled runs one UPDATE ... RETURNING service on the rule and bumps
+// like Update. When the UPDATE matched no row it tells a missing rule
+// (ErrNotFound) from one the UPDATE's condition excluded (ErrRuleUnattached).
+func (r *RuleRepo) switchEnabled(ctx context.Context, id, query string, args ...any) error {
+	var svc string
+	var gen uint64
+	if err := execTx(ctx, r.db, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, query, append([]any{id}, args...)...).Scan(&svc)
+		if errors.Is(err, sql.ErrNoRows) {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM rules WHERE id = $1)`, id).Scan(&exists); err != nil {
+				return fmt.Errorf("switch rule: check existence: %w", err)
+			}
+			if !exists {
+				return ErrNotFound
+			}
+			return ErrRuleUnattached
+		}
+		if err != nil {
+			return fmt.Errorf("switch rule: %w", err)
+		}
+		if err := r.bumpVersion(ctx, tx); err != nil {
+			return err
+		}
+		gen, err = r.bumpGeneration(ctx, tx, svc)
+		return err
+	}); err != nil {
+		return err
+	}
+	r.notify(svc, gen)
+	return nil
+}
+
 // List returns all rules ordered by priority (desc), then creation time, then id.
 func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 	rows, err := r.db.QueryContext(ctx, `

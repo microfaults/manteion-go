@@ -2,6 +2,8 @@ package demo
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -22,13 +24,18 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatalf("defaults: %v", err)
 	}
 	want := Config{
-		Addr: ":8090", EdgeSecret: goodSecret,
+		Addr:   ":8090",
 		RunCap: 5 * time.Minute, StatusPoll: time.Second, SampleEvery: 2 * time.Second,
 		QueryTimeout: 1500 * time.Millisecond, Heartbeat: 15 * time.Second, StreamMaxAge: 10 * time.Minute,
 		HealthTTL: 5 * time.Second, Capacity: 3, Retain: 20, Recent: 10,
 	}
-	if cfg != want {
-		t.Errorf("defaults = %v; want %v", cfg, want)
+	if !cfg.EdgeSecret.Matches(goodSecret) {
+		t.Errorf("the edge secret was not kept")
+	}
+	got := cfg
+	got.EdgeSecret = Secret{}
+	if got != want {
+		t.Errorf("defaults = %v; want %v", got, want)
 	}
 
 	_, err = ConfigFromEnv(envOf(nil))
@@ -79,7 +86,7 @@ func TestConfigFromEnv_EdgeSecret(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := ConfigFromEnv(envOf(map[string]string{"MANTEION_DEMO_EDGE_SECRET": tc.secret}))
 			if tc.ok {
-				if err != nil || cfg.EdgeSecret != tc.secret {
+				if err != nil || !cfg.EdgeSecret.Matches(tc.secret) {
 					t.Fatalf("err = %v; want the secret accepted", err)
 				}
 				return
@@ -95,7 +102,7 @@ func TestConfigFromEnv_EdgeSecret(t *testing.T) {
 				t.Errorf("error %q echoes the secret", msg)
 			}
 			if cfg != (Config{}) {
-				t.Errorf("config returned with the error: %v", cfg)
+				t.Errorf("config returned with the error: %+v", cfg)
 			}
 		})
 	}
@@ -137,7 +144,7 @@ func TestConfigFromEnv_Addr(t *testing.T) {
 // still checked, so a bad edit of a default fails at start-up, naming the field.
 func TestConfigValidate_Bounds(t *testing.T) {
 	base := DefaultConfig()
-	base.EdgeSecret = goodSecret
+	base.EdgeSecret = NewSecret(goodSecret)
 	if err := base.validate(); err != nil {
 		t.Fatalf("defaults with a secret: %v", err)
 	}
@@ -169,17 +176,70 @@ func TestConfigValidate_Bounds(t *testing.T) {
 	}
 }
 
-func TestConfig_NeverPrintsTheSecret(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.EdgeSecret = goodSecret
-	var buf bytes.Buffer
-	slog.New(slog.NewTextHandler(&buf, nil)).Info("config", "cfg", cfg)
-	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "cfg", cfg)
-	out := fmt.Sprintf("%v %+v %#v %s", cfg, cfg, cfg, cfg) + fmt.Sprint(&cfg) + buf.String()
-	if strings.Contains(out, goodSecret) {
-		t.Fatalf("the secret is printed: %s", out)
+// TestSecret_NeverPrinted: the edge secret shows only "[redacted]" (or, where
+// fmt cannot call its methods, an address) however a Config holding it is
+// printed, logged, encoded or wrapped in an error.
+func TestSecret_NeverPrinted(t *testing.T) {
+	cfg, err := ConfigFromEnv(envOf(map[string]string{"MANTEION_DEMO_EDGE_SECRET": goodSecret}))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, ":8090") {
-		t.Errorf("printed config lost its other fields: %s", out)
+	type unexported struct {
+		cfg  Config
+		note string
+	}
+	type embedded struct {
+		Config
+		note string
+	}
+	type pointer struct{ cfg *Config }
+	holders := map[string]any{
+		"Secret":              cfg.EdgeSecret,
+		"Config":              cfg,
+		"*Config":             &cfg,
+		"unexported field":    unexported{cfg: cfg, note: "x"},
+		"embedded":            embedded{Config: cfg, note: "x"},
+		"*embedded":           &embedded{Config: cfg},
+		"unexported pointer":  pointer{cfg: &cfg},
+		"slice of Config":     []Config{cfg},
+		"map of Config":       map[string]Config{"a": cfg},
+		"interface in struct": struct{ v any }{v: cfg},
+	}
+	verbs := []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d", "%T", "%10.3s", "%-v"}
+	leaks := func(what, out string) {
+		t.Helper()
+		if strings.Contains(out, goodSecret) || strings.Contains(strings.ToLower(out), strings.ToLower(fmt.Sprintf("%x", goodSecret))) {
+			t.Errorf("%s leaks the secret: %s", what, out)
+		}
+	}
+	for name, h := range holders {
+		for _, verb := range verbs {
+			leaks(name+" "+verb, fmt.Sprintf(verb, h))
+		}
+		leaks(name+" Sprint", fmt.Sprint(h))
+		leaks(name+" Sprintln", fmt.Sprintln(h))
+		leaks(name+" Errorf", fmt.Errorf("start demo with %v: %w", h, errors.New("boom")).Error())
+
+		var buf bytes.Buffer
+		slog.New(slog.NewTextHandler(&buf, nil)).Info("config", "cfg", h)
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "cfg", h)
+		slog.New(slog.NewTextHandler(&buf, nil)).Info("config", slog.Group("g", "cfg", h))
+		leaks(name+" slog", buf.String())
+
+		if b, err := json.Marshal(h); err == nil {
+			leaks(name+" json", string(b))
+		}
+	}
+	if out := fmt.Sprintf("%v", cfg); !strings.Contains(out, ":8090") || !strings.Contains(out, "[redacted]") {
+		t.Errorf("printed config lost its other fields or the redaction mark: %s", out)
+	}
+	if !cfg.EdgeSecret.Matches(goodSecret) || cfg.EdgeSecret.Matches(goodSecret+"x") || cfg.EdgeSecret.Matches("") {
+		t.Errorf("Matches is wrong")
+	}
+	if (Secret{}).Matches("") || NewSecret("").IsSet() || (Secret{}).Reveal() != "" {
+		t.Errorf("the unset secret matches or reveals something")
+	}
+	if cfg.EdgeSecret.Reveal() != goodSecret || !cfg.EdgeSecret.Equal(NewSecret(goodSecret)) {
+		t.Errorf("Reveal or Equal is wrong")
 	}
 }

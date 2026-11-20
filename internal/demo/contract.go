@@ -329,12 +329,21 @@ func (p PhaseView) MarshalJSON() ([]byte, error) {
 
 // Result is a finished phase's load result, from its phase_workflow_results
 // row: request_count, error_count (failed HTTP requests) and latency_p*_us/1000.
+// The contract types the latencies as numbers, not nullable, so a NaN or
+// infinite latency marshals as 0 rather than failing the whole response.
 type Result struct {
 	Requests   int64   `json:"requests"`
 	HTTPErrors int64   `json:"http_errors"`
 	P50Ms      float64 `json:"p50_ms"`
 	P95Ms      float64 `json:"p95_ms"`
 	P99Ms      float64 `json:"p99_ms"`
+}
+
+func (r Result) MarshalJSON() ([]byte, error) {
+	type plain Result
+	p := plain(r)
+	p.P50Ms, p.P95Ms, p.P99Ms = finiteOr0(p.P50Ms), finiteOr0(p.P95Ms), finiteOr0(p.P99Ms)
+	return json.Marshal(p)
 }
 
 // Testbed describes the machine the demo runs on. It is fixed: use
@@ -414,7 +423,8 @@ type QueueEntry struct {
 	Status   RunStatus `json:"status"`
 }
 
-// RunningPhase is State.Running: where the position-0 run is.
+// RunningPhase is State.Running: where the position-0 run is. Progress
+// marshals clamped to 0..1, NaN and ±Inf as 0.
 type RunningPhase struct {
 	RunID          string     `json:"run_id"`
 	Phase          string     `json:"phase"`
@@ -432,7 +442,18 @@ func (r RunningPhase) MarshalJSON() ([]byte, error) {
 		PhaseStartedAt *string `json:"phase_started_at"`
 		PhaseDurationS int     `json:"phase_duration_s"`
 		Progress       float64 `json:"progress"`
-	}{r.RunID, r.Phase, r.PhaseIndex, stampPtr(r.PhaseStartedAt), r.PhaseDurationS, r.Progress})
+	}{r.RunID, r.Phase, r.PhaseIndex, stampPtr(r.PhaseStartedAt), r.PhaseDurationS, clampProgress(r.Progress)})
+}
+
+// clampProgress keeps progress in 0..1; NaN and ±Inf are 0.
+func clampProgress(p float64) float64 {
+	switch {
+	case math.IsNaN(p) || math.IsInf(p, 0) || p < 0:
+		return 0
+	case p > 1:
+		return 1
+	}
+	return p
 }
 
 // Health is the body of GET /health: 200 iff Checks.All(), else 503.
@@ -509,6 +530,14 @@ func (s Sample) MarshalJSON() ([]byte, error) {
 		P95Ms     *float64 `json:"p95_ms"`
 		ErrorRate *float64 `json:"error_rate"`
 	}{s.RunID, s.Phase, stamp(s.At), finite(s.RPS), finite(s.P95Ms), finite(s.ErrorRate)})
+}
+
+// finiteOr0 returns v, or 0 when v is NaN or infinite.
+func finiteOr0(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return v
 }
 
 // finite returns v, or nil when v is nil, NaN or infinite.

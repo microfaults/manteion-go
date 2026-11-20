@@ -325,3 +325,28 @@ func TestContractNames(t *testing.T) {
 		t.Errorf("names = %q %q %q %q", CreatedBy, RunNamePrefix, SpecName, RunIDPrefix)
 	}
 }
+
+// TestNonFiniteNumbersNeverFailAResponse: a NaN or infinite number in a run
+// or a state marshals; latencies (typed num, not nullable) become 0, progress
+// is clamped to 0..1 and non-finite progress is 0.
+func TestNonFiniteNumbersNeverFailAResponse(t *testing.T) {
+	phases := samplePhases()
+	phases[0].Result = &Result{Requests: 10, P50Ms: math.NaN(), P95Ms: math.Inf(1), P99Ms: math.Inf(-1)}
+	run := Run{RunID: "demo-1", Status: RunCompleted, QueuedAt: testNow, Phases: phases, Testbed: FixedTestbed()}
+	m := decodeObject(t, run)
+	res := m["phases"].([]any)[0].(map[string]any)["result"].(map[string]any)
+	if res["p50_ms"] != 0.0 || res["p95_ms"] != 0.0 || res["p99_ms"] != 0.0 || res["requests"] != 10.0 {
+		t.Errorf("non-finite latencies = %v; want 0", res)
+	}
+
+	for _, tc := range []struct{ in, want float64 }{
+		{math.NaN(), 0}, {math.Inf(1), 0}, {math.Inf(-1), 0}, {-0.2, 0}, {1.5, 1}, {0.4, 0.4},
+	} {
+		st := State{Capacity: 3, Queue: []QueueEntry{{RunID: "demo-1", Status: RunRunning}},
+			Running: &RunningPhase{RunID: "demo-1", Phase: "plain", PhaseDurationS: 40, Progress: tc.in}}
+		m := decodeObject(t, st)
+		if got := m["running"].(map[string]any)["progress"]; got != tc.want {
+			t.Errorf("progress %v marshals as %v; want %v", tc.in, got, tc.want)
+		}
+	}
+}

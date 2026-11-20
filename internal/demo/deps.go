@@ -19,8 +19,8 @@ import (
 // *promql.Client and *sql.DB.
 //
 // Deliberately absent: phase-level start, pause, resume and stop, experiment
-// pause, resume and stop, the non-CAS status writers, fault configs and the
-// kill switch. The demo drives an experiment only through StartExperiment and
+// pause, resume and stop, the non-CAS status writers, RuleRepo.Update, fault
+// configs and the kill switch. The demo drives an experiment only through StartExperiment and
 // CancelExperiment, and owns its rule's enabled flag.
 
 // Clock tells the time. Package code never calls time.Now itself.
@@ -61,11 +61,15 @@ type Experiments interface {
 }
 
 // Rules is the slice of *store.RuleRepo the demo uses. Every write bumps the
-// rule's service generation in the same transaction.
+// rule's service generation in the same transaction. The demo switches a rule
+// only through SetEnabled (unconditional, one statement) and EnableIfAttached
+// (enables only while a phase links the rule, one statement), never through a
+// read-modify-write Update.
 type Rules interface {
 	Create(ctx context.Context, rule *model.Rule) error
 	Get(ctx context.Context, id string) (*model.Rule, error)
-	Update(ctx context.Context, rule *model.Rule) error
+	SetEnabled(ctx context.Context, id string, enabled bool) error
+	EnableIfAttached(ctx context.Context, id string) error
 	Delete(ctx context.Context, id string) error
 	List(ctx context.Context) ([]*model.Rule, error)
 }

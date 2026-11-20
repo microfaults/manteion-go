@@ -3,7 +3,6 @@ package demo
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -31,9 +30,9 @@ type Config struct {
 	// Addr is the demo listener's address (MANTEION_DEMO_ADDR).
 	Addr string
 	// EdgeSecret is what POST /runs must carry in X-Demo-Edge-Secret
-	// (MANTEION_DEMO_EDGE_SECRET). Config's String, GoString and LogValue
-	// leave it out, and it is never marshalled.
-	EdgeSecret string `json:"-"`
+	// (MANTEION_DEMO_EDGE_SECRET). It redacts itself wherever it is printed,
+	// logged or encoded; check a request with EdgeSecret.Matches.
+	EdgeSecret Secret
 
 	RunCap       time.Duration // watchdog from pickup to forced end (MANTEION_DEMO_RUN_CAP)
 	StatusPoll   time.Duration // how often the worker reads the running experiment
@@ -76,7 +75,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if v := getenv(EnvAddr); v != "" {
 		cfg.Addr = v
 	}
-	cfg.EdgeSecret = getenv(EnvEdgeSecret)
+	cfg.EdgeSecret = NewSecret(getenv(EnvEdgeSecret))
 	if v := getenv(EnvRunCap); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -96,7 +95,7 @@ func (c Config) validate() error {
 	if err := checkAddr(c.Addr); err != nil {
 		return err
 	}
-	if err := checkEdgeSecret(c.EdgeSecret); err != nil {
+	if err := checkEdgeSecret(c.EdgeSecret.value()); err != nil {
 		return err
 	}
 	durations := []struct {
@@ -173,52 +172,4 @@ func checkEdgeSecret(s string) error {
 		}
 	}
 	return nil
-}
-
-// redacted is Config without the edge secret, for printing.
-type redacted struct {
-	Addr         string
-	EdgeSecret   string
-	RunCap       time.Duration
-	StatusPoll   time.Duration
-	SampleEvery  time.Duration
-	QueryTimeout time.Duration
-	Heartbeat    time.Duration
-	StreamMaxAge time.Duration
-	HealthTTL    time.Duration
-	Capacity     int
-	Retain       int
-	Recent       int
-}
-
-func (c Config) redacted() redacted {
-	r := redacted(c)
-	if r.EdgeSecret != "" {
-		r.EdgeSecret = "[set]"
-	}
-	return r
-}
-
-// String prints the configuration without the edge secret.
-func (c Config) String() string { return fmt.Sprintf("%+v", c.redacted()) }
-
-// GoString prints the configuration without the edge secret.
-func (c Config) GoString() string { return fmt.Sprintf("demo.Config%+v", c.redacted()) }
-
-// LogValue logs the configuration without the edge secret.
-func (c Config) LogValue() slog.Value {
-	return slog.GroupValue(
-		slog.String("addr", c.Addr),
-		slog.Bool("edge_secret_set", c.EdgeSecret != ""),
-		slog.Duration("run_cap", c.RunCap),
-		slog.Duration("status_poll", c.StatusPoll),
-		slog.Duration("sample_every", c.SampleEvery),
-		slog.Duration("query_timeout", c.QueryTimeout),
-		slog.Duration("heartbeat", c.Heartbeat),
-		slog.Duration("stream_max_age", c.StreamMaxAge),
-		slog.Duration("health_ttl", c.HealthTTL),
-		slog.Int("capacity", c.Capacity),
-		slog.Int("retain", c.Retain),
-		slog.Int("recent", c.Recent),
-	)
 }

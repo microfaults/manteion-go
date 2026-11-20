@@ -35,8 +35,13 @@ func onlyRule(t *testing.T, f *fakeLab) *model.Rule {
 	return nil
 }
 
+// switchCalls lists every call that switches a rule's enabled flag.
+func switchCalls(f *fakeLab) []string {
+	return append(f.callList("rules.SetEnabled"), f.callList("rules.EnableIfAttached")...)
+}
+
 func TestBuildRun_Shape(t *testing.T) {
-	f := newFakeLab(testNow)
+	f := newFakeLab(t, testNow)
 	const runID = "demo-0001"
 
 	built, err := BuildRun(context.Background(), f.deps(), runID, testRunCap)
@@ -95,13 +100,16 @@ func TestBuildRun_Shape(t *testing.T) {
 	if len(f.phaseRules) != 1 || !slices.Equal(f.phaseRules[phases[1].ID], []string{rule.ID}) {
 		t.Errorf("phase rule links = %v; want only phase 1 -> %s", f.phaseRules, rule.ID)
 	}
-	if upd := f.callList("rules.Update"); len(upd) != 0 || f.enabledEver[rule.ID] {
-		t.Errorf("the builder touched the rule's enabled flag: updates %v, enabled ever %v", upd, f.enabledEver[rule.ID])
+	if sw := switchCalls(f); len(sw) != 0 || f.enabledEver[rule.ID] {
+		t.Errorf("the builder touched the rule's enabled flag: %v, enabled ever %v", sw, f.enabledEver[rule.ID])
+	}
+	if f.served(rule.ID) {
+		t.Errorf("a freshly built rule is served")
 	}
 }
 
 func TestBuildRun_ReusesSpec(t *testing.T) {
-	f := newFakeLab(testNow)
+	f := newFakeLab(t, testNow)
 	d := f.deps()
 
 	first, err := BuildRun(context.Background(), d, "demo-a", testRunCap)
@@ -135,7 +143,7 @@ func TestBuildRun_ReusesSpec(t *testing.T) {
 // TestBuildRun_IgnoresAlteredSpec: a spec that carries the demo's name but no
 // longer says +50 ms latency is never reused; the builder makes a correct one.
 func TestBuildRun_IgnoresAlteredSpec(t *testing.T) {
-	f := newFakeLab(testNow)
+	f := newFakeLab(t, testNow)
 	altered := &model.FaultSpec{ID: "spec-altered", Name: SpecName, Category: "inline", FaultType: "latency",
 		Params: json.RawMessage(`{"delay":"500ms"}`), DurationMs: 60000, CreatedAt: testNow.Add(-time.Hour)}
 	f.specs = append(f.specs, altered)
@@ -152,7 +160,7 @@ func TestBuildRun_IgnoresAlteredSpec(t *testing.T) {
 	}
 
 	// A correct spec that already exists is reused as it is.
-	g := newFakeLab(testNow)
+	g := newFakeLab(t, testNow)
 	good := &model.FaultSpec{ID: "spec-good", Name: SpecName, Category: "inline", FaultType: "latency",
 		Params: json.RawMessage(`{ "delay": "50ms" }`), DurationMs: 60000, CreatedAt: testNow.Add(-time.Hour)}
 	g.specs = append(g.specs, good)
@@ -203,7 +211,7 @@ func TestBuildRun_PicksUsableDataset(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFakeLab(testNow)
+			f := newFakeLab(t, testNow)
 			f.datasets = tc.datasets
 			built, err := BuildRun(context.Background(), f.deps(), "demo-ds", runCap)
 			if tc.want == "" {
@@ -234,7 +242,8 @@ func writeCalls(f *fakeLab) []string {
 		op := strings.SplitN(c, " ", 2)[0]
 		switch {
 		case strings.HasSuffix(op, ".Create"), strings.HasSuffix(op, ".CreatePhase"), strings.HasSuffix(op, ".CreateSpec"),
-			strings.HasPrefix(op, "experiments.Attach"), strings.HasSuffix(op, ".Update"), strings.HasSuffix(op, ".Delete"):
+			strings.HasPrefix(op, "experiments.Attach"), strings.HasSuffix(op, ".SetEnabled"),
+			strings.HasSuffix(op, ".EnableIfAttached"), strings.HasSuffix(op, ".Delete"):
 			out = append(out, c)
 		}
 	}
@@ -256,7 +265,7 @@ func TestBuildRun_LoadPreconditions(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFakeLab(testNow)
+			f := newFakeLab(t, testNow)
 			tc.setup(f)
 			_, err := BuildRun(context.Background(), f.deps(), "demo-pre", testRunCap)
 			if !errors.Is(err, tc.want) {
@@ -270,35 +279,86 @@ func TestBuildRun_LoadPreconditions(t *testing.T) {
 	}
 }
 
+// TestBuildRun_DoneContextIsNotNoDataset: a build whose context is cancelled
+// or expired while it looks for the load is an interruption, never "no
+// dataset" and never a build error, so a later task cannot tell a visitor the
+// load generator is down when manteion was shutting down.
+func TestBuildRun_DoneContextIsNotNoDataset(t *testing.T) {
+	for _, step := range []string{"workflows.Get", "zeus.ListDatasets", "specs.ListSpecs"} {
+		t.Run("cancelled during "+step, func(t *testing.T) {
+			f := newFakeLab(t, testNow)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f.onCall(step, cancel)
+			_, err := BuildRun(ctx, f.deps(), "demo-ctx", testRunCap)
+			if !errors.Is(err, context.Canceled) || errors.Is(err, ErrNoDataset) || errors.Is(err, ErrBuild) {
+				t.Fatalf("err = %v; want context.Canceled and neither ErrNoDataset nor ErrBuild", err)
+			}
+			if writes := writeCalls(f); len(writes) != 0 {
+				t.Errorf("writes: %v; want none", writes)
+			}
+		})
+	}
+	t.Run("expired", func(t *testing.T) {
+		f := newFakeLab(t, testNow)
+		ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+		defer cancel()
+		_, err := BuildRun(ctx, f.deps(), "demo-ctx", testRunCap)
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNoDataset) {
+			t.Fatalf("err = %v; want context.DeadlineExceeded, not ErrNoDataset", err)
+		}
+	})
+	t.Run("pickDataset itself", func(t *testing.T) {
+		// A load generator that answers whatever the context: an empty list,
+		// or an error that does not wrap the context's.
+		for _, z := range []stubZeus{{}, {err: errors.New("connection reset by peer")}} {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := pickDataset(ctx, z, testNow, testRunCap); !errors.Is(err, context.Canceled) {
+				t.Errorf("pickDataset with %+v on a cancelled context: err = %v; want context.Canceled", z, err)
+			}
+		}
+	})
+}
+
+// stubZeus answers ListDatasets with datasets and err, ignoring the context.
+type stubZeus struct {
+	datasets []zeus.Dataset
+	err      error
+}
+
+func (s stubZeus) Healthy(context.Context) bool { return s.err == nil }
+func (s stubZeus) ListDatasets(context.Context) ([]zeus.Dataset, error) {
+	return s.datasets, s.err
+}
+
 func TestBuildRun_FailureCleansUp(t *testing.T) {
-	f := newFakeLab(testNow)
+	f := newFakeLab(t, testNow)
 	f.fail("experiments.AttachPhaseRules", errLeaky)
 
 	_, err := BuildRun(context.Background(), f.deps(), "demo-fail", testRunCap)
-	if !errors.Is(err, ErrBuild) {
-		t.Fatalf("err = %v; want ErrBuild", err)
+	if !errors.Is(err, ErrBuild) || errors.Is(err, ErrCleanupIncomplete) {
+		t.Fatalf("err = %v; want ErrBuild with a complete cleanup", err)
 	}
 
-	var expID, ruleID string
-	created := f.callList("rules.Create")
-	if len(created) != 1 {
+	if created := f.callList("rules.Create"); len(created) != 1 {
 		t.Fatalf("rules.Create calls = %v; want 1", created)
 	}
 	deletes := append(f.callList("experiments.Delete"), f.callList("rules.Delete")...)
 	if len(deletes) != 2 {
 		t.Fatalf("delete calls = %v; want one experiment and one rule delete", deletes)
 	}
-	expID = strings.TrimPrefix(deletes[0], "experiments.Delete ")
-	ruleID = strings.TrimPrefix(deletes[1], "rules.Delete ")
-	order := indexOf(f.callList(""), "experiments.Delete "+expID) < indexOf(f.callList(""), "rules.Delete "+ruleID)
-	if !order {
-		t.Errorf("calls = %v; want experiments.Delete before rules.Delete", f.callList(""))
+	expID := strings.TrimPrefix(deletes[0], "experiments.Delete ")
+	ruleID := strings.TrimPrefix(deletes[1], "rules.Delete ")
+	all := f.callList("")
+	if indexOf(all, "experiments.Delete "+expID) > indexOf(all, "rules.Delete "+ruleID) {
+		t.Errorf("calls = %v; want experiments.Delete before rules.Delete", all)
 	}
 	if !strings.HasPrefix(expID, "exp-") || !strings.HasPrefix(ruleID, "rule-") {
 		t.Errorf("deleted %q and %q; want the run's experiment and rule", expID, ruleID)
 	}
-	if upd := f.callList("rules.Update"); len(upd) != 0 || f.enabledEver[ruleID] {
-		t.Errorf("rule enabled during a failed build: updates %v", upd)
+	if sw := switchCalls(f); len(sw) != 0 || f.enabledEver[ruleID] {
+		t.Errorf("rule switched during a failed build: %v", sw)
 	}
 	if left := f.leftovers(); len(left) != 0 {
 		t.Errorf("left behind: %v", left)
@@ -315,105 +375,163 @@ func indexOf(list []string, s string) int {
 	return -1
 }
 
-// TestBuildRun_FailureAtEveryStepLeavesNothing injects a failure at each write
-// of the build in turn: whatever step fails, no experiment, phase, link or
-// rule is left behind, the rule is never enabled, and the error is ErrBuild
-// with none of the cause's text.
-func TestBuildRun_FailureAtEveryStepLeavesNothing(t *testing.T) {
-	steps := []string{
-		"specs.ListSpecs",
-		"specs.CreateSpec",
-		"rules.Create",
-		"experiments.Create",
-		"experiments.CreatePhase#1",
-		"experiments.AttachPhaseWorkflows#1",
-		"experiments.CreatePhase#2",
-		"experiments.AttachPhaseWorkflows#2",
-		"experiments.AttachPhaseRules",
-		"experiments.CreatePhase#3",
-		"experiments.AttachPhaseWorkflows#3",
+// buildWrites are the build's writes in order, as fake operation keys.
+var buildWrites = []string{
+	"specs.CreateSpec",
+	"rules.Create",
+	"experiments.Create",
+	"experiments.CreatePhase#1",
+	"experiments.AttachPhaseWorkflows#1",
+	"experiments.CreatePhase#2",
+	"experiments.AttachPhaseWorkflows#2",
+	"experiments.AttachPhaseRules",
+	"experiments.CreatePhase#3",
+	"experiments.AttachPhaseWorkflows#3",
+}
+
+// checkFailedBuild asserts what every failed build guarantees: ErrBuild, a
+// complete cleanup, nothing per run left, the rule never switched, and an
+// error string without the cause's text or any id.
+func checkFailedBuild(t *testing.T, f *fakeLab, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrBuild) || errors.Is(err, ErrNoDataset) || errors.Is(err, ErrCleanupIncomplete) {
+		t.Fatalf("err = %v; want ErrBuild only, cleanup complete", err)
 	}
-	for _, step := range steps {
+	if !errors.Is(err, errLeaky) {
+		t.Errorf("err = %v; want the cause reachable through errors.Is", err)
+	}
+	if left := f.leftovers(); len(left) != 0 {
+		t.Errorf("left behind: %v (calls %v)", left, f.callList(""))
+	}
+	if sw := switchCalls(f); len(sw) != 0 {
+		t.Errorf("rule switched during a failed build: %v", sw)
+	}
+	for id, on := range f.enabledEver {
+		if on {
+			t.Errorf("rule %s was enabled", id)
+		}
+	}
+	assertNoLeak(t, err.Error())
+}
+
+// TestBuildRun_FailureAtEveryStepLeavesNothing injects a failure, with nothing
+// written, at each write of the build in turn (and at the spec listing).
+func TestBuildRun_FailureAtEveryStepLeavesNothing(t *testing.T) {
+	for _, step := range append([]string{"specs.ListSpecs"}, buildWrites...) {
 		t.Run(step, func(t *testing.T) {
-			f := newFakeLab(testNow)
+			f := newFakeLab(t, testNow)
 			f.fail(step, errLeaky)
 			_, err := BuildRun(context.Background(), f.deps(), "demo-step", testRunCap)
-			if !errors.Is(err, ErrBuild) || errors.Is(err, ErrNoDataset) {
-				t.Fatalf("err = %v; want ErrBuild only", err)
-			}
-			if !errors.Is(err, errLeaky) {
-				t.Errorf("err = %v; want the cause reachable through errors.Is", err)
-			}
-			if left := f.leftovers(); len(left) != 0 {
-				t.Errorf("left behind: %v (calls %v)", left, f.callList(""))
-			}
-			if upd := f.callList("rules.Update"); len(upd) != 0 {
-				t.Errorf("rule updated during a failed build: %v", upd)
-			}
-			for id, on := range f.enabledEver {
-				if on {
-					t.Errorf("rule %s was enabled", id)
-				}
-			}
-			assertNoLeak(t, err.Error())
+			checkFailedBuild(t, f, err)
+		})
+	}
+}
+
+// TestBuildRun_CommittedButFailedWriteIsCleanedUp: at each write in turn, the
+// write commits but its answer is an error (a connection lost after COMMIT).
+// The build still removes the row it believed failed, which it can do only
+// because it records each row before writing it.
+func TestBuildRun_CommittedButFailedWriteIsCleanedUp(t *testing.T) {
+	for _, step := range buildWrites {
+		t.Run(step, func(t *testing.T) {
+			f := newFakeLab(t, testNow)
+			f.failAfterCommit(step, errLeaky)
+			_, err := BuildRun(context.Background(), f.deps(), "demo-commit", testRunCap)
+			checkFailedBuild(t, f, err)
 		})
 	}
 }
 
 // TestBuildRun_CleanupOutlivesCancelledContext: the build's context is
-// cancelled mid-way (a shutdown, say); the cleanup still runs to completion.
+// cancelled mid-way (a shutdown, say); the cleanup still runs to completion,
+// and the error is the interruption, not a build failure.
 func TestBuildRun_CleanupOutlivesCancelledContext(t *testing.T) {
-	f := newFakeLab(testNow)
+	f := newFakeLab(t, testNow)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f.fail("experiments.AttachPhaseWorkflows#3", context.Canceled)
 	f.onCall("experiments.AttachPhaseWorkflows#3", cancel)
 
 	_, err := BuildRun(ctx, f.deps(), "demo-cancel", testRunCap)
-	if !errors.Is(err, ErrBuild) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v; want ErrBuild wrapping context.Canceled", err)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrBuild) || errors.Is(err, ErrCleanupIncomplete) {
+		t.Fatalf("err = %v; want context.Canceled with a complete cleanup", err)
 	}
 	if left := f.leftovers(); len(left) != 0 {
 		t.Errorf("left behind after a cancelled build: %v", left)
 	}
 }
 
-// TestBuildRun_CleanupFailureIsLogged: when the cleanup itself fails, the build
-// still returns ErrBuild, the rule stays disabled, and the log names what was
-// left behind by id without the cause's text.
-func TestBuildRun_CleanupFailureIsLogged(t *testing.T) {
-	f := newFakeLab(testNow)
+// TestBuildRun_CleanupFailureIsReported: when the cleanup itself fails, the
+// build returns ErrBuild and ErrCleanupIncomplete, the rule stays disabled,
+// and the log names what was left behind with the full cause.
+func TestBuildRun_CleanupFailureIsReported(t *testing.T) {
+	f := newFakeLab(t, testNow)
 	f.fail("experiments.AttachPhaseWorkflows#3", errLeaky)
-	f.fail("experiments.Delete", errLeaky)
+	f.fail("experiments.Delete", errors.New("pq: delete timed out"))
 	var buf bytes.Buffer
 	d := f.deps()
 	d.Logger = slog.New(slog.NewTextHandler(&buf, nil))
 
 	_, err := BuildRun(context.Background(), d, "demo-stuck", testRunCap)
-	if !errors.Is(err, ErrBuild) {
-		t.Fatalf("err = %v; want ErrBuild", err)
+	var se *StepError
+	if !errors.Is(err, ErrBuild) || !errors.Is(err, ErrCleanupIncomplete) || !errors.As(err, &se) || !se.CleanupIncomplete {
+		t.Fatalf("err = %v; want ErrBuild with ErrCleanupIncomplete", err)
 	}
+	if !strings.Contains(err.Error(), "cleanup incomplete") {
+		t.Errorf("err text %q does not say the cleanup is incomplete", err.Error())
+	}
+	assertNoLeak(t, err.Error())
 	rule := onlyRule(t, f)
-	if rule.Enabled || f.enabledEver[rule.ID] {
-		t.Errorf("rule left enabled: %+v", rule)
+	if rule.Enabled || f.enabledEver[rule.ID] || f.served(rule.ID) {
+		t.Errorf("rule left enabled or served: %+v", rule)
 	}
 	var expID string
 	for id := range f.experiments {
 		expID = id
 	}
 	logs := buf.String()
-	if !strings.Contains(logs, expID) || !strings.Contains(logs, rule.ID) {
-		t.Errorf("log does not name the experiment %q and rule %q left behind:\n%s", expID, rule.ID, logs)
-	}
-	for _, bad := range []string{"pq:", "192.0.2.10"} {
-		if strings.Contains(logs, bad) {
-			t.Errorf("log carries cause text %q:\n%s", bad, logs)
+	for _, want := range []string{expID, rule.ID, "pq: delete timed out", "pq: dial 192.0.2.10", "cleanup_incomplete=true"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("log lacks %q:\n%s", want, logs)
 		}
 	}
 }
 
+// TestBuildRun_HungCleanupDeleteDoesNotStarveTheOther: the experiment delete
+// of a cleanup hangs; it is cut off by its own timeout, the rule delete is
+// still attempted on a fresh one, the build returns within the two timeouts,
+// and the error says the cleanup is incomplete.
+func TestBuildRun_HungCleanupDeleteDoesNotStarveTheOther(t *testing.T) {
+	f := newFakeLab(t, testNow)
+	f.fail("experiments.AttachPhaseWorkflows#2", errLeaky)
+	f.hang("experiments.Delete")
+	const timeout = 50 * time.Millisecond
+
+	start := time.Now()
+	_, err := buildRun(context.Background(), f.deps(), "demo-hang", testRunCap, timeout)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrBuild) || !errors.Is(err, ErrCleanupIncomplete) {
+		t.Fatalf("err = %v; want ErrBuild with ErrCleanupIncomplete", err)
+	}
+	// The failure came before the rule was attached, so its delete, on a
+	// fresh context of its own, succeeds although the first delete hung.
+	dels := f.callList("rules.Delete")
+	if len(dels) != 1 {
+		t.Fatalf("rules.Delete calls = %v; want it attempted after the hung experiment delete", dels)
+	}
+	if id := strings.TrimPrefix(dels[0], "rules.Delete "); f.rule(id) != nil {
+		t.Errorf("rule %s still there: its delete ran on the hung delete's expired context", id)
+	}
+	if elapsed > 2*timeout+500*time.Millisecond {
+		t.Errorf("build returned after %v; want within two cleanup timeouts", elapsed)
+	}
+	if len(f.experiments) != 1 {
+		t.Errorf("experiments = %d; want the planned one the hung delete left", len(f.experiments))
+	}
+}
+
 func TestBuildRun_RefusesBadInput(t *testing.T) {
-	f := newFakeLab(testNow)
+	f := newFakeLab(t, testNow)
 	if _, err := BuildRun(context.Background(), f.deps(), "", testRunCap); !errors.Is(err, ErrBuild) {
 		t.Errorf("empty run id: err = %v; want ErrBuild", err)
 	}
@@ -438,92 +556,175 @@ func assertNoLeak(t *testing.T, s string) {
 	}
 }
 
+// ctxSpyRules records the context each SetEnabled call ran on.
+type ctxSpyRules struct {
+	fakeRules
+	errAtCall      error
+	deadlineIn     time.Duration
+	hadDeadline    bool
+	setEnabledSeen bool
+}
+
+func (s *ctxSpyRules) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	s.setEnabledSeen = true
+	s.errAtCall = ctx.Err()
+	if dl, ok := ctx.Deadline(); ok {
+		s.hadDeadline, s.deadlineIn = true, time.Until(dl)
+	}
+	return s.fakeRules.SetEnabled(ctx, id, enabled)
+}
+
 func TestSetRuleEnabled(t *testing.T) {
-	newLabWithRule := func(t *testing.T) (*fakeLab, *model.Rule) {
+	// newLabWithRule builds a run, so its rule is attached to the fault phase.
+	newLabWithRule := func(t *testing.T) (*fakeLab, string) {
 		t.Helper()
-		f := newFakeLab(testNow)
+		f := newFakeLab(t, testNow)
 		built, err := BuildRun(context.Background(), f.deps(), "demo-sw", testRunCap)
 		if err != nil {
 			t.Fatalf("BuildRun: %v", err)
 		}
-		return f, f.rules[built.RuleID]
+		return f, built.RuleID
 	}
 
-	t.Run("on then off, everything else kept", func(t *testing.T) {
-		f, before := newLabWithRule(t)
-		r := fakeRules{f}
-		if err := SetRuleEnabled(context.Background(), r, before.ID, true); err != nil {
+	t.Run("on enables an attached demo rule, off disables it", func(t *testing.T) {
+		f, id := newLabWithRule(t)
+		before := f.rule(id)
+		if err := SetRuleEnabled(context.Background(), fakeRules{f}, id, true); err != nil {
 			t.Fatalf("enable: %v", err)
 		}
-		after := *f.rules[before.ID]
+		after := f.rule(id)
 		if !after.Enabled {
 			t.Fatalf("rule not enabled")
 		}
-		after.Enabled = false
 		if after.Name != before.Name || after.Service != before.Service || after.Priority != before.Priority ||
-			after.Mode != before.Mode || after.Action != before.Action {
+			after.Mode != before.Mode || after.Action != before.Action || len(after.Match.Labels) != 0 {
 			t.Errorf("enable changed more than the flag: %+v -> %+v", before, after)
 		}
-		if err := SetRuleEnabled(context.Background(), r, before.ID, false); err != nil {
+		if got := f.callList("rules.EnableIfAttached"); len(got) != 1 {
+			t.Errorf("EnableIfAttached calls = %v; want 1", got)
+		}
+		if err := SetRuleEnabled(context.Background(), fakeRules{f}, id, false); err != nil {
 			t.Fatalf("disable: %v", err)
 		}
-		if f.rules[before.ID].Enabled {
+		if f.rule(id).Enabled {
 			t.Errorf("rule still enabled")
 		}
-		if got := f.callList("rules.Update"); len(got) != 2 {
-			t.Errorf("updates = %v; want 2", got)
+	})
+
+	t.Run("off always writes and never reads first", func(t *testing.T) {
+		f, id := newLabWithRule(t)
+		for i := 0; i < 3; i++ { // the rule is already off every time
+			if err := SetRuleEnabled(context.Background(), fakeRules{f}, id, false); err != nil {
+				t.Fatalf("disable #%d: %v", i, err)
+			}
+		}
+		if got := f.callList("rules.SetEnabled"); len(got) != 3 {
+			t.Errorf("SetEnabled calls = %v; want one write per switch-off, even when already off", got)
+		}
+		if got := f.callList("rules.Get"); len(got) != 0 {
+			t.Errorf("switch-off read the rule first: %v", got)
 		}
 	})
 
-	t.Run("already in the wanted state writes nothing", func(t *testing.T) {
-		f, rule := newLabWithRule(t)
-		if err := SetRuleEnabled(context.Background(), fakeRules{f}, rule.ID, false); err != nil {
-			t.Fatalf("disable a disabled rule: %v", err)
+	t.Run("off on a cancelled context still writes, on its own deadline", func(t *testing.T) {
+		f, id := newLabWithRule(t)
+		if err := SetRuleEnabled(context.Background(), fakeRules{f}, id, true); err != nil {
+			t.Fatalf("enable: %v", err)
 		}
-		if got := f.callList("rules.Update"); len(got) != 0 {
-			t.Errorf("updates = %v; want none", got)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		spy := &ctxSpyRules{fakeRules: fakeRules{f}}
+		if err := SetRuleEnabled(ctx, spy, id, false); err != nil {
+			t.Fatalf("disable on a cancelled context: %v", err)
+		}
+		if f.rule(id).Enabled || f.served(id) {
+			t.Errorf("rule still enabled after a switch-off on a cancelled context")
+		}
+		if !spy.setEnabledSeen || spy.errAtCall != nil || !spy.hadDeadline ||
+			spy.deadlineIn <= 9*time.Second || spy.deadlineIn > 10*time.Second {
+			t.Errorf("switch-off context: seen %v, err %v, deadline %v in %v; want live, about 10 s",
+				spy.setEnabledSeen, spy.errAtCall, spy.hadDeadline, spy.deadlineIn)
 		}
 	})
 
-	t.Run("never enables a rule that is not a demo run's", func(t *testing.T) {
-		f, rule := newLabWithRule(t)
-		operator := *rule
-		operator.ID, operator.Name = "rule-operator", "smoke-x"
-		f.rules[operator.ID] = &operator
-		err := SetRuleEnabled(context.Background(), fakeRules{f}, operator.ID, true)
-		if !errors.Is(err, ErrNotDemoRule) {
-			t.Errorf("enable an operator rule: err = %v; want ErrNotDemoRule", err)
+	t.Run("off is never refused and a missing rule is success", func(t *testing.T) {
+		f, _ := newLabWithRule(t)
+		operator := &model.Rule{ID: "rule-operator", Name: "smoke-x", Service: TargetService, Enabled: true,
+			Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: f.specs[0].ID}}
+		if err := (fakeRules{f}).Create(context.Background(), operator); err != nil {
+			t.Fatal(err)
 		}
-		if got := f.callList("rules.Update"); len(got) != 0 || f.rules[operator.ID].Enabled {
-			t.Errorf("updates = %v; want none", got)
-		}
-
-		// Disabling is never refused: it can only stop a fault.
-		f.rules[operator.ID].Enabled = true
 		if err := SetRuleEnabled(context.Background(), fakeRules{f}, operator.ID, false); err != nil {
-			t.Errorf("disable an enabled operator rule: %v", err)
+			t.Errorf("disable an operator rule: %v", err)
 		}
-		if f.rules[operator.ID].Enabled {
+		if f.rule(operator.ID).Enabled {
 			t.Errorf("operator rule still enabled")
 		}
+		if err := SetRuleEnabled(context.Background(), fakeRules{f}, "rule-gone", false); err != nil {
+			t.Errorf("disable a missing rule: %v; want success", err)
+		}
 	})
 
-	t.Run("errors keep their class and drop their text", func(t *testing.T) {
-		f, rule := newLabWithRule(t)
+	t.Run("off failure keeps its class and drops its text", func(t *testing.T) {
+		f, id := newLabWithRule(t)
+		f.fail("rules.SetEnabled", errLeaky)
+		err := SetRuleEnabled(context.Background(), fakeRules{f}, id, false)
+		if !errors.Is(err, ErrRuleState) || !errors.Is(err, errLeaky) {
+			t.Fatalf("err = %v; want ErrRuleState wrapping the cause", err)
+		}
+		assertNoLeak(t, err.Error())
+	})
+
+	t.Run("on refuses an unattached rule and leaves it disabled", func(t *testing.T) {
+		f, _ := newLabWithRule(t)
+		loose := &model.Rule{ID: "rule-loose", Name: RunNamePrefix + "loose", Service: TargetService,
+			Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: f.specs[0].ID}}
+		if err := (fakeRules{f}).Create(context.Background(), loose); err != nil {
+			t.Fatal(err)
+		}
+		err := SetRuleEnabled(context.Background(), fakeRules{f}, loose.ID, true)
+		if !errors.Is(err, store.ErrRuleUnattached) || !errors.Is(err, ErrRuleState) {
+			t.Fatalf("err = %v; want store.ErrRuleUnattached", err)
+		}
+		if f.rule(loose.ID).Enabled || f.served(loose.ID) {
+			t.Errorf("unattached rule enabled or served")
+		}
+		assertNoLeak(t, err.Error())
+	})
+
+	t.Run("on refuses a rule with another name without a write", func(t *testing.T) {
+		f, id := newLabWithRule(t)
+		f.mu.Lock()
+		f.rules[id].Name = "smoke-x"
+		f.mu.Unlock()
+		err := SetRuleEnabled(context.Background(), fakeRules{f}, id, true)
+		if !errors.Is(err, ErrNotDemoRule) {
+			t.Errorf("err = %v; want ErrNotDemoRule", err)
+		}
+		if sw := switchCalls(f); len(sw) != 0 || f.rule(id).Enabled {
+			t.Errorf("switch calls = %v; want none", sw)
+		}
+	})
+
+	t.Run("on with a cancelled context enables nothing", func(t *testing.T) {
+		f, id := newLabWithRule(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := SetRuleEnabled(ctx, fakeRules{f}, id, true)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v; want context.Canceled", err)
+		}
+		if f.rule(id).Enabled {
+			t.Errorf("rule enabled on a cancelled context")
+		}
+	})
+
+	t.Run("on for a missing rule is not found", func(t *testing.T) {
+		f, _ := newLabWithRule(t)
 		err := SetRuleEnabled(context.Background(), fakeRules{f}, "rule-missing", true)
 		if !errors.Is(err, store.ErrNotFound) {
-			t.Errorf("missing rule: err = %v; want store.ErrNotFound", err)
+			t.Errorf("err = %v; want store.ErrNotFound", err)
 		}
 		assertNoLeak(t, err.Error())
-
-		f.fail("rules.Update", errLeaky)
-		err = SetRuleEnabled(context.Background(), fakeRules{f}, rule.ID, true)
-		if err == nil || !errors.Is(err, errLeaky) {
-			t.Fatalf("update failure: err = %v; want the cause wrapped", err)
-		}
-		assertNoLeak(t, err.Error())
-		if f.rules[rule.ID].Enabled {
-			t.Errorf("rule enabled although the update failed")
-		}
 	})
 }
