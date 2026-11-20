@@ -103,6 +103,30 @@ func (q *Queue) Snapshot() []Run {
 	return out
 }
 
+// check answers as Enqueue would for client now, short of adding a run and of
+// the capacity check: ErrQueueClosed, or ErrClientHasRun with the position of
+// the client's run, or nil.
+func (q *Queue) check(client string) (pos int, err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return 0, ErrQueueClosed
+	}
+	for i, e := range q.line {
+		if e.client == client {
+			return i, ErrClientHasRun
+		}
+	}
+	return 0, nil
+}
+
+// isClosed reports whether the queue was closed (Enqueue refuses).
+func (q *Queue) isClosed() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed
+}
+
 // closeLine closes the queue: Enqueue refuses from now on and next returns
 // false. Idempotent.
 func (q *Queue) closeLine() {

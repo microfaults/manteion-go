@@ -82,6 +82,7 @@ type fakeLab struct {
 	datasets    []zeus.Dataset
 	instances   []*model.SDKInstance
 	results     map[string][]*model.PhaseWorkflowResult // by phase id
+	promValues  map[string]float64                      // fakeMetrics.QueryInstant's answers, by query
 	// autopilot: each ListPhasesForExperiment of a running demo experiment
 	// answers, then moves the run one step on (see advanceLocked).
 	autopilot bool
@@ -118,8 +119,9 @@ func newFakeLab(t testing.TB, now time.Time) *fakeLab {
 		workflows:   map[string]bool{WorkflowID: true},
 		datasets: []zeus.Dataset{{ID: "ds-ok", Name: DatasetName, SizeBytes: 4096, TTLS: 0,
 			CreatedAt: now.Add(-time.Hour)}},
-		instances: []*model.SDKInstance{{ID: "inst-1", Service: TargetService, Status: "alive"}},
-		results:   map[string][]*model.PhaseWorkflowResult{},
+		instances:  []*model.SDKInstance{{ID: "inst-1", Service: TargetService, Status: "alive"}},
+		results:    map[string][]*model.PhaseWorkflowResult{},
+		promValues: map[string]float64{},
 	}
 	t.Cleanup(func() {
 		if !f.allowViols {
@@ -166,6 +168,8 @@ func (f *fakeLab) deps() Deps {
 		Workflows:   fakeWorkflows{f},
 		Zeus:        fakeZeus{f},
 		Instances:   fakeInstances{f},
+		Prom:        fakeMetrics{f},
+		DB:          fakePinger{f},
 		Clock:       f.clock,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -1102,6 +1106,40 @@ func (x fakeInstances) InstancesForService(ctx context.Context, service string) 
 		}
 	}
 	return out, after
+}
+
+// ---- Prometheus and the database ----
+
+// fakeMetrics stands in for *promql.Client. Healthy is "prom.Healthy" and
+// answers false on any injected error; QueryInstant is "prom.QueryInstant
+// <query>" and answers f.promValues[query] (0 when unset).
+type fakeMetrics struct{ f *fakeLab }
+
+func (x fakeMetrics) Healthy(ctx context.Context) bool {
+	after, err := x.f.begin(ctx, "prom.Healthy", "")
+	return err == nil && after == nil
+}
+
+func (x fakeMetrics) QueryInstant(ctx context.Context, query string) (float64, error) {
+	f := x.f
+	after, err := f.begin(ctx, "prom.QueryInstant", query)
+	if err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.promValues[query], after
+}
+
+// fakePinger stands in for *sql.DB: PingContext is "db.PingContext".
+type fakePinger struct{ f *fakeLab }
+
+func (x fakePinger) PingContext(ctx context.Context) error {
+	after, err := x.f.begin(ctx, "db.PingContext", "")
+	if err != nil {
+		return err
+	}
+	return after
 }
 
 // errLeaky is an injected cause whose text a client must never see: a driver
