@@ -528,23 +528,39 @@ func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.Experi
 // fault events and its exit bump wait for its terminal transition, which
 // Recover runs at start-up.
 func (r *ExperimentRepo) ListStrandedPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
+	return r.listPhasesOfEndedExperiments(ctx, "stranded", `p.status IN ('running','paused','draining')`)
+}
+
+// ListPendingPhasesOfEndedExperiments returns every phase still pending under
+// an experiment that has ended (completed, failed or cancelled), by id: what
+// a cancel or stop that stopped before skipping them leaves behind. Such a
+// phase never ran, so it has no load and no fault events; Recover skips it at
+// start-up as the cancel would have.
+func (r *ExperimentRepo) ListPendingPhasesOfEndedExperiments(ctx context.Context) ([]*model.ExperimentPhase, error) {
+	return r.listPhasesOfEndedExperiments(ctx, "pending", `p.status = 'pending'`)
+}
+
+// listPhasesOfEndedExperiments returns the phases matching phaseCond (a fixed
+// condition on p.status) under completed, failed or cancelled experiments, by
+// id; what names them in errors.
+func (r *ExperimentRepo) listPhasesOfEndedExperiments(ctx context.Context, what, phaseCond string) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT p.id, p.experiment_id, p.name, p.position, p.status, p.frozen_services,
 			p.persist_cache, p.started_at, p.completed_at, p.failure_reason
 		FROM experiment_phases p
 		JOIN experiments e ON e.id = p.experiment_id
-		WHERE p.status IN ('running','paused','draining')
+		WHERE `+phaseCond+`
 			AND e.status IN ('completed','failed','cancelled')
 		ORDER BY p.id`)
 	if err != nil {
-		return nil, fmt.Errorf("list stranded phases: %w", err)
+		return nil, fmt.Errorf("list %s phases of ended experiments: %w", what, err)
 	}
 	defer rows.Close()
 	var out []*model.ExperimentPhase
 	for rows.Next() {
 		p, err := scanPhaseRow(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan stranded phase: %w", err)
+			return nil, fmt.Errorf("scan %s phase of an ended experiment: %w", what, err)
 		}
 		out = append(out, p)
 	}
