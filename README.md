@@ -109,6 +109,7 @@ datasets pass through; attacks are orchestrator-managed, not proxied).
 | `CACHE_DIR` | `/var/cache/manteion` | NDJSON cache store root |
 | `MANTEION_CONVERGE_TIMEOUT` | `30s` | Convergence barrier: how long a phase entry or resume waits for every alive instance to observe its bump (and hold a frozen service's replay set committed) before failing; exit and drain wait as long and only log. Must be a positive duration of at most 1 h (startup refuses anything else). The HTTP write timeout is 2 × this + `MANTEION_DRAIN_TIMEOUT` + 30 s, so a stop that waits out a drain barrier and an exit wait still gets its answer |
 | `MANTEION_DRAIN_TIMEOUT` | `30s` | Drain-barrier wait before gap classification. Must be a positive duration of at most 1 h (startup refuses anything else) |
+| `MANTEION_POLL_INTERVAL` | `15s` | How often a running phase's poller asks zeus whether its runs and attacks have ended; the phase ends at the first tick after they have. Must be a positive duration of at most 1 m (startup refuses anything else) |
 | `MANTEION_ALLOW_DEGRADED_BASELINE` | `false` | Permit isolation phases over a degraded baseline recording |
 | `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop |
 | `MANTEION_SDK_PURGE_ENABLED` | `false` | Dead-instance purge sweep |

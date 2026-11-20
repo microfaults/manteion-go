@@ -76,6 +76,39 @@ func TestBarrierTimeouts(t *testing.T) {
 	}
 }
 
+// MANTEION_POLL_INTERVAL sets how often the orchestrator asks zeus whether a
+// phase's load has ended. Unset keeps the poller's own 15 s; zero would spin
+// (and panics time.NewTicker), a typo would silently run on the default, and a
+// value above a minute would leave a phase running long after its load ended.
+func TestPollIntervalEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name, val string
+		want      time.Duration
+		wantErr   string
+	}{
+		{name: "unset: the poller's default", want: 15 * time.Second},
+		{name: "the lab's 2s", val: "2s", want: 2 * time.Second},
+		{name: "at the bound", val: "1m", want: time.Minute},
+		{name: "zero", val: "0s", wantErr: "MANTEION_POLL_INTERVAL=\"0s\" must be positive"},
+		{name: "negative", val: "-2s", wantErr: "MANTEION_POLL_INTERVAL=\"-2s\" must be positive"},
+		{name: "not a duration", val: "abc", wantErr: "MANTEION_POLL_INTERVAL=\"abc\" is not a duration"},
+		{name: "above the bound", val: "2m", wantErr: "MANTEION_POLL_INTERVAL=\"2m\" must be at most 1m0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MANTEION_POLL_INTERVAL", tc.val)
+			got, err := pollIntervalEnv()
+			switch {
+			case tc.wantErr != "":
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("err = %v, want one containing %q", err, tc.wantErr)
+				}
+			case err != nil || got != tc.want:
+				t.Errorf("= %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
 // The HTTP server's write deadline must outlast what a stop can wait out
 // before it answers: the drain barrier's convergence wait and report gate,
 // then the exit bump's convergence wait. Otherwise a stop that succeeded has

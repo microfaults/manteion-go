@@ -62,6 +62,13 @@ func main() {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
+	// How often a running phase's poller asks zeus whether its load has ended
+	// (pollIntervalEnv; set on the orchestrator below).
+	pollInterval, err := pollIntervalEnv()
+	if err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
 
 	// Connect to PostgreSQL and run migrations.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -115,6 +122,9 @@ func main() {
 	}
 	phaseFaultEventRepo := store.NewPhaseFaultEventRepo(database)
 	orch := orchestrator.New(experimentRepo, ruleRepo, faultRepo, workloadRepo, workflowRepo, controller, promClient, zeusClient, cs, phaseFaultEventRepo, artifactRepo, gens, logger)
+	// MANTEION_POLL_INTERVAL: the zeus poll tick. A phase ends at the first
+	// tick after zeus reports its load done, so the tick bounds that lag.
+	orch.WithPollInterval(pollInterval)
 	// Convergence barrier (desired-state contract §4): a phase entry or resume
 	// bumps its services and waits up to MANTEION_CONVERGE_TIMEOUT for every
 	// alive instance to observe the bump (and, on a frozen service, to hold the
@@ -322,6 +332,24 @@ func barrierTimeouts() (converge, drain time.Duration, err error) {
 		return 0, 0, err
 	}
 	return converge, drain, nil
+}
+
+// defaultPollInterval is the orchestrator's own zeus poll tick
+// (defaultZeusPollInterval in internal/orchestrator/poller.go), so leaving
+// MANTEION_POLL_INTERVAL unset changes nothing. Keep the two equal.
+const defaultPollInterval = 15 * time.Second
+
+// maxPollInterval caps MANTEION_POLL_INTERVAL: a phase ends only at the first
+// tick after zeus reports its load done, so a longer tick leaves the phase (and
+// its fault) running that much longer with no load behind it.
+const maxPollInterval = time.Minute
+
+// pollIntervalEnv reads MANTEION_POLL_INTERVAL, how often a running phase's
+// poller asks zeus for the state of its load drivers: defaultPollInterval when
+// unset, otherwise a positive duration of at most maxPollInterval. Zero would
+// panic the poller's ticker, and a typo would silently run on the default.
+func pollIntervalEnv() (time.Duration, error) {
+	return boundedDurationEnv("MANTEION_POLL_INTERVAL", defaultPollInterval, maxPollInterval)
 }
 
 // boundedDurationEnv is positiveDurationEnv with an upper limit: a value above
