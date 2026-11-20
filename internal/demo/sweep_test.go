@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -142,6 +143,17 @@ func requireRemovedInOrder(t *testing.T, f *fakeLab, s seeded) {
 		t.Errorf("run %s: switch-off at %d, experiment delete at %d, rule delete at %d; want off < experiment < rule",
 			s.runID, off, delExp, delRule)
 	}
+	// The guard read every phase's links between the switch-off and the delete.
+	for _, pid := range s.PhaseIDs {
+		if pid == "" {
+			continue
+		}
+		at := slices.Index(calls, "experiments.ListPhaseRules "+pid)
+		if at < 0 || at < off || at > delExp {
+			t.Errorf("run %s: phase %s's links read at %d; want between the switch-off (%d) and the delete (%d)",
+				s.runID, pid, at, off, delExp)
+		}
+	}
 }
 
 // requireKept checks that a run's experiment and rule are still there.
@@ -160,7 +172,7 @@ func requireKept(t *testing.T, f *fakeLab, s seeded) {
 }
 
 // quickTidy are short deadlines for tests of hung calls.
-var quickTidy = tidyTimeouts{call: 40 * time.Millisecond, cancel: 40 * time.Millisecond}
+var quickTidy = tidyTimeouts{call: 40 * time.Millisecond, off: 40 * time.Millisecond, offAll: 100 * time.Millisecond, cancel: 40 * time.Millisecond}
 
 // ---- the start-up sweep ----
 
@@ -658,28 +670,43 @@ func TestRetain_RefusedRuleDeleteRetried(t *testing.T) {
 		addExperiment(t, f, "exp-op", "op", "lab-smoke", "completed", testNow)
 		addPhase(t, f, "phase-op", "exp-op", 0, "completed", old.RuleID)
 
-		err := Retain(context.Background(), f.deps(), 1)
-		if !errors.Is(err, ErrRetainIncomplete) || !strings.Contains(err.Error(), "delete_rule") {
-			t.Fatalf("Retain: %v; want incomplete at delete_rule", err)
+		// The refusal is explained (a phase of another experiment links the
+		// rule): no failure, one Warn per pass, no Error.
+		logs := &syncBuffer{}
+		d := f.deps()
+		d.Logger = slog.New(slog.NewTextHandler(logs, nil))
+		warned := func() int { return strings.Count(logs.String(), "a phase of another experiment still links them") }
+
+		if err := Retain(context.Background(), d, 1); err != nil {
+			t.Fatalf("Retain: %v; want no failure for a rule a phase still links", err)
 		}
-		assertNoLeak(t, err.Error())
 		if f.hasExperiment(old.ExperimentID) {
 			t.Error("the old run's experiment was kept")
 		}
 		if r := f.rule(old.RuleID); r == nil || r.Enabled || f.served(old.RuleID) {
 			t.Fatalf("rule %+v (served %v); want kept, off", r, f.served(old.RuleID))
 		}
-		if err := Retain(context.Background(), f.deps(), 1); !errors.Is(err, ErrRetainIncomplete) {
-			t.Fatalf("Retain while still linked: %v; want incomplete", err)
+		if n := warned(); n != 1 || strings.Contains(logs.String(), "level=ERROR") ||
+			!strings.Contains(logs.String(), old.RuleID) {
+			t.Errorf("after one pass: %d Warn lines naming the rule, logs:\n%s\nwant one Warn, no Error", n, logs)
+		}
+		if err := Retain(context.Background(), d, 1); err != nil {
+			t.Fatalf("Retain while still linked: %v", err)
+		}
+		if n := warned(); n != 2 || strings.Contains(logs.String(), "level=ERROR") {
+			t.Errorf("after two passes: %d Warn lines; want 2, no Error", n)
 		}
 		if err := (fakeExperiments{f}).Delete(context.Background(), "exp-op"); err != nil {
 			t.Fatal(err)
 		}
-		if err := Retain(context.Background(), f.deps(), 1); err != nil {
+		if err := Retain(context.Background(), d, 1); err != nil {
 			t.Fatalf("Retain once unlinked: %v", err)
 		}
 		if f.hasRule(old.RuleID) {
 			t.Error("the rule was not deleted on the next pass")
+		}
+		if n := warned(); n != 2 {
+			t.Errorf("%d Warn lines after the rule went; want still 2", n)
 		}
 	})
 
@@ -856,6 +883,34 @@ func TestWorkerRetain_SparesTheRunInProgress(t *testing.T) {
 		requireKept(t, f, current)
 		if st := f.experimentStatus(current.ExperimentID); st != "planned" {
 			t.Errorf("the run in progress's experiment is %s; want planned", st)
+		}
+	})
+
+	t.Run("an ended run whose switch-off is pending, beyond keep", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		cfg := workerConfig()
+		cfg.Retain = 1
+		pending := seed(t, f, "completed", true)
+		other := seed(t, f, "completed", false)
+		seed(t, f, "completed", false)
+		w := retainWorker(f, cfg, "", "")
+		w.mu.Lock()
+		w.pending = &active{runID: pending.runID, expID: pending.ExperimentID}
+		w.mu.Unlock()
+		if err := w.Retain(context.Background()); err != nil {
+			t.Fatalf("Retain: %v", err)
+		}
+		requireKept(t, f, pending)
+		for _, c := range callsFor(f, pending.RuleID) {
+			if strings.HasPrefix(c, "rules.SetEnabled") {
+				t.Errorf("the pending run's rule was written to: %q (its switch is the worker's)", c)
+			}
+		}
+		requireRemovedInOrder(t, f, other)
+		// The pending rule is on, under a finished experiment: off by hand.
+		if err := (fakeRules{f}).SetEnabled(context.Background(), pending.RuleID, false); err != nil {
+			t.Fatal(err)
 		}
 	})
 
@@ -1165,4 +1220,373 @@ func TestWorker_ShutdownIsSafeAnyTime(t *testing.T) {
 			t.Errorf("Shutdown after Run took %s", took)
 		}
 	})
+}
+
+// ---- fix round 1: the guard, the start-up switch-off, the sweep's deadline ----
+
+// TestRetain_ForeignRuleKeepsExperiment: an operator linked their own rule to
+// a phase of a finished demo experiment and switched it on. Retention must not
+// delete that experiment (the delete would cascade the link away and leave the
+// rule served to every instance, for ever): it keeps it, with its run's own
+// rule switched off, logs the ids at Error and says the pass is incomplete,
+// on every pass. The foreign rule is never served: the fake's invariant
+// watches it after every write, and the test checks it before every write.
+func TestRetain_ForeignRuleKeepsExperiment(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFakeLab(t, testNow)
+	old := seed(t, f, "completed", true)
+	newer := seed(t, f, "completed", false)
+	addRule(t, f, "rule-foreign", "op-latency", false)
+	f.watchRule("rule-foreign")
+	if err := (fakeExperiments{f}).AttachPhaseRules(ctx, old.PhaseIDs[0], []string{"rule-foreign"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (fakeRules{f}).SetEnabled(ctx, "rule-foreign", true); err != nil {
+		t.Fatal(err)
+	}
+	var servedAtWrite atomic.Int32
+	for _, op := range []string{"rules.SetEnabled", "rules.Delete", "experiments.Delete"} {
+		f.onCall(op, func() {
+			if f.served("rule-foreign") {
+				servedAtWrite.Add(1)
+			}
+		})
+	}
+	logs := &syncBuffer{}
+	d := f.deps()
+	d.Logger = slog.New(slog.NewTextHandler(logs, nil))
+
+	for pass := 1; pass <= 2; pass++ {
+		err := Retain(ctx, d, 1)
+		if !errors.Is(err, ErrRetainIncomplete) || !errors.Is(err, errForeignRule) ||
+			!strings.Contains(err.Error(), "foreign_rule_linked") {
+			t.Fatalf("pass %d: %v; want incomplete at foreign_rule_linked", pass, err)
+		}
+		assertNoLeak(t, err.Error())
+		if !f.hasExperiment(old.ExperimentID) || !f.hasRule(old.RuleID) {
+			t.Fatalf("pass %d: the experiment carrying a foreign rule, or its run's rule, was deleted", pass)
+		}
+		if r := f.rule(old.RuleID); r.Enabled {
+			t.Errorf("pass %d: the run's own rule is still on", pass)
+		}
+		if r := f.rule("rule-foreign"); r == nil || !r.Enabled {
+			t.Errorf("pass %d: the foreign rule was touched: %+v", pass, r)
+		}
+		if f.served("rule-foreign") {
+			t.Errorf("pass %d: the foreign rule is served", pass)
+		}
+	}
+	if n := servedAtWrite.Load(); n != 0 {
+		t.Errorf("the foreign rule was served at %d writes", n)
+	}
+	if c := callsFor(f, old.ExperimentID); slices.Contains(c, "experiments.Delete "+old.ExperimentID) {
+		t.Errorf("the experiment's delete was attempted: %v", c)
+	}
+	for _, c := range callsFor(f, "rule-foreign") {
+		if strings.HasPrefix(c, "rules.") && c != "rules.SetEnabled rule-foreign true" { // the test's own switch-on
+			t.Errorf("the foreign rule was written to: %q", c)
+		}
+	}
+	line := ""
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "foreign_rule_linked") {
+			line = l
+			break
+		}
+	}
+	if !strings.Contains(line, "level=ERROR") || !strings.Contains(line, old.ExperimentID) ||
+		!strings.Contains(line, "rule-foreign") || !strings.Contains(line, old.PhaseIDs[0]) {
+		t.Errorf("the refusal's log line %q; want an Error naming the experiment, the rule and the phase", line)
+	}
+	requireKept(t, f, newer)
+}
+
+// TestRetain_PhaseLinkReadFailureKeepsExperiment: when the phases or a
+// phase's links cannot be read, the guard fails closed: the experiment is
+// kept (its rule off) and the pass is incomplete; the next pass, with reads
+// working, deletes it in the usual order.
+func TestRetain_PhaseLinkReadFailureKeepsExperiment(t *testing.T) {
+	t.Parallel()
+	for _, op := range []string{"experiments.ListPhasesForExperiment", "experiments.ListPhaseRules"} {
+		t.Run(op, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeLab(t, testNow)
+			old := seed(t, f, "completed", true)
+			seed(t, f, "completed", false)
+			f.fail(op, errLeaky)
+			err := Retain(context.Background(), f.deps(), 1)
+			if !errors.Is(err, ErrRetainIncomplete) || !errors.Is(err, errLeaky) ||
+				!strings.Contains(err.Error(), "read_phase_links") {
+				t.Fatalf("Retain: %v; want incomplete at read_phase_links", err)
+			}
+			assertNoLeak(t, err.Error())
+			if !f.hasExperiment(old.ExperimentID) || len(f.callList("experiments.Delete")) != 0 {
+				t.Fatal("the experiment was deleted although its links could not be read")
+			}
+			if r := f.rule(old.RuleID); r == nil || r.Enabled {
+				t.Errorf("rule %+v; want kept, off", r)
+			}
+			f.uninject(op)
+			if err := Retain(context.Background(), f.deps(), 1); err != nil {
+				t.Fatalf("second Retain: %v", err)
+			}
+			requireRemovedInOrder(t, f, old)
+		})
+	}
+}
+
+// TestSwitchOffAll: the start-up switch-off switches every enabled demo-run-*
+// rule off and does nothing else: no listing of experiments, no cancel, no
+// delete; it is detached from the caller, bounded as a whole, and says when
+// it is incomplete.
+func TestSwitchOffAll(t *testing.T) {
+	t.Parallel()
+
+	t.Run("switches off, touches nothing else", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		runs := []seeded{seed(t, f, "planned", true), seed(t, f, "running", true), seed(t, f, "completed", true),
+			seed(t, f, "cancelled", false)}
+		addRule(t, f, "rule-smoke", "smoke-x", true)
+		addRule(t, f, "rule-lone", RunNamePrefix+id.New(RunIDPrefix), false)
+		mark := len(f.callList(""))
+		if err := SwitchOffAll(context.Background(), f.deps()); err != nil {
+			t.Fatalf("SwitchOffAll: %v", err)
+		}
+		f.requireDemoRulesOff(t)
+		for _, c := range f.callList("")[mark:] {
+			if c != "rules.List " && !strings.HasPrefix(c, "rules.SetEnabled ") || strings.HasSuffix(c, " true") {
+				t.Errorf("SwitchOffAll made %q; want only the rule list and switch-offs", c)
+			}
+		}
+		if n := len(f.callList("rules.SetEnabled ")); n != 3 {
+			t.Errorf("%d switch-offs; want one per enabled demo rule (3)", n)
+		}
+		if r := f.rule("rule-smoke"); r == nil || !r.Enabled {
+			t.Error("the operator's rule was switched off")
+		}
+		for i, want := range []string{"planned", "running", "completed", "cancelled"} {
+			if st := f.experimentStatus(runs[i].ExperimentID); st != want {
+				t.Errorf("run %d: experiment %s; want %s, untouched", i, st, want)
+			}
+		}
+		if !f.hasRule("rule-lone") {
+			t.Error("SwitchOffAll deleted a rule")
+		}
+	})
+
+	t.Run("detached from the caller", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		seed(t, f, "running", true)
+		seed(t, f, "planned", true)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // the caller gave up: the switch-off still happens
+		if err := SwitchOffAll(ctx, f.deps()); err != nil {
+			t.Fatalf("SwitchOffAll on a cancelled context: %v", err)
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("incomplete when the listing or a switch-off fails", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		a, b := seed(t, f, "running", true), seed(t, f, "running", true)
+		f.fail("rules.List", errLeaky)
+		err := SwitchOffAll(context.Background(), f.deps())
+		if !errors.Is(err, ErrSwitchOffIncomplete) || !errors.Is(err, errLeaky) {
+			t.Fatalf("listing fails: %v; want ErrSwitchOffIncomplete", err)
+		}
+		assertNoLeak(t, err.Error())
+		f.uninject("rules.List")
+		d := f.deps()
+		d.Rules = failRuleOff{fakeRules{f}, a.RuleID}
+		err = SwitchOffAll(context.Background(), d)
+		if !errors.Is(err, ErrSwitchOffIncomplete) || !errors.Is(err, ErrRuleState) {
+			t.Fatalf("one switch-off fails: %v; want ErrSwitchOffIncomplete, ErrRuleState", err)
+		}
+		if r := f.rule(b.RuleID); r.Enabled {
+			t.Error("the other rule was not switched off")
+		}
+		if err := SwitchOffAll(context.Background(), f.deps()); err != nil {
+			t.Fatalf("once it works: %v", err)
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("bounded as a whole", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		for i := 0; i < 6; i++ {
+			seed(t, f, "running", true)
+		}
+		f.hang("rules.SetEnabled")
+		lim := tidyTimeouts{call: time.Second, off: 100 * time.Millisecond, offAll: 250 * time.Millisecond, cancel: time.Second}
+		tid := newTidier(f.deps(), ErrSwitchOffIncomplete, lim)
+		began := time.Now()
+		tid.switchOffAll(context.Background())
+		err := tid.result()
+		took := time.Since(began)
+		if took > 450*time.Millisecond {
+			t.Errorf("took %s; want about the 250 ms bound, not 6 x 100 ms", took)
+		}
+		if n := len(f.callList("rules.SetEnabled ")); n >= 6 {
+			t.Errorf("%d switch-offs started; want the bound to stop them", n)
+		}
+		if !errors.Is(err, ErrSwitchOffIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("result: %v; want incomplete, deadline exceeded", err)
+		}
+		f.uninject("rules.SetEnabled")
+		if err := SwitchOffAll(context.Background(), f.deps()); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestSweep_HonoursDeadline: six running demo experiments whose cancels each
+// wait (on a lock that ignores contexts) past their own bound. The sweep stops
+// starting cancels once its context's deadline passes and returns then,
+// incomplete, with every rule already off: the deadline, not 6 x the cancel
+// bound, is what bounds it.
+func TestSweep_HonoursDeadline(t *testing.T) {
+	t.Parallel()
+	f := newFakeLab(t, testNow)
+	for i := 0; i < 6; i++ {
+		seed(t, f, "running", true)
+	}
+	release := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	defer time.AfterFunc(3*time.Second, free).Stop()
+	var inCall, returned atomic.Int32
+	f.onCall("orch.CancelExperiment", func() {
+		inCall.Add(1)
+		<-release
+		returned.Add(1)
+	})
+	lim := tidyTimeouts{call: time.Second, off: time.Second, offAll: time.Second, cancel: 100 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	err := newTidier(f.deps(), ErrSweepIncomplete, lim).sweep(ctx, 20)
+	took := time.Since(began)
+	if took > 600*time.Millisecond {
+		t.Errorf("sweep took %s with a 250 ms deadline", took)
+	}
+	if n := len(f.callList("orch.CancelExperiment ")); n >= 6 {
+		t.Errorf("%d cancels started; want none after the deadline", n)
+	}
+	if !errors.Is(err, ErrSweepIncomplete) || !errors.Is(err, context.DeadlineExceeded) ||
+		!strings.Contains(err.Error(), "out_of_time") {
+		t.Fatalf("sweep: %v; want incomplete, out of time", err)
+	}
+	f.requireDemoRulesOff(t)
+	free()
+	// Each orchestrator call ends once it gets past the lock; nothing waits on.
+	waitFor(t, "the stuck cancels to return", func() bool { return returned.Load() == inCall.Load() })
+}
+
+// TestWorkerRetain_WhileSwitchOffPending: OnRunEnded runs before the worker
+// waits for a failed switch-off, so the worker's Retain runs while the ended
+// run's rule may still be on. It deletes the older runs beyond keep in the
+// usual order and leaves the pending run alone: its experiment (the newest
+// finished one) is kept and its rule is neither written nor deleted by the
+// pass. Shutdown then switches it off.
+func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
+	t.Parallel()
+	x := newHarness(t, func(c *Config) { noCap(c); c.Retain = 1 })
+	x.w.offRetry = backoff{first: time.Hour, max: time.Hour} // stays pending until Shutdown
+	older := []seeded{seed(t, x.f, "completed", true), seed(t, x.f, "completed", false)}
+	passes := make(chan error, 4)
+	var pendingAtPass atomic.Bool
+	x.w.OnRunEnded = func(ctx context.Context) {
+		pendingAtPass.Store(x.w.SwitchOffPending())
+		passes <- x.w.Retain(ctx)
+	}
+	x.f.fail("rules.SetEnabled#1", errLeaky) // the run's own first switch-off
+	x.f.mu.Lock()
+	x.f.autopilot = true
+	x.f.mu.Unlock()
+	r, ch := x.enqueue("a")
+	x.start()
+	_, end := awaitEnd(t, ch)
+	requireEnded(t, end, RunCompleted, Reason{})
+	if err := <-passes; err != nil {
+		t.Fatalf("the pass: %v", err)
+	}
+	if !pendingAtPass.Load() {
+		t.Fatal("precondition: the switch-off was not pending during the pass")
+	}
+	rule, exp := x.f.ruleIDOfRun(r.RunID), x.expID(r.RunID)
+	if rr := x.f.rule(rule); rr == nil || !rr.Enabled {
+		t.Fatalf("precondition: the pending run's rule %+v; want still on", rr)
+	}
+	if st := x.f.experimentStatus(exp); st != "completed" {
+		t.Errorf("the pending run's experiment is %q; want completed, kept", st)
+	}
+	var writes []string
+	for _, c := range callsFor(x.f, rule) {
+		if strings.HasPrefix(c, "rules.SetEnabled ") || strings.HasPrefix(c, "rules.Delete ") {
+			writes = append(writes, c)
+		}
+	}
+	if !slices.Equal(writes, []string{"rules.SetEnabled " + rule + " false"}) {
+		t.Errorf("writes to the pending run's rule %v; want only the worker's one failed switch-off", writes)
+	}
+	for _, s := range older {
+		requireRemovedInOrder(t, x.f, s)
+	}
+	if !x.w.SwitchOffPending() {
+		t.Error("the switch-off is no longer pending")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := x.w.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	x.f.requireDemoRulesOff(t)
+}
+
+// TestSweep_FailedSwitchOffLoggedOnce: a failed switch-off is logged once per
+// attempt, through the pass's logger, and not again through slog's default.
+// Not parallel: it swaps slog's default logger.
+func TestSweep_FailedSwitchOffLoggedOnce(t *testing.T) {
+	def := &syncBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(def, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	f := newFakeLab(t, testNow)
+	s := seed(t, f, "running", true)
+	logs := &syncBuffer{}
+	d := f.deps()
+	d.Logger = slog.New(slog.NewTextHandler(logs, nil))
+	d.Rules = failRuleOff{fakeRules{f}, s.RuleID}
+	if err := Sweep(context.Background(), d, 20); !errors.Is(err, ErrRuleState) {
+		t.Fatalf("Sweep: %v; want the rule-state failure", err)
+	}
+	attempts := len(f.callList("rules.SetEnabled " + s.RuleID + " false (refused)"))
+	lines := 0
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "level=ERROR") && strings.Contains(l, "rule_id="+s.RuleID) {
+			lines++
+		}
+	}
+	if attempts == 0 || lines != attempts {
+		t.Errorf("%d failed attempts, %d Error lines naming the rule; want one line per attempt", attempts, lines)
+	}
+
+	// The worker's switch goes through the same unlogged write.
+	sw := newRuleSwitch(failRuleOff{fakeRules{f}, s.RuleID}, d.Logger)
+	sw.attach(context.Background(), s.RuleID)
+	if err := sw.off(context.Background()); !errors.Is(err, ErrRuleState) {
+		t.Fatalf("ruleSwitch.off: %v; want the failure", err)
+	}
+	if strings.Contains(def.String(), s.RuleID) {
+		t.Errorf("a failed switch-off was also logged through slog.Default:\n%s", def)
+	}
+	if err := (fakeRules{f}).SetEnabled(context.Background(), s.RuleID, false); err != nil {
+		t.Fatal(err)
+	}
 }

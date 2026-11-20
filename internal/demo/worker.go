@@ -1214,7 +1214,8 @@ func (s *ruleSwitch) off(ctx context.Context) error {
 	}
 	s.write.Lock()
 	defer s.write.Unlock()
-	if err := SetRuleEnabled(ctx, s.rules, ruleID, false); err != nil {
+	// Not SetRuleEnabled: every caller of off logs its failure, once.
+	if err := setRuleEnabled(ctx, s.rules, ruleID, false); err != nil {
 		return err
 	}
 	s.confirm.Do(func() { close(s.confirmed) })

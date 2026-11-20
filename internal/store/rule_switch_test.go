@@ -127,6 +127,30 @@ func TestRuleRepo_SetEnabled(t *testing.T) {
 	})
 }
 
+// TestRuleRepo_DeleteLinkedRuleIsInUse: a rule a phase still links is not
+// deleted, and the refusal is ErrInUse (so a caller can tell it from a failed
+// database by type); once the phase is gone the delete succeeds.
+func TestRuleRepo_DeleteLinkedRuleIsInUse(t *testing.T) {
+	ctx := context.Background()
+	f := newSwitchFixture(t, false, true)
+	err := testRuleRepo.Delete(ctx, f.rule.ID)
+	if !errors.Is(err, ErrInUse) || errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete of a linked rule: %v; want ErrInUse only", err)
+	}
+	if _, err := testRuleRepo.Get(ctx, f.rule.ID); err != nil {
+		t.Fatalf("the refused rule is gone: %v", err)
+	}
+	if _, err := testDB.ExecContext(ctx, `DELETE FROM experiments WHERE id = $1`, f.phase.ExperimentID); err != nil {
+		t.Fatalf("delete experiment: %v", err)
+	}
+	if err := testRuleRepo.Delete(ctx, f.rule.ID); err != nil {
+		t.Fatalf("delete once unlinked: %v", err)
+	}
+	if err := testRuleRepo.Delete(ctx, f.rule.ID); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrInUse) {
+		t.Errorf("delete of a missing rule: %v; want ErrNotFound only", err)
+	}
+}
+
 // TestRuleRepo_EnableIfAttached pins the guarded switch-on: a rule is enabled
 // only while a phase links it, in the same statement, so the switch can never
 // leave an enabled rule attached to no phase.

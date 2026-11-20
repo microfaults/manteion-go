@@ -420,14 +420,11 @@ func SetRuleEnabled(ctx context.Context, r Rules, ruleID string, on bool) error 
 	return err
 }
 
+// setRuleEnabled is SetRuleEnabled without its log line, for callers that log
+// the failure themselves.
 func setRuleEnabled(ctx context.Context, r Rules, ruleID string, on bool) error {
 	if !on {
-		octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), switchOffTimeout)
-		defer cancel()
-		if err := r.SetEnabled(octx, ruleID, false); err != nil && !errors.Is(err, store.ErrNotFound) {
-			return &StepError{Step: "disable_rule", Class: ErrRuleState, Cause: err}
-		}
-		return nil
+		return switchOffRule(ctx, r, ruleID, switchOffTimeout)
 	}
 	rule, err := r.Get(ctx, ruleID)
 	if err != nil {
@@ -438,6 +435,19 @@ func setRuleEnabled(ctx context.Context, r Rules, ruleID string, on bool) error 
 	}
 	if err := r.EnableIfAttached(ctx, ruleID); err != nil {
 		return &StepError{Step: "enable_rule", Class: classFor(ctx, ErrRuleState), Cause: err}
+	}
+	return nil
+}
+
+// switchOffRule is SetRuleEnabled's switch-off with timeout in place of its
+// 10 s, and no log line: one unconditional Rules.SetEnabled(false) on a
+// context detached from ctx and bounded by timeout; a rule that no longer
+// exists is success.
+func switchOffRule(ctx context.Context, r Rules, ruleID string, timeout time.Duration) error {
+	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	if err := r.SetEnabled(octx, ruleID, false); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return &StepError{Step: "disable_rule", Class: ErrRuleState, Cause: err}
 	}
 	return nil
 }

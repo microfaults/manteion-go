@@ -188,7 +188,9 @@ func (r *RuleRepo) Update(ctx context.Context, rule *model.Rule) error {
 }
 
 // Delete removes a rule by ID and bumps the rule version and the generation of
-// the service the rule belonged to.
+// the service the rule belonged to. ErrNotFound when no rule has the id;
+// ErrInUse when a phase still links the rule (phase_rules.rule_id is
+// RESTRICT), the rule then left as it was.
 func (r *RuleRepo) Delete(ctx context.Context, id string) error {
 	var svc string
 	var gen uint64
@@ -196,6 +198,9 @@ func (r *RuleRepo) Delete(ctx context.Context, id string) error {
 		err := tx.QueryRowContext(ctx, `DELETE FROM rules WHERE id = $1 RETURNING service`, id).Scan(&svc)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
+		}
+		if isFKViolation(err) {
+			return fmt.Errorf("delete rule: a phase still links it: %w (%w)", ErrInUse, err)
 		}
 		if err != nil {
 			return fmt.Errorf("delete rule: %w", err)

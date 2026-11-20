@@ -172,7 +172,7 @@ func TestFakeLab_ServingMatchesStore_DB(t *testing.T) {
 	}
 	sameErr := func(what string, real, fake error) {
 		t.Helper()
-		for _, target := range []error{nil, store.ErrNotFound, store.ErrRuleUnattached} {
+		for _, target := range []error{nil, store.ErrNotFound, store.ErrRuleUnattached, store.ErrInUse} {
 			if (target == nil && (real == nil) != (fake == nil)) ||
 				(target != nil && errors.Is(real, target) != errors.Is(fake, target)) {
 				t.Errorf("%s: store %v, fake %v", what, real, fake)

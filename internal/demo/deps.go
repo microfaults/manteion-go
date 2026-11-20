@@ -56,6 +56,9 @@ type Experiments interface {
 	ListWorkflowResultsForPhase(ctx context.Context, phaseID string) ([]*model.PhaseWorkflowResult, error)
 	RunningExperimentIDs(ctx context.Context) ([]string, error)
 	List(ctx context.Context, f store.ExperimentFilter, p store.Page) ([]*model.Experiment, int, error)
+	// ListPhaseRules lists the rules a phase links, so retention can refuse to
+	// delete an experiment that carries a rule other than its run's own.
+	ListPhaseRules(ctx context.Context, phaseID string) ([]model.PhaseRule, error)
 	Delete(ctx context.Context, id string) error
 	TransitionExperiment(ctx context.Context, id, to string, from ...string) (bool, error)
 }

@@ -68,6 +68,7 @@ type fakeLab struct {
 	counts     map[string]int
 	viols      []string
 	allowViols bool
+	watched    map[string]bool // more rules the invariant covers (watchRule)
 
 	clock       *fakeClock
 	experiments map[string]*model.Experiment
@@ -227,11 +228,12 @@ func (f *fakeLab) begin(ctx context.Context, op, arg string) (after, err error) 
 
 // ---- invariant, serving and inspection ----
 
-// checkLocked records a violation for every demo-run-* rule that is enabled
-// and attached to no phase. Called with f.mu held after each mutation.
+// checkLocked records a violation for every demo-run-* rule, and every rule a
+// test watches (watchRule), that is enabled and attached to no phase. Called
+// with f.mu held after each mutation.
 func (f *fakeLab) checkLocked(op string) {
 	for id, r := range f.rules {
-		if r.Enabled && strings.HasPrefix(r.Name, RunNamePrefix) && !f.attachedLocked(id) {
+		if r.Enabled && (strings.HasPrefix(r.Name, RunNamePrefix) || f.watched[id]) && !f.attachedLocked(id) {
 			f.viols = append(f.viols,
 				fmt.Sprintf("after %s: rule %s (%s) is enabled and attached to no phase", op, id, r.Name))
 		}
@@ -408,6 +410,17 @@ func (f *fakeLab) demoRuleIDs() []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// watchRule makes the invariant cover rule id too, whatever its name: for a
+// test whose operator rule must never end up enabled and attached to nothing.
+func (f *fakeLab) watchRule(id string) {
+	f.mu.Lock()
+	if f.watched == nil {
+		f.watched = map[string]bool{}
+	}
+	f.watched[id] = true
+	f.mu.Unlock()
 }
 
 // expectViolations stops the cleanup check, for a test that breaks the
@@ -738,6 +751,23 @@ func (x fakeExperiments) List(ctx context.Context, flt store.ExperimentFilter, p
 	return match[p.Offset:end], len(match), after
 }
 
+// ListPhaseRules mirrors ExperimentRepo.ListPhaseRules: the phase's links in
+// position order; a phase with none, or no such phase, is an empty list.
+func (x fakeExperiments) ListPhaseRules(ctx context.Context, phaseID string) ([]model.PhaseRule, error) {
+	f := x.f
+	after, err := f.begin(ctx, "experiments.ListPhaseRules", phaseID)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []model.PhaseRule
+	for i, ruleID := range f.phaseRules[phaseID] {
+		out = append(out, model.PhaseRule{PhaseID: phaseID, RuleID: ruleID, Position: i})
+	}
+	return out, after
+}
+
 func (x fakeExperiments) Delete(ctx context.Context, id string) error {
 	f := x.f
 	after, err := f.begin(ctx, "experiments.Delete", id)
@@ -876,7 +906,7 @@ func (x fakeRules) Delete(ctx context.Context, id string) error {
 		return store.ErrNotFound
 	}
 	if f.attachedLocked(id) {
-		return fmt.Errorf("delete rule %s: still linked by a phase: restrict violation", id)
+		return fmt.Errorf("delete rule %s: a phase still links it: %w", id, store.ErrInUse)
 	}
 	delete(f.rules, id)
 	f.checkLocked("rules.Delete")

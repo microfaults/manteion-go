@@ -159,17 +159,28 @@ func (l *dbLab) servedDemoRules() []string {
 // made and which demo rules were served at that moment.
 type servedLog struct {
 	l      *dbLab
+	watch  map[string]string // more rules to look for: rule id -> its service
 	mu     sync.Mutex
 	points []servedAt
 }
 
 type servedAt struct {
 	point  string   // "before rules.SetEnabled <id>", "after experiments.Delete <id>", ...
-	served []string // demo rule ids served for productcatalogservice
+	served []string // demo rule ids served for productcatalogservice, and watched rules served for theirs
 }
 
 func (s *servedLog) at(point string) {
 	served := s.l.servedDemoRules()
+	for ruleID, svc := range s.watch {
+		rules, err := s.l.rules.ForService(context.Background(), svc)
+		if err != nil {
+			s.l.t.Errorf("ForService(%s): %v", svc, err)
+			continue
+		}
+		if slices.ContainsFunc(rules, func(r *model.Rule) bool { return r.ID == ruleID }) {
+			served = append(served, ruleID)
+		}
+	}
 	s.mu.Lock()
 	s.points = append(s.points, servedAt{point, served})
 	s.mu.Unlock()
@@ -227,9 +238,13 @@ func (o spyOrch) CancelExperiment(ctx context.Context, id string) error {
 }
 
 // spied returns the lab's deps with every write the sweep and retention make
-// wrapped by a servedLog.
-func (l *dbLab) spied() (Deps, *servedLog) {
-	log := &servedLog{l: l}
+// wrapped by a servedLog, which also looks for the watched rules (rule id ->
+// service).
+func (l *dbLab) spied(watch ...string) (Deps, *servedLog) {
+	log := &servedLog{l: l, watch: map[string]string{}}
+	for i := 0; i+1 < len(watch); i += 2 {
+		log.watch[watch[i]] = watch[i+1]
+	}
 	d := l.d
 	d.Rules = spyRules{l.d.Rules, log}
 	d.Experiments = spyExperiments{l.d.Experiments, log}
@@ -384,5 +399,77 @@ func TestRetain_DB_RuleNeverServedDuringDeletion(t *testing.T) {
 		if strings.Contains(p.point, newer.ExperimentID) || strings.Contains(p.point, newer.RuleID) {
 			t.Errorf("the newer run was touched: %s", p.point)
 		}
+	}
+}
+
+// TestRetain_DB_ForeignRuleKeepsExperiment: an operator linked a second,
+// enabled, differently named rule to a phase of a finished demo experiment.
+// Retention with a keep that would delete the experiment keeps it (its run's
+// own rule switched off), says the pass is incomplete, and the foreign rule is
+// never served, before or after any write: deleting the experiment would have
+// left it attached to nothing and served to every instance of its service.
+func TestRetain_DB_ForeignRuleKeepsExperiment(t *testing.T) {
+	l := newDBLab(t)
+	ctx := context.Background()
+	old := l.build()
+	if err := SetRuleEnabled(ctx, l.d.Rules, old.RuleID, true); err != nil {
+		t.Fatalf("switch on: %v", err)
+	}
+	l.moveExperiment(old.ExperimentID, "completed", "planned")
+	own, err := l.rules.Get(ctx, old.RuleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tag := fmt.Sprintf("%d", time.Now().UnixNano())
+	foreign := &model.Rule{ID: "rule-foreign-" + tag, Name: "op-foreign-" + tag, Service: "svc-foreign-" + tag,
+		Priority: 10, Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: own.Action.FaultSpecID},
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := l.rules.Create(ctx, foreign); err != nil {
+		t.Fatalf("create the operator's rule: %v", err)
+	}
+	t.Cleanup(func() { // before the lab's own clean-up: unlink by deleting the experiment, then the rule
+		bg := context.Background()
+		_ = l.rules.SetEnabled(bg, foreign.ID, false)
+		_ = l.exps.Delete(bg, old.ExperimentID)
+		_ = l.rules.Delete(bg, foreign.ID)
+	})
+	if err := l.exps.AttachPhaseRules(ctx, old.PhaseIDs[0], []string{foreign.ID}); err != nil {
+		t.Fatalf("link the operator's rule: %v", err)
+	}
+	if err := l.rules.SetEnabled(ctx, foreign.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	newer := l.build()
+	l.moveExperiment(newer.ExperimentID, "completed", "planned")
+
+	d, log := l.spied(foreign.ID, foreign.Service)
+	log.at("before the pass")
+	if p := log.all()[0]; len(p.served) != 0 {
+		t.Fatalf("precondition: served %v under a completed experiment; want none", p.served)
+	}
+	err = Retain(ctx, d, 1)
+	if !errors.Is(err, ErrRetainIncomplete) || !strings.Contains(err.Error(), "foreign_rule_linked") {
+		t.Fatalf("Retain: %v; want incomplete at foreign_rule_linked", err)
+	}
+	log.at("after the pass")
+
+	requireNeverServed(t, log, 0)
+	if e, err := l.exps.Get(ctx, old.ExperimentID); err != nil || e.Status != "completed" {
+		t.Errorf("old experiment %+v, %v; want kept", e, err)
+	}
+	if r, err := l.rules.Get(ctx, old.RuleID); err != nil || r.Enabled {
+		t.Errorf("the run's own rule %+v, %v; want kept, off", r, err)
+	}
+	if r, err := l.rules.Get(ctx, foreign.ID); err != nil || !r.Enabled {
+		t.Errorf("the operator's rule %+v, %v; want untouched", r, err)
+	}
+	if links, err := l.exps.ListPhaseRules(ctx, old.PhaseIDs[0]); err != nil || len(links) != 1 {
+		t.Errorf("the operator's link %+v, %v; want kept", links, err)
+	}
+	if log.index("before experiments.Delete "+old.ExperimentID) >= 0 {
+		t.Error("the old experiment's delete was attempted")
+	}
+	if _, err := l.exps.Get(ctx, newer.ExperimentID); err != nil {
+		t.Errorf("newer experiment: %v; want kept", err)
 	}
 }

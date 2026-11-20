@@ -1,10 +1,12 @@
 package demo
 
 import (
+	"context"
 	"database/sql"
 	"time"
 
 	"manteion-go/internal/atrocontrol"
+	"manteion-go/internal/model"
 	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/promql"
 	"manteion-go/internal/store"
@@ -24,4 +26,7 @@ var (
 	_ Metrics      = (*promql.Client)(nil)
 	_ Pinger       = (*sql.DB)(nil)
 	_ Clock        = ClockFunc(time.Now)
+
+	// Retention's guard reads phase links through the store's own read.
+	_ func(*store.ExperimentRepo, context.Context, string) ([]model.PhaseRule, error) = (*store.ExperimentRepo).ListPhaseRules
 )
