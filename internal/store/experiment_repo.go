@@ -41,6 +41,9 @@ func NewExperimentRepo(db *sql.DB) *ExperimentRepo {
 // (Page, the pagination request shape, lives in helpers.go.)
 type ExperimentFilter struct {
 	Status string
+	// CreatedBy keeps only experiments whose created_by equals it exactly
+	// (the demo lists its own runs by "manteion-demo"). ANDed with Status.
+	CreatedBy string
 }
 
 // =========================================================================
@@ -99,12 +102,20 @@ func (r *ExperimentRepo) List(ctx context.Context, f ExperimentFilter, p Page) (
 	}
 
 	args := []any{p.Limit, p.Offset}
-	where := ""
+	var conds []string
 	if f.Status != "" {
 		// status::text keeps the comparison graceful for unknown filter
 		// values (matches nothing) instead of a 22P02 enum-cast error.
-		where = "WHERE status::text = $3"
 		args = append(args, f.Status)
+		conds = append(conds, fmt.Sprintf("status::text = $%d", len(args)))
+	}
+	if f.CreatedBy != "" {
+		args = append(args, f.CreatedBy)
+		conds = append(conds, fmt.Sprintf("created_by = $%d", len(args)))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
