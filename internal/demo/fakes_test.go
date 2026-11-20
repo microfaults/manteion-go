@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"manteion-go/internal/model"
+	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
 )
@@ -33,7 +34,14 @@ import (
 //   - Experiments.List pages, orders and counts like ExperimentRepo.List;
 //   - served(id) decides serving like RuleRepo.ForService: enabled, and
 //     attached to no phase or to a running phase of a running experiment;
-//   - every method fails with ctx.Err() once ctx is done.
+//   - the orchestrator (fakeOrch) starts and cancels experiments over these
+//     rows as orchestrator.StartExperiment and CancelExperiment do;
+//   - every method fails with ctx.Err() once ctx is done, except
+//     fakeOrch.StartExperiment, which completes a start whose claim is under
+//     way however its context ends (see fakeOrch).
+//
+// requireDemoRulesOff asserts, at any moment, that no demo-run-* rule is
+// enabled or served: worker tests call it after every ending.
 //
 // After every mutation it checks the demo's invariant: no demo-run-* rule is
 // enabled while attached to no phase (such a rule is served to every instance
@@ -70,6 +78,11 @@ type fakeLab struct {
 	specs       []*model.FaultSpec
 	workflows   map[string]bool
 	datasets    []zeus.Dataset
+	instances   []*model.SDKInstance
+	results     map[string][]*model.PhaseWorkflowResult // by phase id
+	// autopilot: each ListPhasesForExperiment of a running demo experiment
+	// answers, then moves the run one step on (see advanceLocked).
+	autopilot bool
 }
 
 type injectKind int
@@ -103,6 +116,8 @@ func newFakeLab(t testing.TB, now time.Time) *fakeLab {
 		workflows:   map[string]bool{WorkflowID: true},
 		datasets: []zeus.Dataset{{ID: "ds-ok", Name: DatasetName, SizeBytes: 4096, TTLS: 0,
 			CreatedAt: now.Add(-time.Hour)}},
+		instances: []*model.SDKInstance{{ID: "inst-1", Service: TargetService, Status: "alive"}},
+		results:   map[string][]*model.PhaseWorkflowResult{},
 	}
 	t.Cleanup(func() {
 		if !f.allowViols {
@@ -142,11 +157,13 @@ func (c *fakeClock) SetStep(d time.Duration) {
 
 func (f *fakeLab) deps() Deps {
 	return Deps{
+		Orch:        fakeOrch{f},
 		Experiments: fakeExperiments{f},
 		Rules:       fakeRules{f},
 		Specs:       fakeSpecs{f},
 		Workflows:   fakeWorkflows{f},
 		Zeus:        fakeZeus{f},
+		Instances:   fakeInstances{f},
 		Clock:       f.clock,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -279,6 +296,119 @@ func (f *fakeLab) requireNoViolations(t testing.TB) {
 	for _, v := range viols {
 		t.Errorf("invariant broken: %s", v)
 	}
+}
+
+// requireDemoRulesOff fails t if any demo-run-* rule is enabled, or would be
+// served, right now. Every ending switches its run's rule off before anything
+// else, so worker tests call this immediately after each end event.
+func (f *fakeLab) requireDemoRulesOff(t testing.TB) {
+	t.Helper()
+	f.mu.Lock()
+	var ids []string
+	for id, r := range f.rules {
+		if strings.HasPrefix(r.Name, RunNamePrefix) {
+			ids = append(ids, id)
+			if r.Enabled {
+				t.Errorf("demo rule %s (%s) is still enabled", id, r.Name)
+			}
+		}
+	}
+	f.mu.Unlock()
+	for _, id := range ids {
+		if f.served(id) {
+			t.Errorf("demo rule %s is served", id)
+		}
+	}
+}
+
+// requireRunRuleOff fails t if the rule of run runID is enabled or served.
+// A run whose build never created a rule passes.
+func (f *fakeLab) requireRunRuleOff(t testing.TB, runID string) {
+	t.Helper()
+	id := f.ruleIDOfRun(runID)
+	if id == "" {
+		return
+	}
+	if r := f.rule(id); r != nil && r.Enabled {
+		t.Errorf("run %s: its rule is still enabled", runID)
+	}
+	if f.served(id) {
+		t.Errorf("run %s: its rule is served", runID)
+	}
+}
+
+// ruleIDOfRun returns the id of run runID's rule, or "".
+func (f *fakeLab) ruleIDOfRun(runID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, r := range f.rules {
+		if r.Name == RunNamePrefix+runID {
+			return id
+		}
+	}
+	return ""
+}
+
+// experimentIDOfRun returns the id of run runID's experiment, or "".
+func (f *fakeLab) experimentIDOfRun(runID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, e := range f.experiments {
+		if e.Name == RunNamePrefix+runID {
+			return id
+		}
+	}
+	return ""
+}
+
+// endExperiment ends an experiment as the orchestrator would: status, start
+// and end times; phases still pending or in flight are skipped, the others
+// keep their status.
+func (f *fakeLab) endExperiment(expID, status string, started, ended time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := f.experiments[expID]
+	e.Status, e.StartedAt, e.CompletedAt = status, &started, &ended
+	for _, p := range f.phases {
+		if p.ExperimentID == expID {
+			switch p.Status {
+			case "pending", "running", "paused", "draining":
+				p.Status = "skipped"
+			}
+		}
+	}
+	f.checkLocked("endExperiment")
+}
+
+// ruleEnabledEver reports whether the rule was ever switched on.
+func (f *fakeLab) ruleEnabledEver(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enabledEver[id]
+}
+
+// experimentStatus returns the experiment's status, or "" when it is gone.
+func (f *fakeLab) experimentStatus(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e, ok := f.experiments[id]; ok {
+		return e.Status
+	}
+	return ""
+}
+
+// demoRuleIDs lists the demo-run-* rules, sorted.
+func (f *fakeLab) demoRuleIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for id, r := range f.rules {
+		if strings.HasPrefix(r.Name, RunNamePrefix) {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // expectViolations stops the cleanup check, for a test that breaks the
@@ -493,12 +623,62 @@ func (x fakeExperiments) ListPhasesForExperiment(ctx context.Context, experiment
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.phasesOfLocked(experimentID), after
+	out := f.phasesOfLocked(experimentID)
+	if f.autopilot {
+		f.advanceLocked(experimentID)
+	}
+	return out, after
+}
+
+// advanceLocked moves a running demo experiment one step on, as the
+// orchestrator would over a phase's lifetime: the running phase completes
+// (with a harvested result row), the next pending one starts, and after the
+// last one the experiment completes.
+func (f *fakeLab) advanceLocked(expID string) {
+	exp := f.experiments[expID]
+	if exp == nil || exp.Status != "running" || exp.CreatedBy != CreatedBy {
+		return
+	}
+	now := f.clock.Now()
+	var byPos []*model.ExperimentPhase
+	for _, p := range f.phases {
+		if p.ExperimentID == expID {
+			byPos = append(byPos, p)
+		}
+	}
+	slices.SortFunc(byPos, func(a, b *model.ExperimentPhase) int { return a.Position - b.Position })
+	for i, p := range byPos {
+		if p.Status != "running" {
+			continue
+		}
+		p.Status, p.CompletedAt = "completed", &now
+		f.results[p.ID] = []*model.PhaseWorkflowResult{{PhaseID: p.ID, WorkflowID: WorkflowID,
+			RequestCount: 290 + int64(i), ErrorCount: int64(i), LatencyP50Us: 110_000, LatencyP95Us: 250_500,
+			LatencyP99Us: 359_000, ComputedAt: now}}
+		if i+1 < len(byPos) {
+			byPos[i+1].Status, byPos[i+1].StartedAt = "running", &now
+		} else {
+			exp.Status, exp.CompletedAt = "completed", &now
+		}
+		f.checkLocked("autopilot")
+		return
+	}
 }
 
 func (x fakeExperiments) ListWorkflowResultsForPhase(ctx context.Context, phaseID string) ([]*model.PhaseWorkflowResult, error) {
-	_, err := x.f.begin(ctx, "experiments.ListWorkflowResultsForPhase", phaseID)
-	return nil, err
+	f := x.f
+	after, err := f.begin(ctx, "experiments.ListWorkflowResultsForPhase", phaseID)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*model.PhaseWorkflowResult
+	for _, r := range f.results[phaseID] {
+		cp := *r
+		out = append(out, &cp)
+	}
+	return out, after
 }
 
 func (x fakeExperiments) RunningExperimentIDs(ctx context.Context) ([]string, error) {
@@ -797,6 +977,102 @@ func (x fakeZeus) ListDatasets(ctx context.Context) ([]zeus.Dataset, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.datasets), after
+}
+
+// ---- Orchestrator and instances ----
+
+// fakeOrch stands in for *orchestrator.Orchestrator over the lab's rows.
+//
+// StartExperiment claims a planned experiment (planned -> running) and starts
+// its first phase. Its hooks and injections run as for any call, but it then
+// completes the claim whatever its context says: the real start's claim can
+// land before it notices a cancelled context, so a worker must never assume a
+// cancelled start started nothing. A missing experiment is ErrNotFound and a
+// non-planned one *orchestrator.ErrInvalidState.
+//
+// CancelExperiment is terminateExperiment: a planned or running experiment
+// becomes cancelled, its running, paused and draining phases and its pending
+// ones skipped; any other status answers *orchestrator.ErrInvalidState, a
+// missing experiment ErrNotFound. It honours its context like the store.
+type fakeOrch struct{ f *fakeLab }
+
+func (o fakeOrch) StartExperiment(ctx context.Context, id string) error {
+	f := o.f
+	after, err := f.begin(context.WithoutCancel(ctx), "orch.StartExperiment", id)
+	if err != nil {
+		return err
+	}
+	now := f.clock.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	exp, ok := f.experiments[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if exp.Status != "planned" {
+		return &orchestrator.ErrInvalidState{Kind: "experiment", ID: id, Current: exp.Status, Wanted: "planned",
+			Msg: "fake: experiment " + id + " is not planned"}
+	}
+	exp.Status, exp.StartedAt = "running", &now
+	for _, p := range f.phases {
+		if p.ExperimentID == id && p.Position == 0 && p.Status == "pending" {
+			p.Status, p.StartedAt = "running", &now
+		}
+	}
+	f.checkLocked("orch.StartExperiment")
+	return after
+}
+
+func (o fakeOrch) CancelExperiment(ctx context.Context, id string) error {
+	f := o.f
+	after, err := f.begin(ctx, "orch.CancelExperiment", id)
+	if err != nil {
+		return err
+	}
+	now := f.clock.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	exp, ok := f.experiments[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if exp.Status != "planned" && exp.Status != "running" {
+		return &orchestrator.ErrInvalidState{Kind: "experiment", ID: id, Current: exp.Status,
+			Wanted: "planned|running", Msg: "fake: experiment " + id + " is already terminal"}
+	}
+	exp.Status, exp.CompletedAt = "cancelled", &now
+	for _, p := range f.phases {
+		if p.ExperimentID != id {
+			continue
+		}
+		switch p.Status {
+		case "running", "paused", "draining", "pending":
+			p.Status, p.CompletedAt = "skipped", &now
+		}
+	}
+	f.checkLocked("orch.CancelExperiment")
+	return after
+}
+
+// fakeInstances answers InstancesForService from f.instances.
+type fakeInstances struct{ f *fakeLab }
+
+func (x fakeInstances) InstancesForService(ctx context.Context, service string) ([]*model.SDKInstance, error) {
+	f := x.f
+	after, err := f.begin(ctx, "instances.InstancesForService", service)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*model.SDKInstance
+	for _, in := range f.instances {
+		if in.Service == service {
+			cp := *in
+			out = append(out, &cp)
+		}
+	}
+	return out, after
 }
 
 // errLeaky is an injected cause whose text a client must never see: a driver
