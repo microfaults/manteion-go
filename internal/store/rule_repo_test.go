@@ -190,9 +190,10 @@ func TestRuleRepo_ForService_PhaseGating(t *testing.T) {
 		t.Cleanup(func() { _ = testRuleRepo.Delete(context.Background(), rid) })
 	}
 
-	// Experiment + one phase; attach the phase-scoped rule.
+	// Experiment + one phase; attach the phase-scoped rule. The experiment runs,
+	// so the phase's own status is what gates the rule here.
 	expRepo := NewExperimentRepo(testDB)
-	exp := &model.Experiment{ID: "exp-" + tag, Name: "phasegate", Status: "planned", CreatedAt: time.Now()}
+	exp := &model.Experiment{ID: "exp-" + tag, Name: "phasegate", Status: "running", CreatedAt: time.Now()}
 	if err := expRepo.Create(ctx, exp); err != nil {
 		t.Fatalf("create experiment: %v", err)
 	}

@@ -65,11 +65,12 @@ func TestPoll_RulesCarryPhaseContext(t *testing.T) {
 		return sync
 	}
 
-	// Build an experiment with a baseline that will record `svc` (frozen in the
-	// experiment's isolation phase) using `strat`, then set the baseline running.
+	// Build a running experiment with a baseline that will record `svc` (frozen
+	// in the experiment's isolation phase) using `strat`, then set the baseline
+	// running.
 	buildRecording := func(name, svc, strat string) (expID, basePhaseID string) {
 		t.Helper()
-		e := &model.Experiment{ID: id.New("exp"), Name: name + id.New("n"), Status: "planned", CreatedAt: time.Now()}
+		e := &model.Experiment{ID: id.New("exp"), Name: name + id.New("n"), Status: "running", CreatedAt: time.Now()}
 		if err := exp.Create(ctx, e); err != nil {
 			t.Fatalf("create exp: %v", err)
 		}

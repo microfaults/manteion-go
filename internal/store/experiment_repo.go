@@ -484,9 +484,11 @@ func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, er
 	return out, rows.Err()
 }
 
-// ListRunningPhases returns every phase currently in status 'running' across
-// all experiments (newest-started first, phases started in the same instant by
-// id), each with its frozen_services — the input to per-service cache-box rule
+// ListRunningPhases returns every phase currently in status 'running' whose
+// experiment is 'running' too, across all experiments (newest-started first,
+// phases started in the same instant by id; a phase left running under an
+// experiment that ended, by a cancel or stop that failed part-way, is not
+// listed), each with its frozen_services — the input to per-service cache-box rule
 // synthesis (MANT-4) and to the freeze config and replay set derived from the
 // phase that freezes a service. The order is total on purpose: callers take the
 // first phase that freezes a service, that choice feeds the materialized
@@ -497,11 +499,12 @@ func (r *ExperimentRepo) RunningExperimentIDs(ctx context.Context) ([]string, er
 // several running at once.
 func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, experiment_id, name, position, status, frozen_services,
-			persist_cache, started_at, completed_at, failure_reason
-		FROM experiment_phases
-		WHERE status = 'running'
-		ORDER BY started_at DESC NULLS LAST, id`)
+		SELECT p.id, p.experiment_id, p.name, p.position, p.status, p.frozen_services,
+			p.persist_cache, p.started_at, p.completed_at, p.failure_reason
+		FROM experiment_phases p
+		JOIN experiments e ON e.id = p.experiment_id AND e.status = 'running'
+		WHERE p.status = 'running'
+		ORDER BY p.started_at DESC NULLS LAST, p.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list running phases: %w", err)
 	}

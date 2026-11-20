@@ -235,11 +235,14 @@ func (r *RuleRepo) List(ctx context.Context) ([]*model.Rule, error) {
 //
 // This is the authoritative poll set: the SDK reconciles to EXACTLY this array,
 // so the query is phase-aware (M4) — a rule is served iff it is attached to NO
-// experiment phase, OR attached to a phase that is currently 'running'. A
-// phase-scoped fault rule is therefore dark during the baseline (its phase
-// pending) and stops the instant the measurement window ends ('running' only,
-// deliberately NOT 'draining'), so it neither corrupts the baseline delta nor
-// gets resurrected after finishPhase clears it.
+// experiment phase, OR attached to a phase that is currently 'running' in an
+// experiment that is 'running' too. A phase-scoped fault rule is therefore
+// dark during the baseline (its phase pending) and stops the instant the
+// measurement window ends ('running' only, deliberately NOT 'draining'), so it
+// neither corrupts the baseline delta nor gets resurrected after finishPhase
+// clears it. The experiment gate covers a cancel or stop that fails after the
+// experiment's terminal CAS: its phase stays 'running', and without the gate
+// its rules would be served for ever, since nothing revisits that phase.
 //
 // Each rule also carries the running phase it is served through (ServedPhaseID
 // and ServedExperimentID, empty for a rule attached to no phase), which the
@@ -261,6 +264,7 @@ func (r *RuleRepo) ForService(ctx context.Context, service string) ([]*model.Rul
 			SELECT p.id, p.experiment_id
 			FROM phase_rules pr
 			JOIN experiment_phases p ON p.id = pr.phase_id
+			JOIN experiments e ON e.id = p.experiment_id AND e.status = 'running'
 			WHERE pr.rule_id = r.id AND p.status = 'running'
 			ORDER BY p.started_at DESC NULLS LAST, p.id
 			LIMIT 1) rp ON true
