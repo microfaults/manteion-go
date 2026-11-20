@@ -39,6 +39,7 @@ recording surfaces as a verdict, not as silently skewed numbers.
 | `internal/faultcatalog/` | Fault vocabulary + typed param validation backed by `atropos-go/faultparams`. |
 | `internal/opaharness/` | OPA harness: Rego policies over Prometheus/Loki inputs that mutate rules through the rule repo (`MANTEION_POLICY_ENGINE=rego`); see `docs/opa-harness.md`. |
 | `internal/logql/` | Loki instant metric-query client (harness inputs). |
+| `internal/demo/` | Public demo mode (`MANTEION_DEMO=true`): a queue of preset three-phase runs, one at a time, with health, state, run views and an event stream on a second listener of its own. |
 | `internal/policy/` | Frozen PromQL threshold loop, reachable only as `MANTEION_POLICY_ENGINE=threshold`. Acts through rule CRUD: `push_rules` enables the listed rules, `clear_rules` disables the service's enabled ones, each update bumping the service's generation in-tx. |
 
 ## Wire contracts (shared with atropos-go)
@@ -111,8 +112,12 @@ datasets pass through; attacks are orchestrator-managed, not proxied).
 | `MANTEION_DRAIN_TIMEOUT` | `30s` | Drain-barrier wait before gap classification. Must be a positive duration of at most 1 h (startup refuses anything else) |
 | `MANTEION_POLL_INTERVAL` | `15s` | How often a running phase's poller asks zeus whether its runs and attacks have ended; the phase ends at the first tick after they have. Must be a positive duration of at most 1 m (startup refuses anything else) |
 | `MANTEION_ALLOW_DEGRADED_BASELINE` | `false` | Permit isolation phases over a degraded baseline recording |
-| `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop |
+| `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop. Demo mode refuses to start unless it is `off` |
 | `MANTEION_SDK_PURGE_ENABLED` | `false` | Dead-instance purge sweep |
+| `MANTEION_DEMO` | `false` | `true` starts the public demo (`internal/demo`) on a second listener with its own six routes |
+| `MANTEION_DEMO_ADDR` | `:8090` | The demo listener's address, `host:port` with a numeric port |
+| `MANTEION_DEMO_EDGE_SECRET` | (none) | Required in demo mode: what the edge sends in `X-Demo-Edge-Secret`. 32 to 512 printable ASCII characters, no whitespace; never logged |
+| `MANTEION_DEMO_RUN_CAP` | `5m` | Demo mode: the watchdog from a run's pickup to its forced end, 30 s to 15 min |
 
 ## SDK dependency
 

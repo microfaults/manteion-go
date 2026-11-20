@@ -8,8 +8,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +23,7 @@ import (
 	"manteion-go/internal/atropos"
 	"manteion-go/internal/cachestore"
 	"manteion-go/internal/db"
+	"manteion-go/internal/demo"
 	"manteion-go/internal/desired"
 	"manteion-go/internal/logql"
 	"manteion-go/internal/model"
@@ -68,6 +71,23 @@ func main() {
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
+	}
+	// Policy automation (started below): "rego" (or "on"), "threshold" or "off".
+	policyEngineMode := envOr("MANTEION_POLICY_ENGINE", "off")
+	// Demo mode (MANTEION_DEMO=true; wired after Recover below). Its
+	// configuration is refused here, with the rest, before anything starts.
+	// demo.ConfigFromEnv's errors never contain the edge secret.
+	demoOn := envOr("MANTEION_DEMO", "false") == "true"
+	if err := demoModeCheck(demoOn, policyEngineMode); err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	var demoCfg demo.Config
+	if demoOn {
+		if demoCfg, err = demo.ConfigFromEnv(os.Getenv); err != nil {
+			logger.Error("invalid configuration", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// Connect to PostgreSQL and run migrations.
@@ -205,13 +225,41 @@ func main() {
 	// held polls answer at once as if their wait had elapsed and streams end.
 	httpServer.RegisterOnShutdown(srv.BeginShutdown)
 
+	// ---- Demo mode (MANTEION_DEMO=true): internal/demo on a second listener ----
+	// The public demo's six routes on their own mux and port; nothing of the
+	// operator API is reachable there. Its start-up (startDemo, at the
+	// listeners below) and its shutdown (shutdownInOrder) have an order of
+	// their own. With demo mode off, dm and demoServer stay nil and nothing
+	// below changes.
+	var (
+		dm         *demo.Demo
+		demoServer *http.Server
+	)
+	if demoOn {
+		dm = demo.New(demo.Deps{
+			Orch:        orch,
+			Experiments: experimentRepo,
+			Rules:       ruleRepo,
+			Specs:       faultRepo,
+			Workflows:   workflowRepo,
+			Zeus:        zeusClient,
+			Instances:   controller,
+			Prom:        promClient, // never nil: promql.NewClient above
+			DB:          database,
+			Clock:       demo.ClockFunc(time.Now),
+			Logger:      logger,
+		}, demoCfg)
+		demoServer = newDemoServer(demoCfg.Addr, dm.Handler())
+	}
+	// ---- end of demo mode's set-up ----
+
 	// Policy automation. "rego" (or "on") starts the OPA harness
 	// (docs/opa-harness.md); "threshold" starts the frozen PromQL engine
 	// (docs/decisions/2026-06-policy-engine-freeze.md); "off" starts neither.
-	// harnessDone is closed once the harness loop has returned (at once when
-	// it is not started); shutdown waits for it, so an evaluation in flight
-	// at the signal still applies and records its decision.
-	policyEngineMode := envOr("MANTEION_POLICY_ENGINE", "off")
+	// Demo mode refuses all but "off" (demoModeCheck). harnessDone is closed
+	// once the harness loop has returned (at once when it is not started);
+	// shutdown waits for it, so an evaluation in flight at the signal still
+	// applies and records its decision.
 	harnessDone := make(chan struct{})
 	switch policyEngineMode {
 	case "rego", "on":
@@ -257,8 +305,10 @@ func main() {
 		}()
 	}
 
-	// Start server in a goroutine.
-	go func() {
+	// Start the server(s): each binds its address now and serves in a
+	// goroutine (listenAndServe), so the sockets accept connections once
+	// listen returns.
+	listen := func() {
 		displayAddr := addr
 		if displayAddr[0] == ':' {
 			displayAddr = "localhost" + displayAddr
@@ -269,37 +319,66 @@ func main() {
 			"loki_url", lokiURL,
 			"policy_engine", policyEngineMode,
 		)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("server error", "error", err)
-			os.Exit(1)
+		listenAndServe(httpServer, "server error", logger)
+		if demoServer != nil {
+			logger.Info("demo listener starting", "addr", demoServer.Addr)
+			listenAndServe(demoServer, "demo server error", logger)
 		}
-	}()
+	}
+	if dm != nil {
+		// The demo's switch-off, then listen, then its sweep and worker.
+		startDemo(ctx, dm, defaultDemoTimings, listen, logger)
+	} else {
+		listen()
+	}
 
 	// Block until signal.
 	<-ctx.Done()
 	logger.Info("shutdown signal received")
 
-	// Give in-flight requests 10 seconds to complete.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	shutdownErr := httpServer.Shutdown(shutdownCtx)
-	if shutdownErr != nil {
-		logger.Error("shutdown error", "error", shutdownErr)
+	// In demo mode the demo shuts down first, while both listeners still
+	// serve; then the listeners get serverShutdownBudget (10 s) for in-flight
+	// requests to complete (shutdownInOrder). The two are passed as nil
+	// interfaces, never typed nils, when demo mode is off.
+	var (
+		stopDemo       demoLifecycle
+		stopDemoServer shutdowner
+	)
+	if dm != nil {
+		stopDemo, stopDemoServer = dm, demoServer
 	}
-	// The harness loop returns after its in-flight tick (its apply and
-	// record are detached from ctx); wait for it within what is left of the
-	// shutdown budget.
-	select {
-	case <-harnessDone:
-	case <-shutdownCtx.Done():
-		logger.Warn("opa harness: loop did not stop within the shutdown timeout")
-	}
+	shutdownErr := shutdownInOrder(stopDemo, stopDemoServer, httpServer, defaultDemoTimings, func(shutdownCtx context.Context) {
+		// The harness loop returns after its in-flight tick (its apply and
+		// record are detached from ctx); wait for it within what is left of
+		// the shutdown budget.
+		select {
+		case <-harnessDone:
+		case <-shutdownCtx.Done():
+			logger.Warn("opa harness: loop did not stop within the shutdown timeout")
+		}
+	}, logger)
 	if shutdownErr != nil {
 		os.Exit(1)
 	}
 
 	logger.Info("manteion stopped")
+}
+
+// listenAndServe is http.Server.ListenAndServe split in two: it binds
+// srv.Addr now and serves it in a goroutine. A bind or serve error (other than
+// http.ErrServerClosed) is logged as msg and ends the process with status 1.
+func listenAndServe(srv *http.Server, msg string, logger *slog.Logger) {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		logger.Error(msg, "error", err)
+		os.Exit(1)
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logger.Error(msg, "error", err)
+			os.Exit(1)
+		}
+	}()
 }
 
 // envOr returns the value of the environment variable key, or fallback if unset.
@@ -393,4 +472,178 @@ func positiveDurationEnv(key string, fallback time.Duration) (time.Duration, err
 // their own deadlines.
 func httpWriteTimeout(convergeTimeout, drainTimeout time.Duration) time.Duration {
 	return 2*convergeTimeout + drainTimeout + 30*time.Second
+}
+
+// ---- demo mode ----
+
+// demoModeCheck refuses demo mode beside a policy engine. The OPA harness
+// ("rego" or "on") and the threshold engine both switch rules on and off by
+// themselves, and the demo owns its run's rule: an engine could switch it on
+// outside a run, or off in the middle of one. Without demo mode, any engine
+// is allowed; an unknown value starts no engine and passes.
+func demoModeCheck(demo bool, policyEngineMode string) error {
+	if !demo {
+		return nil
+	}
+	switch policyEngineMode {
+	case "rego", "on", "threshold":
+		return fmt.Errorf("MANTEION_DEMO=true needs MANTEION_POLICY_ENGINE=off, not %q: "+
+			"a policy engine switches rules on and off by itself, and the demo owns its run's rule", policyEngineMode)
+	}
+	return nil
+}
+
+// newDemoServer is the demo listener's server. The handler is the demo's own
+// (demo.Demo.Handler), with nothing around it: the event stream and the
+// unread-body guard reach the connection through http.NewResponseController,
+// which a wrapper without Unwrap hides. The event stream sets its own write
+// deadline per frame, so WriteTimeout does not cut it. net/http must not
+// answer OPTIONS * itself (DisableGeneralOptionsHandler), and the listener
+// speaks HTTP/1.1 only: the stream's deadline handling is untested on HTTP/2.
+func newDemoServer(addr string, h http.Handler) *http.Server {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	return &http.Server{
+		Addr:                         addr,
+		Handler:                      h,
+		ReadHeaderTimeout:            5 * time.Second,
+		ReadTimeout:                  10 * time.Second,
+		WriteTimeout:                 30 * time.Second,
+		IdleTimeout:                  60 * time.Second,
+		MaxHeaderBytes:               16 << 10,
+		DisableGeneralOptionsHandler: true,
+		Protocols:                    protocols,
+	}
+}
+
+// demoLifecycle is the part of *demo.Demo whose calls main orders
+// (startDemo, shutdownInOrder). Nothing else calls them.
+type demoLifecycle interface {
+	SwitchOffAll(ctx context.Context) error
+	Sweep(ctx context.Context) error
+	Run(ctx context.Context)
+	Shutdown(ctx context.Context) error
+}
+
+// shutdowner is the part of *http.Server that shutdownInOrder uses.
+type shutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// demoTimings bounds demo mode's steps in the start-up and shutdown orders.
+type demoTimings struct {
+	switchOffTimeout  time.Duration // each attempt of the start-up switch-off
+	switchOffAttempts int
+	switchOffPause    time.Duration // between two attempts
+	sweepTimeout      time.Duration // the start-up sweep
+	shutdownTimeout   time.Duration // the demo's own shutdown, before the servers'
+}
+
+var defaultDemoTimings = demoTimings{
+	switchOffTimeout:  10 * time.Second,
+	switchOffAttempts: 3,
+	switchOffPause:    time.Second,
+	sweepTimeout:      2 * time.Minute,
+	shutdownTimeout:   15 * time.Second,
+}
+
+// serverShutdownBudget is how long the servers' Shutdown (in-flight requests
+// to complete) and the wait for the OPA harness loop share after the signal.
+const serverShutdownBudget = 10 * time.Second
+
+// startDemo runs demo mode's start-up around listen, which starts the
+// listeners. In this order:
+//
+//  1. d.SwitchOffAll, before listen: the operator listener serves desired
+//     state to the SDKs, and a demo rule left enabled by a kill would be
+//     served the moment they can poll. It is database only. Each attempt has
+//     a deadline of its own (t.switchOffTimeout), up to t.switchOffAttempts
+//     attempts, none after ctx (the signal) is done; a final failure is
+//     logged and start-up goes on: the sweep repeats the step, and no run is
+//     accepted before the sweep has run.
+//  2. listen.
+//  3. In a goroutine, d.Sweep under a deadline of t.sweepTimeout: it cancels
+//     leftover demo experiments, and a cancel waits for the fleet to
+//     converge, which the fleet can only do by polling the operator listener.
+//     Its error is logged and does not stop the next step. Then d.Run(ctx),
+//     until ctx is done or d.Shutdown is called.
+//
+// It returns once listen has returned.
+func startDemo(ctx context.Context, d demoLifecycle, t demoTimings, listen func(), logger *slog.Logger) {
+	var err error
+	for attempt := 1; ; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, t.switchOffTimeout)
+		err = d.SwitchOffAll(actx)
+		cancel()
+		if err == nil || attempt >= t.switchOffAttempts || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(t.switchOffPause):
+		}
+	}
+	if err != nil {
+		logger.Error("demo: the start-up switch-off failed; starting anyway: the sweep repeats it, and no run is accepted before the sweep has run",
+			"error", err)
+	}
+
+	listen()
+
+	go func() {
+		sctx, cancel := context.WithTimeout(ctx, t.sweepTimeout)
+		err := d.Sweep(sctx)
+		cancel()
+		if err != nil {
+			logger.Warn("demo: the start-up sweep did not complete; starting the worker anyway", "error", err)
+		}
+		d.Run(ctx)
+	}()
+}
+
+// shutdownInOrder runs main's shutdown once the signal has come. In this
+// order:
+//
+//  1. When d is not nil, d.Shutdown under a context of its own,
+//     t.shutdownTimeout long (the signal's context is already done), while
+//     both servers still serve: it switches the current run's rule off,
+//     which the SDKs pick up only from the operator listener, and ends every
+//     event stream, which a server's Shutdown would otherwise wait out (up to
+//     the streams' 10-minute maximum age). Its error is logged and changes
+//     nothing else.
+//  2. demoSrv's Shutdown (when not nil), then srv's, under one context of
+//     serverShutdownBudget, which starts only now.
+//  3. after, within what is left of that budget.
+//
+// It returns the servers' errors (nil when both shut down cleanly); main
+// exits 1 on one. Pass d and demoSrv as nil interfaces when demo mode is off.
+func shutdownInOrder(d demoLifecycle, demoSrv, srv shutdowner, t demoTimings, after func(context.Context), logger *slog.Logger) error {
+	if d != nil {
+		logger.Info("demo: shutting down")
+		dctx, cancel := context.WithTimeout(context.Background(), t.shutdownTimeout)
+		err := d.Shutdown(dctx)
+		cancel()
+		if err != nil {
+			logger.Warn("demo: shutdown did not complete; stopping the listeners anyway", "error", err)
+		} else {
+			logger.Info("demo: shut down")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), serverShutdownBudget)
+	defer cancel()
+	var demoErr error
+	if demoSrv != nil {
+		if demoErr = demoSrv.Shutdown(ctx); demoErr != nil {
+			logger.Error("demo server shutdown error", "error", demoErr)
+		} else {
+			logger.Info("demo listener closed")
+		}
+	}
+	err := srv.Shutdown(ctx)
+	if err != nil {
+		logger.Error("shutdown error", "error", err)
+	}
+	after(ctx)
+	return errors.Join(demoErr, err)
 }

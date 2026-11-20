@@ -21,6 +21,10 @@ spec:
       # the preload gate reads them across phases).
       securityContext:
         fsGroup: 1000
+      # On SIGTERM the demo shuts down first (up to 15 s: the current run's
+      # rule switched off, every event stream ended), then both listeners
+      # get 10 s; the default 30 s grace period is too tight for both.
+      terminationGracePeriodSeconds: 45
       volumes:
         - name: cache
           persistentVolumeClaim:
@@ -43,6 +47,11 @@ spec:
           ports:
             - containerPort: 8080
               protocol: TCP
+            # The public demo's own listener (MANTEION_DEMO_ADDR): its six
+            # routes only, none of the operator API.
+            - containerPort: 8090
+              name: demo
+              protocol: TCP
           volumeMounts:
             - name: cache
               mountPath: /var/cache/manteion
@@ -58,6 +67,21 @@ spec:
                 secretKeyRef:
                   name: manteion-postgres
                   key: DATABASE_URL
+            # The lab's zeus poll tick: a demo phase ends within 2 s of its
+            # load (default 15 s).
+            - name: MANTEION_POLL_INTERVAL
+              value: "2s"
+            - name: MANTEION_DEMO
+              value: "true"
+            - name: MANTEION_DEMO_ADDR
+              value: ":8090"
+            # Created on the box by service-beds' scripts/lab-demo-secret.sh
+            # before the stack is applied; required.
+            - name: MANTEION_DEMO_EDGE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: manteion-demo-edge
+                  key: EDGE_SECRET
           # First boot runs the migrations before /healthz answers; liveness
           # waits until the startup probe passes (up to 2 s x 60 = 120 s).
           startupProbe:
@@ -102,6 +126,10 @@ spec:
       targetPort: 8080
       protocol: TCP
       name: http
+    - port: 8090
+      targetPort: 8090
+      protocol: TCP
+      name: demo
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
