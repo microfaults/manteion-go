@@ -1,12 +1,14 @@
 package demo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +21,14 @@ import (
 )
 
 // ---- harness ----
+
+// testOffRetry is the switch-off retry schedule of every test worker: the
+// production 1 s doubling to 30 s, shrunk a thousandfold.
+var testOffRetry = backoff{first: time.Millisecond, max: 30 * time.Millisecond}
+
+// noCap gives a test whose run must not end by the watchdog a cap it cannot
+// reach, so a slow machine cannot turn its ending into timed_out.
+func noCap(c *Config) { c.RunCap = 10 * time.Second }
 
 // workerConfig is the brief's test configuration: StatusPoll 5 ms, RunCap
 // 200 ms, the rest default.
@@ -50,7 +60,9 @@ func newHarness(t *testing.T, tweak func(*Config)) *harness {
 		tweak(&cfg)
 	}
 	q, h := NewQueue(cfg.Capacity), NewHub()
-	return &harness{t: t, f: f, cfg: cfg, q: q, h: h, w: NewWorker(f.deps(), cfg, q, h)}
+	w := NewWorker(f.deps(), cfg, q, h)
+	w.offRetry = testOffRetry
+	return &harness{t: t, f: f, cfg: cfg, q: q, h: h, w: w}
 }
 
 // enqueue queues a run for client and subscribes to its events.
@@ -237,7 +249,7 @@ func offBeforeCancel(f *fakeLab) *atomic.Int32 {
 // after the experiment completes; the run ends completed with results.
 func TestWorker_HappyPath(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	x.f.autopilot = true
 	var expAtDisable atomic.Value
 	x.f.onCall("rules.SetEnabled", func() {
@@ -287,8 +299,11 @@ func TestWorker_HappyPath(t *testing.T) {
 	if n := len(x.q.Snapshot()); n != 0 {
 		t.Errorf("%d runs still in line", n)
 	}
-	if v, ok := x.w.View(context.Background(), r.RunID); !ok || v.Status != RunCompleted {
-		t.Errorf("View = %+v, %v", v, ok)
+	if v, err := x.w.View(context.Background(), r.RunID); err != nil || v.Status != RunCompleted {
+		t.Errorf("View = %+v, %v", v, err)
+	}
+	if n := len(x.f.callList("rules.SetEnabled ")); n != 1 || x.w.SwitchOffPending() {
+		t.Errorf("%d switch-off writes, pending %v; want exactly 1 and none pending", n, x.w.SwitchOffPending())
 	}
 	if id, _, _ := x.w.Current(); id != "" {
 		t.Errorf("Current() = %q after the run ended", id)
@@ -378,7 +393,7 @@ func TestPreflight_OwnExperimentIsNotBusy(t *testing.T) {
 // phase_failed; the rule goes off and nothing is cancelled.
 func TestWorker_PhaseFailed(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	r, ch := x.enqueue("a")
 	x.start()
 	awaitPhase(t, ch, 0, PhaseRunning)
@@ -401,7 +416,7 @@ func TestWorker_PhaseFailed(t *testing.T) {
 // run cancelled/interrupted without a cancel of the worker's own.
 func TestWorker_ExternalCancel(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	r, ch := x.enqueue("a")
 	x.start()
 	awaitPhase(t, ch, 0, PhaseRunning)
@@ -431,6 +446,7 @@ func TestWorker_WatchdogWhileStartBlocks(t *testing.T) {
 			cancelsBefore.Add(1)
 		}
 	})
+	ruleOn := offBeforeCancel(x.f)
 	var offAt atomic.Int64
 	x.f.onCall("rules.SetEnabled", func() { offAt.CompareAndSwap(0, int64(time.Since(x.began))) })
 	r, ch := x.enqueue("a")
@@ -460,11 +476,27 @@ func TestWorker_WatchdogWhileStartBlocks(t *testing.T) {
 	if cancelsBefore.Load() != 0 || cancelsAfter.Load() != 1 {
 		t.Errorf("cancels before release %d, after %d; want 0, 1", cancelsBefore.Load(), cancelsAfter.Load())
 	}
+	requireOffBeforeCancel(t, x.f, rule, ruleOn)
 	if st := x.f.experimentStatus(x.expID(r.RunID)); st != "cancelled" {
 		t.Errorf("experiment %s; want cancelled after the late start", st)
 	}
 	x.stop()
 	requireNoMore(t, ch)
+}
+
+// requireOffBeforeCancel: the rule's first switch-off precedes the first
+// cancel in the call log, and no demo rule was on at any cancel.
+func requireOffBeforeCancel(t *testing.T, f *fakeLab, rule string, ruleOn *atomic.Int32) {
+	t.Helper()
+	calls := f.callList("")
+	off := slices.Index(calls, "rules.SetEnabled "+rule+" false")
+	cancel := indexOfPrefix(calls, "orch.CancelExperiment ")
+	if off < 0 || cancel < 0 || off > cancel {
+		t.Errorf("switch-off at %d, cancel at %d; want the switch-off first", off, cancel)
+	}
+	if ruleOn.Load() != 0 {
+		t.Error("a demo rule was still on when the cancel was issued")
+	}
 }
 
 // TestWorker_CancelErrorStillDisablesRule: the watchdog's cancel fails while
@@ -474,6 +506,7 @@ func TestWorker_CancelErrorStillDisablesRule(t *testing.T) {
 	t.Parallel()
 	x := newHarness(t, nil)
 	x.f.fail("orch.CancelExperiment", errLeaky)
+	ruleOn := offBeforeCancel(x.f)
 	r, ch := x.enqueue("a")
 	x.start()
 	awaitPhase(t, ch, 0, PhaseRunning)
@@ -490,6 +523,7 @@ func TestWorker_CancelErrorStillDisablesRule(t *testing.T) {
 	if n := len(x.f.callList("orch.CancelExperiment")); n != 1 {
 		t.Errorf("%d cancels; want 1", n)
 	}
+	requireOffBeforeCancel(t, x.f, rule, ruleOn)
 	if n := len(x.q.Snapshot()); n != 0 {
 		t.Errorf("%d runs in line; want none", n)
 	}
@@ -582,7 +616,7 @@ func TestWorker_StartError(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			x := newHarness(t, nil)
+			x := newHarness(t, noCap)
 			tc.inject(x.f)
 			ruleOn := offBeforeCancel(x.f)
 			r, ch := x.enqueue("a")
@@ -622,7 +656,7 @@ func TestWorker_BuildErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			x := newHarness(t, nil)
+			x := newHarness(t, noCap)
 			tc.inject(x)
 			_, ch := x.enqueue("a")
 			x.start()
@@ -647,7 +681,7 @@ func TestWorker_BuildErrors(t *testing.T) {
 // off and the build's rows are left for the start-up sweep.
 func TestWorker_SwitchOnRefusedWhenUnattached(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	x.f.onCall("rules.EnableIfAttached", func() {
 		x.f.mu.Lock()
 		clear(x.f.phaseRules)
@@ -747,7 +781,7 @@ func TestWorker_UnknownCoreStatus(t *testing.T) {
 	for _, which := range []string{"phase", "experiment"} {
 		t.Run(which, func(t *testing.T) {
 			t.Parallel()
-			x := newHarness(t, nil)
+			x := newHarness(t, noCap)
 			ruleOn := offBeforeCancel(x.f)
 			r, ch := x.enqueue("a")
 			x.start()
@@ -785,7 +819,7 @@ func TestWorker_UnknownCoreStatus(t *testing.T) {
 // run at the next poll with the rule switched off.
 func TestWorker_ExperimentGone(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	x.f.expectViolations()
 	r, ch := x.enqueue("a")
 	x.start()
@@ -803,7 +837,7 @@ func TestWorker_ExperimentGone(t *testing.T) {
 // worker lives on and completes the next run.
 func TestWorker_PanicsAreContained(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	x.f.autopilot = true
 	x.f.onCall("zeus.Healthy#1", func() { panic("preflight exploded") })
 	x.f.onCall("experiments.Get#1", func() { panic("status read exploded") })
@@ -850,7 +884,7 @@ func TestWorker_PanicsAreContained(t *testing.T) {
 // one end event, last, and move the runs behind them up.
 func TestWorker_EveryEndingFreesOnceAndEndsLast(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	x.f.autopilot = true
 	x.f.fail("zeus.Healthy#1", errLeaky)
 	x.f.fail("orch.StartExperiment#1", errLeaky)
@@ -873,6 +907,19 @@ func TestWorker_EveryEndingFreesOnceAndEndsLast(t *testing.T) {
 	evsC, endC := awaitEnd(t, chC)
 	x.f.requireDemoRulesOff(t)
 	requireEnded(t, endC, RunCompleted, Reason{})
+	if n := len(x.q.Snapshot()); n != 0 {
+		t.Errorf("%d runs in line; want none", n)
+	}
+	// Exactly the three slots are free again (the worker takes the first of
+	// these at once; it still counts).
+	for _, cl := range []string{"a", "b", "c"} {
+		if _, err := x.q.Enqueue(cl, testNow); err != nil {
+			t.Errorf("client %s after its run ended: %v", cl, err)
+		}
+	}
+	if _, err := x.q.Enqueue("d", testNow); !errors.Is(err, ErrQueueFull) {
+		t.Errorf("fourth enqueue: %v; want ErrQueueFull", err)
+	}
 	x.stop()
 	for _, ch := range []<-chan Event{chA, chB, chC} {
 		requireNoMore(t, ch)
@@ -894,16 +941,7 @@ func TestWorker_EveryEndingFreesOnceAndEndsLast(t *testing.T) {
 		t.Errorf("run c moved to %v; want [1 0]", got)
 	}
 	if n := len(x.q.Snapshot()); n != 0 {
-		t.Errorf("%d runs in line; want none", n)
-	}
-	// Exactly the three slots are free again.
-	for _, cl := range []string{"a", "b", "c"} {
-		if _, err := x.q.Enqueue(cl, testNow); err != nil {
-			t.Errorf("client %s after its run ended: %v", cl, err)
-		}
-	}
-	if _, err := x.q.Enqueue("d", testNow); !errors.Is(err, ErrQueueFull) {
-		t.Errorf("fourth enqueue: %v; want ErrQueueFull", err)
+		t.Errorf("%d runs in line after the stop; want none", n)
 	}
 }
 
@@ -912,7 +950,7 @@ func TestWorker_EveryEndingFreesOnceAndEndsLast(t *testing.T) {
 // and returns.
 func TestWorker_ShutdownEndsRuns(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	a, chA := x.enqueue("a")
 	b, chB := x.enqueue("b")
 	x.start()
@@ -942,7 +980,7 @@ func TestWorker_ShutdownEndsRuns(t *testing.T) {
 // without a cancel and Run returns.
 func TestWorker_SwitchOffCurrentAndHalt(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	a, ch := x.enqueue("a")
 	x.start()
 	awaitPhase(t, ch, 0, PhaseRunning)
@@ -976,7 +1014,7 @@ func TestWorker_SwitchOffCurrentAndHalt(t *testing.T) {
 // follows the phases.
 func TestWorker_PhaseEventsOnChangeOnly(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	x := newHarness(t, noCap)
 	r, ch := x.enqueue("a")
 	x.start()
 	evs := awaitPhase(t, ch, 0, PhaseRunning)
@@ -1014,35 +1052,496 @@ func TestWorker_PhaseEventsOnChangeOnly(t *testing.T) {
 	}
 }
 
+// ---- a switch-off that fails ----
+
+// syncBuffer is a log sink safe for concurrent writers.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// rebuild replaces the worker, before start, with one over the fake's deps as
+// edit changes them.
+func (x *harness) rebuild(edit func(*Deps)) {
+	d := x.f.deps()
+	edit(&d)
+	x.w = NewWorker(d, x.cfg, x.q, x.h)
+	x.w.offRetry = testOffRetry
+}
+
+// captureLogs rebuilds the worker with its log in a buffer.
+func (x *harness) captureLogs() *syncBuffer {
+	buf := &syncBuffer{}
+	x.rebuild(func(d *Deps) { d.Logger = slog.New(slog.NewTextHandler(buf, nil)) })
+	return buf
+}
+
+// TestWorker_FailedSwitchOffHoldsTheNextRun: the ending's switch-off fails three
+// times (on the watchdog path, the watchdog's own try is the first). It is
+// retried with backoff, each failure logged at error with the rule and the
+// attempt; SwitchOffPending holds meanwhile; the next run is not picked up
+// until the switch-off has landed; then it runs, and pending clears.
+func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"completed", "watchdog"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			cap := 10 * time.Second // the completed path must not race the watchdog
+			if path == "watchdog" {
+				cap = 150 * time.Millisecond
+			}
+			x := newHarness(t, func(c *Config) { c.RunCap = cap })
+			logs := x.captureLogs()
+			x.f.autopilot = path == "completed"
+			for i := 1; i <= 3; i++ {
+				x.f.fail(fmt.Sprintf("rules.SetEnabled#%d", i), errLeaky)
+			}
+			fourth, release := make(chan struct{}), make(chan struct{})
+			x.f.onCall("rules.SetEnabled#4", func() { close(fourth); <-release })
+			a, chA := x.enqueue("a")
+			b, chB := x.enqueue("b")
+			var ruleAOnAtB atomic.Int32
+			x.f.onCall("zeus.Healthy#2", func() { // the next run's first call
+				if r := x.f.rule(x.f.ruleIDOfRun(a.RunID)); r == nil || r.Enabled {
+					ruleAOnAtB.Add(1)
+				}
+			})
+			x.start()
+
+			_, endA := awaitEnd(t, chA)
+			want := RunCompleted
+			if path == "watchdog" {
+				want = RunCancelled
+			}
+			if endA.Status != want {
+				t.Fatalf("run a ended %s; want %s", endA.Status, want)
+			}
+			waitClosed(t, fourth, "the fourth switch-off")
+			if !x.w.SwitchOffPending() {
+				t.Error("SwitchOffPending is false while the switch-off has not landed")
+			}
+			time.Sleep(20 * time.Millisecond)
+			if n := len(x.f.callList("zeus.Healthy")); n != 1 || x.f.ruleIDOfRun(b.RunID) != "" {
+				t.Fatalf("the next run was picked up while the switch-off was pending (%d preflights)", n)
+			}
+			if v, err := x.w.View(context.Background(), b.RunID); err != nil || v.Status != RunQueued || *v.Position != 0 {
+				t.Errorf("waiting run = %+v, %v; want queued at 0", v, err)
+			}
+			close(release)
+
+			waitFor(t, "the next run's pickup", func() bool { return x.f.ruleIDOfRun(b.RunID) != "" })
+			if x.w.SwitchOffPending() {
+				t.Error("SwitchOffPending still true after the switch-off landed")
+			}
+			if ruleAOnAtB.Load() != 0 {
+				t.Error("the next run started while the ended run's rule was still on")
+			}
+			ruleA := x.f.ruleIDOfRun(a.RunID)
+			calls := x.f.callList("")
+			var offs []int
+			for i, c := range calls {
+				if c == "rules.SetEnabled "+ruleA+" false" {
+					offs = append(offs, i)
+				}
+			}
+			built := slices.Index(calls, "rules.Create "+RunNamePrefix+b.RunID)
+			if len(offs) != 4 || built < 0 || built < offs[3] {
+				t.Errorf("switch-offs of a at %v, run b built at %d; want 4 switch-offs, all before b", offs, built)
+			}
+			// The worker numbers its own tries; on the watchdog path the
+			// watchdog's try came first and is logged on its own.
+			workerFails := 3
+			if path == "watchdog" {
+				workerFails = 2
+				if !logLineHas(logs.String(), "level=ERROR", "watchdog could not switch", "rule_id="+ruleA) {
+					t.Error("no error log for the watchdog's failed switch-off with the rule id")
+				}
+			}
+			for attempt := 1; attempt <= workerFails; attempt++ {
+				if !logLineHas(logs.String(), "level=ERROR", "rule_id="+ruleA, fmt.Sprintf("attempt=%d", attempt)) {
+					t.Errorf("no error log for attempt %d with the rule id", attempt)
+				}
+			}
+			if path == "completed" {
+				_, endB := awaitEnd(t, chB)
+				requireEnded(t, endB, RunCompleted, Reason{})
+			}
+			x.stop()
+			if x.w.SwitchOffPending() {
+				t.Error("SwitchOffPending after the stop")
+			}
+		})
+	}
+}
+
+// logLineHas reports whether one line of logs holds every part.
+func logLineHas(logs string, parts ...string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		all := true
+		for _, p := range parts {
+			if !strings.Contains(line, p) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWorker_SwitchOffFailsForEver: the next run never starts; the retries go
+// on, spaced out by the backoff; a shutdown returns at once, tries the pending
+// rule itself, and leaves no goroutine behind; the next start's sweep then
+// switches the rule off.
+func TestWorker_SwitchOffFailsForEver(t *testing.T) {
+	t.Parallel()
+	x := newHarness(t, noCap)
+	x.f.autopilot = true
+	x.w.offRetry = backoff{first: 2 * time.Millisecond, max: 8 * time.Millisecond}
+	var offTimes []time.Time
+	var offMu sync.Mutex
+	x.f.onCall("rules.SetEnabled", func() {
+		offMu.Lock()
+		offTimes = append(offTimes, time.Now())
+		offMu.Unlock()
+	})
+	x.f.fail("rules.SetEnabled", errLeaky)
+	_, chA := x.enqueue("a")
+	b, chB := x.enqueue("b")
+	x.start()
+	awaitEnd(t, chA)
+	waitFor(t, "six switch-off attempts", func() bool { return len(x.f.callList("rules.SetEnabled ")) >= 6 })
+	if !x.w.SwitchOffPending() {
+		t.Error("SwitchOffPending is false")
+	}
+	if x.f.ruleIDOfRun(b.RunID) != "" || len(x.f.callList("zeus.Healthy")) != 1 {
+		t.Fatal("the next run was picked up with the ended run's rule still on")
+	}
+	offMu.Lock()
+	gaps := make([]time.Duration, 0, len(offTimes))
+	for i := 1; i < len(offTimes); i++ {
+		gaps = append(gaps, offTimes[i].Sub(offTimes[i-1]))
+	}
+	offMu.Unlock()
+	// The first write is the ending's own; then 2, 4, 8, 8 ms apart at least.
+	for i, min := range []time.Duration{2, 4, 8, 8} {
+		if i+1 < len(gaps) && gaps[i+1] < min*time.Millisecond {
+			t.Errorf("retry gap %d is %s; want at least %s", i+1, gaps[i+1], min*time.Millisecond)
+		}
+	}
+
+	before := len(x.f.callList("rules.SetEnabled "))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	began := time.Now()
+	err := x.w.Shutdown(ctx)
+	if took := time.Since(began); took > 200*time.Millisecond {
+		t.Errorf("Shutdown took %s", took)
+	}
+	if !errors.Is(err, ErrRuleState) {
+		t.Errorf("Shutdown: %v; want the pending switch-off's failure", err)
+	}
+	if len(x.f.callList("rules.SetEnabled ")) <= before {
+		t.Error("Shutdown did not try the pending rule's switch-off")
+	}
+	waitClosed(t, x.w.done, "Run to return")
+	bg := make(chan struct{})
+	go func() { x.w.bg.Wait(); close(bg) }()
+	waitClosed(t, bg, "the retry goroutine to end")
+	_, endB := awaitEnd(t, chB)
+	requireEnded(t, endB, RunCancelled, ReasonInterrupted)
+
+	x.f.uninject("rules.SetEnabled")
+	if err := Sweep(context.Background(), x.f.deps(), 20); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	x.f.requireDemoRulesOff(t)
+}
+
+// TestWorker_FirstSwitchOffSucceeds: no retry, no extra write, no wait. With
+// a retry schedule of an hour, any wait would stall the next run.
+func TestWorker_FirstSwitchOffSucceeds(t *testing.T) {
+	t.Parallel()
+	x := newHarness(t, noCap)
+	x.f.autopilot = true
+	x.w.offRetry = backoff{first: time.Hour, max: time.Hour}
+	a, chA := x.enqueue("a")
+	b, chB := x.enqueue("b")
+	x.start()
+	awaitEnd(t, chA)
+	if x.w.SwitchOffPending() {
+		t.Error("SwitchOffPending after a switch-off that succeeded")
+	}
+	_, endB := awaitEnd(t, chB)
+	requireEnded(t, endB, RunCompleted, Reason{})
+	for _, r := range []Run{a, b} {
+		rule := x.f.ruleIDOfRun(r.RunID)
+		if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+			t.Errorf("run %s: %d switch-off writes; want 1", r.RunID, n)
+		}
+	}
+}
+
+// TestWorker_PanicInEndStillFreesTheSlot: the clock panics inside the first
+// run's ending, before its slot would be freed; the run still leaves the line
+// with its end event, and the next run is picked up and completes.
+func TestWorker_PanicInEndStillFreesTheSlot(t *testing.T) {
+	t.Parallel()
+	x := newHarness(t, noCap)
+	x.f.autopilot = true
+	x.f.fail("zeus.Healthy#1", errLeaky) // refused before any clock call: end's is the first
+	x.rebuild(func(d *Deps) { d.Clock = &panicOnceClock{Clock: d.Clock} })
+	a, chA := x.enqueue("a")
+	_, chB := x.enqueue("b")
+	x.start()
+	_, endA := awaitEnd(t, chA)
+	if endA.Status != RunFailed || endA.Reason != ReasonLoadGeneratorUnavailable || endA.Position != nil {
+		t.Errorf("run a ended %+v", endA)
+	}
+	if v, err := x.w.View(context.Background(), a.RunID); err != nil || v.Status != RunFailed {
+		t.Errorf("run a's view = %+v, %v", v, err)
+	}
+	_, endB := awaitEnd(t, chB)
+	requireEnded(t, endB, RunCompleted, Reason{})
+}
+
+// panicOnceClock panics on its first call.
+type panicOnceClock struct {
+	Clock
+	calls atomic.Int32
+}
+
+func (c *panicOnceClock) Now() time.Time {
+	if c.calls.Add(1) == 1 {
+		panic("clock exploded")
+	}
+	return c.Clock.Now()
+}
+
+// TestWorker_EndedRunNeverShownInLine: while runs end, a reader hammering
+// Snapshot and View never sees an ended run in line, never sees one with a
+// position, and never sees a run go back from ended.
+func TestWorker_EndedRunNeverShownInLine(t *testing.T) {
+	// Not parallel: its busy loops would starve the timing tests' timers
+	// when GOMAXPROCS is 1.
+	for round := 0; round < 10; round++ {
+		x := newHarness(t, nil)
+		x.f.fail("zeus.Healthy", errLeaky) // every run ends at once, refused
+		var ids []string
+		var chans []<-chan Event
+		for _, c := range []string{"a", "b", "c"} {
+			r, ch := x.enqueue(c)
+			ids = append(ids, r.RunID)
+			chans = append(chans, ch)
+		}
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		var bad atomic.Value
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ended := map[string]bool{}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				runtime.Gosched()
+				for _, r := range x.q.Snapshot() {
+					if r.Status != RunQueued && r.Status != RunRunning {
+						bad.Store(fmt.Sprintf("snapshot holds run %s %s", r.RunID, r.Status))
+					}
+				}
+				for _, id := range ids {
+					v, err := x.w.View(context.Background(), id)
+					if err != nil {
+						bad.Store(fmt.Sprintf("view of %s: %v", id, err))
+						continue
+					}
+					done := v.Status != RunQueued && v.Status != RunRunning
+					switch {
+					case done && v.Position != nil:
+						bad.Store(fmt.Sprintf("ended run %s has position %d", id, *v.Position))
+					case !done && ended[id]:
+						bad.Store(fmt.Sprintf("run %s went back to %s", id, v.Status))
+					}
+					ended[id] = ended[id] || done
+				}
+			}
+		}()
+		x.start()
+		for _, ch := range chans {
+			awaitEnd(t, ch)
+		}
+		close(stop)
+		wg.Wait()
+		x.stop()
+		if msg := bad.Load(); msg != nil {
+			t.Fatalf("round %d: %s", round, msg)
+		}
+	}
+}
+
+// TestWorker_EnqueueRefusedOnceStopped: once the worker is halted, while its
+// run is still ending, after Run returned, and after a Shutdown before Run,
+// Enqueue answers ErrQueueClosed.
+func TestWorker_EnqueueRefusedOnceStopped(t *testing.T) {
+	t.Parallel()
+	t.Run("halted, Run still ending", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, nil)
+		entered, release := make(chan struct{}), make(chan struct{})
+		x.f.onCall("experiments.Get#1", func() { close(entered); <-release })
+		_, ch := x.enqueue("a")
+		x.start()
+		waitClosed(t, entered, "the worker to block in a read")
+		x.w.halt()
+		if _, err := x.q.Enqueue("b", testNow); !errors.Is(err, ErrQueueClosed) {
+			t.Errorf("enqueue after halt: %v; want ErrQueueClosed", err)
+		}
+		select {
+		case <-x.w.done:
+			t.Fatal("Run returned while its worker was blocked")
+		default:
+		}
+		close(release)
+		awaitEnd(t, ch)
+		waitClosed(t, x.w.done, "Run to return")
+	})
+	t.Run("after Run returned", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, nil)
+		x.start()
+		x.stop()
+		if _, err := x.q.Enqueue("a", testNow); !errors.Is(err, ErrQueueClosed) {
+			t.Errorf("enqueue after Run returned: %v; want ErrQueueClosed", err)
+		}
+	})
+	t.Run("Shutdown before Run", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, nil)
+		if err := x.w.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := x.q.Enqueue("a", testNow); !errors.Is(err, ErrQueueClosed) {
+			t.Errorf("enqueue after Shutdown: %v; want ErrQueueClosed", err)
+		}
+	})
+}
+
+// TestWorker_EnqueueRacingStopIsNeverOrphaned: runs enqueued while the worker
+// stops are each either refused (ErrQueueClosed) or ended with an end event;
+// none is left in line. Subscribing after the end still gets the end.
+func TestWorker_EnqueueRacingStopIsNeverOrphaned(t *testing.T) {
+	// Not parallel: its busy loops would starve the timing tests' timers
+	// when GOMAXPROCS is 1.
+	for round := 0; round < 20; round++ {
+		x := newHarness(t, func(c *Config) { c.Capacity = 10; c.RunCap = 10 * time.Second })
+		var (
+			mu       sync.Mutex
+			accepted []string
+			stop     = make(chan struct{})
+			wg       sync.WaitGroup
+		)
+		for g := 0; g < 6; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					runtime.Gosched()
+					r, err := x.q.Enqueue(fmt.Sprintf("c%d-%d", g, i), testNow)
+					switch {
+					case err == nil:
+						mu.Lock()
+						accepted = append(accepted, r.RunID)
+						mu.Unlock()
+					case errors.Is(err, ErrQueueClosed), errors.Is(err, ErrQueueFull):
+					default:
+						t.Errorf("enqueue: %v", err)
+					}
+				}
+			}()
+		}
+		x.start()
+		time.Sleep(time.Duration(round%5) * time.Millisecond)
+		x.cancel()
+		waitClosed(t, x.w.done, "Run to return")
+		time.Sleep(2 * time.Millisecond) // enqueuers keep trying after the close
+		close(stop)
+		wg.Wait()
+		x.stop()
+		if n := len(x.q.Snapshot()); n != 0 {
+			t.Fatalf("round %d: %d runs orphaned in line", round, n)
+		}
+		mu.Lock()
+		ids := slices.Clone(accepted)
+		mu.Unlock()
+		for _, id := range ids {
+			ch, unsub := x.h.Subscribe(id)
+			ev, ok := recvWithin(t, ch)
+			unsub()
+			if !ok || ev.Type != EventEnd {
+				t.Fatalf("round %d: run %s has no end event (got %q, open %v)", round, id, ev.Type, ok)
+			}
+			if v, err := x.w.View(context.Background(), id); err != nil || v.Status == RunQueued || v.Status == RunRunning {
+				t.Fatalf("round %d: run %s = %s, %v; want ended", round, id, v.Status, err)
+			}
+		}
+	}
+}
+
 // ---- views ----
 
 // TestWorker_ViewAndRecent: views come from memory first, then from the
-// database with the restart mapping; an id never accepted, or a database
-// error, is not found and reveals nothing.
+// database with the restart mapping. An id never accepted is ErrRunNotFound
+// without a database read; a database failure is ErrRunUnavailable, never
+// not-found; Recent on a database failure returns what memory has and says it
+// is partial. Nothing internal reaches a view or an error.
 func TestWorker_ViewAndRecent(t *testing.T) {
 	t.Parallel()
-	x := newHarness(t, nil)
+	ctx := context.Background()
+	x := newHarness(t, noCap)
 	x.f.autopilot = true
 	r, ch := x.enqueue("a")
-	queued, ok := x.w.View(context.Background(), r.RunID)
-	if !ok || queued.Status != RunQueued || *queued.Position != 0 {
-		t.Fatalf("queued view = %+v, %v", queued, ok)
+	queued, err := x.w.View(ctx, r.RunID)
+	if err != nil || queued.Status != RunQueued || *queued.Position != 0 {
+		t.Fatalf("queued view = %+v, %v", queued, err)
 	}
 	x.start()
 	awaitEnd(t, ch)
 	x.stop()
 	listed := len(x.f.callList("experiments.List"))
-	if v, ok := x.w.View(context.Background(), r.RunID); !ok || v.Status != RunCompleted {
-		t.Fatalf("finished view = %+v, %v", v, ok)
+	if v, err := x.w.View(ctx, r.RunID); err != nil || v.Status != RunCompleted {
+		t.Fatalf("finished view = %+v, %v", v, err)
 	}
 	if n := len(x.f.callList("experiments.List")); n != listed {
 		t.Errorf("an in-memory view read the database (%d List calls)", n-listed)
 	}
 	// Recent fills up from the database, but never lists a run twice.
-	if got := x.w.Recent(context.Background(), 10); len(got) != 1 || got[0].RunID != r.RunID {
-		t.Fatalf("Recent = %+v", got)
+	if got, complete := x.w.Recent(ctx, 10); len(got) != 1 || got[0].RunID != r.RunID || !complete {
+		t.Fatalf("Recent = %+v, complete %v", got, complete)
 	}
-	if got := x.w.Recent(context.Background(), 1); len(got) != 1 || len(x.f.callList("experiments.List")) != listed+1 {
+	if got, complete := x.w.Recent(ctx, 1); len(got) != 1 || !complete || len(x.f.callList("experiments.List")) != listed+1 {
 		t.Errorf("Recent(1) with one run in memory read the database again")
 	}
 
@@ -1050,7 +1549,7 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 	older := map[string]string{}
 	for i, st := range []string{"failed", "cancelled", "completed", "running"} {
 		id := fmt.Sprintf("demo-0190c2f4-95b4-7cc3-8000-00000000000%d", i)
-		built, err := BuildRun(context.Background(), x.f.deps(), id, testRunCap)
+		built, err := BuildRun(ctx, x.f.deps(), id, testRunCap)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1077,9 +1576,9 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 		{older["running"], RunCancelled, ReasonInterrupted},
 	}
 	for _, tc := range cases {
-		v, ok := w2.View(context.Background(), tc.id)
-		if !ok {
-			t.Errorf("View(%s) not found", tc.id)
+		v, err := w2.View(ctx, tc.id)
+		if err != nil {
+			t.Errorf("View(%s): %v", tc.id, err)
 			continue
 		}
 		if v.RunID != tc.id || v.Status != tc.status || v.Reason != tc.reason || v.Position != nil {
@@ -1091,45 +1590,64 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 		}
 		assertNoLeak(t, string(b))
 	}
-	if v, _ := w2.View(context.Background(), r.RunID); v.Phases[2].Result == nil || v.Phases[2].Result.Requests != 292 ||
+	if v, _ := w2.View(ctx, r.RunID); v.Phases[2].Result == nil || v.Phases[2].Result.Requests != 292 ||
 		v.Phases[2].Status != PhaseCompleted || v.StartedAt == nil || v.EndedAt == nil {
 		t.Errorf("view from the database = %+v, last phase %+v", v, v.Phases[2])
 	}
 
-	recent := w2.Recent(context.Background(), 10)
+	recent, complete := w2.Recent(ctx, 10)
 	var ids []string
 	for _, v := range recent {
 		ids = append(ids, v.RunID)
 	}
 	want := []string{r.RunID, older["failed"], older["cancelled"], older["completed"]}
-	if !slices.Equal(ids, want) {
-		t.Errorf("Recent = %v; want %v (terminal runs, newest ended first)", ids, want)
+	if !slices.Equal(ids, want) || !complete {
+		t.Errorf("Recent = %v, complete %v; want %v (terminal runs, newest ended first), complete", ids, complete, want)
 	}
-	if got := w2.Recent(context.Background(), 2); len(got) != 2 {
+	if got, _ := w2.Recent(ctx, 2); len(got) != 2 {
 		t.Errorf("Recent(2) returned %d", len(got))
 	}
 
-	// Never accepted: no database read at all.
+	// Never accepted: not found, and no database read at all.
 	listed = len(x.f.callList("experiments.List"))
 	for _, bad := range []string{"", "nope", "exp-123", "demo-../../x", RunNamePrefix + r.RunID} {
-		if _, ok := w2.View(context.Background(), bad); ok {
-			t.Errorf("View(%q) found something", bad)
+		if v, err := w2.View(ctx, bad); !errors.Is(err, ErrRunNotFound) || v.RunID != "" {
+			t.Errorf("View(%q) = %+v, %v; want ErrRunNotFound", bad, v, err)
 		}
 	}
 	if n := len(x.f.callList("experiments.List")); n != listed {
 		t.Errorf("malformed ids read the database %d times", n-listed)
 	}
-	if _, ok := w2.View(context.Background(), "demo-0190c2f4-95b4-7cc3-8000-0000000000ff"); ok {
-		t.Error("View of a well-formed unknown id found something")
+	if _, err := w2.View(ctx, "demo-0190c2f4-95b4-7cc3-8000-0000000000ff"); !errors.Is(err, ErrRunNotFound) {
+		t.Errorf("View of a well-formed unknown id: %v; want ErrRunNotFound", err)
 	}
 
-	// A database error is not found, and Recent falls back to what it has.
+	// A database failure is unavailable, not not-found, and says nothing.
 	x.f.fail("experiments.List", errLeaky)
-	if v, ok := w2.View(context.Background(), older["failed"]); ok || v.RunID != "" {
-		t.Errorf("View on a database error = %+v, %v; want not found", v, ok)
+	v, err := w2.View(ctx, older["failed"])
+	if !errors.Is(err, ErrRunUnavailable) || errors.Is(err, ErrRunNotFound) || v.RunID != "" {
+		t.Errorf("View on a database error = %+v, %v; want ErrRunUnavailable", v, err)
 	}
-	if got := w2.Recent(context.Background(), 10); len(got) != 0 {
-		t.Errorf("Recent on a database error = %d runs; want none", len(got))
+	if err != nil {
+		assertNoLeak(t, err.Error())
+	}
+	x.f.uninject("experiments.List")
+	x.f.fail("experiments.ListPhasesForExperiment", errLeaky)
+	if _, err := w2.View(ctx, older["failed"]); !errors.Is(err, ErrRunUnavailable) {
+		t.Errorf("View when the phases cannot be read: %v; want ErrRunUnavailable", err)
+	}
+	x.f.uninject("experiments.ListPhasesForExperiment")
+
+	// Recent on a database failure: what memory has, marked partial.
+	x.f.fail("experiments.List", errLeaky)
+	if got, complete := w2.Recent(ctx, 10); len(got) != 0 || complete {
+		t.Errorf("Recent on a database error, nothing in memory = %d runs, complete %v; want 0, partial", len(got), complete)
+	}
+	if got, complete := x.w.Recent(ctx, 10); len(got) != 1 || got[0].RunID != r.RunID || complete {
+		t.Errorf("Recent on a database error = %d runs, complete %v; want the one in memory, partial", len(got), complete)
+	}
+	if got, complete := x.w.Recent(ctx, 1); len(got) != 1 || !complete {
+		t.Errorf("Recent(1) served from memory = %d runs, complete %v; want 1, complete", len(got), complete)
 	}
 }
 

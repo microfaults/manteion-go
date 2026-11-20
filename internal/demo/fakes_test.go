@@ -55,7 +55,8 @@ import (
 //   - failAfterCommit(op, err): write, then return err (a commit whose answer
 //     was lost);
 //   - hang(op): block until ctx is done, write nothing, return ctx.Err();
-//   - onCall(op, hook): run hook first.
+//   - onCall(op, hook): run hook first; hooks added for one op all run, in
+//     the order they were added.
 //
 // Hooks run and hangs wait without f.mu held, so a hook may call back into
 // the fake.
@@ -63,7 +64,7 @@ type fakeLab struct {
 	mu         sync.Mutex
 	calls      []string
 	injections map[string]injection
-	hooks      map[string]func()
+	hooks      map[string][]func()
 	counts     map[string]int
 	viols      []string
 	allowViols bool
@@ -104,7 +105,7 @@ type injection struct {
 func newFakeLab(t testing.TB, now time.Time) *fakeLab {
 	f := &fakeLab{
 		injections:  map[string]injection{},
-		hooks:       map[string]func(){},
+		hooks:       map[string][]func(){},
 		counts:      map[string]int{},
 		clock:       &fakeClock{now: now},
 		experiments: map[string]*model.Experiment{},
@@ -182,7 +183,7 @@ func (f *fakeLab) failAfterCommit(op string, err error) {
 func (f *fakeLab) hang(op string) { f.inject(op, injection{kind: injectHang}) }
 func (f *fakeLab) onCall(op string, hook func()) {
 	f.mu.Lock()
-	f.hooks[op] = hook
+	f.hooks[op] = append(f.hooks[op], hook)
 	f.mu.Unlock()
 }
 
@@ -197,9 +198,7 @@ func (f *fakeLab) begin(ctx context.Context, op, arg string) (after, err error) 
 	var hooks []func()
 	var inj *injection
 	for _, k := range keys {
-		if h := f.hooks[k]; h != nil {
-			hooks = append(hooks, h)
-		}
+		hooks = append(hooks, f.hooks[k]...)
 		if i, ok := f.injections[k]; ok && inj == nil {
 			inj = &i
 		}

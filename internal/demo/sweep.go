@@ -211,11 +211,17 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 		w.log.Info("demo: worker shut down before it ran")
 		return nil
 	}
-	// The run current before halt, and one the worker may have picked up as
-	// halt landed. Each switch is idempotent.
+	// The run current before halt, one the worker may have picked up as halt
+	// landed, and an ended run whose switch-off is still being retried (the
+	// retry stops with the worker, so this is its last try before the next
+	// start's sweep). Each switch is idempotent; writes to one rule never
+	// overlap.
 	runs := []*active{before}
 	if after := w.currentActive(); after != before {
 		runs = append(runs, after)
+	}
+	if p := w.pendingActive(); p != nil && !slices.Contains(runs, p) {
+		runs = append(runs, p)
 	}
 
 	switched := make(chan error, 1)

@@ -17,6 +17,9 @@ var (
 	ErrQueueFull = errors.New("demo: the queue is full")
 	// ErrClientHasRun: the client already has a run queued or running.
 	ErrClientHasRun = errors.New("demo: the client already has a run queued or running")
+	// ErrQueueClosed: the worker has been halted or has stopped; no run will
+	// be picked up any more (a route answers 503 unavailable).
+	ErrQueueClosed = errors.New("demo: the queue is closed")
 )
 
 // Queue is the line of runs that have not ended, in memory: the run the
@@ -30,11 +33,17 @@ var (
 //
 // The queue also keeps each waiting or running run's live view (its Run, less
 // the position, which is computed); the worker updates it as the run goes.
-// Every Run it hands out is a deep copy.
+// Every Run it hands out is a deep copy. A run's ended view never lives here:
+// the worker records it and takes the run out of the line in one step.
+//
+// The worker closes the queue when it is halted or stops; Enqueue then
+// refuses. The worker reads the runs still waiting after closing it, so a run
+// is either refused or ended, never left in line.
 type Queue struct {
 	mu       sync.Mutex
 	capacity int
 	line     []*queued
+	closed   bool
 	wake     chan struct{} // holds a token when a run was added since the worker last looked
 }
 
@@ -54,14 +63,17 @@ func NewQueue(capacity int) *Queue {
 }
 
 // Enqueue adds a run for client at the end of the line and returns its view:
-// status queued, its position, queued at now. It refuses with ErrClientHasRun
-// when the client already has a run in the line (checked first), and with
-// ErrQueueFull when the line is at capacity. The run's id is
-// id.New(RunIDPrefix). Nothing is built here: the worker builds a run when it
-// picks it up.
+// status queued, its position, queued at now. It refuses with ErrQueueClosed
+// once the worker was halted or stopped, then with ErrClientHasRun when the
+// client already has a run in the line, and with ErrQueueFull when the line is
+// at capacity. The run's id is id.New(RunIDPrefix). Nothing is built here: the
+// worker builds a run when it picks it up.
 func (q *Queue) Enqueue(client string, now time.Time) (Run, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.closed {
+		return Run{}, ErrQueueClosed
+	}
 	for _, e := range q.line {
 		if e.client == client {
 			return Run{}, ErrClientHasRun
@@ -91,15 +103,31 @@ func (q *Queue) Snapshot() []Run {
 	return out
 }
 
+// closeLine closes the queue: Enqueue refuses from now on and next returns
+// false. Idempotent.
+func (q *Queue) closeLine() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
 // next waits until the first run in the line is one the worker has not taken
-// yet, marks it taken and returns its id. It returns false once ctx is done,
-// without taking anything.
+// yet, marks it taken and returns its id. It returns false once ctx is done or
+// the queue is closed, without taking anything.
 func (q *Queue) next(ctx context.Context) (string, bool) {
 	for {
 		if ctx.Err() != nil {
 			return "", false
 		}
 		q.mu.Lock()
+		if q.closed {
+			q.mu.Unlock()
+			return "", false
+		}
 		if len(q.line) > 0 && !q.line[0].taken {
 			q.line[0].taken = true
 			runID := q.line[0].run.RunID

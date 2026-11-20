@@ -90,6 +90,47 @@ func TestHub_NothingAfterEnd(t *testing.T) {
 	}
 }
 
+// TestHub_SubscribeAfterEnd: a subscription to a run that already ended gets
+// its end event at once and is then closed, registering nothing; a closed hub
+// gives a closed, empty channel, which a caller tells apart. This is what makes
+// "subscribe, then read the view" safe for a stream: an end published before
+// the subscription is not lost.
+func TestHub_SubscribeAfterEnd(t *testing.T) {
+	h := NewHub()
+	end := Event{Type: EventEnd, Data: Run{RunID: "run-a", Status: RunCompleted}}
+	h.Publish("run-a", end)
+	ch, unsub := h.Subscribe("run-a")
+	ev, ok := recvWithin(t, ch)
+	if !ok || ev.Type != EventEnd || ev.Data.(Run).RunID != "run-a" {
+		t.Fatalf("late subscriber got %+v, open %v; want the end event", ev, ok)
+	}
+	if _, open := recvWithin(t, ch); open {
+		t.Fatal("the late subscription stayed open after the end")
+	}
+	unsub()
+	unsub()
+	if h.Count() != 0 {
+		t.Fatalf("Count = %d; a late subscription registered", h.Count())
+	}
+	h.CloseAll()
+	c, _ := h.Subscribe("run-b")
+	if ev, open := recvWithin(t, c); open || ev.Type != "" {
+		t.Fatalf("after CloseAll got %+v, open %v; want closed and empty", ev, open)
+	}
+}
+
+// recvWithin receives from ch, failing t after a second instead of hanging.
+func recvWithin(t *testing.T, ch <-chan Event) (Event, bool) {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		return ev, ok
+	case <-time.After(time.Second):
+		t.Fatal("nothing received within a second")
+		return Event{}, false
+	}
+}
+
 // TestHub_SubscribersAreSeparate: an event reaches every subscriber of its
 // run and no one else's.
 func TestHub_SubscribersAreSeparate(t *testing.T) {

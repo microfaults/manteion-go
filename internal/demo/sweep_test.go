@@ -971,10 +971,12 @@ func TestWorker_ShutdownDisablesCurrentRule(t *testing.T) {
 	if err := x.w.Shutdown(ctx); err != nil {
 		t.Errorf("second Shutdown: %v", err)
 	}
-	c, _ := x.enqueue("c")
-	time.Sleep(20 * time.Millisecond)
-	if x.f.ruleIDOfRun(c.RunID) != "" {
-		t.Error("a run was picked up after Shutdown")
+	// No run can be queued, let alone picked up, after Shutdown.
+	if _, err := x.q.Enqueue("c", testNow); !errors.Is(err, ErrQueueClosed) {
+		t.Errorf("enqueue after Shutdown: %v; want ErrQueueClosed", err)
+	}
+	if n := len(x.f.callList("rules.Create")); n != 1 {
+		t.Errorf("%d runs built; want only the first", n)
 	}
 }
 

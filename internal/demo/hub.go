@@ -6,8 +6,9 @@ import "sync"
 // new ones for it.
 const hubBuffer = 16
 
-// hubSealed is how many ended runs the hub remembers, to drop anything
-// published for them after their end event.
+// hubSealed is how many ended runs the hub remembers, with their end events:
+// to drop anything published for them after their end, and to hand the end to
+// a subscriber that comes late.
 const hubSealed = 256
 
 // Hub fans a run's events out to its subscribers (the event streams). It
@@ -15,15 +16,22 @@ const hubSealed = 256
 // event, except the end event, which takes the place of the oldest buffered
 // one so that a slow subscriber still learns its run ended. Once a run's end
 // event is published, anything else published for that run (a late sample, a
-// second end) is dropped, so the end is always the last event. The hub runs no
-// goroutine of its own.
+// second end) is dropped, so the end is always the last event; a later
+// Subscribe to that run gets the end event at once. The hub runs no goroutine
+// of its own.
+//
+// The safe order for an event stream is: Subscribe first, then read the run's
+// view (Worker.View) for the state frame. The worker records a run's ended view
+// before it publishes the end event, so an end published before the Subscribe
+// shows in the view (and is also replayed by Subscribe), and one published
+// after it is in the channel. Nothing is missed either way.
 type Hub struct {
 	mu     sync.Mutex
 	subs   map[string]map[*subscription]struct{} // by run id; an entry exists only while it has subscribers
 	n      int
 	closed bool
-	sealed map[string]struct{} // runs whose end was published (the last hubSealed)
-	order  []string            // sealed run ids, oldest first
+	sealed map[string]Event // ended runs (the last hubSealed) and their end events
+	order  []string         // sealed run ids, oldest first
 }
 
 type subscription struct {
@@ -32,7 +40,7 @@ type subscription struct {
 
 // NewHub returns a hub with no subscribers.
 func NewHub() *Hub {
-	return &Hub{subs: map[string]map[*subscription]struct{}{}, sealed: map[string]struct{}{}}
+	return &Hub{subs: map[string]map[*subscription]struct{}{}, sealed: map[string]Event{}}
 }
 
 // Publish sends ev to every subscriber of runID without blocking. It does
@@ -47,7 +55,7 @@ func (h *Hub) Publish(runID string, ev Event) {
 		return
 	}
 	if ev.Type == EventEnd {
-		h.sealed[runID] = struct{}{}
+		h.sealed[runID] = ev
 		h.order = append(h.order, runID)
 		if len(h.order) > hubSealed {
 			delete(h.sealed, h.order[0])
@@ -80,12 +88,22 @@ func (h *Hub) Publish(runID string, ev Event) {
 // Subscribe returns a channel of runID's events and a function that ends the
 // subscription. Ending it closes the channel and removes every trace of the
 // subscription; it may be called any number of times, also after CloseAll.
-// After CloseAll, Subscribe returns a closed channel.
+//
+// Two channels come back already closed, and a caller tells them apart by
+// what they hold:
+//   - runID has already ended: the channel holds the run's end event, then is
+//     closed (nothing is registered);
+//   - after CloseAll: the channel is closed and empty.
 func (h *Hub) Subscribe(runID string) (<-chan Event, func()) {
 	s := &subscription{ch: make(chan Event, hubBuffer)}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
+		close(s.ch)
+		return s.ch, func() {}
+	}
+	if end, ok := h.sealed[runID]; ok {
+		s.ch <- end
 		close(s.ch)
 		return s.ch, func() {}
 	}

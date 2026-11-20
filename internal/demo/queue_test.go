@@ -88,6 +88,29 @@ func TestQueue_OneRunPerClient(t *testing.T) {
 	}
 }
 
+// TestQueue_Closed: a closed queue refuses every enqueue first of all, keeps
+// what waits for the worker to end, and next returns false at once.
+func TestQueue_Closed(t *testing.T) {
+	q := NewQueue(3)
+	r, err := q.Enqueue("a", testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.closeLine()
+	q.closeLine()
+	for _, c := range []string{"a", "b"} {
+		if _, err := q.Enqueue(c, testNow); !errors.Is(err, ErrQueueClosed) {
+			t.Errorf("enqueue %s on a closed queue: %v; want ErrQueueClosed", c, err)
+		}
+	}
+	if w := q.waiting(); !slices.Equal(w, []string{r.RunID}) {
+		t.Errorf("waiting = %v; want the run queued before the close", w)
+	}
+	if id, ok := q.next(t.Context()); ok {
+		t.Errorf("next on a closed queue took %q", id)
+	}
+}
+
 // TestQueue_Positions: position is the 0-based place in the line, 0 for the
 // first run before the worker took it; removing the head moves the others up
 // and reports their new positions; a second remove frees nothing.
