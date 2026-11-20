@@ -191,35 +191,67 @@ func TestLimiter_StreamRetryAfter(t *testing.T) {
 	}
 }
 
-// TestLimiter_ClientCap: the map holds at most 10 000 clients; a new client
-// is refused while it is full; an entry with no live state expires a minute
-// after its last use, which makes room again; an entry with a recent enqueue
-// or an open stream does not expire.
+// TestLimiter_ClientCap: the table holds at most 10 000 clients. While it is
+// full, a client it does not hold is not refused: every such client shares
+// one overflow bucket with the per-client limits; clients it holds keep their
+// own entries; DefaultClient has a bucket of its own outside the table. An
+// entry with no live state expires a minute after its last use, which makes
+// room again; an entry with a recent enqueue or an open stream does not.
 func TestLimiter_ClientCap(t *testing.T) {
 	t.Parallel()
 	l, c := newTestLimiter()
 	for i := 0; i < maxClients; i++ {
 		if !l.AllowRead(fmt.Sprintf("c%05d", i)) {
-			t.Fatalf("client %d refused before the map was full", i)
+			t.Fatalf("client %d refused before the table was full", i)
 		}
 	}
 	if n := l.clientCount(); n != maxClients {
 		t.Fatalf("%d clients; want %d", n, maxClients)
 	}
-	if ok, wait := l.takeRead("new"); ok || wait != time.Minute {
-		t.Errorf("new client's read: ok %v, wait %v; want refused, 1m", ok, wait)
+
+	// New clients are served from one shared bucket: 120 reads between all.
+	for i := 0; i < readLimit; i++ {
+		if !l.AllowRead(fmt.Sprintf("new%03d", i)) {
+			t.Fatalf("new client %d refused while the table is full", i)
+		}
 	}
-	if ok, _ := l.enqueueWait("new"); ok {
-		t.Error("new client's enqueue allowed while full")
+	if ok, wait := l.takeRead("yet-another"); ok || wait != time.Minute {
+		t.Errorf("the overflow bucket's 121st read: ok %v, wait %v; want refused, 1m", ok, wait)
 	}
-	if _, ok := l.AcquireStream("new"); ok {
-		t.Error("new client's stream allowed while full")
+	if !l.AllowEnqueue("newE") {
+		t.Fatal("a new client's enqueue refused while the table is full")
 	}
-	if !l.AllowRead("c00042") {
-		t.Error("a known client was refused because the map is full")
+	l.RecordEnqueue("newE")
+	if l.AllowEnqueue("newF") {
+		t.Error("the overflow bucket allowed a second enqueue within 5 minutes")
+	}
+	for i := 0; i < streamsPerClient; i++ {
+		if _, ok := l.AcquireStream(fmt.Sprintf("newS%d", i)); !ok {
+			t.Fatalf("overflow stream %d refused", i+1)
+		}
+	}
+	if _, ok := l.AcquireStream("newS9"); ok {
+		t.Error("the overflow bucket allowed a 4th stream")
 	}
 	if n := l.clientCount(); n != maxClients {
-		t.Fatalf("%d clients after refusals; want %d", n, maxClients)
+		t.Fatalf("%d clients after the overflow; want %d", n, maxClients)
+	}
+	for _, k := range []string{"new000", "newE", "newS0"} {
+		if l.has(k) {
+			t.Errorf("%s got a table entry while the table is full", k)
+		}
+	}
+	// Known clients and DefaultClient are not affected.
+	if !l.AllowRead("c00042") {
+		t.Error("a known client was refused while the table is full")
+	}
+	for i := 0; i < readLimit; i++ {
+		if !l.AllowRead(DefaultClient) {
+			t.Fatalf("%s's read %d refused: it has a bucket of its own", DefaultClient, i+1)
+		}
+	}
+	if l.has(DefaultClient) {
+		t.Errorf("%s holds a table entry", DefaultClient)
 	}
 
 	// Three clients keep live state: an enqueue, an open stream, a read.
@@ -231,8 +263,8 @@ func TestLimiter_ClientCap(t *testing.T) {
 	l.AllowRead("c00003")
 
 	c.Advance(31 * time.Second) // 61 s after the fill: the fill's reads are idle
-	if !l.AllowRead("new") {
-		t.Fatal("a new client is still refused after the idle entries expired")
+	if !l.AllowRead("new") || !l.has("new") {
+		t.Fatal("a new client has no entry of its own after the idle entries expired")
 	}
 	// Kept: c00001 (enqueue), c00002 (open stream), c00003 (read 31 s ago),
 	// and the new client. Every other entry was last used 61 s ago.

@@ -31,16 +31,26 @@ const (
 
 // Limiter enforces the per-client limits: 120 reads in any rolling minute,
 // one enqueue every 5 minutes, 3 open event streams; and 50 open streams in
-// all. A client is the key the routes derive from X-Demo-Client.
+// all. A client is the key the routes resolve (clientOf): the edge's
+// X-Demo-Client on a request with the edge secret, else DefaultClient.
 //
-// It tracks at most 10 000 clients. While that many are tracked, a client it
-// does not know is refused everything (rate limited), and a client it knows
-// is served as usual. An entry expires once it holds nothing (no read within
-// the last minute, no enqueue within the last 5 minutes, no open stream) and
-// was last used a minute ago or more. Expired entries are dropped by a sweep
-// of the map, made at most once a minute in the course of use, and at most
-// once a second when the map is full and a new client asks; so the map never
-// grows past its cap, and a full map of idle clients empties within a minute.
+// Buckets. DefaultClient ("local", every caller without the edge secret) has
+// a bucket of its own that never expires and is not counted in the table.
+// Every other client has an entry in a table of at most 10 000.
+//
+// Degraded mode, while the table is full: a client the table does not hold
+// is not refused; it is accounted to one shared overflow bucket, with the
+// same per-client limits, which every such client shares (120 reads a
+// minute between all of them, and so on). Clients the table holds keep their
+// own entries. The overflow bucket is not reachable by any key: it is a field,
+// not a table entry. The mode ends by itself as entries expire.
+//
+// An entry expires once it holds nothing (no read within the last minute, no
+// enqueue within the last 5 minutes, no open stream) and was last used a
+// minute ago or more. Expired entries are dropped by a sweep of the table,
+// made at most once a minute in the course of use, and at most once a second
+// when the table is full and a new client asks; so the table never grows past
+// its cap, and a full table of idle clients empties within a minute.
 //
 // Time comes from the Clock. A wall clock stepped backwards never locks a
 // client out for longer than the limits themselves: reads stamped in the
@@ -53,7 +63,9 @@ type Limiter struct {
 	streamMaxAge time.Duration // an event stream is closed after this long (Config.StreamMaxAge)
 
 	mu        sync.Mutex
-	clients   map[string]*clientState
+	clients   map[string]*clientState // every client but DefaultClient, at most maxClients
+	local     *clientState            // DefaultClient's bucket
+	overflow  *clientState            // the bucket of clients met while the table is full
 	streams   map[*openStream]struct{}
 	lastSweep int64 // UnixNano of the last sweep
 }
@@ -86,6 +98,8 @@ func NewLimiter(c Clock) *Limiter {
 		clock:        c,
 		streamMaxAge: DefaultConfig().StreamMaxAge,
 		clients:      map[string]*clientState{},
+		local:        &clientState{},
+		overflow:     &clientState{},
 		streams:      map[*openStream]struct{}{},
 	}
 }
@@ -103,10 +117,7 @@ func (l *Limiter) takeRead(client string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	c := l.entry(client, now, true)
-	if c == nil {
-		return false, readWindow
-	}
+	c := l.entry(client, now)
 	c.pruneReads(now)
 	if c.n >= readLimit {
 		return false, time.Duration(c.reads[c.head] + int64(readWindow) - now)
@@ -129,10 +140,7 @@ func (l *Limiter) enqueueWait(client string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	c := l.entry(client, now, true)
-	if c == nil {
-		return false, readWindow
-	}
+	c := l.entry(client, now)
 	if !c.enqueued {
 		return true, 0
 	}
@@ -145,20 +153,14 @@ func (l *Limiter) enqueueWait(client string) (bool, time.Duration) {
 	return true, 0
 }
 
-// RecordEnqueue records an enqueue by client now. Call it only once the run
-// was accepted (the 201). It records even when the map is full and client
-// has no entry (possible only if more than a minute passed since
-// AllowEnqueue): an accepted run must count, and accepted runs are few.
+// RecordEnqueue records an enqueue by client now, in the bucket AllowEnqueue
+// checked. Call it only once the run was accepted (the 201).
 func (l *Limiter) RecordEnqueue(client string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	c, ok := l.clients[client]
-	if !ok {
-		c = &clientState{}
-		l.clients[client] = c
-	}
-	c.enqueued, c.enqueuedAt, c.lastSeen = true, now, now
+	c := l.entry(client, now)
+	c.enqueued, c.enqueuedAt = true, now
 }
 
 // AcquireStream takes an event-stream slot for client: at most 3 per client
@@ -176,10 +178,7 @@ func (l *Limiter) takeStream(client string) (release func(), ok bool, wait time.
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	c := l.entry(client, now, true)
-	if c == nil {
-		return func() {}, false, readWindow
-	}
+	c := l.entry(client, now)
 	if c.streams >= streamsPerClient {
 		return func() {}, false, l.streamWait(now, c)
 	}
@@ -217,30 +216,38 @@ func (l *Limiter) streamWait(now int64, c *clientState) time.Duration {
 // now is the clock's time in UnixNano.
 func (l *Limiter) now() int64 { return l.clock.Now().UnixNano() }
 
-// entry returns client's entry, marking it used; a new client gets one when
-// create is set and the map has room (after an early sweep if it is full),
-// else nil. Called with l.mu held.
-func (l *Limiter) entry(client string, now int64, create bool) *clientState {
+// entry returns the bucket client is accounted to, marking it used:
+// DefaultClient's own; the client's entry, made if the table has room (after
+// an early sweep if it is full); else the shared overflow bucket. Called with
+// l.mu held.
+func (l *Limiter) entry(client string, now int64) *clientState {
 	if l.lastSweep > now {
 		l.lastSweep = now // the clock went back
 	}
 	if now-l.lastSweep >= int64(sweepEvery) {
 		l.sweep(now)
 	}
-	if c, ok := l.clients[client]; ok {
-		c.lastSeen = max(c.lastSeen, now)
-		return c
+	c := l.local
+	if client != DefaultClient {
+		c = l.tableEntry(client, now)
 	}
-	if !create {
-		return nil
+	c.lastSeen = max(c.lastSeen, now)
+	return c
+}
+
+// tableEntry is client's table entry, or the overflow bucket while the table
+// is full. Called with l.mu held.
+func (l *Limiter) tableEntry(client string, now int64) *clientState {
+	if c, ok := l.clients[client]; ok {
+		return c
 	}
 	if len(l.clients) >= maxClients && now-l.lastSweep >= int64(fullSweepEvery) {
 		l.sweep(now)
 	}
 	if len(l.clients) >= maxClients {
-		return nil
+		return l.overflow
 	}
-	c := &clientState{lastSeen: now}
+	c := &clientState{}
 	l.clients[client] = c
 	return c
 }

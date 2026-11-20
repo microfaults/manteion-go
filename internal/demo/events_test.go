@@ -162,6 +162,7 @@ func (x *streamHarness) request(t *testing.T, runID, client string) (*http.Respo
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set(HeaderEdgeSecret, goodSecret) // as the edge sends every request
 	if client != "" {
 		req.Header.Set(HeaderClient, client)
 	}

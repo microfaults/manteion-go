@@ -123,6 +123,7 @@ type Worker struct {
 	offRetry backoff // the switch-off retry schedule; set before Run
 
 	running atomic.Bool
+	ended   atomic.Uint64   // runs ended in this process (endedCount)
 	halted  context.Context // done once halt was called
 	haltFn  context.CancelFunc
 	done    chan struct{}  // closed when Run returns
@@ -888,6 +889,7 @@ func (w *Worker) retire(runID string, final *Run) {
 		if extra := len(w.finished) - w.cfg.Retain; extra > 0 {
 			w.finished = slices.Clone(w.finished[extra:])
 		}
+		w.ended.Add(1)
 	}
 	if w.cur != nil && w.cur.runID == runID {
 		w.cur = nil
@@ -903,6 +905,11 @@ func (w *Worker) retire(runID string, final *Run) {
 	}
 	w.log.Info("demo: run ended", "run_id", runID, "status", string(final.Status), "reason", final.Reason.String())
 }
+
+// endedCount is how many runs have ended in this process. It counts each run
+// as its ended view is recorded, before its end event is published, so a
+// reader that sees the new count finds the run in View and Recent.
+func (w *Worker) endedCount() uint64 { return w.ended.Load() }
 
 func (w *Worker) callOnRunEnded(parent context.Context) {
 	if w.OnRunEnded == nil {

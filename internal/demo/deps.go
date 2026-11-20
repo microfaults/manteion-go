@@ -24,8 +24,8 @@ import (
 // CancelExperiment, and owns its rule's enabled flag.
 
 // Clock tells the time. Package code never calls time.Now itself, except
-// for a socket's write deadline, which the network poller compares with the
-// wall clock (events.go, wallDeadline).
+// for a socket's read or write deadline, which the network poller compares
+// with the wall clock (events.go, wallDeadline).
 type Clock interface {
 	Now() time.Time
 }

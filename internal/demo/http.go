@@ -33,9 +33,18 @@ const (
 	// The sixth, routeEvents, is in events.go.
 )
 
-// maxBodyBytes caps a request body. No route takes one: a body this small is
-// read and ignored, a larger one is 400 bad_request.
+// maxBodyBytes caps a request body. Only POST from the edge has its body
+// read: up to this much is read and ignored, more is 400 bad_request.
 const maxBodyBytes = 1 << 10
+
+// bodyReadTimeout bounds how long a POST from the edge may take to send its
+// (ignored) body: a body that stalls or never ends is 400 bad_request once it
+// passes.
+const bodyReadTimeout = 3 * time.Second
+
+// maxRetryWait caps a Retry-After before it is rounded up; real waits are
+// minutes at most.
+const maxRetryWait = time.Hour
 
 // errEnqueueLimited: the client's last enqueue is less than 5 minutes old (429
 // rate_limited).
@@ -56,10 +65,20 @@ var errEnqueueLimited = errors.New("demo: the client enqueued less than 5 minute
 //     header, never the edge secret).
 //
 // Each route answers only its own method (ServeMux would also route HEAD to a
-// GET pattern), caps and drains the request body, and checks the client key
-// (X-Demo-Client: absent is "local"; empty, repeated, over 200 bytes, not
-// UTF-8 or holding a control character is 400 bad_request). A GET counts as
-// one read of the client's 120 a minute. POST checks the edge secret first.
+// GET pattern) and resolves its client with clientOf: the edge's
+// X-Demo-Client on a request with the edge secret, else the shared client
+// "local". A GET counts as one read of its client's 120 a minute; a GET that
+// declares a body is 400 bad_request, unread. POST answers 403 without the
+// edge secret before it touches the body, then reads the body under a cap and
+// a deadline of its own (readBody).
+//
+// Unread bodies: whenever a response goes out while the request's declared
+// body has not been read to its end, the recorder adds Connection: close and
+// sets the connection's read deadline to now. Otherwise net/http would read up
+// to 256 KiB of it before writing the response headers, and again when it
+// closes the body after the reply, each bounded only by the server's
+// ReadTimeout (net/http server.go: chunkWriter.writeHeader and
+// response.finishRequest; transfer.go: body.Close).
 //
 // Pass the wiring's http.Server DisableGeneralOptionsHandler: true, or
 // net/http answers OPTIONS * itself, before this handler.
@@ -81,7 +100,7 @@ func (d *Demo) Handler() http.Handler {
 func (d *Demo) serve(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := d.d.Clock.Now()
-		rec := &recorder{ResponseWriter: w}
+		rec := &recorder{ResponseWriter: w, unreadBody: declaresBody(r)}
 		h := rec.Header()
 		h.Set("Content-Type", "application/json")
 		h.Set("Cache-Control", "no-store")
@@ -136,44 +155,56 @@ func (d *Demo) logRequest(rec *recorder, r *http.Request, start time.Time) {
 	d.log.Info("demo: request", attrs...)
 }
 
-// only answers 404 not_found to any method but method, and 400 bad_request
-// to a body over maxBodyBytes; it reads and drops a smaller one.
+// only answers 404 not_found to any method but method.
 func (d *Demo) only(method string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != method {
 			d.writeError(w, CodeNotFound, 0)
 			return
 		}
-		if !d.dropBody(w, r) {
-			return
-		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// dropBody reads and drops the request body, at most maxBodyBytes of it; a
-// larger body is 400 bad_request and closes the connection.
-func (d *Demo) dropBody(w http.ResponseWriter, r *http.Request) bool {
-	if r.Body == nil {
+// declaresBody reports whether r declares a request body.
+func declaresBody(r *http.Request) bool {
+	return r.ContentLength != 0 || len(r.TransferEncoding) > 0
+}
+
+// readBody reads and drops a POST's body, at most maxBodyBytes of it and for
+// at most the demo's body deadline (bodyReadTimeout), set on the connection.
+// A body over the cap, or one that stalls or never ends, is 400 bad_request
+// (the recorder then closes the connection, the body being unread). Call it
+// only once the edge secret has been checked.
+func (d *Demo) readBody(w http.ResponseWriter, r *http.Request) bool {
+	if !declaresBody(r) {
 		return true
 	}
-	tooLarge := r.ContentLength > maxBodyBytes
-	if !tooLarge {
-		_, err := io.Copy(io.Discard, http.MaxBytesReader(unwrap(w), r.Body, maxBodyBytes))
-		tooLarge = err != nil
-	}
-	if tooLarge {
-		w.Header().Set("Connection", "close")
+	rc := http.NewResponseController(unwrap(w))
+	_ = rc.SetReadDeadline(wallDeadline(d.bodyTimeout)) // unsupported only off a real connection
+	_, err := io.Copy(io.Discard, http.MaxBytesReader(unwrap(w), r.Body, maxBodyBytes))
+	if err != nil {
 		d.writeError(w, CodeBadRequest, 0)
 		return false
+	}
+	// Read to its end: nothing more is read for this request, and the
+	// connection may serve the next one.
+	_ = rc.SetReadDeadline(time.Time{})
+	if rec, ok := w.(*recorder); ok {
+		rec.unreadBody = false
 	}
 	return true
 }
 
-// read is a GET route that counts one read for its client.
+// read is a GET route that counts one read for its client. A GET that
+// declares a body is 400 bad_request, without a byte of it read.
 func (d *Demo) read(h func(w http.ResponseWriter, r *http.Request, client string)) http.Handler {
 	return d.only(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		client, ok := clientKey(r)
+		if declaresBody(r) {
+			d.writeError(w, CodeBadRequest, 0)
+			return
+		}
+		client, ok := d.clientOf(r)
 		if !ok {
 			d.writeError(w, CodeBadRequest, 0)
 			return
@@ -236,7 +267,8 @@ func (d *Demo) state() State {
 
 // runningPhase is where run r is at now: its running phase, else the next
 // pending one, else the last. Progress is the phase's elapsed fraction while
-// it runs, 0 before it starts, 1 once it has ended.
+// it runs (0..1: a phase past its 40 s is 1, a clock stepped back 0), 0
+// before it starts, 1 once it has ended.
 func runningPhase(r Run, now time.Time) RunningPhase {
 	var statuses [len(PhaseNames)]PhaseStatus
 	for i, p := range r.Phases {
@@ -248,7 +280,7 @@ func runningPhase(r Run, now time.Time) RunningPhase {
 	rp := RunningPhase{RunID: r.RunID, Phase: name, PhaseIndex: i, PhaseStartedAt: clonePtr(p.StartedAt), PhaseDurationS: PhaseDurationS}
 	switch {
 	case running && p.StartedAt != nil:
-		rp.Progress = now.Sub(*p.StartedAt).Seconds() / PhaseDurationS
+		rp.Progress = clampProgress(now.Sub(*p.StartedAt).Seconds() / PhaseDurationS)
 	case running || p.Status == PhasePending:
 		rp.Progress = 0
 	default:
@@ -258,22 +290,26 @@ func runningPhase(r Run, now time.Time) RunningPhase {
 }
 
 // handlePostRun queues a run. In order: the edge secret (403 forbidden,
-// whether missing or wrong), the client key (400), the lab open (503
+// whether missing or wrong, before the body is touched), the client key
+// (400), the body (readBody: 400), the lab open (503
 // unavailable before the start-up sweep, during shutdown, or once the queue
 // is closed), the client's run in line (429 client_has_run), the client's
 // enqueue limit (429 rate_limited), a free slot (429 queue_full); then 201,
 // and only then is the enqueue counted against the client.
 func (d *Demo) handlePostRun(w http.ResponseWriter, r *http.Request) {
-	if s := r.Header.Values(HeaderEdgeSecret); len(s) != 1 || !d.cfg.EdgeSecret.Matches(s[0]) {
+	if !d.fromEdge(r) {
 		d.writeError(w, CodeForbidden, 0)
 		return
 	}
-	client, ok := clientKey(r)
+	client, ok := d.clientOf(r)
 	if !ok {
 		d.writeError(w, CodeBadRequest, 0)
 		return
 	}
 	d.noteClient(w, client)
+	if !d.readBody(w, r) {
+		return
+	}
 	if !d.ready.Load() || d.stopping.Load() {
 		d.writeError(w, CodeUnavailable, 0)
 		return
@@ -359,14 +395,16 @@ func (d *Demo) handleRun(w http.ResponseWriter, r *http.Request, _ string) {
 	d.writeJSON(w, r, http.StatusOK, run)
 }
 
-// handleRecent: the last Config.Recent ended runs. When the database could
-// not be read in full, it still answers 200 with what was found.
+// handleRecent: the last Config.Recent ended runs, from the recent cache
+// (recentRuns). When the database could not be read in full, it still answers
+// 200 with what was found.
 func (d *Demo) handleRecent(w http.ResponseWriter, r *http.Request, _ string) {
-	ctx, cancel := context.WithTimeout(r.Context(), d.cfg.routeTimeout())
+	ctx, cancel := context.WithTimeout(r.Context(), d.cfg.routeTimeout()+d.cfg.QueryTimeout)
 	defer cancel()
-	runs, complete := d.recent(ctx, d.cfg.Recent)
-	if !complete {
-		d.log.Warn("demo: recent runs answered with what could be read", "runs", len(runs))
+	runs, err := d.recentRuns(ctx)
+	if err != nil {
+		d.fail(w, r, err, 0)
+		return
 	}
 	d.writeJSON(w, r, http.StatusOK, RecentRuns{Runs: runs})
 }
@@ -430,16 +468,37 @@ func (d *Demo) writeError(w http.ResponseWriter, code Code, wait time.Duration) 
 }
 
 // retrySeconds is a Retry-After value: wait in whole seconds, rounded up, at
-// least 1.
+// least 1; wait is capped at maxRetryWait first, so rounding cannot overflow.
 func retrySeconds(wait time.Duration) int {
+	wait = min(wait, maxRetryWait)
 	return max(1, int((wait+time.Second-1)/time.Second))
 }
 
 // ---- requests ----
 
-// clientKey is the request's client key: X-Demo-Client, or DefaultClient
-// when it is absent. ok is false for an empty or repeated header, or a value
-// over MaxClientBytes, not UTF-8, or holding a control character.
+// fromEdge reports whether r carries the edge secret: exactly one
+// X-Demo-Edge-Secret, matching in constant time.
+func (d *Demo) fromEdge(r *http.Request) bool {
+	s := r.Header.Values(HeaderEdgeSecret)
+	return len(s) == 1 && d.cfg.EdgeSecret.Matches(s[0])
+}
+
+// clientOf resolves who r is from, for every route. A request from the edge
+// (fromEdge) is the client its X-Demo-Client names (clientKey; ok is false
+// for a malformed one, which is 400). Any other request is the one shared
+// client DefaultClient: its X-Demo-Client is not read, so a caller that does
+// not hold the secret cannot choose, rotate or spoof a client id.
+func (d *Demo) clientOf(r *http.Request) (client string, ok bool) {
+	if !d.fromEdge(r) {
+		return DefaultClient, true
+	}
+	return clientKey(r)
+}
+
+// clientKey is the edge's client key: X-Demo-Client, or DefaultClient when it
+// is absent. ok is false for an empty or repeated header, or a value that is
+// all whitespace, over MaxClientBytes, not UTF-8, or holding a control
+// character.
 func clientKey(r *http.Request) (key string, ok bool) {
 	vals := r.Header.Values(HeaderClient)
 	switch len(vals) {
@@ -453,7 +512,7 @@ func clientKey(r *http.Request) (key string, ok bool) {
 	if key == "" || len(key) > MaxClientBytes || !utf8.ValidString(key) {
 		return "", false
 	}
-	if strings.ContainsFunc(key, unicode.IsControl) {
+	if strings.ContainsFunc(key, unicode.IsControl) || strings.TrimFunc(key, unicode.IsSpace) == "" {
 		return "", false
 	}
 	return key, true
@@ -486,20 +545,38 @@ func canonicalPath(u *url.URL) bool {
 // the status, the error code and the client's log tag. It passes Flush on,
 // and Unwrap lets http.ResponseController reach the connection (the event
 // stream clears its write deadline through it).
+//
+// When the response goes out while the request's declared body has not been
+// read to its end (unreadBody), it closes the connection: see closeUnread.
 type recorder struct {
 	http.ResponseWriter
-	status int
-	wrote  bool
-	code   string
-	client string
+	status     int
+	wrote      bool
+	code       string
+	client     string
+	unreadBody bool // the request declared a body that has not been read to its end
 }
 
 func (r *recorder) WriteHeader(status int) {
 	if r.wrote {
 		return
 	}
+	if r.unreadBody {
+		r.closeUnread()
+	}
 	r.status, r.wrote = status, true
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// closeUnread makes the response close the connection and sets the
+// connection's read deadline to now. With Connection: close, net/http does
+// not read the unread body before it writes the response headers; with the
+// deadline, the read it makes when it closes the body after the reply fails
+// at once, so the connection and its goroutine go without waiting for the
+// client or for the server's ReadTimeout.
+func (r *recorder) closeUnread() {
+	r.Header().Set("Connection", "close")
+	_ = http.NewResponseController(r.ResponseWriter).SetReadDeadline(wallDeadline(0)) // unsupported only off a real connection
 }
 
 func (r *recorder) Write(b []byte) (int, error) {

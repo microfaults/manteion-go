@@ -141,15 +141,22 @@ func clientHeader(client string) http.Header {
 	return h
 }
 
-func (x *demoHarness) get(target, client string) *httptest.ResponseRecorder {
-	return x.serve(http.MethodGet, target, clientHeader(client), nil)
-}
-
-// post queues a run for client, with the right edge secret.
-func (x *demoHarness) post(client string) *httptest.ResponseRecorder {
+// edgeHeader is what the edge sends: the secret, and client in X-Demo-Client
+// (none when client is "").
+func edgeHeader(client string) http.Header {
 	h := clientHeader(client)
 	h.Set(HeaderEdgeSecret, goodSecret)
-	return x.serve(http.MethodPost, pathRuns, h, nil)
+	return h
+}
+
+// get reads target as the edge's client.
+func (x *demoHarness) get(target, client string) *httptest.ResponseRecorder {
+	return x.serve(http.MethodGet, target, edgeHeader(client), nil)
+}
+
+// post queues a run as the edge's client.
+func (x *demoHarness) post(client string) *httptest.ResponseRecorder {
+	return x.serve(http.MethodPost, pathRuns, edgeHeader(client), nil)
 }
 
 // postOK queues a run for client and returns its id.
@@ -418,6 +425,241 @@ func TestPostRun_Body(t *testing.T) {
 	}
 }
 
+// countingBody is a request body that counts its reads.
+type countingBody struct {
+	r     io.Reader
+	reads atomic.Int32
+}
+
+func (b *countingBody) Read(p []byte) (int, error) { b.reads.Add(1); return b.r.Read(p) }
+func (b *countingBody) Close() error               { return nil }
+
+// TestBodies_Unread: a body is read only on a POST from the edge with a valid
+// client key. A GET that declares a body (a length or chunked) is 400, every
+// route the events route included; a POST without the secret is 403; an
+// unknown route is 404; none of them reads a byte, and each of those
+// responses closes the connection. A response to a request with no body, or
+// whose body was read to its end, keeps it.
+func TestBodies_Unread(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	runID := x.postOK("a")
+	send := func(method, target string, hdr http.Header, chunked bool) (*httptest.ResponseRecorder, *countingBody) {
+		body := &countingBody{r: strings.NewReader("hello")}
+		r := httptest.NewRequest(method, target, nil)
+		r.Header = hdr.Clone()
+		r.Body, r.ContentLength = body, 5
+		if chunked {
+			r.ContentLength, r.TransferEncoding = -1, []string{"chunked"}
+		}
+		rec := httptest.NewRecorder()
+		x.h.ServeHTTP(rec, r)
+		return rec, body
+	}
+	unread := func(what string, rec *httptest.ResponseRecorder, body *countingBody, status int, code string) {
+		t.Helper()
+		requireError(t, rec, status, code)
+		if n := body.reads.Load(); n != 0 {
+			t.Errorf("%s: the body was read %d times; want never", what, n)
+		}
+		if c := rec.Header().Get("Connection"); c != "close" {
+			t.Errorf("%s: Connection %q; want close", what, c)
+		}
+	}
+	for _, target := range []string{pathHealth, pathState, pathRecent, pathRun(runID), pathEvents(runID)} {
+		for _, chunked := range []bool{false, true} {
+			rec, body := send(http.MethodGet, target, edgeHeader("g"), chunked)
+			unread(fmt.Sprintf("GET %s (chunked %v)", target, chunked), rec, body, http.StatusBadRequest, "bad_request")
+		}
+	}
+	rec, body := send(http.MethodPost, pathRuns, clientHeader("p"), false)
+	unread("POST without the secret", rec, body, http.StatusForbidden, "forbidden")
+	wrong := clientHeader("p")
+	wrong.Set(HeaderEdgeSecret, "not-the-secret")
+	rec, body = send(http.MethodPost, pathRuns, wrong, true)
+	unread("POST with a wrong secret, chunked", rec, body, http.StatusForbidden, "forbidden")
+	rec, body = send(http.MethodPost, pathRuns, edgeHeader(strings.Repeat("k", 300)), false)
+	unread("POST with a bad client key", rec, body, http.StatusBadRequest, "bad_request")
+	rec, body = send(http.MethodPut, pathRuns, edgeHeader("p"), false)
+	unread("PUT", rec, body, http.StatusNotFound, "not_found")
+
+	rec, body = send(http.MethodPost, pathRuns, edgeHeader("p"), false)
+	if rec.Code != http.StatusCreated || body.reads.Load() == 0 || rec.Header().Get("Connection") != "" {
+		t.Errorf("POST from the edge with a small body: %d, %d reads, Connection %q; want 201, read, kept",
+			rec.Code, body.reads.Load(), rec.Header().Get("Connection"))
+	}
+	if rec := x.get(pathState, "g"); rec.Header().Get("Connection") != "" {
+		t.Errorf("GET without a body: Connection %q; want none", rec.Header().Get("Connection"))
+	}
+}
+
+// TestUnreadBodies_RawTCP: over raw TCP, against a server with no
+// ReadTimeout, a request whose declared body is never read, or never ends, is
+// answered within the bound, and the server then closes the connection and
+// its goroutine is gone: net/http neither waits for the body before the
+// response nor holds the connection after it. A request whose small body is
+// read to its end keeps its connection for the next request.
+func TestUnreadBodies_RawTCP(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	x.d.bodyTimeout = 200 * time.Millisecond
+	var active atomic.Int32
+	var mu sync.Mutex
+	closedConns := map[string]chan struct{}{}
+	closedCh := func(addr string) chan struct{} {
+		mu.Lock()
+		defer mu.Unlock()
+		ch, ok := closedConns[addr]
+		if !ok {
+			ch = make(chan struct{})
+			closedConns[addr] = ch
+		}
+		return ch
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		active.Add(1)
+		defer active.Add(-1)
+		x.h.ServeHTTP(w, r)
+	}))
+	srv.Config.DisableGeneralOptionsHandler = true // and no ReadTimeout, ReadHeaderTimeout or WriteTimeout
+	srv.Config.ConnState = func(c net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			close(closedCh(c.RemoteAddr().String()))
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	// Feeds: what the client sends after the headers, until stop.
+	nothing := func(net.Conn, <-chan struct{}) {}
+	trickle := func(conn net.Conn, stop <-chan struct{}) {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			if _, err := conn.Write([]byte("x")); err != nil {
+				return
+			}
+		}
+	}
+	endlessChunks := func(conn net.Conn, stop <-chan struct{}) {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			if _, err := conn.Write([]byte("1\r\nx\r\n")); err != nil {
+				return
+			}
+		}
+	}
+	secret := "X-Demo-Edge-Secret: " + goodSecret + "\r\n"
+	cases := []struct {
+		name, head string
+		feed       func(net.Conn, <-chan struct{})
+		status     int
+		code       string
+	}{
+		{"GET, Content-Length 500, no body",
+			"GET /api/v1/demo/state HTTP/1.1\r\nHost: demo\r\n" + secret + "Content-Length: 500\r\n\r\n", nothing, 400, "bad_request"},
+		{"GET, chunked, never ends",
+			"GET /api/v1/demo/state HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\n", endlessChunks, 400, "bad_request"},
+		{"GET events, Content-Length 500, no body",
+			"GET /api/v1/demo/runs/demo-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0/events HTTP/1.1\r\nHost: demo\r\n" + secret + "Content-Length: 500\r\n\r\n", nothing, 400, "bad_request"},
+		{"POST, wrong secret, Content-Length 500, no body",
+			"POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\nX-Demo-Edge-Secret: wrong\r\nContent-Length: 500\r\n\r\n", nothing, 403, "forbidden"},
+		{"POST, no secret, chunked, never ends",
+			"POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\n", endlessChunks, 403, "forbidden"},
+		{"POST, right secret, Content-Length 500, no body",
+			"POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n" + secret + "X-Demo-Client: c1\r\nContent-Length: 500\r\n\r\n", nothing, 400, "bad_request"},
+		{"POST, right secret, body trickles",
+			"POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n" + secret + "X-Demo-Client: c2\r\nContent-Length: 1000\r\n\r\n", trickle, 400, "bad_request"},
+		{"POST, right secret, chunked, never ends",
+			"POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n" + secret + "X-Demo-Client: c3\r\nTransfer-Encoding: chunked\r\n\r\n", endlessChunks, 400, "bad_request"},
+		{"POST, right secret, over the cap",
+			"POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n" + secret + "X-Demo-Client: c4\r\nContent-Length: 2048\r\n\r\n" + strings.Repeat("x", 2048), nothing, 400, "bad_request"},
+		{"PUT, Content-Length 500, no body",
+			"PUT /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\nContent-Length: 500\r\n\r\n", nothing, 404, "not_found"},
+	}
+	t.Run("unread", func(t *testing.T) {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				closed := closedCh(conn.LocalAddr().String())
+				stop := make(chan struct{})
+				defer close(stop)
+				began := time.Now()
+				if _, err := io.WriteString(conn, tc.head); err != nil {
+					t.Fatal(err)
+				}
+				go tc.feed(conn, stop)
+				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				br := bufio.NewReader(conn)
+				resp, err := http.ReadResponse(br, nil)
+				if err != nil {
+					t.Fatalf("no response within 2 s: %v", err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if d := time.Since(began); d > time.Second {
+					t.Errorf("answered after %v; want within 1 s", d)
+				}
+				if resp.StatusCode != tc.status || string(body) != `{"error":"`+tc.code+`"}` || !resp.Close {
+					t.Errorf("%d %s, close %v; want %d %s and Connection: close", resp.StatusCode, body, resp.Close, tc.status, tc.code)
+				}
+				select {
+				case <-closed:
+				case <-time.After(2 * time.Second):
+					t.Fatal("the server still holds the connection 2 s after its response")
+				}
+				if n, err := br.Read(make([]byte, 1)); n != 0 || err == nil {
+					t.Errorf("the connection is still readable after the server closed it: %d, %v", n, err)
+				}
+			})
+		}
+	})
+	if n := active.Load(); n != 0 {
+		t.Errorf("%d handlers still running", n)
+	}
+
+	// A small body read to its end keeps the connection: the next request on
+	// it is served.
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	br := bufio.NewReader(conn)
+	fmt.Fprintf(conn, "POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n%sX-Demo-Client: keep\r\nContent-Length: 5\r\n\r\nhello", secret)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || resp.Close {
+		t.Fatalf("POST with a small body: %d, close %v; want 201, kept", resp.StatusCode, resp.Close)
+	}
+	fmt.Fprintf(conn, "GET /api/v1/demo/state HTTP/1.1\r\nHost: demo\r\n\r\n")
+	resp, err = http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("the kept connection: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET on the kept connection: %d", resp.StatusCode)
+	}
+}
+
 // TestPostRun_Concurrent: racing POSTs fill the line exactly; one client
 // racing itself gets one run.
 func TestPostRun_Concurrent(t *testing.T) {
@@ -463,14 +705,14 @@ func TestPostRun_Concurrent(t *testing.T) {
 
 // ---- client key ----
 
-// TestClientKey: no X-Demo-Client is the one shared client "local"; a key
-// over 200 bytes, empty, sent twice, not UTF-8 or with a control character is
-// 400 bad_request on every route, and nothing is queued or counted.
+// TestClientKey: with the edge secret, no X-Demo-Client is the shared client
+// "local"; a key over 200 bytes, empty, all whitespace, sent twice, not UTF-8
+// or with a control character is 400 bad_request on every route, the events
+// route included, and nothing is queued or counted.
 func TestClientKey(t *testing.T) {
 	t.Parallel()
 	x := newDemo(t, nil)
-	h := http.Header{}
-	h.Set(HeaderEdgeSecret, goodSecret)
+	h := edgeHeader("")
 	if rec := x.serve(http.MethodPost, pathRuns, h, nil); rec.Code != http.StatusCreated {
 		t.Fatalf("no client key: %d; want 201", rec.Code)
 	}
@@ -483,6 +725,10 @@ func TestClientKey(t *testing.T) {
 	bad := map[string][]string{
 		"too long":       {strings.Repeat("k", MaxClientBytes+1)},
 		"empty":          {""},
+		"one space":      {" "},
+		"spaces":         {"   "},
+		"no-break space": {"\u00a0"},
+		"em spaces":      {"\u2003\u2003"},
 		"twice":          {"a", "b"},
 		"control char":   {"a\x01b"},
 		"DEL":            {"a\x7fb"},
@@ -491,11 +737,11 @@ func TestClientKey(t *testing.T) {
 		"invalid UTF-8":  {"a\xffb"},
 		"newline inside": {"a\nb"},
 	}
+	runID := id.New(RunIDPrefix)
 	for name, values := range bad {
-		hdr := http.Header{}
-		hdr.Set(HeaderEdgeSecret, goodSecret)
+		hdr := edgeHeader("")
 		hdr[HeaderClient] = values
-		for _, target := range []string{pathHealth, pathState, pathRecent, pathRun(id.New(RunIDPrefix))} {
+		for _, target := range []string{pathHealth, pathState, pathRecent, pathRun(runID), pathEvents(runID)} {
 			rec := x.serve(http.MethodGet, target, hdr, nil)
 			if rec.Code != http.StatusBadRequest || rec.Body.String() != `{"error":"bad_request"}` {
 				t.Errorf("%s, GET %s: %d %s; want 400 bad_request", name, target, rec.Code, rec.Body)
@@ -509,8 +755,144 @@ func TestClientKey(t *testing.T) {
 	if n := len(x.d.q.Snapshot()); n != 2 {
 		t.Errorf("%d runs queued; want 2", n)
 	}
-	if n := x.d.lim.clientCount(); n != 2 {
-		t.Errorf("%d clients in the limiter; want 2 (local and the 200-byte key)", n)
+	if n := x.d.lim.clientCount(); n != 1 {
+		t.Errorf("%d clients in the table; want 1 (the 200-byte key; local is outside it)", n)
+	}
+}
+
+// TestClient_WithoutSecretIsLocal: a request without a valid edge secret is
+// the shared client "local" whatever X-Demo-Client says. 1000 GETs with 1000
+// different client ids and no secret share one budget: the 121st is 429,
+// unknown-run lookups cost at most 120 store calls, and the client table
+// gains no entry.
+func TestClient_WithoutSecretIsLocal(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	unknown := pathRun(id.New(RunIDPrefix))
+	notFound, limited := 0, 0
+	for i := 0; i < 1000; i++ {
+		rec := x.serve(http.MethodGet, unknown, clientHeader(fmt.Sprintf("rot-%04d", i)), nil)
+		switch rec.Code {
+		case http.StatusNotFound:
+			notFound++
+			if i >= readLimit {
+				t.Fatalf("request %d answered 404 past the shared budget", i+1)
+			}
+		case http.StatusTooManyRequests:
+			limited++
+			if i == readLimit {
+				requireError(t, rec, http.StatusTooManyRequests, "rate_limited")
+			}
+		default:
+			t.Fatalf("request %d: %d %s", i+1, rec.Code, rec.Body)
+		}
+	}
+	if notFound != readLimit || limited != 1000-readLimit {
+		t.Errorf("%d not found, %d limited; want %d and %d", notFound, limited, readLimit, 1000-readLimit)
+	}
+	if n := len(x.f.callList("experiments.List")); n > readLimit {
+		t.Errorf("%d store calls for rotating client ids; want at most %d", n, readLimit)
+	}
+	if n := x.d.lim.clientCount(); n != 0 {
+		t.Errorf("%d entries in the client table; want none", n)
+	}
+	// The edge's own client of the same name is someone else.
+	if rec := x.get(pathState, "rot-0000"); rec.Code != http.StatusOK {
+		t.Errorf("the edge's client rot-0000: %d; want 200", rec.Code)
+	}
+}
+
+// TestClient_GarbageWithoutSecret: without a valid secret, X-Demo-Client is
+// not read at all: an empty, repeated, oversized or control-character value
+// is never 400; a GET is 200 as "local" and a POST is 403.
+func TestClient_GarbageWithoutSecret(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	secrets := map[string][]string{
+		"none":         nil,
+		"empty":        {""},
+		"wrong":        {"not-the-secret"},
+		"right twice":  {goodSecret, goodSecret},
+		"wrong, right": {"guess", goodSecret},
+	}
+	garbage := map[string][]string{
+		"empty":        {""},
+		"repeated":     {"a", "b"},
+		"300 bytes":    {strings.Repeat("k", 300)},
+		"control char": {"a\x01b"},
+		"spaces":       {"   "},
+	}
+	for sn, sv := range secrets {
+		for gn, gv := range garbage {
+			hdr := http.Header{HeaderClient: gv}
+			if sv != nil {
+				hdr[HeaderEdgeSecret] = sv
+			}
+			if rec := x.serve(http.MethodGet, pathState, hdr, nil); rec.Code != http.StatusOK {
+				t.Errorf("secret %s, client %s, GET: %d %s; want 200", sn, gn, rec.Code, rec.Body)
+			}
+			requireError(t, x.serve(http.MethodPost, pathRuns, hdr, nil), http.StatusForbidden, "forbidden")
+		}
+	}
+	if n := x.d.lim.clientCount(); n != 0 {
+		t.Errorf("%d entries in the client table; want none", n)
+	}
+}
+
+// TestClient_WithSecretSeparateBudgets: with the secret, two client ids have
+// budgets of their own, and neither is "local".
+func TestClient_WithSecretSeparateBudgets(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	for i := 0; i < readLimit; i++ {
+		if rec := x.get(pathState, "a"); rec.Code != http.StatusOK {
+			t.Fatalf("a's read %d: %d", i+1, rec.Code)
+		}
+	}
+	requireError(t, x.get(pathState, "a"), http.StatusTooManyRequests, "rate_limited")
+	if rec := x.get(pathState, "b"); rec.Code != http.StatusOK {
+		t.Errorf("b: %d; want 200", rec.Code)
+	}
+	if rec := x.serve(http.MethodGet, pathState, clientHeader("a"), nil); rec.Code != http.StatusOK {
+		t.Errorf("\"a\" without the secret is local: %d; want 200", rec.Code)
+	}
+}
+
+// TestClient_TableFull: once the edge's clients fill the client table, a new
+// edge client is served from the shared overflow bucket, not refused; a
+// caller without the secret is still served as "local", from its own bucket;
+// known clients keep theirs.
+func TestClient_TableFull(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, func(_ *Config, d *Deps) { d.Logger = discardLog })
+	for i := 0; i < maxClients; i++ {
+		if rec := x.get(pathState, fmt.Sprintf("f%05d", i)); rec.Code != http.StatusOK {
+			t.Fatalf("filling, client %d: %d", i, rec.Code)
+		}
+	}
+	if n := x.d.lim.clientCount(); n != maxClients {
+		t.Fatalf("%d clients; want %d", n, maxClients)
+	}
+	for i := 0; i < readLimit; i++ {
+		if rec := x.get(pathState, fmt.Sprintf("late%03d", i)); rec.Code != http.StatusOK {
+			t.Fatalf("new edge client %d while the table is full: %d; want 200 from the overflow bucket", i, rec.Code)
+		}
+	}
+	requireError(t, x.get(pathState, "late-121"), http.StatusTooManyRequests, "rate_limited")
+	if rec := x.serve(http.MethodGet, pathState, nil, nil); rec.Code != http.StatusOK {
+		t.Errorf("a caller without the secret: %d; want 200 as local", rec.Code)
+	}
+	if rec := x.get(pathState, ""); rec.Code != http.StatusOK {
+		t.Errorf("the edge's local: %d; want 200", rec.Code)
+	}
+	if rec := x.get(pathState, "f00042"); rec.Code != http.StatusOK {
+		t.Errorf("a known client: %d; want 200", rec.Code)
+	}
+	if rec := x.post("late-post"); rec.Code != http.StatusCreated {
+		t.Errorf("a new edge client's POST while the table is full: %d %s; want 201", rec.Code, rec.Body)
+	}
+	if n := x.d.lim.clientCount(); n != maxClients {
+		t.Errorf("%d clients; want still %d", n, maxClients)
 	}
 }
 
@@ -705,6 +1087,25 @@ func TestResponseHeaders(t *testing.T) {
 		"forbidden":      x.serve(http.MethodPost, pathRuns, clientHeader("b"), nil),
 		"bad_request":    x.get(pathState, strings.Repeat("k", 300)),
 		"unknown":        x.get("/api/v1/rules", "a"),
+	}
+	for i := 0; i < readLimit; i++ {
+		x.get(pathState, "limited")
+	}
+	recs["rate_limited"] = x.get(pathState, "limited")
+	for _, c := range []string{"b", "c"} {
+		x.postOK(c)
+	}
+	recs["queue_full"] = x.post("d")
+	x.f.fail("experiments.List", errLeakyAll)
+	recs["unavailable"] = x.get(pathRun(id.New(RunIDPrefix)), "a")
+	view := x.d.view
+	x.d.view = func(context.Context, string) (Run, error) { return Run{}, errLeakyAll }
+	recs["internal"] = x.get(pathRun(runID), "a")
+	x.d.view = view
+	for name, want := range map[string]int{"rate_limited": 429, "queue_full": 429, "unavailable": 503, "internal": 500} {
+		if recs[name].Code != want {
+			t.Fatalf("%s: %d; want %d", name, recs[name].Code, want)
+		}
 	}
 	for name, rec := range recs {
 		for h, want := range map[string]string{
@@ -1245,7 +1646,7 @@ func TestNoInternalLeak(t *testing.T) {
 		rec = x.post("b")
 		requireError(t, rec, http.StatusInternalServerError, "internal")
 		check(t, "enqueue error", rec)
-		x.d.recent = func(context.Context, int) ([]Run, bool) { panic(errLeakyAll.Error()) }
+		x.d.readRecent = func(context.Context, int) ([]Run, bool) { panic(errLeakyAll.Error()) }
 		rec = x.get(pathRecent, "a")
 		requireError(t, rec, http.StatusInternalServerError, "internal")
 		check(t, "recent panics", rec)
@@ -1288,6 +1689,143 @@ func TestNoInternalLeak(t *testing.T) {
 			t.Errorf("the encoding failure was not logged:\n%s", x.logs)
 		}
 	})
+}
+
+// ---- recent runs ----
+
+// TestRecent_OneStorePass: concurrent GETs of /runs/recent from many clients
+// make one store pass; the answer is then served from memory for recentTTL.
+func TestRecent_OneStorePass(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	const n = 20
+	release := make(chan struct{})
+	x.f.onCall("experiments.List", func() { <-release })
+	results := make(chan *httptest.ResponseRecorder, n)
+	for i := 0; i < n; i++ {
+		go func() { results <- x.get(pathRecent, fmt.Sprintf("r%02d", i)) }()
+	}
+	waitFor(t, "every request past its read limit", func() bool { return x.d.lim.clientCount() == n })
+	waitFor(t, "the store pass", func() bool { return len(x.f.callList("experiments.List")) >= 1 })
+	time.Sleep(20 * time.Millisecond) // let every request reach the cache (a slow one only weakens the test)
+	close(release)
+	for i := 0; i < n; i++ {
+		if rec := <-results; rec.Code != http.StatusOK || rec.Body.String() != `{"runs":[]}` {
+			t.Errorf("recent: %d %s", rec.Code, rec.Body)
+		}
+	}
+	lists := func() int { return len(x.f.callList("experiments.List")) }
+	if got := lists(); got != 1 {
+		t.Fatalf("%d store passes for %d concurrent GETs; want 1", got, n)
+	}
+	x.f.clock.Advance(recentTTL - time.Millisecond)
+	x.get(pathRecent, "r00")
+	if got := lists(); got != 1 {
+		t.Errorf("%d store passes within the TTL; want 1", got)
+	}
+	x.f.clock.Advance(time.Millisecond)
+	x.get(pathRecent, "r00")
+	if got := lists(); got != 2 {
+		t.Errorf("%d store passes after the TTL; want 2", got)
+	}
+}
+
+// TestRecent_SeesARunThatJustEnded: a run that ends drops the cached answer:
+// the next GET lists it at once, with no clock movement.
+func TestRecent_SeesARunThatJustEnded(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	if rec := x.get(pathRecent, "a"); rec.Body.String() != `{"runs":[]}` {
+		t.Fatalf("recent: %s", rec.Body)
+	}
+	runID := x.postOK("b")
+	x.d.w.end(runID, RunFailed, ReasonLabBusy)
+	rec := x.get(pathRecent, "a")
+	runs := decodeBody(t, rec)["runs"].([]any)
+	if len(runs) != 1 || runs[0].(map[string]any)["run_id"] != runID {
+		t.Errorf("recent right after the run ended: %s; want the run", rec.Body)
+	}
+}
+
+// TestRecent_RefreshThatMissedTheEnd: a refresh that read the runs before a
+// run ended is not served as current: its caller reads again.
+func TestRecent_RefreshThatMissedTheEnd(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	runID := x.postOK("b")
+	release := make(chan struct{})
+	x.f.onCall("experiments.List", func() { <-release })
+	leader := make(chan *httptest.ResponseRecorder, 1)
+	go func() { leader <- x.get(pathRecent, "a") }()
+	waitFor(t, "the refresh to reach the store", func() bool { return len(x.f.callList("experiments.List")) == 1 })
+	x.d.w.end(runID, RunFailed, ReasonLabBusy) // ends while the refresh waits on the store
+	close(release)
+	rec := <-leader
+	runs := decodeBody(t, rec)["runs"].([]any)
+	if len(runs) != 1 || runs[0].(map[string]any)["run_id"] != runID {
+		t.Errorf("recent: %s; want the run that ended during the refresh", rec.Body)
+	}
+	if n := len(x.f.callList("experiments.List")); n != 2 {
+		t.Errorf("%d store passes; want 2", n)
+	}
+}
+
+// TestRecent_IncompleteCachedNoLonger: an incomplete answer (the database
+// failed) is served 200 and cached for recentTTL, no longer.
+func TestRecent_IncompleteCachedNoLonger(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	x.f.fail("experiments.List", errLeakyAll)
+	if rec := x.get(pathRecent, "a"); rec.Code != http.StatusOK || rec.Body.String() != `{"runs":[]}` {
+		t.Fatalf("recent, database down: %d %s", rec.Code, rec.Body)
+	}
+	lists := func() int { return len(x.f.callList("experiments.List")) }
+	x.f.clock.Advance(recentTTL - time.Millisecond)
+	x.get(pathRecent, "a")
+	if got := lists(); got != 1 {
+		t.Errorf("%d store passes within the TTL; want 1", got)
+	}
+	x.f.clock.Advance(time.Millisecond)
+	x.get(pathRecent, "a")
+	if got := lists(); got != 2 {
+		t.Errorf("%d store passes at the TTL; want 2 (an incomplete answer is cached no longer)", got)
+	}
+}
+
+// ---- small rules ----
+
+// TestRetrySeconds: whole seconds, rounded up, at least 1, never overflowing.
+func TestRetrySeconds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		wait time.Duration
+		want int
+	}{
+		{-time.Hour, 1}, {0, 1}, {time.Nanosecond, 1}, {time.Second, 1}, {time.Second + time.Nanosecond, 2},
+		{59500 * time.Millisecond, 60}, {5 * time.Minute, 300}, {maxRetryWait, 3600},
+		{maxRetryWait + time.Nanosecond, 3600}, {time.Duration(1<<63 - 1), 3600},
+	} {
+		if got := retrySeconds(tc.wait); got != tc.want {
+			t.Errorf("retrySeconds(%v) = %d; want %d", tc.wait, got, tc.want)
+		}
+	}
+}
+
+// TestRunningPhase_ProgressClamped: progress stays in 0..1, for a phase past
+// its 40 s and for a clock stepped back.
+func TestRunningPhase_ProgressClamped(t *testing.T) {
+	t.Parallel()
+	run := newRun("demo-x", testNow)
+	for _, tc := range []struct {
+		started time.Duration
+		want    float64
+	}{{-20 * time.Second, 0.5}, {-50 * time.Second, 1}, {10 * time.Second, 0}} {
+		at := testNow.Add(tc.started)
+		run.Phases[0].Status, run.Phases[0].StartedAt = PhaseRunning, &at
+		if got := runningPhase(run, testNow).Progress; got != tc.want {
+			t.Errorf("started %v from now: progress %v; want %v", tc.started, got, tc.want)
+		}
+	}
 }
 
 // ---- logging ----

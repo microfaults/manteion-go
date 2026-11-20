@@ -3,6 +3,7 @@ package demo
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -45,14 +46,17 @@ type Demo struct {
 	admitMu sync.Mutex
 
 	health healthCache
+	recent recentCache
 	logKey []byte // keys the client tags of the request log
+
+	bodyTimeout time.Duration // bodyReadTimeout; tests shorten it
 
 	// The run store as the routes reach it: the worker's views and the
 	// queue. Tests replace them to reach error paths the real ones do not
 	// take.
-	view    func(ctx context.Context, runID string) (Run, error)
-	recent  func(ctx context.Context, n int) ([]Run, bool)
-	enqueue func(client string, now time.Time) (Run, error)
+	view       func(ctx context.Context, runID string) (Run, error)
+	readRecent func(ctx context.Context, n int) ([]Run, bool)
+	enqueue    func(client string, now time.Time) (Run, error)
 }
 
 // New builds the demo over d: a queue of cfg.Capacity, a hub, a limiter and
@@ -69,9 +73,10 @@ func New(d Deps, cfg Config) *Demo {
 	w := NewWorker(d, cfg, q, hub)
 	lim := NewLimiter(d.Clock)
 	lim.streamMaxAge = cfg.StreamMaxAge
-	x := &Demo{d: d, cfg: cfg, log: d.logger(), q: q, hub: hub, w: w, lim: lim, logKey: make([]byte, 32)}
+	x := &Demo{d: d, cfg: cfg, log: d.logger(), q: q, hub: hub, w: w, lim: lim, logKey: make([]byte, 32),
+		bodyTimeout: bodyReadTimeout}
 	_, _ = rand.Read(x.logKey)
-	x.view, x.recent, x.enqueue = w.View, w.Recent, q.Enqueue
+	x.view, x.readRecent, x.enqueue = w.View, w.Recent, q.Enqueue
 	w.OnRunEnded = func(ctx context.Context) {
 		if err := w.Retain(ctx); err != nil {
 			x.log.Warn("demo: retention after a run did not complete; the next pass tries again", "error", err)
@@ -397,5 +402,121 @@ func (d *Demo) probe(i int, log *slog.Logger, fn func(context.Context, *slog.Log
 			log.Warn("demo: health: a probe did not answer in time", "check", checkNames[i], "deadline", d.cfg.QueryTimeout)
 			return false
 		}
+	}
+}
+
+// ---- recent runs ----
+
+// recentTTL is how long an answer of GET /runs/recent is served from memory
+// while no run has ended.
+const recentTTL = 3 * time.Second
+
+// errRecentPanicked: reading the recent runs panicked (500 internal; the
+// panic is in the log).
+var errRecentPanicked = errors.New("demo: reading the recent runs panicked")
+
+// recentCache holds the last answer of GET /runs/recent, in the style of
+// healthCache: one refresh at a time, in a goroutine of its own with its own
+// deadline (Config.routeTimeout), no lock held while it reads.
+//
+// An answer is served for recentTTL by Deps.Clock, and only while no run has
+// ended since its refresh began (Worker.endedCount, counted as each run's
+// ended view is recorded, before its end event is published): a visitor
+// whose stream has just shown the end finds the run in the list at once. An
+// incomplete answer (the database could not be read in full) is served 200
+// and cached for no longer than a complete one. A refresh that panics caches
+// nothing; the callers waiting for it answer 500.
+//
+// With no current answer, a caller starts a refresh, or joins the one in
+// flight, and waits for it. While a refresh runs and the last answer is only
+// older than recentTTL (no run ended since), every other caller gets that
+// answer at once. A refresh that began before the latest end is waited for and
+// then followed by a new one.
+type recentCache struct {
+	mu     sync.Mutex
+	have   bool
+	ans    recentAnswer
+	flight *recentFlight
+}
+
+type recentAnswer struct {
+	runs     []Run
+	complete bool
+	gen      uint64    // Worker.endedCount when the read began
+	at       time.Time // when the read ended
+}
+
+// recentFlight is one refresh. Its answer and err are written before done is
+// closed and only read after.
+type recentFlight struct {
+	done chan struct{}
+	recentAnswer
+	err error
+}
+
+// recentRuns returns the recent runs; see recentCache. When ctx ends first,
+// it returns the last answer, or none.
+func (d *Demo) recentRuns(ctx context.Context) ([]Run, error) {
+	rc := &d.recent
+	for {
+		rc.mu.Lock()
+		gen, now := d.w.endedCount(), d.d.Clock.Now()
+		current := rc.have && rc.ans.gen == gen
+		if current && !now.Before(rc.ans.at) && now.Sub(rc.ans.at) < recentTTL {
+			runs := rc.ans.runs
+			rc.mu.Unlock()
+			return runs, nil
+		}
+		f := rc.flight
+		switch {
+		case f == nil:
+			f = &recentFlight{done: make(chan struct{}), recentAnswer: recentAnswer{gen: gen}}
+			rc.flight = f
+			go d.refreshRecent(f)
+		case current:
+			runs := rc.ans.runs
+			rc.mu.Unlock()
+			return runs, nil
+		}
+		rc.mu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			rc.mu.Lock()
+			defer rc.mu.Unlock()
+			return rc.ans.runs, nil
+		}
+		if f.err != nil {
+			return nil, f.err
+		}
+		if f.gen == d.w.endedCount() {
+			return f.runs, nil
+		}
+		// A run ended while it read: read again.
+	}
+}
+
+// refreshRecent reads the recent runs for f and caches the answer.
+func (d *Demo) refreshRecent(f *recentFlight) {
+	rc := &d.recent
+	defer func() {
+		if r := recover(); r != nil {
+			d.log.Error("demo: reading the recent runs panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			f.err = errRecentPanicked
+		}
+		rc.mu.Lock()
+		if f.err == nil {
+			rc.ans, rc.have = f.recentAnswer, true
+		}
+		rc.flight = nil
+		rc.mu.Unlock()
+		close(f.done)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.routeTimeout())
+	defer cancel()
+	f.runs, f.complete = d.readRecent(ctx, d.cfg.Recent)
+	f.at = d.d.Clock.Now()
+	if !f.complete {
+		d.log.Warn("demo: recent runs answered with what could be read", "runs", len(f.runs))
 	}
 }
