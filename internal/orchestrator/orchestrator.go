@@ -80,6 +80,10 @@ type Orchestrator struct {
 	convergeTimeout      time.Duration
 	convergePollInterval time.Duration
 
+	// reconcileBudget bounds how long Recover keeps asking zeus about one
+	// workflow run that it does not answer for (reconcileOneRun).
+	reconcileBudget time.Duration
+
 	// zeusDatasetID is the dataset a workflow run binds to when its
 	// phase_workflows row carries no dataset_id of its own
 	// (MANTEION_ZEUS_DATASET_ID). Empty means "no dataset", which zeus
@@ -135,6 +139,7 @@ func New(
 		drainPollInterval:    200 * time.Millisecond,
 		convergeTimeout:      defaultConvergeTimeout,
 		convergePollInterval: defaultConvergePollInterval,
+		reconcileBudget:      defaultReconcileBudget,
 		running:              make(map[string]context.CancelFunc),
 		expLocks:             make(map[string]*sync.Mutex),
 		phaseLocks:           make(map[string]*sync.Mutex),
@@ -162,6 +167,17 @@ func (o *Orchestrator) WithConvergePollInterval(d time.Duration) {
 		d = defaultConvergePollInterval
 	}
 	o.convergePollInterval = d
+}
+
+// WithReconcileBudget overrides how long Recover keeps asking zeus about one
+// workflow run while zeus does not answer (default 20s; each call is bounded
+// by 5s, with backoff 1, 2, 4, 8s between calls). Zero or less keeps the
+// default.
+func (o *Orchestrator) WithReconcileBudget(d time.Duration) {
+	if d <= 0 {
+		d = defaultReconcileBudget
+	}
+	o.reconcileBudget = d
 }
 
 // WithAllowDegradedBaseline lets isolation phases start from a degraded
@@ -601,12 +617,16 @@ func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, sta
 }
 
 // Recover restores in-memory state from the DB after a process restart.
-// For every 'running' experiment:
+// First, every phase still running, paused or draining under an experiment
+// that has ended (a cancel or stop that failed part-way) is ended as
+// 'skipped' through finishPhase, in a goroutine, as the cancel would have:
+// its load stopped, its fault events closed, its services bumped. Then, for
+// every 'running' experiment:
 //
-//   - 'running' phases get their zeus attacks reconciled (GetAttack with
-//     retries). All attacks lost → the phase is finalized 'failed'; survivors
-//     → the poller goroutine is respawned; no attacks configured → the phase
-//     auto-completes (it has no driver).
+//   - 'running' phases get their zeus drivers reconciled (GetAttack with
+//     retries; GetRun until zeus answers, within the reconcile budget). All
+//     drivers lost → the phase is finalized 'failed'; survivors → the poller
+//     goroutine is respawned; no drivers configured → the phase auto-completes.
 //   - 'draining' phases (a recording phase that crashed mid-barrier) re-enter
 //     the drain barrier and complete — otherwise they wedge forever and
 //     advanceExperiment stalls on them.
@@ -616,6 +636,21 @@ func (o *Orchestrator) finalizeExperiment(ctx context.Context, experimentID, sta
 // landed between phases. Recover must be called before the API server
 // starts accepting requests.
 func (o *Orchestrator) Recover(ctx context.Context) error {
+	// Nothing is served for a stranded phase any more, but nothing else would
+	// ever end it. On a background context like the goroutines below: the zeus
+	// stops and the exit bump's wait must not hold up start-up. A failed read
+	// leaves them for the next start, as before this sweep existed.
+	stranded, err := o.experiments.ListStrandedPhases(ctx)
+	if err != nil {
+		o.logger.Error("orchestrator: recover: list phases stranded under ended experiments failed",
+			"error", err)
+	}
+	for _, p := range stranded {
+		o.logger.Warn("orchestrator: recover: phase still in flight under an ended experiment; skipping it",
+			"phase_id", p.ID, "experiment_id", p.ExperimentID, "status", p.Status)
+		go o.finishPhase(context.Background(), p.ID, "skipped", "running", "paused", "draining")
+	}
+
 	exps, _, err := o.experiments.List(ctx,
 		store.ExperimentFilter{Status: "running"}, store.Page{Limit: 200})
 	if err != nil {
@@ -752,6 +787,16 @@ func (o *Orchestrator) recoverDrainingPhase(phaseID string) {
 // recovery finds with configured load but no driver handle recorded.
 const recoverInterruptedEntryReason = "entry interrupted by a manteion restart; create a new phase to retry"
 
+// The run reconcile's bounds (reconcileOneRun): the default budget for one
+// run, the bound on each call, and the backoff between calls (the last step
+// repeats).
+const (
+	defaultReconcileBudget = 20 * time.Second
+	reconcileCallTimeout   = 5 * time.Second
+)
+
+var reconcileRunBackoff = [...]time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+
 const reconcileRetries = 3
 
 var reconcileBackoff = [reconcileRetries]time.Duration{
@@ -778,23 +823,54 @@ func (o *Orchestrator) reconcileOneAttack(ctx context.Context, phaseID, attackID
 	return lastErr
 }
 
-// reconcileOneRun calls Zeus.GetRun with retries. Returns nil when zeus still
-// knows the run (the k6 subprocess survives a manteion restart because it
-// runs inside zeus; it is lost only if zeus itself restarted), else the last
-// error.
+// reconcileOneRun asks zeus whether it still knows a workflow run (the k6
+// subprocess survives a manteion restart because it runs inside zeus; it is
+// lost only if zeus itself restarted). Only zeus answering that it does not
+// know the run (404, zeus.ErrRunNotFound) returns an error, the driver's
+// "lost" line. Any other failure says nothing about the run (connection
+// refused while zeus is itself restarting, a timeout, a 5xx): it is retried,
+// each call bounded by reconcileCallTimeout and the calls spaced by
+// reconcileRunBackoff, until the next wait would reach the end of the
+// reconcile budget or ctx ends. Then the run is handed to the phase's poller
+// (nil), which carries on while zeus knows the run and fails the phase on
+// zeus's 404 once it answers.
 func (o *Orchestrator) reconcileOneRun(ctx context.Context, phaseID, runID string) error {
+	deadline := time.Now().Add(o.reconcileBudget)
 	var lastErr error
-	for attempt := 0; attempt < reconcileRetries; attempt++ {
-		if _, err := o.zeusClient.GetRun(ctx, runID); err == nil {
+	attempts := 0
+	for {
+		attempts++
+		callCtx, cancel := context.WithTimeout(ctx, min(reconcileCallTimeout, time.Until(deadline)))
+		_, err := o.zeusClient.GetRun(callCtx, runID)
+		cancel()
+		if err == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
-		if attempt < reconcileRetries-1 {
-			time.Sleep(reconcileBackoff[attempt])
+		if errors.Is(err, zeus.ErrRunNotFound) {
+			o.logger.Warn("orchestrator: recover: zeus no longer knows run",
+				"phase_id", phaseID, "run_id", runID, "error", err)
+			return err
+		}
+		lastErr = err
+		wait := reconcileRunBackoff[min(attempts, len(reconcileRunBackoff))-1]
+		if wait >= time.Until(deadline) || !sleepCtx(ctx, wait) {
+			break
 		}
 	}
-	o.logger.Warn("orchestrator: recover: zeus run not found after retries",
-		"phase_id", phaseID, "run_id", runID, "error", lastErr)
-	return lastErr
+	o.logger.Warn("orchestrator: recover: zeus did not answer for run within the reconcile budget; the poller takes it over",
+		"phase_id", phaseID, "run_id", runID, "attempts", attempts, "budget", o.reconcileBudget, "error", lastErr)
+	return nil
+}
+
+// sleepCtx waits d, or less when ctx ends first; it reports whether the whole
+// wait elapsed.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }

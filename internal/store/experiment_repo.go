@@ -520,6 +520,37 @@ func (r *ExperimentRepo) ListRunningPhases(ctx context.Context) ([]*model.Experi
 	return out, rows.Err()
 }
 
+// ListStrandedPhases returns every phase still in flight (running, paused or
+// draining) under an experiment that has ended (completed, failed or
+// cancelled), by id: what a cancel or stop that failed part-way leaves
+// behind. Nothing is served for such a phase (ListRunningPhases and
+// RuleRepo.ForService join on the experiment's status), but its load, its open
+// fault events and its exit bump wait for its terminal transition, which
+// Recover runs at start-up.
+func (r *ExperimentRepo) ListStrandedPhases(ctx context.Context) ([]*model.ExperimentPhase, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT p.id, p.experiment_id, p.name, p.position, p.status, p.frozen_services,
+			p.persist_cache, p.started_at, p.completed_at, p.failure_reason
+		FROM experiment_phases p
+		JOIN experiments e ON e.id = p.experiment_id
+		WHERE p.status IN ('running','paused','draining')
+			AND e.status IN ('completed','failed','cancelled')
+		ORDER BY p.id`)
+	if err != nil {
+		return nil, fmt.Errorf("list stranded phases: %w", err)
+	}
+	defer rows.Close()
+	var out []*model.ExperimentPhase
+	for rows.Next() {
+		p, err := scanPhaseRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan stranded phase: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ActiveCacheBoxPhaseForService resolves the cache-box role a service is
 // currently playing, if any — the context from which the poll path synthesizes
 // the service's compiled cache-box rule (MANT-4, replacing the deleted global
