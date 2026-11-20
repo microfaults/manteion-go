@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"manteion-go/internal/model"
+	"manteion-go/internal/orchestrator"
 	"manteion-go/internal/store"
 )
 
@@ -684,8 +685,23 @@ func (s *Server) handleDeletePhase(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartPhase(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("phaseId")
+	expID, id := r.PathValue("id"), r.PathValue("phaseId")
+	// 404 unless the phase is one of the experiment the path names, as the
+	// phase edit routes answer (editablePhase).
+	phase, err := s.experiments.GetPhase(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && phase.ExperimentID != expID) {
+		writeErrorCode(w, http.StatusNotFound, codeNotFound, "phase not found", nil)
+		return
+	}
+	if err != nil {
+		s.logger.Error("get phase failed", "error", err, "phase_id", id)
+		writeErrorCode(w, http.StatusInternalServerError, codeInternal, "failed to get phase", nil)
+		return
+	}
 	if !s.preflightPhaseDatasets(w, r, id) {
+		return
+	}
+	if !s.admitPhaseEntry(r.Context(), w, id) {
 		return
 	}
 	// Detach from the request context: the entry waits up to
@@ -698,6 +714,57 @@ func (s *Server) handleStartPhase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// admitPhaseEntry refuses to start or resume a single phase unless its
+// experiment is running, for the two routes that do it (the nested start and
+// the flat resume). A phase's rules, freeze and cache-box role are served only
+// while its experiment runs too, so a phase entered under a planned or ended
+// experiment would drive its load against a bed serving none of it and be
+// harvested as a fault phase that measured no fault. The refusal is the
+// experiment lifecycle's own, 409 invalid_state carrying the experiment's
+// status.
+//
+// Under an experiment that is not running, a pending phase's cache-box rule
+// agreement is checked here first, so its 422 keeps the precedence it has
+// inside StartPhase, which checks it for a fresh start (and still does so
+// itself under a running experiment). The gate is the routes' and not
+// StartPhase's: the scheduler and ResumeExperiment call StartPhase holding the
+// experiment's lock. It takes no lock, so a cancel can land between it and the
+// phase's claim; the cancel then ends the phase like any other, and nothing is
+// served for it meanwhile. ok is false once a response has been written.
+func (s *Server) admitPhaseEntry(ctx context.Context, w http.ResponseWriter, phaseID string) bool {
+	phase, err := s.experiments.GetPhase(ctx, phaseID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("get phase failed", "error", err, "phase_id", phaseID)
+		}
+		writeErrorFor(w, err, "phase", "failed to get phase")
+		return false
+	}
+	exp, err := s.experiments.Get(ctx, phase.ExperimentID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Error("get experiment failed", "error", err, "experiment_id", phase.ExperimentID)
+		}
+		writeErrorFor(w, err, "experiment", "failed to get experiment")
+		return false
+	}
+	if exp.Status == "running" {
+		return true
+	}
+	if phase.Status == "pending" {
+		phases, ruleIDs, ok := s.experimentKeying(ctx, w, exp.ID, phase, nil)
+		if !ok || !s.checkCacheBoxRuleAgreement(ctx, w, phases, ruleIDs) {
+			return false
+		}
+	}
+	// The orchestrator's notRunning refusal, word for word.
+	refusal := &orchestrator.ErrInvalidState{Kind: "experiment", ID: exp.ID, Current: exp.Status, Wanted: "running",
+		Msg: fmt.Sprintf("orchestrator: experiment %q is not running (status=%s)", exp.ID, exp.Status)}
+	s.logger.Warn("phase entry refused", "error", refusal, "phase_id", phaseID)
+	writeErrorFor(w, refusal, "phase", refusal.Error())
+	return false
 }
 
 func (s *Server) handleStopPhase(w http.ResponseWriter, r *http.Request) {

@@ -350,7 +350,7 @@ func TestHandleStartPhase_ZeusUnreachable(t *testing.T) {
 	// 127.0.0.1:1 refuses connections immediately: a transport failure, not a
 	// zeus response.
 	s := &Server{experiments: e.exp, logger: discardLogger(), orch: newTestOrch(t, e.db, "http://127.0.0.1:1")}
-	exp := e.experiment("planned")
+	exp := e.experiment("running")
 	ph := e.phase(exp, "load", 0)
 	wf := e.workflow()
 	if err := e.exp.AttachPhaseWorkflows(e.ctx, ph.ID, []model.PhaseWorkflow{{WorkflowID: wf, VUs: 1, DurationSec: 1}}); err != nil {
@@ -407,7 +407,8 @@ func TestCacheBoxRuleAgreement_Start(t *testing.T) {
 		t.Errorf("experiment = %s after the refused start, want planned", got.Status)
 	}
 
-	w = e.do(e.s.handleStartPhase, http.MethodPost, "/api/v1/phases/"+base.ID+"/start", "", map[string]string{"phaseId": base.ID})
+	url, pv := phaseAction(exp.ID, base.ID, "start")
+	w = e.do(e.s.handleStartPhase, http.MethodPost, url, "", pv)
 	wantRefusal(t, w)
 	if got, _ := e.exp.GetPhase(e.ctx, base.ID); got.Status != "pending" {
 		t.Errorf("phase = %s after the refused start, want pending", got.Status)

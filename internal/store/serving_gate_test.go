@@ -167,3 +167,135 @@ func TestListRunningPhases_ExcludesTerminalExperiments(t *testing.T) {
 		})
 	}
 }
+
+// servedCounts reads ForService for servingGateService and counts how often
+// each of ids is served; the rules it serves through are returned by id.
+func servedCounts(t *testing.T, ids ...string) (map[string]int, map[string]*model.Rule) {
+	t.Helper()
+	rules, err := testRuleRepo.ForService(context.Background(), servingGateService)
+	if err != nil {
+		t.Fatalf("ForService: %v", err)
+	}
+	counts := make(map[string]int, len(ids))
+	byID := make(map[string]*model.Rule, len(ids))
+	for _, id := range ids {
+		counts[id] = 0
+	}
+	for _, r := range rules {
+		if _, ours := counts[r.ID]; ours {
+			counts[r.ID]++
+			byID[r.ID] = r
+		}
+	}
+	return counts, byID
+}
+
+// TestForService_UnattachedRuleStillServedAfterNeighbourExperimentEnds pins
+// that the experiment gate applies only to phase-attached rules: an enabled
+// rule on the same service that no phase attaches is live on its own, before
+// and after a neighbouring experiment is cancelled, while that experiment's
+// attached rule stops being served.
+func TestForService_UnattachedRuleStillServedAfterNeighbourExperimentEnds(t *testing.T) {
+	tag := fmt.Sprintf("servegate-free-%d", time.Now().UnixNano())
+	repo, exp, phase, attached := seedServingGate(t, tag, "frozen-"+tag)
+	free := createOrderedRule(t, attached.Action.FaultSpecID, servingGateService, "free-"+tag, 5, time.Now())
+
+	counts, _ := servedCounts(t, attached.ID, free.ID)
+	if counts[attached.ID] != 1 || counts[free.ID] != 1 {
+		t.Fatalf("experiment running: served %v, want each of %s and %s once", counts, attached.ID, free.ID)
+	}
+
+	endExperimentLeavingPhaseRunning(t, repo, exp, phase, "cancelled")
+	counts, _ = servedCounts(t, attached.ID, free.ID)
+	if counts[attached.ID] != 0 {
+		t.Errorf("experiment cancelled: attached rule %s served %d time(s), want 0", attached.ID, counts[attached.ID])
+	}
+	if counts[free.ID] != 1 {
+		t.Errorf("experiment cancelled: unattached rule %s served %d time(s), want 1", free.ID, counts[free.ID])
+	}
+}
+
+// TestForService_DualAttachmentServedOnceViaHealthyPhase pins the pick among
+// several running phases that attach one rule: a phase left running under a
+// cancelled experiment is not a candidate, so the rule is served once, through
+// the running phase of the running experiment. The stranded phase is made the
+// most recently started, which is the one the pick prefers among candidates:
+// only the experiment gate can pass it over.
+func TestForService_DualAttachmentServedOnceViaHealthyPhase(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("servegate-dual-%d", time.Now().UnixNano())
+	repo, exp, stranded, rule := seedServingGate(t, tag, "frozen-"+tag)
+
+	healthyExp := &model.Experiment{ID: "exp-healthy-" + tag, Name: "exp-healthy-" + tag, Status: "planned", CreatedAt: time.Now()}
+	if err := repo.Create(ctx, healthyExp); err != nil {
+		t.Fatalf("create experiment: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testDB.Exec("DELETE FROM experiments WHERE id = $1", healthyExp.ID) })
+	healthy := &model.ExperimentPhase{ID: "phase-healthy-" + tag, ExperimentID: healthyExp.ID, Name: "fault", Position: 0, Status: "pending"}
+	if err := repo.CreatePhase(ctx, healthy); err != nil {
+		t.Fatalf("create phase: %v", err)
+	}
+	if err := repo.AttachPhaseRules(ctx, healthy.ID, []string{rule.ID}); err != nil {
+		t.Fatalf("attach rule: %v", err)
+	}
+	if ok, err := repo.TransitionExperiment(ctx, healthyExp.ID, "running", "planned"); err != nil || !ok {
+		t.Fatalf("start experiment: claimed=%v err=%v", ok, err)
+	}
+	if ok, err := repo.TransitionPhase(ctx, healthy.ID, "running", "pending"); err != nil || !ok {
+		t.Fatalf("start phase: claimed=%v err=%v", ok, err)
+	}
+	if _, err := testDB.Exec(`UPDATE experiment_phases SET started_at = now() + interval '1 hour' WHERE id = $1`, stranded.ID); err != nil {
+		t.Fatalf("make the first phase the most recently started: %v", err)
+	}
+
+	counts, byID := servedCounts(t, rule.ID)
+	if counts[rule.ID] != 1 || byID[rule.ID].ServedPhaseID != stranded.ID {
+		t.Fatalf("both experiments running: served %d time(s) through %v, want once through %s (the most recently started)",
+			counts[rule.ID], byID[rule.ID], stranded.ID)
+	}
+
+	endExperimentLeavingPhaseRunning(t, repo, exp, stranded, "cancelled")
+	counts, byID = servedCounts(t, rule.ID)
+	if counts[rule.ID] != 1 {
+		t.Fatalf("one experiment cancelled: rule %s served %d time(s), want exactly once", rule.ID, counts[rule.ID])
+	}
+	if got := byID[rule.ID]; got.ServedPhaseID != healthy.ID || got.ServedExperimentID != healthyExp.ID {
+		t.Errorf("served through (%q, %q), want the healthy phase (%q, %q)",
+			got.ServedExperimentID, got.ServedPhaseID, healthyExp.ID, healthy.ID)
+	}
+}
+
+// TestForService_PhaseUnderPlannedExperimentNotServed pins that "running"
+// means the experiment too, not only "ended": a phase forced to running under
+// an experiment that is planned (what a phase started through the phase-level
+// API before its experiment looked like) serves none of its rules and is not
+// in the running-phase set (so no freeze or replay set either).
+func TestForService_PhaseUnderPlannedExperimentNotServed(t *testing.T) {
+	ctx := context.Background()
+	tag := fmt.Sprintf("servegate-planned-%d", time.Now().UnixNano())
+	repo, exp, phase, rule := seedServingGate(t, tag, "frozen-"+tag)
+
+	if counts, _ := servedCounts(t, rule.ID); counts[rule.ID] != 1 {
+		t.Fatalf("experiment and phase running: rule %s served %d time(s), want 1", rule.ID, counts[rule.ID])
+	}
+	// Force the experiment back to planned, its phase left running.
+	if ok, err := repo.TransitionExperiment(ctx, exp.ID, "planned", "running"); err != nil || !ok {
+		t.Fatalf("experiment -> planned: transitioned=%v err=%v", ok, err)
+	}
+	if p, err := repo.GetPhase(ctx, phase.ID); err != nil || p.Status != "running" {
+		t.Fatalf("phase = %+v, %v; want running", p, err)
+	}
+
+	if counts, _ := servedCounts(t, rule.ID); counts[rule.ID] != 0 {
+		t.Errorf("experiment planned, phase running: rule %s served %d time(s), want 0", rule.ID, counts[rule.ID])
+	}
+	running, err := repo.ListRunningPhases(ctx)
+	if err != nil {
+		t.Fatalf("ListRunningPhases: %v", err)
+	}
+	for _, p := range running {
+		if p.ID == phase.ID {
+			t.Errorf("experiment planned: phase %s is in ListRunningPhases, want it left out", phase.ID)
+		}
+	}
+}

@@ -482,6 +482,10 @@ func TestPhaseWorkflowDatasets(t *testing.T) {
 			t.Errorf("start phase with expiring dataset: status=%d body=%s, want 422 dataset_expiring", w.Code, w.Body.String())
 		}
 
+		// A phase is started only under a running experiment.
+		if ok, err := expRepo.TransitionExperiment(ctx, expID, "running", "planned"); err != nil || !ok {
+			t.Fatalf("experiment -> running: transitioned=%v err=%v", ok, err)
+		}
 		fz.set(zeusDataset("ds-a", 86400, now))
 		w = call(s.handleStartPhase, http.MethodPost, path, "", pv)
 		if w.Code != http.StatusAccepted {

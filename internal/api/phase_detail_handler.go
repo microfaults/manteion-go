@@ -124,6 +124,10 @@ func (s *Server) handlePausePhaseFlat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResumePhaseFlat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("phaseId")
+	// 409 invalid_state unless the phase's experiment is running.
+	if !s.admitPhaseEntry(r.Context(), w, id) {
+		return
+	}
 	// StartPhase resumes a paused phase (and would start a pending one).
 	// Detached from the request context, as pause and stop are: the resume
 	// waits up to MANTEION_CONVERGE_TIMEOUT for its fleet, and a client
