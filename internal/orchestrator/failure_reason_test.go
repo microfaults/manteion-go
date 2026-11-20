@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,23 @@ func (f *fakeZeus) endAllRuns(status, reason string) {
 		f.runs[id] = status
 		f.runReasons[id] = reason
 	}
+}
+
+// forgetAllRuns drops every run, as a zeus restart does to its in-memory run
+// store: GET /runs/{id} answers 404 from then on.
+func (f *fakeZeus) forgetAllRuns() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	clear(f.runs)
+	clear(f.runReasons)
+}
+
+// failRunGets makes every GET /runs/{id} answer status (0 restores normal
+// answers): a zeus that is up but erroring.
+func (f *fakeZeus) failRunGets(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runGetStatus = status
 }
 
 // endAllAttacks moves every known attack to status.
@@ -212,6 +230,69 @@ func TestFailureReason_Poller_RunEndsRejectedOrFailed(t *testing.T) {
 	}
 }
 
+// zeus restarts mid-phase and forgets the run, so GET /runs/{id} answers 404.
+// The phase fails on the next tick through the same path as a failed run (not
+// at the safety-net deadline), the reason says zeus no longer knows the run,
+// and the experiment fails naming the phase.
+func TestFailureReason_Poller_RunUnknownToZeus(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	o.WithMaxPollDuration(time.Minute) // the safety net must not be what ends it
+	exp, phases := mkExperiment(t, 1)
+	wfID := attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1})
+
+	if err := o.StartExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("start experiment: %v", err)
+	}
+	pw := startedRun(t, phases[0].ID)
+	forgotAt := time.Now()
+	fz.forgetAllRuns()
+
+	p := waitPhaseStatus(t, phases[0].ID, "failed")
+	if took := time.Since(forgotAt); took > 5*time.Second {
+		t.Errorf("phase failed %s after zeus forgot the run, want within a few poll ticks", took)
+	}
+	wantContains(t, "phase failure_reason", p.FailureReason,
+		"zeus no longer knows run "+pw.ZeusRunID, "for workflow "+wfID, "zeus restarted")
+	if strings.Contains(p.FailureReason, "safety-net") {
+		t.Errorf("phase failure_reason = %q, want the not-found reason, not the safety net", p.FailureReason)
+	}
+	e := waitExpStatus(t, exp.ID, "failed")
+	wantContains(t, "experiment failure_reason", e.FailureReason,
+		"phase "+phases[0].Name+" failed: ", "zeus no longer knows run "+pw.ZeusRunID)
+}
+
+// A zeus that answers GET /runs/{id} with a 5xx is up but erroring: the
+// poller keeps retrying, the phase stays running, and once zeus answers again
+// the run's natural end completes it with no reason.
+func TestFailureReason_Poller_TransientGetRunErrorKeepsPhase(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	o.WithMaxPollDuration(time.Minute)
+	exp, phases := mkExperiment(t, 1)
+	attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{VUs: 1, DurationSec: 1})
+
+	if err := o.StartExperiment(ctx, exp.ID); err != nil {
+		t.Fatalf("start experiment: %v", err)
+	}
+	startedRun(t, phases[0].ID)
+	fz.failRunGets(http.StatusServiceUnavailable)
+	time.Sleep(time.Second) // ~20 poll ticks of 503s
+	if p := getPhase(t, phases[0].ID); p.Status != "running" {
+		t.Fatalf("phase = %s/%q after transient GET /runs errors, want running", p.Status, p.FailureReason)
+	}
+
+	fz.failRunGets(0)
+	fz.endAllRuns("completed", "")
+	p := waitPhaseStatus(t, phases[0].ID, "completed")
+	if p.FailureReason != "" {
+		t.Errorf("completed phase carries failure_reason %q", p.FailureReason)
+	}
+	waitExpStatus(t, exp.ID, "completed")
+}
+
 // An additive attack ends in a state the poller does not recognize: the
 // reason names the attack and its state.
 func TestFailureReason_Poller_AttackEndsUnexpectedly(t *testing.T) {
@@ -293,6 +374,39 @@ func TestFailureReason_Recover_AllDriversLost(t *testing.T) {
 	e := waitExpStatus(t, exp.ID, "failed")
 	wantContains(t, "experiment failure_reason", e.FailureReason,
 		"phase "+phases[0].Name+" failed: ", "recovery:")
+}
+
+// After a restart zeus still knows the phase's attack but not its run: not
+// every driver is lost, so recovery restores the phase and its poller, which
+// then fails it on the run's 404 instead of waiting out the safety net.
+func TestFailureReason_Recover_RunLostAttackSurvives(t *testing.T) {
+	ctx := context.Background()
+	fz := newFakeZeus(t)
+	o := newOrch(t, fz.srv.URL)
+	o.WithMaxPollDuration(time.Minute)
+	exp, phases := mkExperiment(t, 1)
+	atkID, runID := "atk-alive-"+exp.ID, "run-lost-"+exp.ID
+	fz.mu.Lock()
+	fz.attacks[atkID] = &fakeAttack{status: "running"}
+	fz.mu.Unlock()
+	wfID := attachAttackWorkflow(t, phases[0].ID, model.PhaseWorkflow{
+		VUs: 1, DurationSec: 1, TargetURL: "http://frontend:8080/",
+		ZeusAttackID: atkID, ZeusRunID: runID,
+	})
+	if err := testExpRepo.UpdateStatus(ctx, exp.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testExpRepo.UpdatePhaseStatus(ctx, phases[0].ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	p := waitPhaseStatus(t, phases[0].ID, "failed")
+	wantContains(t, "phase failure_reason", p.FailureReason,
+		"zeus no longer knows run "+runID, "for workflow "+wfID)
+	waitExpStatus(t, exp.ID, "failed")
 }
 
 // ---- operator stops ----

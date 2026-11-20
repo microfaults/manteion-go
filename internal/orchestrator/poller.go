@@ -2,11 +2,13 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"manteion-go/internal/model"
+	"manteion-go/internal/zeus"
 )
 
 const (
@@ -81,10 +83,11 @@ func (o *Orchestrator) pollPhaseAttacks(ctx context.Context, phaseID string, pha
 // additive attack cannot end the phase while its workflow run is still
 // generating traffic (or vice versa). A "stopped" driver counts as done
 // (externally managed); a "failed"/"rejected"/unrecognized driver fails the
-// phase; transient GetRun/GetAttack errors leave that driver uncounted so the
-// next tick retries. A phase with no drivers at all returns not-done (the
-// auto-complete path in enterPhase handles the driver-less case before the
-// poller is ever spawned).
+// phase, and so does a run zeus answers 404 for (ErrRunNotFound: zeus
+// restarted and lost it); transient GetRun/GetAttack errors leave that driver
+// uncounted so the next tick retries. A phase with no drivers at all returns
+// not-done (the auto-complete path in enterPhase handles the driver-less case
+// before the poller is ever spawned).
 func (o *Orchestrator) checkLoadStatuses(ctx context.Context, phaseID string, pws []model.PhaseWorkflow) (allDone bool, failures []string) {
 	if o.zeusClient == nil {
 		return false, nil
@@ -95,6 +98,14 @@ func (o *Orchestrator) checkLoadStatuses(ctx context.Context, phaseID string, pw
 		if pw.ZeusRunID != "" {
 			total++
 			info, err := o.zeusClient.GetRun(ctx, pw.ZeusRunID)
+			if errors.Is(err, zeus.ErrRunNotFound) {
+				// zeus answered, and does not have the run: it restarted and
+				// lost its in-memory run store. No later tick can find it.
+				o.logger.Error("orchestrator: zeus no longer knows run",
+					"phase_id", phaseID, "run_id", pw.ZeusRunID, "error", err)
+				failures = append(failures, runNotFoundLine(pw.ZeusRunID, pw.WorkflowID))
+				continue
+			}
 			if err != nil {
 				o.logger.Warn("orchestrator: get run status failed",
 					"phase_id", phaseID, "run_id", pw.ZeusRunID, "error", err)
@@ -145,6 +156,14 @@ func (o *Orchestrator) checkLoadStatuses(ctx context.Context, phaseID string, pw
 		return false, failures
 	}
 	return completed == total, failures
+}
+
+// runNotFoundLine words a run zeus answers 404 for. zeus keeps runs in memory
+// only, so a zeus that is up but does not know a run it accepted has
+// restarted (a zeus that is restarting refuses connections, which stays a
+// transient error).
+func runNotFoundLine(runID, workflowID string) string {
+	return fmt.Sprintf("zeus no longer knows run %s for workflow %s (404), probably because zeus restarted", runID, workflowID)
 }
 
 // runFailureLine words a k6 run that zeus reports in a non-completing state:

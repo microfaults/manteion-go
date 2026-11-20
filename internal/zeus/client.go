@@ -453,7 +453,10 @@ type RunInfo struct {
 	Reason string `json:"reason,omitempty"` // e.g. "thresholds breached" on a completed run (k6 exit 99)
 }
 
-// GetRun fetches a run's current status.
+// GetRun fetches a run's current status. A 404 returns an error wrapping
+// ErrRunNotFound (errors.Is): zeus is up but no longer knows the run, which
+// with zeus's in-memory run store means it restarted. Any other failure
+// (transport error, 5xx) is a plain error a caller may retry.
 func (c *Client) GetRun(ctx context.Context, runID string) (*RunInfo, error) {
 	resp, err := c.Do(ctx, http.MethodGet, "/runs/"+runID, nil)
 	if err != nil {
@@ -461,7 +464,8 @@ func (c *Client) GetRun(ctx context.Context, runID string) (*RunInfo, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("zeus: run %q not found", runID)
+		io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("%w: %q", ErrRunNotFound, runID)
 	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
@@ -506,10 +510,11 @@ const runStatsPendingStatus = "no stats available yet"
 // it is worth a short retry.
 var ErrRunStatsNotReady = fmt.Errorf("zeus: run stats not ready")
 
-// ErrRunNotFound is returned when zeus does not know the run at all (404).
-// Run state is in-memory on the zeus side, so this is what a zeus restart
-// between run completion and harvest looks like: the stats are gone for good
-// and retrying cannot recover them.
+// ErrRunNotFound is returned by GetRun and GetRunStats when zeus does not
+// know the run at all (404). Run state is in-memory on the zeus side, so this
+// is what a zeus restart looks like, mid-phase (GetRun) or between run
+// completion and harvest (GetRunStats): the run is gone for good and retrying
+// cannot recover it.
 var ErrRunNotFound = fmt.Errorf("zeus: run not found")
 
 // GetRunStats fetches the finalized stats snapshot for a workflow run

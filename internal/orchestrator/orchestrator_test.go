@@ -257,6 +257,9 @@ type fakeZeus struct {
 	runsReject *fakeReject
 	runsDrop   bool
 	runReasons map[string]string
+	// runGetStatus, when non-zero, makes GET /runs/{id} answer that status
+	// with no run (a zeus that is up but erroring: transient for the poller).
+	runGetStatus int
 	// runStartHook and attackStartHook, when set, run inside POST .../runs
 	// and POST /attacks before the driver is accepted: something that lands
 	// while an entry is starting its load.
@@ -329,7 +332,12 @@ func newFakeZeus(t *testing.T) *fakeZeus {
 		f.mu.Lock()
 		st, ok := f.runs[r.PathValue("run_id")]
 		reason := f.runReasons[r.PathValue("run_id")]
+		getStatus := f.runGetStatus
 		f.mu.Unlock()
+		if getStatus != 0 {
+			w.WriteHeader(getStatus)
+			return
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return

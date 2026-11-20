@@ -61,6 +61,67 @@ func TestStartRun_ResponseError(t *testing.T) {
 	}
 }
 
+// Pins GET /api/v1/runs/{id}: a 404 (zeus restarted and lost its in-memory
+// run state) is the ErrRunNotFound sentinel the poller fails the phase on;
+// every other failure stays a plain error the poller retries.
+func TestGetRun(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.PathValue("run_id") {
+		case "run-ok":
+			_, _ = w.Write([]byte(`{"id": "run-ok", "status": "running"}`))
+		case "run-gone":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error": "run not found: run-gone"}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error": "boom"}`))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+
+	t.Run("200 decodes the run", func(t *testing.T) {
+		info, err := c.GetRun(ctx, "run-ok")
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if info.ID != "run-ok" || info.Status != "running" {
+			t.Errorf("info = %+v, want run-ok/running", info)
+		}
+	})
+
+	t.Run("404 is ErrRunNotFound", func(t *testing.T) {
+		info, err := c.GetRun(ctx, "run-gone")
+		if !errors.Is(err, ErrRunNotFound) {
+			t.Fatalf("err = %v, want ErrRunNotFound", err)
+		}
+		if info != nil {
+			t.Fatalf("info = %+v, want nil on 404", info)
+		}
+	})
+
+	t.Run("500 is a plain error", func(t *testing.T) {
+		_, err := c.GetRun(ctx, "run-boom")
+		if err == nil || errors.Is(err, ErrRunNotFound) {
+			t.Fatalf("err = %v, want a non-sentinel error", err)
+		}
+	})
+
+	t.Run("connection refused is a plain error", func(t *testing.T) {
+		dead := httptest.NewServer(http.NotFoundHandler())
+		url := dead.URL
+		dead.Close()
+		_, err := NewClient(url).GetRun(ctx, "run-ok")
+		if err == nil || errors.Is(err, ErrRunNotFound) {
+			t.Fatalf("err = %v, want a non-sentinel transport error", err)
+		}
+	})
+}
+
 // Pins GET /api/v1/runs/{id}/stats against zeus-go's stats.RunStats wire
 // shape: duration and the latency percentiles are Go time.Duration values
 // serialised as integer NANOSECONDS; an in-flight run answers 200 with the
