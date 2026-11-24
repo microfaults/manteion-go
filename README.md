@@ -39,7 +39,7 @@ recording surfaces as a verdict, not as silently skewed numbers.
 | `internal/faultcatalog/` | Fault vocabulary + typed param validation backed by `atropos-go/faultparams`. |
 | `internal/opaharness/` | OPA harness: Rego policies over Prometheus/Loki inputs that mutate rules through the rule repo (`MANTEION_POLICY_ENGINE=rego`); see `docs/opa-harness.md`. |
 | `internal/logql/` | Loki instant metric-query client (harness inputs). |
-| `internal/demo/` | Public demo mode (`MANTEION_DEMO=true`): a queue of preset three-phase runs, one at a time, with health, state, run views and an event stream on a second listener of its own. |
+| `internal/demo/` | Public demo mode (`MANTEION_DEMO=true`): a queue of runs of a compiled-in scenario catalog, one at a time, each three 40 s phases (`baseline`, `memory`, `cpu`), with health, state, the catalog, run views and an event stream on a second listener of its own (see "Demo API"). |
 | `internal/policy/` | Frozen PromQL threshold loop, reachable only as `MANTEION_POLICY_ENGINE=threshold`. Acts through rule CRUD: `push_rules` enables the listed rules, `clear_rules` disables the service's enabled ones, each update bumping the service's generation in-tx. |
 
 ## Wire contracts (shared with atropos-go)
@@ -98,6 +98,40 @@ artifacts) · OPA policies (`/api/v1/opa/policies` CRUD, `/{id}/decisions`,
 `/{id}/evaluate?apply=`) · Zeus proxy (`/api/v1/zeus/*` — workflows, runs,
 datasets pass through; attacks are orchestrator-managed, not proxied).
 
+## Demo API
+
+With `MANTEION_DEMO=true` a second listener (`MANTEION_DEMO_ADDR`) serves seven routes and nothing
+else. They are not in `docs/swagger.*`; `internal/demo/contract.go` is the reference for their JSON.
+Every response carries `Cache-Control: no-store` and, but for the event stream, is JSON; an error
+is `{"error":<code>}`.
+
+- Reads, 120 a minute per client: `GET /api/v1/demo/health`, `/state`, `/scenarios`,
+  `/runs/recent`, `/runs/{id}`, `/runs/{id}/events` (server-sent events).
+- `POST /api/v1/demo/runs` queues a run; it needs `X-Demo-Edge-Secret`, and answers 201
+  `{"run_id","status","position"}`.
+- `GET /scenarios` lists the catalog in order: each scenario's `id`, `title`, `description`,
+  `default` (exactly one is), `workload` (`workflow`, `dataset`, `description`) and three
+  `phases` (`name`, `duration_s`, and on a fault phase `fault`, `target`, `intensity`; never a
+  fault parameter). The catalog is compiled into `internal/demo/scenarios.go`; no route, file or
+  environment variable adds to it. A scenario id is never reused for a changed scenario: a run read
+  back by id is shown with the catalog's current definition of that id.
+- POST's body is optional JSON of at most 1 KiB; its `Content-Type` is not read. No body, a body
+  of only whitespace, or `{}` runs the default scenario; `{"scenario":"<id>"}`, with `<id>` exactly
+  a catalog id (case and spaces count), runs that one. Anything else is 400 `bad_request`, and
+  queues nothing and counts nothing against the client: another key, the key twice, a value that
+  is not a string (`null` included), an unknown or empty id, anything after the object, a body
+  that is not JSON or not UTF-8, or one over 1 KiB.
+- A run carries `scenario` (its id) and three phases, `baseline`, `memory` and `cpu`, 40 s each.
+  A fault phase carries `fault` (`memory` or `cpu`), `target`, `intensity`, and, once it has
+  completed, `measure` and `fault_observed`. `measure` is `{"metric","value","baseline"}`: the
+  target's own resident memory in bytes (`target_memory_bytes`) or CPU in cores
+  (`target_cpu_cores`), from its process metrics in Prometheus, over the phase and over the
+  baseline phase. `fault_observed` is true when the rise reaches a fixed threshold (6694502 bytes for
+  memory, 0.0503 cores for CPU), false when it does not, and null when either figure is missing (a failed, empty
+  or late query); a missing figure never fails the run. The figures are not stored: a run read
+  after a restart shows them, and `fault_observed`, as null. The event stream's `sample` frames
+  also carry the running phase's target's `target_cpu_cores` and `target_memory_bytes`.
+
 ## Environment
 
 | Variable | Default | Purpose |
@@ -114,7 +148,7 @@ datasets pass through; attacks are orchestrator-managed, not proxied).
 | `MANTEION_ALLOW_DEGRADED_BASELINE` | `false` | Permit isolation phases over a degraded baseline recording |
 | `MANTEION_POLICY_ENGINE` | `off` | `rego` (or `on`) starts the OPA harness; `threshold` the frozen PromQL loop; any other value starts no engine (an unknown one is logged). Demo mode refuses to start beside `rego`, `on` or `threshold`, and accepts `off` or an unknown value |
 | `MANTEION_SDK_PURGE_ENABLED` | `false` | Dead-instance purge sweep |
-| `MANTEION_DEMO` | `false` | `true` starts the public demo (`internal/demo`) on a second listener with its own six routes |
+| `MANTEION_DEMO` | `false` | `true` starts the public demo (`internal/demo`) on a second listener with its own seven routes |
 | `MANTEION_DEMO_ADDR` | `:8090` | The demo listener's address, `host:port` with a numeric port |
 | `MANTEION_DEMO_EDGE_SECRET` | (none) | Required in demo mode: what the edge sends in `X-Demo-Edge-Secret`. 32 to 512 printable ASCII characters, no whitespace; never logged |
 | `MANTEION_DEMO_RUN_CAP` | `5m` | Demo mode: the watchdog from a run's pickup to its forced end, 30 s to 15 min |

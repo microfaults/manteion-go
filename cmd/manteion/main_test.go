@@ -144,7 +144,7 @@ func TestHTTPWriteTimeoutOutlastsAStop(t *testing.T) {
 
 // Demo mode refuses a policy engine: the OPA harness ("rego" or "on") and the
 // threshold engine both switch rules on and off by themselves, and the demo
-// owns its run's rule. Without demo mode, any engine is allowed.
+// owns its run's rules. Without demo mode, any engine is allowed.
 func TestDemoModeCheck(t *testing.T) {
 	for _, tc := range []struct {
 		demo    bool
@@ -540,7 +540,7 @@ func TestLogDemoSettings(t *testing.T) {
 }
 
 // Shutdown: the demo's Shutdown returns before either server's Shutdown is
-// called (it switches the run's rule off, which the SDKs pick up only from
+// called (it switches the run's rules off, which the SDKs pick up only from
 // the operator listener, and ends every event stream, which a server's
 // Shutdown would otherwise wait out). Its context is its own, 15 s long, not
 // the signal's; the servers' 10 s budget starts once it has returned, and the

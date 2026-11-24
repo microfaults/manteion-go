@@ -1,6 +1,7 @@
 package demo
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -26,21 +27,22 @@ import (
 // other request, an unsupported method on one of these paths included, is
 // 404 not_found.
 const (
-	routeHealth = "GET /api/v1/demo/health"
-	routeState  = "GET /api/v1/demo/state"
-	routePost   = "POST /api/v1/demo/runs"
-	routeRecent = "GET /api/v1/demo/runs/recent"
-	routeRun    = "GET /api/v1/demo/runs/{id}"
-	// The sixth, routeEvents, is in events.go.
+	routeHealth    = "GET /api/v1/demo/health"
+	routeState     = "GET /api/v1/demo/state"
+	routeScenarios = "GET /api/v1/demo/scenarios"
+	routePost      = "POST /api/v1/demo/runs"
+	routeRecent    = "GET /api/v1/demo/runs/recent"
+	routeRun       = "GET /api/v1/demo/runs/{id}"
+	// The seventh, routeEvents, is in events.go.
 )
 
 // maxBodyBytes caps a request body. Only POST from the edge has its body
-// read: up to this much is read and ignored, more is 400 bad_request.
+// read: up to this much is read and parsed (scenarioOf), more is 400
+// bad_request.
 const maxBodyBytes = 1 << 10
 
 // bodyReadTimeout bounds how long a POST from the edge may take to send its
-// (ignored) body: a body that stalls or never ends is 400 bad_request once it
-// passes.
+// body: a body that stalls or never ends is 400 bad_request once it passes.
 const bodyReadTimeout = 3 * time.Second
 
 // maxRetryWait caps a Retry-After before it is rounded up; real waits are
@@ -71,7 +73,8 @@ var errEnqueueLimited = errors.New("demo: the client enqueued less than 5 minute
 // "local". A GET counts as one read of its client's 120 a minute; a GET that
 // declares a body is 400 bad_request, unread. POST answers 403 without the
 // edge secret before it touches the body, then reads the body under a cap and
-// a deadline of its own (readBody).
+// a deadline of its own (readBody) and takes from it the scenario to run
+// (scenarioOf).
 //
 // Unread bodies: whenever a response goes out while the request's declared
 // body has not been read to its end, the recorder adds Connection: close and
@@ -87,6 +90,7 @@ func (d *Demo) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle(routeHealth, d.read(d.handleHealth))
 	mux.Handle(routeState, d.read(d.handleState))
+	mux.Handle(routeScenarios, d.read(d.handleScenarios))
 	mux.Handle(routePost, d.only(http.MethodPost, http.HandlerFunc(d.handlePostRun)))
 	mux.Handle(routeRecent, d.read(d.handleRecent))
 	mux.Handle(routeRun, d.read(d.handleRun))
@@ -179,21 +183,22 @@ func declaresBody(r *http.Request) bool {
 	return r.ContentLength != 0 || len(r.TransferEncoding) > 0
 }
 
-// readBody reads and drops a POST's body, at most maxBodyBytes of it and for
-// at most the demo's body deadline (bodyReadTimeout), set on the connection.
-// A body over the cap, or one that stalls or never ends, is 400 bad_request
-// (the recorder then closes the connection, the body being unread). Call it
-// only once the edge secret has been checked.
-func (d *Demo) readBody(w http.ResponseWriter, r *http.Request) bool {
+// readBody reads a POST's body, at most maxBodyBytes of it and for at most
+// the demo's body deadline (bodyReadTimeout), set on the connection, and
+// returns it (nil when the request declares none). A body over the cap, or
+// one that stalls or never ends, is 400 bad_request (the recorder then closes
+// the connection, the body being unread). Call it only once the edge secret
+// has been checked.
+func (d *Demo) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	if !declaresBody(r) {
-		return true
+		return nil, true
 	}
 	rc := http.NewResponseController(unwrap(w))
 	_ = rc.SetReadDeadline(wallDeadline(d.bodyTimeout)) // unsupported only off a real connection
-	_, err := io.Copy(io.Discard, http.MaxBytesReader(unwrap(w), r.Body, maxBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(unwrap(w), r.Body, maxBodyBytes))
 	if err != nil {
 		d.writeError(w, CodeBadRequest, 0)
-		return false
+		return nil, false
 	}
 	// Read to its end: nothing more is read for this request, and the
 	// connection may serve the next one.
@@ -201,7 +206,62 @@ func (d *Demo) readBody(w http.ResponseWriter, r *http.Request) bool {
 	if rec, ok := w.(*recorder); ok {
 		rec.unreadBody = false
 	}
-	return true
+	return body, true
+}
+
+// runBodyKey is the one key a POST's body may hold.
+const runBodyKey = "scenario"
+
+// scenarioOf is the scenario a POST's body asks for. The rule, exactly:
+//
+//   - an empty body, one of only JSON whitespace (space, tab, CR, LF), or the
+//     empty object {}: the catalog's default (DefaultScenario);
+//   - an object whose one key is "scenario" and whose value is a JSON string
+//     equal to a catalog id (ScenarioByID: no case folding, no trimming; a JSON
+//     escape is the string it decodes to): that scenario;
+//   - anything else: ok is false (400 bad_request). That is any other key,
+//     the key twice (even with equal values), a value that is not a string
+//     (null included), an unknown or empty id, anything but whitespace after
+//     the object, a body that is not one JSON object, or not UTF-8.
+//
+// The Content-Type is not read: the edge sends none. It walks the body's
+// tokens rather than decoding into a struct, because encoding/json matches
+// keys without regard to case and keeps the last of a duplicate key. Nothing
+// of the body is kept or logged.
+func scenarioOf(body []byte) (Scenario, bool) {
+	if len(bytes.Trim(body, " \t\r\n")) == 0 {
+		return DefaultScenario(), true
+	}
+	if !utf8.Valid(body) {
+		return Scenario{}, false // encoding/json would turn invalid bytes into U+FFFD
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return Scenario{}, false
+	}
+	var id *string
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil || key != runBodyKey || id != nil {
+			return Scenario{}, false
+		}
+		val, err := dec.Token()
+		s, isString := val.(string)
+		if err != nil || !isString {
+			return Scenario{}, false
+		}
+		id = &s
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return Scenario{}, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return Scenario{}, false // data after the object
+	}
+	if id == nil {
+		return DefaultScenario(), true
+	}
+	return ScenarioByID(*id)
 }
 
 // read is a GET route that counts one read for its client. A GET that
@@ -252,6 +312,23 @@ func (d *Demo) handleState(w http.ResponseWriter, r *http.Request, _ string) {
 	d.writeJSON(w, r, http.StatusOK, d.state())
 }
 
+// handleScenarios: the catalog, in order, as a visitor sees it; built once by
+// New (scenarioList), so it is answered from memory and touches no store.
+func (d *Demo) handleScenarios(w http.ResponseWriter, r *http.Request, _ string) {
+	d.writeJSON(w, r, http.StatusOK, d.scenarios)
+}
+
+// scenarioList is the body of GET /scenarios: every catalog entry, in order,
+// as ViewOf shows it (no target_load, no internal id).
+func scenarioList() ScenarioList {
+	cat := Catalog()
+	l := ScenarioList{Scenarios: make([]ScenarioView, 0, len(cat))}
+	for _, sc := range cat {
+		l.Scenarios = append(l.Scenarios, ViewOf(sc))
+	}
+	return l
+}
+
 // state is the State now: every run that has not ended, in line order, and,
 // while the position-0 run is running, where it is. A position-0 run that is
 // still queued (the worker has not taken it, or holds it while a switch-off
@@ -297,13 +374,14 @@ func runningPhase(r Run, now time.Time) RunningPhase {
 	return rp
 }
 
-// handlePostRun queues a run. In order: the edge secret (403 forbidden,
-// whether missing or wrong, before the body is touched), the client key
-// (400), the body (readBody: 400), the lab open (503
-// unavailable before the start-up sweep, during shutdown, or once the queue
-// is closed), the client's run in line (429 client_has_run), the client's
-// enqueue limit (429 rate_limited), a free slot (429 queue_full); then 201,
-// and only then is the enqueue counted against the client.
+// handlePostRun queues a run of the scenario its body asks for. In order: the
+// edge secret (403 forbidden, whether missing or wrong, before the body is
+// touched), the client key (400), the body (readBody, then scenarioOf: 400),
+// the lab open (503 unavailable before the start-up sweep, during shutdown,
+// or once the queue is closed), the client's run in line (429
+// client_has_run), the client's enqueue limit (429 rate_limited), a free slot
+// (429 queue_full); then 201, and only then is the enqueue counted against
+// the client.
 func (d *Demo) handlePostRun(w http.ResponseWriter, r *http.Request) {
 	if !d.fromEdge(r) {
 		d.writeError(w, CodeForbidden, 0)
@@ -315,14 +393,20 @@ func (d *Demo) handlePostRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.noteClient(w, client)
-	if !d.readBody(w, r) {
+	body, ok := d.readBody(w, r)
+	if !ok {
+		return
+	}
+	sc, ok := scenarioOf(body)
+	if !ok {
+		d.writeError(w, CodeBadRequest, 0)
 		return
 	}
 	if !d.ready.Load() || d.stopping.Load() {
 		d.writeError(w, CodeUnavailable, 0)
 		return
 	}
-	run, wait, err := d.admit(client, DefaultScenario()) // Task 6: the scenario the body names
+	run, wait, err := d.admit(client, sc)
 	if err == nil && run.Position == nil {
 		err = errors.New("demo: an enqueued run came back without a position")
 	}

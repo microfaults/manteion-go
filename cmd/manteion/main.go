@@ -226,7 +226,7 @@ func main() {
 	httpServer.RegisterOnShutdown(srv.BeginShutdown)
 
 	// ---- Demo mode (MANTEION_DEMO=true): internal/demo on a second listener ----
-	// The public demo's six routes on their own mux and port; nothing of the
+	// The public demo's seven routes on their own mux and port; nothing of the
 	// operator API is reachable there. Its start-up (startDemo, at the
 	// listeners below) and its shutdown (shutdownInOrder) have an order of
 	// their own. With demo mode off, dm and demoServer stay nil and nothing
@@ -480,8 +480,8 @@ func httpWriteTimeout(convergeTimeout, drainTimeout time.Duration) time.Duration
 
 // demoModeCheck refuses demo mode beside a policy engine. The OPA harness
 // ("rego" or "on") and the threshold engine both switch rules on and off by
-// themselves, and the demo owns its run's rule: an engine could switch it on
-// outside a run, or off in the middle of one. Without demo mode, any engine
+// themselves, and the demo owns its run's rules: an engine could switch one
+// on outside a run, or off in the middle of one. Without demo mode, any engine
 // is allowed; an unknown value starts no engine and passes.
 func demoModeCheck(demo bool, policyEngineMode string) error {
 	if !demo {
@@ -490,7 +490,7 @@ func demoModeCheck(demo bool, policyEngineMode string) error {
 	switch policyEngineMode {
 	case "rego", "on", "threshold":
 		return fmt.Errorf("MANTEION_DEMO=true needs MANTEION_POLICY_ENGINE=off, not %q: "+
-			"a policy engine switches rules on and off by itself, and the demo owns its run's rule", policyEngineMode)
+			"a policy engine switches rules on and off by itself, and the demo owns its run's rules", policyEngineMode)
 	}
 	return nil
 }
@@ -610,7 +610,7 @@ func logDemoSettings(logger *slog.Logger, cfg demo.Config, pollInterval time.Dur
 //
 //  1. When d is not nil, d.Shutdown under a context of its own,
 //     t.shutdownTimeout long (the signal's context is already done), while
-//     both servers still serve: it switches the current run's rule off,
+//     both servers still serve: it switches the current run's rules off,
 //     which the SDKs pick up only from the operator listener, and ends every
 //     event stream, which a server's Shutdown would otherwise wait out (up to
 //     the streams' 10-minute maximum age). Its error is logged and changes

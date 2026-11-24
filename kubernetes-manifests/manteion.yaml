@@ -22,7 +22,7 @@ spec:
       securityContext:
         fsGroup: 1000
       # On SIGTERM the demo shuts down first (up to 15 s: the current run's
-      # rule switched off, every event stream ended), then both listeners
+      # rules switched off, every event stream ended), then both listeners
       # get 10 s; the default 30 s grace period is too tight for both.
       terminationGracePeriodSeconds: 45
       volumes:
@@ -47,7 +47,7 @@ spec:
           ports:
             - containerPort: 8080
               protocol: TCP
-            # The public demo's own listener (MANTEION_DEMO_ADDR): its six
+            # The public demo's own listener (MANTEION_DEMO_ADDR): its seven
             # routes only, none of the operator API.
             - containerPort: 8090
               name: demo

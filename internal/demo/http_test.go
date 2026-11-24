@@ -25,10 +25,11 @@ import (
 
 // Paths of the contract (the events path is pathEvents, in events_test.go).
 const (
-	pathHealth = "/api/v1/demo/health"
-	pathState  = "/api/v1/demo/state"
-	pathRuns   = "/api/v1/demo/runs"
-	pathRecent = "/api/v1/demo/runs/recent"
+	pathHealth    = "/api/v1/demo/health"
+	pathState     = "/api/v1/demo/state"
+	pathScenarios = "/api/v1/demo/scenarios"
+	pathRuns      = "/api/v1/demo/runs"
+	pathRecent    = "/api/v1/demo/runs/recent"
 )
 
 func pathRun(runID string) string { return pathRuns + "/" + runID }
@@ -157,6 +158,20 @@ func (x *demoHarness) get(target, client string) *httptest.ResponseRecorder {
 // post queues a run as the edge's client.
 func (x *demoHarness) post(client string) *httptest.ResponseRecorder {
 	return x.serve(http.MethodPost, pathRuns, edgeHeader(client), nil)
+}
+
+// postWith queues a run as the edge's client with body, declared by its
+// length, or sent chunked (no length) when chunked. An empty body that is not
+// chunked is no body at all.
+func (x *demoHarness) postWith(client, body string, chunked bool) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, pathRuns, strings.NewReader(body))
+	r.Header = edgeHeader(client)
+	if chunked {
+		r.ContentLength, r.TransferEncoding = -1, []string{"chunked"}
+	}
+	rec := httptest.NewRecorder()
+	x.h.ServeHTTP(rec, r)
+	return rec
 }
 
 // postOK queues a run for client and returns its id.
@@ -396,14 +411,399 @@ func TestPostRun_QueueClosed(t *testing.T) {
 	}
 }
 
-// TestPostRun_Body: POST takes no body; a small one is ignored, a larger one
-// (declared or chunked) is 400 bad_request and closes the connection.
+// namedBody is the body that names scenario id.
+func namedBody(id string) string { return `{"scenario":"` + id + `"}` }
+
+// TestPostRun_Scenario: POST queues a run of the scenario its body names, by
+// exact id; no body, an empty or whitespace-only body (declared or chunked)
+// and {} queue the default. An id or key spelled with a JSON escape is the
+// same JSON string, and a body of exactly the 1 KiB cap is read. The 201 body
+// is unchanged; the run's scenario, and its phases' faults, targets and
+// intensities, are the named scenario's.
+func TestPostRun_Scenario(t *testing.T) {
+	t.Parallel()
+	def := DefaultScenario()
+	atCap := namedBody("cart-moderate")
+	atCap += strings.Repeat(" ", maxBodyBytes-len(atCap))
+	type tc struct {
+		name, body string
+		chunked    bool
+		want       string
+	}
+	cases := []tc{
+		{"no body", "", false, def.ID},
+		{"empty, chunked", "", true, def.ID},
+		{"only JSON whitespace", " \t\r\n ", false, def.ID},
+		{"only JSON whitespace, chunked", "\n", true, def.ID},
+		{"empty object", "{}", false, def.ID},
+		{"empty object, chunked", "{}", true, def.ID},
+		{"empty object in whitespace", " {\n} \r\n", false, def.ID},
+		{"the default by name", namedBody(def.ID), false, def.ID},
+		{"whitespace between the tokens", "\t{ \"scenario\" :\n\"cart-heavy\" }\n", false, "cart-heavy"},
+		{"an escaped character in the id", `{"scenario":"cart-heavy"}`, false, "cart-heavy"},
+		{"an escaped character in the key", `{"scenario":"cart-heavy"}`, false, "cart-heavy"},
+		{"exactly the cap", atCap, false, "cart-moderate"},
+		{"exactly the cap, chunked", atCap, true, "cart-moderate"},
+	}
+	for _, sc := range Catalog() {
+		cases = append(cases, tc{"named " + sc.ID, namedBody(sc.ID), false, sc.ID},
+			tc{"named " + sc.ID + ", chunked", namedBody(sc.ID), true, sc.ID})
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			x := newDemo(t, nil)
+			rec := x.postWith("a", c.body, c.chunked)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("POST %q: %d %s; want 201", c.body, rec.Code, rec.Body)
+			}
+			m := decodeBody(t, rec)
+			wantKeys(t, "201 body", m, "run_id", "status", "position")
+			runID, _ := m["run_id"].(string)
+			if m["status"] != "queued" || m["position"] != float64(0) || !validRunID(runID) {
+				t.Errorf("201 body %s; want a run id, queued, position 0", rec.Body)
+			}
+			if line := x.d.q.Snapshot(); len(line) != 1 || line[0].RunID != runID || line[0].Scenario != c.want {
+				t.Fatalf("line %+v; want the one run, of %s", line, c.want)
+			}
+			if x.d.lim.AllowEnqueue("a") {
+				t.Error("the 201 was not counted against the client")
+			}
+			view := x.get(pathRun(runID), "reader")
+			if view.Code != http.StatusOK {
+				t.Fatalf("GET the run: %d %s", view.Code, view.Body)
+			}
+			v := decodeBody(t, view)
+			if v["scenario"] != c.want {
+				t.Errorf("the run's scenario %v; want %s", v["scenario"], c.want)
+			}
+			sc, _ := ScenarioByID(c.want)
+			for i, st := range faultSteps(&sc) {
+				p := v["phases"].([]any)[i].(map[string]any)
+				if p["name"] != PhaseNames[i] {
+					t.Errorf("phase %d named %v; want %s", i, p["name"], PhaseNames[i])
+				}
+				if st == nil {
+					if p["fault"] != nil || p["target"] != nil || p["intensity"] != nil {
+						t.Errorf("phase %d %v; want no fault", i, p)
+					}
+					continue
+				}
+				if p["fault"] != string(st.Kind) || p["target"] != st.Target || p["intensity"] != st.Intensity {
+					t.Errorf("phase %d %v; want %s on %s, %s", i, p, st.Kind, st.Target, st.Intensity)
+				}
+			}
+		})
+	}
+}
+
+// badBodies are POST bodies that are 400 bad_request (Review Focus 1). marker
+// is in some of them: nothing of a body may reach a response or the log.
+const marker = "zq7-marker"
+
+var badBodies = map[string]string{
+	"scenario null":                       `{"scenario":null}`,
+	"scenario an array":                   `{"scenario":["a"]}`,
+	"scenario an array of an id":          `{"scenario":["catalog-moderate"]}`,
+	"scenario an object":                  `{"scenario":{"id":"catalog-moderate"}}`,
+	"scenario a number":                   `{"scenario":1}`,
+	"scenario true":                       `{"scenario":true}`,
+	"an id and another field":             `{"scenario":"catalog-moderate","extra":1}`,
+	"another field, then the id":          `{"extra":1,"scenario":"catalog-moderate"}`,
+	"another field only":                  `{"` + marker + `":"catalog-moderate"}`,
+	"the key capitalised":                 `{"Scenario":"catalog-moderate"}`,
+	"the key in capitals":                 `{"SCENARIO":"catalog-moderate"}`,
+	"the key with a space":                `{"scenario ":"catalog-moderate"}`,
+	"a string":                            `"moderate"`,
+	"a string naming an id":               `"catalog-moderate"`,
+	"an array":                            `[]`,
+	"an array of the object":              `[{"scenario":"catalog-moderate"}]`,
+	"null":                                `null`,
+	"a number":                            `0`,
+	"false":                               `false`,
+	"the key twice, equal values":         `{"scenario":"catalog-moderate","scenario":"catalog-moderate"}`,
+	"the key twice, different values":     `{"scenario":"catalog-moderate","scenario":"cart-heavy"}`,
+	"the key twice, unknown first":        `{"scenario":"` + marker + `","scenario":"catalog-moderate"}`,
+	"the key twice, once escaped":         `{"scenario":"catalog-moderate","scenario":"catalog-moderate"}`,
+	"the id capitalised":                  `{"scenario":"Catalog-Moderate"}`,
+	"the id in capitals":                  `{"scenario":"CATALOG-MODERATE"}`,
+	"the id with a leading space":         `{"scenario":" catalog-moderate"}`,
+	"the id with a trailing space":        `{"scenario":"catalog-moderate "}`,
+	"the id with a newline":               `{"scenario":"catalog-moderate\n"}`,
+	"the id with a tab":                   `{"scenario":"\tcatalog-moderate"}`,
+	"an unknown id":                       namedBody(marker),
+	"an id like build 2's":                `{"scenario":"catalog-latency-50ms"}`,
+	"an empty id":                         `{"scenario":""}`,
+	"data after the object":               namedBody("catalog-moderate") + " x",
+	"a second object":                     namedBody("catalog-moderate") + "{}",
+	"two empty objects":                   `{}{}`,
+	"null after the object":               `{} null`,
+	"no closing brace":                    `{"scenario":"catalog-moderate"`,
+	"only an opening brace":               `{`,
+	"a trailing comma":                    `{"scenario":"catalog-moderate",}`,
+	"no colon":                            `{"scenario" "catalog-moderate"}`,
+	"single quotes":                       `{'scenario':'catalog-moderate'}`,
+	"an unquoted key":                     `{scenario:"catalog-moderate"}`,
+	"not JSON":                            "hello " + marker,
+	"invalid UTF-8 in the id":             "{\"scenario\":\"catalog-moderate\xff\"}",
+	"invalid UTF-8 before the object":     "\xff{}",
+	"a byte-order mark":                   "\xef\xbb\xbf{}",
+	"whitespace JSON does not know":       "\u00a0",
+	"a form feed":                         "\f",
+	"a NUL byte":                          "\x00",
+	"an id over the cap":                  namedBody("catalog-moderate") + strings.Repeat(" ", maxBodyBytes),
+	"one byte over the cap":               strings.Repeat(" ", maxBodyBytes-2) + "{}" + " ",
+	"a lone surrogate in the id":          `{"scenario":"\ud800catalog-moderate"}`,
+	"an id with a NUL escape":             `{"scenario":"catalog-moderate\u0000"}`,
+	"the key with an escaped capital":     `{"Scenario":"catalog-moderate"}`,
+	"an id with an escaped capital":       `{"scenario":"Catalog-moderate"}`,
+	"a nested object with the key inside": `{"scenario":{"scenario":"catalog-moderate"}}`,
+}
+
+// TestPostRun_BadBody: a body that is not empty, only JSON whitespace, {} or
+// exactly {"scenario":"<a catalog id>"} is 400 bad_request, declared or
+// chunked: a scenario that is not a string, another field, a duplicate key
+// (even with equal values), an id that differs in case or space, an unknown or
+// empty id, data after the object, a body that is not JSON or not UTF-8, one
+// over the cap. Nothing is queued, nothing is counted against the client's
+// enqueue limit (its next POST is 201), the response is the bare error, and
+// each request line is at Debug with nothing of the body.
+func TestPostRun_BadBody(t *testing.T) {
+	t.Parallel()
+	debug := &syncBuffer{}
+	x := newDemo(t, func(_ *Config, d *Deps) {
+		d.Logger = slog.New(slog.NewJSONHandler(debug, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+	for name, body := range badBodies {
+		for _, chunked := range []bool{false, true} {
+			rec := x.postWith("a", body, chunked)
+			if rec.Code != http.StatusBadRequest || rec.Body.String() != `{"error":"bad_request"}` {
+				t.Errorf("%s (chunked %v): %d %s; want 400 bad_request", name, chunked, rec.Code, rec.Body)
+			}
+			if n := len(x.d.q.Snapshot()); n != 0 {
+				t.Fatalf("%s (chunked %v): %d runs queued", name, chunked, n)
+			}
+			if !x.d.lim.AllowEnqueue("a") {
+				t.Fatalf("%s (chunked %v): counted against the client's enqueue limit", name, chunked)
+			}
+			requireNoLeak(t, name, rec)
+			if strings.Contains(rec.Body.String()+fmt.Sprint(rec.Header()), marker) {
+				t.Errorf("%s: the response carries the body: %s", name, rec.Body)
+			}
+		}
+	}
+	if rec := x.post("a"); rec.Code != http.StatusCreated {
+		t.Errorf("the client's POST after its bad bodies: %d %s; want 201", rec.Code, rec.Body)
+	}
+	logs := debug.String()
+	if strings.Contains(logs, marker) {
+		t.Errorf("the log carries a body:\n%s", logs)
+	}
+	refused := 0
+	for _, l := range requestLines(t, logs) {
+		if l["status"] != float64(http.StatusBadRequest) {
+			continue
+		}
+		refused++
+		if l["level"] != "DEBUG" || l["code"] != "bad_request" || l["route"] != routePost {
+			t.Errorf("request line %v; want DEBUG, bad_request, %s", l, routePost)
+		}
+	}
+	if refused != 2*len(badBodies) {
+		t.Errorf("%d request lines of a 400; want %d", refused, 2*len(badBodies))
+	}
+}
+
+// TestPostRun_BodyBeforeAdmission: the body is judged after the secret and
+// the client key and before everything else: a bad body is 400 before the
+// start-up sweep (where a good one is 503), while the client has a run in
+// line (client_has_run), within its enqueue limit (rate_limited) and with the
+// line full (queue_full); none of those 400s changes what follows.
+func TestPostRun_BodyBeforeAdmission(t *testing.T) {
+	t.Parallel()
+	x := newUnsweptDemo(t, nil)
+	bad := `{"scenario":null}`
+	requireError(t, x.postWith("a", bad, false), http.StatusBadRequest, "bad_request")
+	requireError(t, x.postWith("a", namedBody("cart-heavy"), false), http.StatusServiceUnavailable, "unavailable")
+	x.d.markReady()
+	runID := x.postOK("a")
+	requireError(t, x.postWith("a", bad, false), http.StatusBadRequest, "bad_request")
+	requireError(t, x.post("a"), http.StatusTooManyRequests, "client_has_run")
+	x.d.q.remove(runID)
+	requireError(t, x.postWith("a", bad, true), http.StatusBadRequest, "bad_request")
+	requireError(t, x.post("a"), http.StatusTooManyRequests, "rate_limited")
+	for _, c := range []string{"b", "c", "d"} {
+		x.postOK(c)
+	}
+	requireError(t, x.postWith("e", bad, false), http.StatusBadRequest, "bad_request")
+	requireError(t, x.post("e"), http.StatusTooManyRequests, "queue_full")
+	if !x.d.lim.AllowEnqueue("e") {
+		t.Error("refused POSTs counted against client e")
+	}
+}
+
+// TestPostRun_SecretBeforeBody: a POST without the edge secret, or with a
+// wrong one, is 403 forbidden whatever its body (one that names nothing, one
+// over the cap, one that is not JSON; declared or chunked), and not a byte of
+// it is read; with the secret, a malformed client key is 400 before the body
+// is read. Nothing is queued or counted.
+func TestPostRun_SecretBeforeBody(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	send := func(hdr http.Header, body string, chunked bool) (*httptest.ResponseRecorder, *countingBody) {
+		cb := &countingBody{r: strings.NewReader(body)}
+		r := httptest.NewRequest(http.MethodPost, pathRuns, nil)
+		r.Header = hdr
+		r.Body, r.ContentLength = cb, int64(len(body))
+		if chunked {
+			r.ContentLength, r.TransferEncoding = -1, []string{"chunked"}
+		}
+		rec := httptest.NewRecorder()
+		x.h.ServeHTTP(rec, r)
+		return rec, cb
+	}
+	secrets := map[string][]string{
+		"none":        nil,
+		"empty":       {""},
+		"wrong":       {"not-the-secret"},
+		"right twice": {goodSecret, goodSecret},
+	}
+	bodies := []string{`{"scenario":null}`, `{"scenario":"catalog-moderate","extra":1}`, "hello",
+		namedBody("catalog-moderate") + strings.Repeat(" ", 2*maxBodyBytes)}
+	for sn, sv := range secrets {
+		for _, body := range bodies {
+			for _, chunked := range []bool{false, true} {
+				hdr := clientHeader("a")
+				if sv != nil {
+					hdr[HeaderEdgeSecret] = sv
+				}
+				rec, cb := send(hdr, body, chunked)
+				requireError(t, rec, http.StatusForbidden, "forbidden")
+				if n := cb.reads.Load(); n != 0 {
+					t.Errorf("secret %s, body %.20q (chunked %v): read %d times; want never", sn, body, chunked, n)
+				}
+				if c := rec.Header().Get("Connection"); c != "close" {
+					t.Errorf("secret %s, body %.20q (chunked %v): Connection %q; want close", sn, body, chunked, c)
+				}
+			}
+		}
+	}
+	rec, cb := send(edgeHeader(strings.Repeat("k", MaxClientBytes+1)), `{"scenario":null}`, false)
+	requireError(t, rec, http.StatusBadRequest, "bad_request")
+	if n := cb.reads.Load(); n != 0 {
+		t.Errorf("a malformed client key: the body was read %d times; want never", n)
+	}
+	if n := len(x.d.q.Snapshot()); n != 0 {
+		t.Errorf("%d runs queued", n)
+	}
+	if !x.d.lim.AllowEnqueue("a") || !x.d.lim.AllowEnqueue(DefaultClient) {
+		t.Error("a refused POST counted against a client")
+	}
+}
+
+// ---- GET /scenarios ----
+
+// TestScenarios_List: GET /scenarios is the catalog in order, as ViewOf shows
+// each entry, with exactly the contract's keys and one default, and no
+// target_load anywhere in the bytes. It is answered from memory (no store
+// call, also with the store failing), with the headers of every route, and
+// counts as one read of its client's 120 a minute, the same budget as the
+// other reads.
+func TestScenarios_List(t *testing.T) {
+	t.Parallel()
+	x := newDemo(t, nil)
+	for _, op := range []string{"experiments.List", "zeus.Healthy", "zeus.ListDatasets", "instances.InstancesForService",
+		"prom.Healthy", "db.PingContext"} {
+		x.f.fail(op, errLeakyAll)
+	}
+	rec := x.get(pathScenarios, "a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET scenarios: %d %s", rec.Code, rec.Body)
+	}
+	var views []ScenarioView
+	for _, sc := range Catalog() {
+		views = append(views, ViewOf(sc))
+	}
+	want, err := json.Marshal(ScenarioList{Scenarios: views})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Body.String() != string(want) {
+		t.Errorf("body\n %s\nwant\n %s", rec.Body, want)
+	}
+	for _, leak := range []string{"target_load", "TargetLoad", "WorkflowID", "DatasetName"} {
+		if strings.Contains(rec.Body.String(), leak) {
+			t.Errorf("the body carries %q: %s", leak, rec.Body)
+		}
+	}
+	requireNoLeak(t, "scenarios", rec)
+	m := decodeBody(t, rec)
+	wantKeys(t, "scenarios", m, "scenarios")
+	list := m["scenarios"].([]any)
+	if len(list) != len(Catalog()) || len(list) < 4 {
+		t.Fatalf("%d scenarios; want the catalog's %d", len(list), len(Catalog()))
+	}
+	defaults := 0
+	for i, v := range list {
+		s := v.(map[string]any)
+		wantKeys(t, "scenario", s, "id", "title", "description", "default", "workload", "phases")
+		if s["id"] != Catalog()[i].ID {
+			t.Errorf("scenario %d is %v; want %s", i, s["id"], Catalog()[i].ID)
+		}
+		if s["default"] == true {
+			defaults++
+			if s["id"] != DefaultScenario().ID {
+				t.Errorf("the default is %v; want %s", s["id"], DefaultScenario().ID)
+			}
+		}
+		for j, p := range s["phases"].([]any) {
+			pm := p.(map[string]any)
+			wantKeys(t, "scenario phase", pm, "name", "duration_s", "fault", "target", "intensity")
+			if pm["name"] != PhaseNames[j] || pm["duration_s"] != float64(PhaseDurationS) {
+				t.Errorf("scenario %v phase %d: %v", s["id"], j, pm)
+			}
+		}
+	}
+	if defaults != 1 {
+		t.Errorf("%d defaults; want 1", defaults)
+	}
+	for h, want := range map[string]string{
+		"Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+	} {
+		if got := rec.Header().Get(h); got != want {
+			t.Errorf("%s %q; want %q", h, got, want)
+		}
+	}
+	if calls := x.f.callList(""); len(calls) != 0 {
+		t.Errorf("GET scenarios made store calls: %v", calls)
+	}
+
+	// One read of its client's budget, shared with the other reads.
+	for i := 1; i < readLimit; i++ {
+		target := pathScenarios
+		if i%2 == 0 {
+			target = pathState
+		}
+		if rec := x.get(target, "a"); rec.Code != http.StatusOK {
+			t.Fatalf("read %d (%s): %d", i+1, target, rec.Code)
+		}
+	}
+	requireError(t, x.get(pathScenarios, "a"), http.StatusTooManyRequests, "rate_limited")
+	requireError(t, x.get(pathState, "a"), http.StatusTooManyRequests, "rate_limited")
+	if rec := x.get(pathScenarios, "b"); rec.Code != http.StatusOK {
+		t.Errorf("client b: %d; want 200", rec.Code)
+	}
+}
+
+// TestPostRun_Body: POST's body is read up to 1 KiB: a small one that names a
+// scenario is taken, a larger one (declared or chunked) is 400 bad_request
+// and closes the connection.
 func TestPostRun_Body(t *testing.T) {
 	t.Parallel()
 	x := newDemo(t, nil)
 	h := clientHeader("a")
 	h.Set(HeaderEdgeSecret, goodSecret)
-	if rec := x.serve(http.MethodPost, pathRuns, h, strings.NewReader(`{"preset":"evil"}`)); rec.Code != http.StatusCreated {
+	if rec := x.serve(http.MethodPost, pathRuns, h, strings.NewReader(`{"scenario":"cart-heavy"}`)); rec.Code != http.StatusCreated {
 		t.Fatalf("small body: %d %s; want 201", rec.Code, rec.Body)
 	}
 	big := strings.Repeat("x", 2048)
@@ -466,7 +866,7 @@ func TestBodies_Unread(t *testing.T) {
 			t.Errorf("%s: Connection %q; want close", what, c)
 		}
 	}
-	for _, target := range []string{pathHealth, pathState, pathRecent, pathRun(runID), pathEvents(runID)} {
+	for _, target := range []string{pathHealth, pathState, pathScenarios, pathRecent, pathRun(runID), pathEvents(runID)} {
 		for _, chunked := range []bool{false, true} {
 			rec, body := send(http.MethodGet, target, edgeHeader("g"), chunked)
 			unread(fmt.Sprintf("GET %s (chunked %v)", target, chunked), rec, body, http.StatusBadRequest, "bad_request")
@@ -483,10 +883,16 @@ func TestBodies_Unread(t *testing.T) {
 	rec, body = send(http.MethodPut, pathRuns, edgeHeader("p"), false)
 	unread("PUT", rec, body, http.StatusNotFound, "not_found")
 
+	// "hello" is read to its end and is not JSON: 400, and the connection is
+	// kept; a small body that is JSON is taken, and keeps it too.
 	rec, body = send(http.MethodPost, pathRuns, edgeHeader("p"), false)
-	if rec.Code != http.StatusCreated || body.reads.Load() == 0 || rec.Header().Get("Connection") != "" {
-		t.Errorf("POST from the edge with a small body: %d, %d reads, Connection %q; want 201, read, kept",
+	if rec.Code != http.StatusBadRequest || body.reads.Load() == 0 || rec.Header().Get("Connection") != "" {
+		t.Errorf("POST from the edge with a small body that is not JSON: %d, %d reads, Connection %q; want 400, read, kept",
 			rec.Code, body.reads.Load(), rec.Header().Get("Connection"))
+	}
+	if rec := x.serve(http.MethodPost, pathRuns, edgeHeader("p"), strings.NewReader("{}")); rec.Code != http.StatusCreated ||
+		rec.Header().Get("Connection") != "" {
+		t.Errorf("POST from the edge with {}: %d, Connection %q; want 201, kept", rec.Code, rec.Header().Get("Connection"))
 	}
 	if rec := x.get(pathState, "g"); rec.Header().Get("Connection") != "" {
 		t.Errorf("GET without a body: Connection %q; want none", rec.Header().Get("Connection"))
@@ -630,8 +1036,8 @@ func TestUnreadBodies_RawTCP(t *testing.T) {
 		t.Errorf("%d handlers still running", n)
 	}
 
-	// A small body read to its end keeps the connection: the next request on
-	// it is served.
+	// A small body read to its end keeps the connection, whether it is
+	// refused (not JSON) or taken: the next request on it is served.
 	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -639,18 +1045,24 @@ func TestUnreadBodies_RawTCP(t *testing.T) {
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	br := bufio.NewReader(conn)
-	fmt.Fprintf(conn, "POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n%sX-Demo-Client: keep\r\nContent-Length: 5\r\n\r\nhello", secret)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated || resp.Close {
-		t.Fatalf("POST with a small body: %d, close %v; want 201, kept", resp.StatusCode, resp.Close)
+	for _, step := range []struct {
+		length, body string
+		status       int
+	}{{"5", "hello", http.StatusBadRequest}, {"2", "{}", http.StatusCreated}} {
+		fmt.Fprintf(conn, "POST /api/v1/demo/runs HTTP/1.1\r\nHost: demo\r\n%sX-Demo-Client: keep\r\nContent-Length: %s\r\n\r\n%s",
+			secret, step.length, step.body)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != step.status || resp.Close {
+			t.Fatalf("POST with the small body %q: %d, close %v; want %d, kept", step.body, resp.StatusCode, resp.Close, step.status)
+		}
 	}
 	fmt.Fprintf(conn, "GET /api/v1/demo/state HTTP/1.1\r\nHost: demo\r\n\r\n")
-	resp, err = http.ReadResponse(br, nil)
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		t.Fatalf("the kept connection: %v", err)
 	}
@@ -741,7 +1153,7 @@ func TestClientKey(t *testing.T) {
 	for name, values := range bad {
 		hdr := edgeHeader("")
 		hdr[HeaderClient] = values
-		for _, target := range []string{pathHealth, pathState, pathRecent, pathRun(runID), pathEvents(runID)} {
+		for _, target := range []string{pathHealth, pathState, pathScenarios, pathRecent, pathRun(runID), pathEvents(runID)} {
 			rec := x.serve(http.MethodGet, target, hdr, nil)
 			if rec.Code != http.StatusBadRequest || rec.Body.String() != `{"error":"bad_request"}` {
 				t.Errorf("%s, GET %s: %d %s; want 400 bad_request", name, target, rec.Code, rec.Body)
@@ -922,7 +1334,7 @@ func TestReads_RateLimitedPerClient(t *testing.T) {
 	}
 
 	unknown := pathRun(id.New(RunIDPrefix))
-	targets := []string{pathHealth, pathState, pathRecent, unknown}
+	targets := []string{pathHealth, pathState, pathScenarios, pathRecent, unknown}
 	for i := 0; i < 120; i++ {
 		target := targets[i%len(targets)]
 		if rec := x.get(target, "c"); rec.Code == http.StatusTooManyRequests {
@@ -968,6 +1380,11 @@ var unknownRoutes = []struct{ method, target string }{
 	{"GET", "/api/v1/demo/runs/exp-123"},
 	{"GET", "/api/v1/demo/runs/DEMO-0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"},
 	{"GET", "/api/v1/demo/runs/demo-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0/other"},
+	{"GET", "/api/v1/demo/scenarios/"},
+	{"GET", "/api/v1/demo/scenarios/catalog-moderate"},
+	{"GET", "/api/v1/demo/scenario"},
+	{"POST", "/api/v1/demo/scenarios"},
+	{"HEAD", "/api/v1/demo/scenarios"},
 	{"POST", "/api/v1/demo/state"},
 	{"POST", "/api/v1/demo/health"},
 	{"POST", "/api/v1/demo/runs/recent"},
@@ -1011,7 +1428,7 @@ func TestUnknownRoutes404(t *testing.T) {
 		requireNotFound(t, rt.method+" "+rt.target, rec.Code, rec.Body.String(), rec.Header(), rt.method)
 		requireNoLeak(t, rt.method+" "+rt.target, rec)
 	}
-	// A path outside the six is not a read: it never runs into the limit.
+	// A path outside the seven is not a read: it never runs into the limit.
 	for i := 0; i < 200; i++ {
 		if rec := x.get("/api/v1/rules", "u"); rec.Code != http.StatusNotFound {
 			t.Fatalf("request %d: %d; want 404", i+1, rec.Code)
@@ -1080,6 +1497,7 @@ func TestResponseHeaders(t *testing.T) {
 	recs := map[string]*httptest.ResponseRecorder{
 		"health":         x.get(pathHealth, "a"),
 		"state":          x.get(pathState, "a"),
+		"scenarios":      x.get(pathScenarios, "a"),
 		"recent":         x.get(pathRecent, "a"),
 		"run":            x.get(pathRun(runID), "a"),
 		"run not found":  x.get(pathRun("nope"), "a"),
@@ -1652,6 +2070,7 @@ func TestNoInternalLeak(t *testing.T) {
 		for what, rec := range map[string]*httptest.ResponseRecorder{
 			"health":              x.get(pathHealth, "a"),
 			"state":               x.get(pathState, "a"),
+			"scenarios":           x.get(pathScenarios, "a"),
 			"recent":              x.get(pathRecent, "a"),
 			"run unknown":         x.get(pathRun(id.New(RunIDPrefix)), "a"),
 			"run malformed":       x.get(pathRun("exp-123"), "a"),

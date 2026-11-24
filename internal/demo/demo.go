@@ -45,9 +45,10 @@ type Demo struct {
 	// cannot both pass the limit. Nothing in it waits on I/O.
 	admitMu sync.Mutex
 
-	health healthCache
-	recent recentCache
-	logKey []byte // keys the client tags of the request log
+	health    healthCache
+	recent    recentCache
+	scenarios ScenarioList // GET /scenarios' answer, built once from the catalog
+	logKey    []byte       // keys the client tags of the request log
 
 	bodyTimeout time.Duration // bodyReadTimeout; tests shorten it
 
@@ -73,8 +74,8 @@ func New(d Deps, cfg Config) *Demo {
 	w := NewWorker(d, cfg, q, hub)
 	lim := NewLimiter(d.Clock)
 	lim.streamMaxAge = cfg.StreamMaxAge
-	x := &Demo{d: d, cfg: cfg, log: d.logger(), q: q, hub: hub, w: w, lim: lim, logKey: make([]byte, 32),
-		bodyTimeout: bodyReadTimeout}
+	x := &Demo{d: d, cfg: cfg, log: d.logger(), q: q, hub: hub, w: w, lim: lim, scenarios: scenarioList(),
+		logKey: make([]byte, 32), bodyTimeout: bodyReadTimeout}
 	_, _ = rand.Read(x.logKey)
 	x.view, x.readRecent, x.enqueue = w.View, w.Recent, q.Enqueue
 	w.OnRunEnded = func(ctx context.Context) {
