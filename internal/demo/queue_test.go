@@ -157,7 +157,9 @@ func TestQueue_Positions(t *testing.T) {
 }
 
 // TestQueue_RunView: a queued run's view is the contract's Run with the
-// preset's phases, the fixed testbed and a run id of the demo's shape.
+// default scenario's id and phases (baseline with no fault, then memory and
+// cpu with their fault, target and intensity), the fixed testbed and a run id
+// of the demo's shape.
 func TestQueue_RunView(t *testing.T) {
 	q := NewQueue(3)
 	r, err := q.Enqueue("a", testNow)
@@ -167,10 +169,24 @@ func TestQueue_RunView(t *testing.T) {
 	if !validRunID(r.RunID) {
 		t.Errorf("run id %q has not the demo's shape", r.RunID)
 	}
+	if r.Scenario != "catalog-moderate" {
+		t.Errorf("scenario = %q; want the default, catalog-moderate", r.Scenario)
+	}
+	str := func(p *string) any {
+		if p == nil {
+			return nil
+		}
+		return *p
+	}
+	wantFaults := [3][3]any{
+		{nil, nil, nil},
+		{"memory", "productcatalogservice", "moderate"},
+		{"cpu", "productcatalogservice", "moderate"},
+	}
 	for i, p := range r.Phases {
 		if p.Name != PhaseNames[i] || p.Status != PhasePending || p.DurationS != PhaseDurationS ||
-			(p.Fault != nil) != (i == FaultPhaseIndex) {
-			t.Errorf("phase %d = %+v", i, p)
+			[3]any{str(p.Fault), str(p.Target), str(p.Intensity)} != wantFaults[i] {
+			t.Errorf("phase %d = %+v; want %s pending with fault, target, intensity %v", i, p, PhaseNames[i], wantFaults[i])
 		}
 	}
 	if r.Testbed != FixedTestbed() || !r.QueuedAt.Equal(testNow) || r.StartedAt != nil || r.EndedAt != nil {
@@ -178,9 +194,10 @@ func TestQueue_RunView(t *testing.T) {
 	}
 	// Views are copies: changing one leaves the queue's alone.
 	*r.Position = 7
-	*r.Phases[FaultPhaseIndex].Fault = "changed"
+	*r.Phases[1].Fault, *r.Phases[2].Target, *r.Phases[2].Intensity = "changed", "changed", "changed"
 	again, _ := q.get(r.RunID)
-	if *again.Position != 0 || *again.Phases[FaultPhaseIndex].Fault != FaultLabel {
+	if *again.Position != 0 || *again.Phases[1].Fault != "memory" || *again.Phases[2].Target != "productcatalogservice" ||
+		*again.Phases[2].Intensity != "moderate" {
 		t.Fatalf("the queue's view changed through a copy: %+v", again)
 	}
 	b, err := json.Marshal(again)

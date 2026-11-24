@@ -229,15 +229,18 @@ func (q *Queue) remove(runID string) (moved []QueueEvent, ok bool) {
 
 // ---- run views ----
 
-// newRun is a queued run's first view: the preset's three phases pending, the
-// fixed testbed, no position (callers add it).
+// newRun is a queued run's first view: the default scenario's id and its three
+// phases pending, each fault phase with its fault's kind, target and
+// intensity, the fixed testbed, no position (callers add it).
 func newRun(runID string, queuedAt time.Time) Run {
-	r := Run{RunID: runID, Status: RunQueued, QueuedAt: queuedAt, Testbed: FixedTestbed()}
+	sc := DefaultScenario() // Task 4: the queued entry's scenario, or the one read from the database
+	r := Run{RunID: runID, Scenario: sc.ID, Status: RunQueued, QueuedAt: queuedAt, Testbed: FixedTestbed()}
+	steps := faultSteps(&sc)
 	for i := range r.Phases {
 		r.Phases[i] = PhaseView{Name: PhaseNames[i], Status: PhasePending, DurationS: PhaseDurationS}
-		if i == FaultPhaseIndex {
-			label := FaultLabel
-			r.Phases[i].Fault = &label
+		if st := steps[i]; st != nil {
+			kind, target, intensity := string(st.Kind), st.Target, st.Intensity
+			r.Phases[i].Fault, r.Phases[i].Target, r.Phases[i].Intensity = &kind, &target, &intensity
 		}
 	}
 	return r

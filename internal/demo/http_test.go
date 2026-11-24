@@ -1205,7 +1205,7 @@ func TestHealth_EachCheck(t *testing.T) {
 		}},
 		{"no alive target", "target", func(_ *testing.T, f *fakeLab) {
 			f.mu.Lock()
-			f.instances = []*model.SDKInstance{{ID: "inst-1", Service: TargetService, Status: "stale"}}
+			f.instances = []*model.SDKInstance{{ID: "inst-1", Service: testTarget, Status: "stale"}}
 			f.mu.Unlock()
 		}},
 		{"target unreadable", "target", func(_ *testing.T, f *fakeLab) { f.fail("instances.InstancesForService", errLeakyAll) }},
@@ -1442,21 +1442,21 @@ func TestState(t *testing.T) {
 		return fmt.Sprintf(`{"capacity":3,"accepting":true,"queue":[{"run_id":%q,"position":0,"status":"running"},{"run_id":%q,"position":1,"status":"queued"}],"running":%s}`, a, b, detail)
 	}
 	if rec := x.get(pathState, "a"); rec.Body.String() != running(fmt.Sprintf(
-		`{"run_id":%q,"phase":"plain","phase_index":0,"phase_started_at":"2026-11-20T11:59:50.000Z","phase_duration_s":40,"progress":0.25}`, a)) {
+		`{"run_id":%q,"phase":"baseline","phase_index":0,"phase_started_at":"2026-11-20T11:59:50.000Z","phase_duration_s":40,"progress":0.25}`, a)) {
 		t.Errorf("first phase running: %s", rec.Body)
 	}
 
 	ended := testNow.Add(-2 * time.Second)
 	x.d.q.update(a, func(r *Run) { r.Phases[0].Status, r.Phases[0].EndedAt = PhaseCompleted, &ended })
 	if rec := x.get(pathState, "a"); rec.Body.String() != running(fmt.Sprintf(
-		`{"run_id":%q,"phase":"catalog-latency-50ms","phase_index":1,"phase_started_at":null,"phase_duration_s":40,"progress":0}`, a)) {
+		`{"run_id":%q,"phase":"memory","phase_index":1,"phase_started_at":null,"phase_duration_s":40,"progress":0}`, a)) {
 		t.Errorf("between phases: %s", rec.Body)
 	}
 
 	late := testNow.Add(-50 * time.Second)
 	x.d.q.update(a, func(r *Run) { r.Phases[1].Status, r.Phases[1].StartedAt = PhaseRunning, &late })
 	if rec := x.get(pathState, "a"); rec.Body.String() != running(fmt.Sprintf(
-		`{"run_id":%q,"phase":"catalog-latency-50ms","phase_index":1,"phase_started_at":"2026-11-20T11:59:10.000Z","phase_duration_s":40,"progress":1}`, a)) {
+		`{"run_id":%q,"phase":"memory","phase_index":1,"phase_started_at":"2026-11-20T11:59:10.000Z","phase_duration_s":40,"progress":1}`, a)) {
 		t.Errorf("overrunning phase: %s", rec.Body)
 	}
 
@@ -1465,7 +1465,7 @@ func TestState(t *testing.T) {
 		r.Phases[2].Status, r.Phases[2].StartedAt = PhaseCompleted, &late
 	})
 	if rec := x.get(pathState, "a"); rec.Body.String() != running(fmt.Sprintf(
-		`{"run_id":%q,"phase":"plain-end","phase_index":2,"phase_started_at":"2026-11-20T11:59:10.000Z","phase_duration_s":40,"progress":1}`, a)) {
+		`{"run_id":%q,"phase":"cpu","phase_index":2,"phase_started_at":"2026-11-20T11:59:10.000Z","phase_duration_s":40,"progress":1}`, a)) {
 		t.Errorf("all phases ended: %s", rec.Body)
 	}
 }
@@ -2022,17 +2022,31 @@ func TestDemo_OnRunEndedIsTheWorkersRetain(t *testing.T) {
 	})
 }
 
-// TestDemo_SwitchOffAll: the start-up switch-off, through the Demo.
+// TestDemo_SwitchOffAll: the start-up switch-off, through the Demo, of a run of
+// build 2's shape and of a run of a scenario, both of whose rules
+// (demo-run-<id>-memory, demo-run-<id>-cpu) were left on.
 func TestDemo_SwitchOffAll(t *testing.T) {
 	t.Parallel()
 	x := newUnsweptDemo(t, nil)
 	s := seed(t, x.f, "running", true)
+	built, err := BuildRun(context.Background(), x.f.deps(), id.New(RunIDPrefix), DefaultScenario(), testRunCap)
+	if err != nil {
+		t.Fatalf("BuildRun: %v", err)
+	}
+	for _, rule := range built.RuleIDs {
+		if err := SetRuleEnabled(context.Background(), fakeRules{x.f}, rule, true); err != nil {
+			t.Fatalf("switch on: %v", err)
+		}
+	}
 	if err := x.d.SwitchOffAll(context.Background()); err != nil {
 		t.Fatalf("SwitchOffAll: %v", err)
 	}
-	if r := x.f.rule(s.RuleID); r == nil || r.Enabled {
-		t.Errorf("rule %+v; want off", r)
+	for _, rule := range append([]string{s.RuleID}, built.RuleIDs[:]...) {
+		if r := x.f.rule(rule); r == nil || r.Enabled {
+			t.Errorf("rule %+v; want off", r)
+		}
 	}
+	x.f.requireDemoRulesOff(t)
 	requireError(t, x.post("a"), http.StatusServiceUnavailable, "unavailable")
 }
 
@@ -2044,9 +2058,14 @@ func TestDemo_Shutdown(t *testing.T) {
 	x := newDemo(t, nil)
 	x.start()
 	runID := x.postOK("a")
-	waitFor(t, "the run's rule to be on", func() bool {
-		r := x.f.rule(x.f.ruleIDOfRun(runID))
-		return r != nil && r.Enabled
+	waitFor(t, "the run's rules to be on", func() bool {
+		ids := x.f.ruleIDsOfRun(runID)
+		for _, id := range ids {
+			if r := x.f.rule(id); r == nil || !r.Enabled {
+				return false
+			}
+		}
+		return len(ids) == 2
 	})
 	events, unsub := x.d.hub.Subscribe(runID)
 	defer unsub()

@@ -60,21 +60,26 @@ func loadGenReady(ctx context.Context, d Deps, runCap time.Duration, log *slog.L
 	if d.Clock != nil {
 		now = d.Clock.Now()
 	}
-	if _, err := pickDataset(ctx, d.Zeus, now, runCap); err != nil {
-		log.Warn("demo: preflight: no usable dataset", "dataset", DatasetName, "error", err)
+	dataset := DefaultScenario().Workload.DatasetName // Task 4: the run's scenario's dataset
+	if _, err := pickDataset(ctx, d.Zeus, dataset, now, runCap); err != nil {
+		log.Warn("demo: preflight: no usable dataset", "dataset", dataset, "error", err)
 		return false
 	}
 	return true
 }
 
-// targetReady: at least one productcatalogservice instance is alive.
+// targetReady: at least one instance of the default scenario's target
+// (productcatalogservice, both of its steps') is alive.
 func targetReady(ctx context.Context, d Deps, log *slog.Logger) bool {
 	if d.Instances == nil {
 		return false
 	}
-	insts, err := d.Instances.InstancesForService(ctx, TargetService)
+	// Task 4: every service the run's scenario targets; for the health check,
+	// every CatalogTargets() service.
+	service := DefaultScenario().Memory.Target
+	insts, err := d.Instances.InstancesForService(ctx, service)
 	if err != nil {
-		log.Warn("demo: preflight could not list the target's instances", "service", TargetService, "error", err)
+		log.Warn("demo: preflight could not list the target's instances", "service", service, "error", err)
 		return false
 	}
 	for _, in := range insts {
@@ -82,7 +87,7 @@ func targetReady(ctx context.Context, d Deps, log *slog.Logger) bool {
 			return true
 		}
 	}
-	log.Warn("demo: preflight: the target has no alive instance", "service", TargetService, "instances", len(insts))
+	log.Warn("demo: preflight: the target has no alive instance", "service", service, "instances", len(insts))
 	return false
 }
 

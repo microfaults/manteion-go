@@ -27,6 +27,10 @@ import (
 // is served, so a moment in which a demo rule is served shows up even when the
 // end state is clean.
 
+// demoWorkflow is the workflow every phase of a demo run runs: the catalog's
+// browse workload's, and build 2's.
+const demoWorkflow = "demo-browse"
+
 // dbLab is the real store on the test database, a load generator that holds
 // one usable demo-products dataset, and an orchestrator whose cancel is the
 // experiment's planned|running -> cancelled CAS.
@@ -44,15 +48,15 @@ func newDBLab(t *testing.T) *dbLab {
 	clearDemoRows(t, conn)
 
 	wfs := store.NewWorkflowRepo(conn)
-	if _, err := wfs.Get(ctx, WorkflowID); errors.Is(err, store.ErrNotFound) {
-		wf := &model.Workflow{ID: WorkflowID, Name: fmt.Sprintf("%s (test %d)", WorkflowID, time.Now().UnixNano()),
+	if _, err := wfs.Get(ctx, demoWorkflow); errors.Is(err, store.ErrNotFound) {
+		wf := &model.Workflow{ID: demoWorkflow, Name: fmt.Sprintf("%s (test %d)", demoWorkflow, time.Now().UnixNano()),
 			DSL: json.RawMessage(`{"name":"demo-browse"}`), CreatedAt: time.Now()}
 		if err := wfs.Create(ctx, wf); err != nil {
-			t.Fatalf("register workflow %s: %v", WorkflowID, err)
+			t.Fatalf("register workflow %s: %v", demoWorkflow, err)
 		}
-		t.Cleanup(func() { _ = wfs.Delete(context.Background(), WorkflowID) }) // runs after the rows below are gone
+		t.Cleanup(func() { _ = wfs.Delete(context.Background(), demoWorkflow) }) // runs after the rows below are gone
 	} else if err != nil {
-		t.Fatalf("read workflow %s: %v", WorkflowID, err)
+		t.Fatalf("read workflow %s: %v", demoWorkflow, err)
 	}
 	t.Cleanup(func() { clearDemoRows(t, conn) })
 
@@ -64,7 +68,7 @@ func newDBLab(t *testing.T) *dbLab {
 		Rules:       rules,
 		Specs:       store.NewFaultRepo(conn),
 		Workflows:   wfs,
-		Zeus: stubZeus{datasets: []zeus.Dataset{{ID: "ds-sweep-db", Name: DatasetName, SizeBytes: 4096,
+		Zeus: stubZeus{datasets: []zeus.Dataset{{ID: "ds-sweep-db", Name: "demo-products", SizeBytes: 4096,
 			CreatedAt: time.Now()}}},
 		Clock:  &fakeClock{now: time.Now().UTC().Truncate(time.Millisecond), step: time.Second},
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -112,15 +116,14 @@ func (o dbOrch) transition(ctx context.Context, id, to string, from ...string) e
 		Msg: "test: experiment " + id + " is " + e.Status}
 }
 
-// build builds a run on the real store and returns it.
+// build writes a run of build 2's shape on the real store (buildOldRun) and
+// returns it.
 func (l *dbLab) build() seeded {
 	l.t.Helper()
-	s := seeded{runID: id.New(RunIDPrefix)}
-	built, err := BuildRun(context.Background(), l.d, s.runID, 5*time.Minute)
+	s, err := buildOldRun(context.Background(), l.d, id.New(RunIDPrefix))
 	if err != nil {
-		l.t.Fatalf("BuildRun: %v", err)
+		l.t.Fatalf("build: %v", err)
 	}
-	s.Built = built
 	return s
 }
 
@@ -142,7 +145,7 @@ func (l *dbLab) movePhase(phaseID, to string, from ...string) {
 // productcatalogservice right now.
 func (l *dbLab) servedDemoRules() []string {
 	l.t.Helper()
-	served, err := l.rules.ForService(context.Background(), TargetService)
+	served, err := l.rules.ForService(context.Background(), testTarget)
 	if err != nil {
 		l.t.Fatalf("ForService: %v", err)
 	}
@@ -296,8 +299,8 @@ func TestSweep_DB_EnabledRuleOnPlannedExperiment(t *testing.T) {
 	if err != nil || e.Status != "cancelled" {
 		t.Errorf("experiment %+v, %v; want cancelled", e, err)
 	}
-	if served, err := l.rules.ForService(ctx, TargetService); err != nil || len(served) != 0 {
-		t.Errorf("ForService(%s) = %d rules, %v; want none", TargetService, len(served), err)
+	if served, err := l.rules.ForService(ctx, testTarget); err != nil || len(served) != 0 {
+		t.Errorf("ForService(%s) = %d rules, %v; want none", testTarget, len(served), err)
 	}
 	requireNeverServed(t, log, 0)
 	off, cancel := log.index("after rules.SetEnabled "+run.RuleID+" false"), log.index("before orch.CancelExperiment "+run.ExperimentID)
@@ -319,7 +322,7 @@ func TestSweep_DB_ServedRuleOnRunningExperiment(t *testing.T) {
 	l.moveExperiment(run.ExperimentID, "running", "planned")
 	l.movePhase(run.PhaseIDs[0], "running", "pending")
 	l.movePhase(run.PhaseIDs[0], "completed", "running")
-	l.movePhase(run.PhaseIDs[FaultPhaseIndex], "running", "pending")
+	l.movePhase(run.PhaseIDs[oldFaultPhase], "running", "pending")
 	if got := l.servedDemoRules(); !slices.Equal(got, []string{run.RuleID}) {
 		t.Fatalf("precondition: served %v; want the run's rule", got)
 	}
@@ -360,7 +363,7 @@ func TestRetain_DB_RuleNeverServedDuringDeletion(t *testing.T) {
 	l.moveExperiment(old.ExperimentID, "running", "planned")
 	l.movePhase(old.PhaseIDs[0], "running", "pending")
 	l.movePhase(old.PhaseIDs[0], "completed", "running")
-	l.movePhase(old.PhaseIDs[FaultPhaseIndex], "running", "pending")
+	l.movePhase(old.PhaseIDs[oldFaultPhase], "running", "pending")
 	if got := l.servedDemoRules(); !slices.Equal(got, []string{old.RuleID}) {
 		t.Fatalf("precondition: served %v; want the old run's rule", got)
 	}

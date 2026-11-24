@@ -23,21 +23,23 @@ import (
 //   - Any rule named demo-run-* that is enabled is switched off when the
 //     start-up switch-off finds it: switching off is safe whoever made the
 //     rule, and the name is the demo's.
-//   - A rule is deleted only when its name is demo-run-<a run id this package
-//     mints> (validRunID). Rules record no creator, so the name is all that
-//     ties a rule to a run: a demo-run-x rule an operator made is switched off
-//     and kept, and so is any rule a phase of an operator's experiment still
-//     links (the store refuses that delete with store.ErrInUse).
-//   - A run's experiment and its rule share the name demo-run-<run id>
-//     (BuildRun); that is how a run's rules are found for its experiment, and
-//     the other way.
+//   - A rule is deleted only when RunIDOfRule reads its name as a run's rule:
+//     demo-run-<run id>-memory or demo-run-<run id>-cpu (BuildRun), or build
+//     2's demo-run-<run id>, the run id one this package mints (validRunID).
+//     Rules record no creator, so the name is all that ties a rule to a run: a
+//     demo-run-x rule an operator made is switched off and kept, and so is any
+//     rule a phase of an operator's experiment still links (the store refuses
+//     that delete with store.ErrInUse).
+//   - A run's experiment is named demo-run-<run id>, and each of its rules is
+//     grouped under that name (runKey): that is how a run's rules are found
+//     for its experiment, and the other way.
 //
 // The ordering rule. Deleting an experiment removes its phases' rule links,
 // and an enabled rule attached to no phase is served to every instance of its
 // service, for ever. So:
-//   - an experiment is deleted only after every rule named like it was
-//     switched off (one unconditional write, detached from the caller's
-//     cancellation);
+//   - an experiment is deleted only after every rule grouped under its name
+//     (runKey) was switched off (one unconditional write each, detached from
+//     the caller's cancellation);
 //   - and only when every rule its phases link is one of those: an operator
 //     can link any rule to any phase, a finished demo experiment's included,
 //     and deleting the experiment would leave that rule, if it is linked
@@ -190,10 +192,10 @@ func Sweep(ctx context.Context, d Deps, keep int) error {
 
 // Retain keeps the newest keep finished demo experiments (completed, failed or
 // cancelled; newest by creation) and deletes the rest, each as: every rule
-// named like it switched off; its phases' rule links read, and the experiment
-// kept if any links a rule that is not one of those; the experiment deleted;
-// then the run's rule deleted. A run's rule whose experiment no longer exists
-// is switched off and deleted too. Retain never touches a planned or running
+// grouped under its name (runKey: the run's rules) switched off; its phases'
+// rule links read, and the experiment kept if any links a rule that is not one
+// of those; the experiment deleted; then the run's rules deleted. A run's rule
+// whose experiment no longer exists is switched off and deleted too. Retain never touches a planned or running
 // experiment and never cancels anything; it pages through all the demo's
 // experiments. Once ctx is done it starts nothing new.
 //
@@ -368,7 +370,7 @@ func (s spared) owns(e *model.Experiment) bool {
 	return slices.Contains(s.names, e.Name) || slices.Contains(s.experimentIDs, e.ID)
 }
 
-func (s spared) ownsRule(r *model.Rule) bool { return slices.Contains(s.names, r.Name) }
+func (s spared) ownsRule(r *model.Rule) bool { return slices.Contains(s.names, runKey(r.Name)) }
 
 // tidier carries one pass and what failed in it.
 type tidier struct {
@@ -592,16 +594,16 @@ func (t *tidier) retain(ctx context.Context, keep int) {
 	if (len(doomed) == 0 && !complete) || t.stopped(ctx) {
 		return
 	}
-	// Read after the experiments: a run's rule is written before its
-	// experiment, so every listed experiment's rule is in this list.
+	// Read after the experiments: a run's rules are written before its
+	// experiment, so every listed experiment's rules are in this list.
 	rules, ok := t.listRules(ctx)
 	if !ok {
 		return // no rule can be switched off by name, so nothing is deleted
 	}
-	byName := map[string][]*model.Rule{}
+	byName := map[string][]*model.Rule{} // by runKey: a run's rules under its experiment's name
 	for _, r := range rules {
 		if r != nil && demoRuleName(r.Name) {
-			byName[r.Name] = append(byName[r.Name], r)
+			byName[runKey(r.Name)] = append(byName[runKey(r.Name)], r)
 		}
 	}
 	for i := len(doomed) - 1; i >= 0; i-- { // oldest first
@@ -635,9 +637,10 @@ func (t *tidier) cancelStalePlanned(ctx context.Context, exps []*model.Experimen
 	}
 }
 
-// remove deletes one finished demo experiment: every rule named like it off,
-// then, if its phases link no other rule, the experiment, then the run's rule
-// (a rule with the name that is not a run's stays, off). A step that fails, or
+// remove deletes one finished demo experiment: every rule grouped under its
+// name (runKey) off, then, if its phases link no other rule, the experiment,
+// then each of the run's rules (a rule with the name that is not a run's
+// stays, off). A step that fails, or
 // a foreign link, ends the sequence for this experiment.
 func (t *tidier) remove(ctx context.Context, e *model.Experiment, rules []*model.Rule) {
 	if t.spared().owns(e) {
@@ -715,7 +718,7 @@ func (t *tidier) linksOnly(ctx context.Context, e *model.Experiment, own []*mode
 // experiment.
 func (t *tidier) removeOrphanRules(ctx context.Context, rules []*model.Rule, names map[string]bool) {
 	for _, r := range rules {
-		if r == nil || !ownRuleName(r.Name) || names[r.Name] {
+		if r == nil || !ownRuleName(r.Name) || names[runKey(r.Name)] {
 			continue
 		}
 		if t.stopped(ctx) {
@@ -790,7 +793,7 @@ func (t *tidier) switchOff(ctx context.Context, r *model.Rule) bool {
 		return false
 	}
 	attrs := []any{"rule_id", r.ID, "rule", r.Name, "reason", t.offReason()}
-	if runID, ok := strings.CutPrefix(r.Name, RunNamePrefix); ok && validRunID(runID) {
+	if runID, ok := RunIDOfRule(r.Name); ok {
 		attrs = append([]any{"run_id", runID}, attrs...)
 	}
 	t.counted.off++
@@ -904,11 +907,22 @@ func callWithin(ctx context.Context, timeout time.Duration, fn func(context.Cont
 // whenever a start-up pass finds it on.
 func demoRuleName(name string) bool { return strings.HasPrefix(name, RunNamePrefix) }
 
-// ownRuleName: a run's rule as this package names it, demo-run-<run id>. Only
-// such rules are ever deleted.
+// ownRuleName: a run's rule as this package names it (RunIDOfRule):
+// demo-run-<run id>-memory, demo-run-<run id>-cpu, or build 2's
+// demo-run-<run id>. Only such rules are ever deleted.
 func ownRuleName(name string) bool {
-	runID, ok := strings.CutPrefix(name, RunNamePrefix)
-	return ok && validRunID(runID)
+	_, ok := RunIDOfRule(name)
+	return ok
+}
+
+// runKey is the name a rule is grouped under: for a run's rule (RunIDOfRule),
+// its run's experiment name demo-run-<run id>, so a run's rules are found
+// together for its experiment; any other name stands for itself.
+func runKey(name string) string {
+	if runID, ok := RunIDOfRule(name); ok {
+		return RunNamePrefix + runID
+	}
+	return name
 }
 
 // ownExperiment: an experiment the demo created and named.

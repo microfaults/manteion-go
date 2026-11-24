@@ -302,8 +302,13 @@ func TestWorker_HappyPath(t *testing.T) {
 	if v, err := x.w.View(context.Background(), r.RunID); err != nil || v.Status != RunCompleted {
 		t.Errorf("View = %+v, %v", v, err)
 	}
-	if n := len(x.f.callList("rules.SetEnabled ")); n != 1 || x.w.SwitchOffPending() {
-		t.Errorf("%d switch-off writes, pending %v; want exactly 1 and none pending", n, x.w.SwitchOffPending())
+	for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+		if n := len(x.f.callList("rules.SetEnabled " + rule + " ")); n != 1 {
+			t.Errorf("%d switch-off writes of rule %s; want exactly 1", n, rule)
+		}
+	}
+	if n := len(x.f.callList("rules.SetEnabled ")); n != 2 || x.w.SwitchOffPending() {
+		t.Errorf("%d switch-off writes, pending %v; want exactly 2, one per rule, and none pending", n, x.w.SwitchOffPending())
 	}
 	if id, _, _ := x.w.Current(); id != "" {
 		t.Errorf("Current() = %q after the run ended", id)
@@ -329,7 +334,7 @@ func TestWorker_PreflightRefusals(t *testing.T) {
 		{"no dataset", func(f *fakeLab) { f.datasets = nil }, ReasonLoadGeneratorUnavailable},
 		{"datasets unreadable", func(f *fakeLab) { f.fail("zeus.ListDatasets", errLeaky) }, ReasonLoadGeneratorUnavailable},
 		{"only a stale instance", func(f *fakeLab) {
-			f.instances = []*model.SDKInstance{{ID: "inst-s", Service: TargetService, Status: "stale"}}
+			f.instances = []*model.SDKInstance{{ID: "inst-s", Service: testTarget, Status: "stale"}}
 		}, ReasonTargetUnavailable},
 		{"no instance", func(f *fakeLab) { f.instances = nil }, ReasonTargetUnavailable},
 		{"instances unreadable", func(f *fakeLab) { f.fail("instances.InstancesForService", errLeaky) }, ReasonTargetUnavailable},
@@ -457,11 +462,13 @@ func TestWorker_WatchdogWhileStartBlocks(t *testing.T) {
 	if at < x.cfg.RunCap || at > x.cfg.RunCap+50*time.Millisecond {
 		t.Errorf("rule switched off %s after start; want within 50 ms of the %s cap", at, x.cfg.RunCap)
 	}
-	rule := x.f.ruleIDOfRun(r.RunID)
-	if !x.f.ruleEnabledEver(rule) {
-		t.Fatal("the rule was never switched on")
+	rules := x.f.rulesOfRun(t, r.RunID)
+	for _, rule := range rules {
+		if !x.f.ruleEnabledEver(rule) {
+			t.Fatalf("rule %s was never switched on", rule)
+		}
+		waitFor(t, "the rule to be off", func() bool { return !x.f.rule(rule).Enabled })
 	}
-	waitFor(t, "the rule to be off", func() bool { return !x.f.rule(rule).Enabled })
 	x.f.requireDemoRulesOff(t)
 	time.Sleep(30 * time.Millisecond) // the worker is now waiting for the start
 	if n := cancelsBefore.Load() + cancelsAfter.Load(); n != 0 {
@@ -476,7 +483,9 @@ func TestWorker_WatchdogWhileStartBlocks(t *testing.T) {
 	if cancelsBefore.Load() != 0 || cancelsAfter.Load() != 1 {
 		t.Errorf("cancels before release %d, after %d; want 0, 1", cancelsBefore.Load(), cancelsAfter.Load())
 	}
-	requireOffBeforeCancel(t, x.f, rule, ruleOn)
+	for _, rule := range rules {
+		requireOffBeforeCancel(t, x.f, rule, ruleOn)
+	}
 	if st := x.f.experimentStatus(x.expID(r.RunID)); st != "cancelled" {
 		t.Errorf("experiment %s; want cancelled after the late start", st)
 	}
@@ -513,9 +522,9 @@ func TestWorker_CancelErrorStillDisablesRule(t *testing.T) {
 	phases := x.f.phasesOf(x.expID(r.RunID))
 	x.f.setPhaseStatus(phases[0].ID, "completed")
 	x.f.setPhaseStatus(phases[1].ID, "running")
-	rule := x.f.ruleIDOfRun(r.RunID)
-	if !x.f.served(rule) {
-		t.Fatal("the fault phase runs but its rule is not served")
+	rules := x.f.rulesOfRun(t, r.RunID)
+	if !x.f.served(rules[0]) || x.f.served(rules[1]) {
+		t.Fatal("the memory phase runs but its rule is not served, or the cpu rule is")
 	}
 	_, end := awaitEnd(t, ch)
 	x.f.requireDemoRulesOff(t)
@@ -523,7 +532,9 @@ func TestWorker_CancelErrorStillDisablesRule(t *testing.T) {
 	if n := len(x.f.callList("orch.CancelExperiment")); n != 1 {
 		t.Errorf("%d cancels; want 1", n)
 	}
-	requireOffBeforeCancel(t, x.f, rule, ruleOn)
+	for _, rule := range rules {
+		requireOffBeforeCancel(t, x.f, rule, ruleOn)
+	}
 	if n := len(x.q.Snapshot()); n != 0 {
 		t.Errorf("%d runs in line; want none", n)
 	}
@@ -695,9 +706,10 @@ func TestWorker_SwitchOnRefusedWhenUnattached(t *testing.T) {
 	if c := x.f.callList("orch."); len(c) != 0 {
 		t.Errorf("orchestrator calls %v; want none", c)
 	}
-	rule := x.f.ruleIDOfRun(r.RunID)
-	if rule == "" || x.f.ruleEnabledEver(rule) {
-		t.Errorf("rule %q: enabled ever %v; want it kept and never on", rule, x.f.ruleEnabledEver(rule))
+	for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+		if x.f.ruleEnabledEver(rule) {
+			t.Errorf("rule %q was switched on; want both kept and never on", rule)
+		}
 	}
 	if st := x.f.experimentStatus(x.expID(r.RunID)); st != "planned" {
 		t.Errorf("experiment %s; want planned, left for the sweep", st)
@@ -720,8 +732,10 @@ func TestWorker_WatchdogDuringSwitchOn(t *testing.T) {
 	_, end := awaitEnd(t, ch)
 	x.f.requireDemoRulesOff(t)
 	requireEnded(t, end, RunCancelled, ReasonTimedOut)
-	if rule := x.f.ruleIDOfRun(r.RunID); rule == "" || x.f.ruleEnabledEver(rule) {
-		t.Errorf("rule %q was switched on after the watchdog fired", rule)
+	for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+		if x.f.ruleEnabledEver(rule) {
+			t.Errorf("rule %q was switched on after the watchdog fired", rule)
+		}
 	}
 	if c := x.f.callList("orch."); len(c) != 0 {
 		t.Errorf("orchestrator calls %v; want none", c)
@@ -756,15 +770,17 @@ func TestWorker_HungStatusRead(t *testing.T) {
 		x.f.onCall("rules.SetEnabled", func() { offAt.CompareAndSwap(0, int64(time.Since(x.began))) })
 		r, ch := x.enqueue("a")
 		x.start()
-		waitFor(t, "the rule to be switched on", func() bool {
-			id := x.f.ruleIDOfRun(r.RunID)
-			return id != "" && x.f.ruleEnabledEver(id)
+		waitFor(t, "the rules to be switched on", func() bool {
+			ids := x.f.ruleIDsOfRun(r.RunID)
+			return len(ids) == 2 && x.f.ruleEnabledEver(ids[0]) && x.f.ruleEnabledEver(ids[1])
 		})
 		waitFor(t, "the switch-off", func() bool { return offAt.Load() != 0 })
 		if at := time.Duration(offAt.Load()); at < x.cfg.RunCap || at > x.cfg.RunCap+50*time.Millisecond {
 			t.Errorf("rule switched off %s after start; want within 50 ms of the %s cap", at, x.cfg.RunCap)
 		}
-		waitFor(t, "the rule to be off", func() bool { return !x.f.rule(x.f.ruleIDOfRun(r.RunID)).Enabled })
+		for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+			waitFor(t, "the rule to be off", func() bool { return !x.f.rule(rule).Enabled })
+		}
 		x.f.requireDemoRulesOff(t)
 		close(release)
 		_, end := awaitEnd(t, ch)
@@ -854,11 +870,11 @@ func TestWorker_PanicsAreContained(t *testing.T) {
 	x.start()
 
 	_, endA := awaitEnd(t, chA)
-	x.f.requireRunRuleOff(t, a.RunID)
+	x.f.requireRunRulesOff(t, a.RunID)
 	requireEnded(t, endA, RunFailed, ReasonInternalError)
 
 	_, endB := awaitEnd(t, chB)
-	x.f.requireRunRuleOff(t, b.RunID)
+	x.f.requireRunRulesOff(t, b.RunID)
 	requireEnded(t, endB, RunFailed, ReasonInternalError)
 	if n := len(x.f.callList("orch.CancelExperiment")); n != 1 {
 		t.Errorf("%d cancels for the run whose read panicked; want 1", n)
@@ -897,11 +913,11 @@ func TestWorker_EveryEndingFreesOnceAndEndsLast(t *testing.T) {
 	x.start()
 
 	_, endA := awaitEnd(t, chA)
-	x.f.requireRunRuleOff(t, a.RunID)
+	x.f.requireRunRulesOff(t, a.RunID)
 	requireEnded(t, endA, RunFailed, ReasonLoadGeneratorUnavailable)
 
 	evsB, endB := awaitEnd(t, chB)
-	x.f.requireRunRuleOff(t, b.RunID)
+	x.f.requireRunRulesOff(t, b.RunID)
 	requireEnded(t, endB, RunFailed, ReasonInternalError)
 
 	evsC, endC := awaitEnd(t, chC)
@@ -955,8 +971,10 @@ func TestWorker_ShutdownEndsRuns(t *testing.T) {
 	b, chB := x.enqueue("b")
 	x.start()
 	awaitPhase(t, chA, 0, PhaseRunning)
-	if !x.f.ruleEnabledEver(x.f.ruleIDOfRun(a.RunID)) {
-		t.Fatal("the rule was never switched on")
+	for _, rule := range x.f.rulesOfRun(t, a.RunID) {
+		if !x.f.ruleEnabledEver(rule) {
+			t.Fatalf("rule %s was never switched on", rule)
+		}
 	}
 	x.stop()
 	_, endA := awaitEnd(t, chA)
@@ -967,7 +985,7 @@ func TestWorker_ShutdownEndsRuns(t *testing.T) {
 	if c := x.f.callList("orch.CancelExperiment"); len(c) != 0 {
 		t.Errorf("cancels %v; want none on a shutdown", c)
 	}
-	if x.f.ruleIDOfRun(b.RunID) != "" {
+	if len(x.f.ruleIDsOfRun(b.RunID)) != 0 {
 		t.Error("the waiting run was built")
 	}
 	if n := len(x.q.Snapshot()); n != 0 {
@@ -1000,7 +1018,7 @@ func TestWorker_SwitchOffCurrentAndHalt(t *testing.T) {
 	waitClosed(t, x.w.done, "Run to return after halt")
 	_, end := awaitEnd(t, ch)
 	requireEnded(t, end, RunCancelled, ReasonInterrupted)
-	x.f.requireRunRuleOff(t, a.RunID)
+	x.f.requireRunRulesOff(t, a.RunID)
 	if c := x.f.callList("orch.CancelExperiment"); len(c) != 0 {
 		t.Errorf("cancels %v; want none", c)
 	}
@@ -1021,7 +1039,7 @@ func TestWorker_PhaseEventsOnChangeOnly(t *testing.T) {
 	exp := x.expID(r.RunID)
 	ph := x.f.phasesOf(exp)
 	if id, phase, running := x.w.Current(); id != r.RunID || phase != PhaseNames[0] || !running {
-		t.Errorf("Current() = %q %q %v; want the run in phase plain, running", id, phase, running)
+		t.Errorf("Current() = %q %q %v; want the run in phase baseline, running", id, phase, running)
 	}
 	if got := x.w.currentExperimentID(); got != exp {
 		t.Errorf("currentExperimentID() = %q", got)
@@ -1088,11 +1106,14 @@ func (x *harness) captureLogs() *syncBuffer {
 	return buf
 }
 
-// TestWorker_FailedSwitchOffHoldsTheNextRun: the ending's switch-off fails three
-// times (on the watchdog path, the watchdog's own try is the first). It is
-// retried with backoff, the first failure logged at Warn with the rule and the
-// attempt; SwitchOffPending holds meanwhile; the next run is not picked up
-// until the switch-off has landed; then it runs, and pending clears.
+// TestWorker_FailedSwitchOffHoldsTheNextRun: the ending's switch-off of both
+// of the run's rules fails three times (on the watchdog path, the watchdog's
+// own try is the first). It is retried with backoff, the first failure logged
+// at Warn with each rule and the attempt; SwitchOffPending holds meanwhile;
+// the next run is not picked up until the switch-off has landed on both rules;
+// then it runs, and pending clears. Each switch-off writes the memory rule,
+// then the CPU rule, so writes 1 to 6 are three failed attempts and write 7
+// is the memory rule's fourth.
 func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
 	t.Parallel()
 	for _, path := range []string{"completed", "watchdog"} {
@@ -1105,17 +1126,23 @@ func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
 			x := newHarness(t, func(c *Config) { c.RunCap = cap })
 			logs := x.captureLogs()
 			x.f.autopilot = path == "completed"
-			for i := 1; i <= 3; i++ {
+			for i := 1; i <= 6; i++ {
 				x.f.fail(fmt.Sprintf("rules.SetEnabled#%d", i), errLeaky)
 			}
 			fourth, release := make(chan struct{}), make(chan struct{})
-			x.f.onCall("rules.SetEnabled#4", func() { close(fourth); <-release })
+			x.f.onCall("rules.SetEnabled#7", func() { close(fourth); <-release })
 			a, chA := x.enqueue("a")
 			b, chB := x.enqueue("b")
 			var ruleAOnAtB atomic.Int32
 			x.f.onCall("zeus.Healthy#2", func() { // the next run's first call
-				if r := x.f.rule(x.f.ruleIDOfRun(a.RunID)); r == nil || r.Enabled {
+				ids := x.f.ruleIDsOfRun(a.RunID)
+				if len(ids) != 2 {
 					ruleAOnAtB.Add(1)
+				}
+				for _, id := range ids {
+					if r := x.f.rule(id); r == nil || r.Enabled {
+						ruleAOnAtB.Add(1)
+					}
 				}
 			})
 			x.start()
@@ -1133,7 +1160,7 @@ func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
 				t.Error("SwitchOffPending is false while the switch-off has not landed")
 			}
 			time.Sleep(20 * time.Millisecond)
-			if n := len(x.f.callList("zeus.Healthy")); n != 1 || x.f.ruleIDOfRun(b.RunID) != "" {
+			if n := len(x.f.callList("zeus.Healthy")); n != 1 || len(x.f.ruleIDsOfRun(b.RunID)) != 0 {
 				t.Fatalf("the next run was picked up while the switch-off was pending (%d preflights)", n)
 			}
 			if v, err := x.w.View(context.Background(), b.RunID); err != nil || v.Status != RunQueued || *v.Position != 0 {
@@ -1141,41 +1168,43 @@ func TestWorker_FailedSwitchOffHoldsTheNextRun(t *testing.T) {
 			}
 			close(release)
 
-			waitFor(t, "the next run's pickup", func() bool { return x.f.ruleIDOfRun(b.RunID) != "" })
+			waitFor(t, "the next run's pickup", func() bool { return len(x.f.ruleIDsOfRun(b.RunID)) != 0 })
 			if x.w.SwitchOffPending() {
 				t.Error("SwitchOffPending still true after the switch-off landed")
 			}
 			if ruleAOnAtB.Load() != 0 {
-				t.Error("the next run started while the ended run's rule was still on")
+				t.Error("the next run started while a rule of the ended run was still on")
 			}
-			ruleA := x.f.ruleIDOfRun(a.RunID)
 			calls := x.f.callList("")
-			var offs []int
-			for i, c := range calls {
-				if c == "rules.SetEnabled "+ruleA+" false" {
-					offs = append(offs, i)
+			built := slices.Index(calls, "rules.Create "+RuleName(b.RunID, FaultMemory))
+			for _, ruleA := range x.f.rulesOfRun(t, a.RunID) {
+				var offs []int
+				for i, c := range calls {
+					if c == "rules.SetEnabled "+ruleA+" false" {
+						offs = append(offs, i)
+					}
 				}
-			}
-			built := slices.Index(calls, "rules.Create "+RunNamePrefix+b.RunID)
-			if len(offs) != 4 || built < 0 || built < offs[3] {
-				t.Errorf("switch-offs of a at %v, run b built at %d; want 4 switch-offs, all before b", offs, built)
-			}
-			// The first failure is logged at Warn (on the watchdog path, the
-			// watchdog's or the ending's, whichever wrote first), and no
-			// other: the clock stands still, so no minute passes for a second
-			// one. Then the success, at Info, with the attempt that landed.
-			first := logLineHas(logs.String(), "level=WARN", "switching the run's rule off failed; retrying", "rule_id="+ruleA, "attempt=1")
-			if path == "watchdog" && !first {
-				first = logLineHas(logs.String(), "level=WARN", "watchdog could not switch", "rule_id="+ruleA, "attempt=1")
-			}
-			if !first {
-				t.Errorf("no Warn line for the first failed switch-off with the rule id:\n%s", logs)
-			}
-			if n := countLines(logs.String(), "level=WARN", "rule_id="+ruleA, "attempt="); n != 1 {
-				t.Errorf("%d Warn lines for the failed switch-offs; want 1, the first", n)
-			}
-			if n := countLines(logs.String(), "level=INFO", "rule switched off", "rule_id="+ruleA, "attempt=4"); n != 1 {
-				t.Errorf("%d Info lines for the switch-off that landed at attempt 4; want 1:\n%s", n, logs)
+				if len(offs) != 4 || built < 0 || built < offs[3] {
+					t.Errorf("switch-offs of a's rule %s at %v, run b built at %d; want 4 switch-offs, all before b", ruleA, offs, built)
+				}
+				// The first failure is logged at Warn (on the watchdog path,
+				// the watchdog's or the ending's, whichever wrote first), and
+				// no other: the clock stands still, so no minute passes for a
+				// second one. Then the success, at Info, with the attempt that
+				// landed.
+				first := logLineHas(logs.String(), "level=WARN", "switching the run's rule off failed; retrying", "rule_id="+ruleA, "attempt=1")
+				if path == "watchdog" && !first {
+					first = logLineHas(logs.String(), "level=WARN", "watchdog could not switch", "rule_id="+ruleA, "attempt=1")
+				}
+				if !first {
+					t.Errorf("no Warn line for the first failed switch-off with the rule id %s:\n%s", ruleA, logs)
+				}
+				if n := countLines(logs.String(), "level=WARN", "rule_id="+ruleA, "attempt="); n != 1 {
+					t.Errorf("%d Warn lines for rule %s's failed switch-offs; want 1, the first", n, ruleA)
+				}
+				if n := countLines(logs.String(), "level=INFO", "rule switched off", "rule_id="+ruleA, "attempt=4"); n != 1 {
+					t.Errorf("%d Info lines for rule %s's switch-off that landed at attempt 4; want 1:\n%s", n, ruleA, logs)
+				}
 			}
 			if path == "completed" {
 				_, endB := awaitEnd(t, chB)
@@ -1238,17 +1267,19 @@ func TestWorker_SwitchOffFailsForEver(t *testing.T) {
 	b, chB := x.enqueue("b")
 	x.start()
 	awaitEnd(t, chA)
-	waitFor(t, "six switch-off attempts", func() bool { return len(x.f.callList("rules.SetEnabled ")) >= 6 })
+	// Each attempt writes the memory rule, then the CPU rule.
+	waitFor(t, "six switch-off attempts", func() bool { return len(x.f.callList("rules.SetEnabled ")) >= 12 })
 	if !x.w.SwitchOffPending() {
 		t.Error("SwitchOffPending is false")
 	}
-	if x.f.ruleIDOfRun(b.RunID) != "" || len(x.f.callList("zeus.Healthy")) != 1 {
+	if len(x.f.ruleIDsOfRun(b.RunID)) != 0 || len(x.f.callList("zeus.Healthy")) != 1 {
 		t.Fatal("the next run was picked up with the ended run's rule still on")
 	}
 	offMu.Lock()
+	// The attempts' times: each attempt's first write (the memory rule's).
 	gaps := make([]time.Duration, 0, len(offTimes))
-	for i := 1; i < len(offTimes); i++ {
-		gaps = append(gaps, offTimes[i].Sub(offTimes[i-1]))
+	for i := 2; i < len(offTimes); i += 2 {
+		gaps = append(gaps, offTimes[i].Sub(offTimes[i-2]))
 	}
 	offMu.Unlock()
 	// The first write is the ending's own; then 2, 4, 8, 8 ms apart at least.
@@ -1303,9 +1334,10 @@ func TestWorker_FirstSwitchOffSucceeds(t *testing.T) {
 	_, endB := awaitEnd(t, chB)
 	requireEnded(t, endB, RunCompleted, Reason{})
 	for _, r := range []Run{a, b} {
-		rule := x.f.ruleIDOfRun(r.RunID)
-		if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
-			t.Errorf("run %s: %d switch-off writes; want 1", r.RunID, n)
+		for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+			if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+				t.Errorf("run %s: %d switch-off writes of rule %s; want 1", r.RunID, n, rule)
+			}
 		}
 	}
 }
@@ -1563,7 +1595,7 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 	older := map[string]string{}
 	for i, st := range []string{"failed", "cancelled", "completed", "running"} {
 		id := fmt.Sprintf("demo-0190c2f4-95b4-7cc3-8000-00000000000%d", i)
-		built, err := BuildRun(ctx, x.f.deps(), id, testRunCap)
+		built, err := BuildRun(ctx, x.f.deps(), id, DefaultScenario(), testRunCap)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1676,41 +1708,60 @@ func TestWorker_ViewAndRecent(t *testing.T) {
 // ---- the rule switch ----
 
 // TestRuleSwitch: once off, a switch refuses every switch-on; off always
-// writes and may be called from any goroutine any number of times; an off
-// waits for a switch-on in flight, so its write lands last; a rule attached
-// after the switch closed is switched off at once.
+// writes every rule and may be called from any goroutine any number of times;
+// an off waits for a switch-on in flight, so its writes land last; rules
+// attached after the switch closed are switched off at once; the switch is
+// confirmed off only once the switch-off of both of a run's rules has landed.
 func TestRuleSwitch(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	build := func(t *testing.T) (*fakeLab, string) {
+	build := func(t *testing.T) (*fakeLab, [2]string) {
 		f := newFakeLab(t, testNow)
-		built, err := BuildRun(ctx, f.deps(), "demo-sw", testRunCap)
+		built, err := BuildRun(ctx, f.deps(), "demo-sw", DefaultScenario(), testRunCap)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return f, built.RuleID
+		return f, built.RuleIDs
 	}
 
 	t.Run("on after off is refused", func(t *testing.T) {
-		f, rule := build(t)
+		f, rules := build(t)
 		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
-		sw.attach(ctx, rule)
+		sw.attach(ctx, rules[:]...)
 		if err := sw.off(ctx, offCompleted); err != nil {
 			t.Fatal(err)
 		}
 		if err := sw.on(ctx); err == nil {
 			t.Fatal("switch-on after off accepted")
 		}
-		if c := f.callList("rules.EnableIfAttached"); len(c) != 0 || f.ruleEnabledEver(rule) {
+		if c := f.callList("rules.EnableIfAttached"); len(c) != 0 || f.ruleEnabledEver(rules[0]) || f.ruleEnabledEver(rules[1]) {
 			t.Fatalf("switch-on reached the store: %v", c)
 		}
 	})
 
-	t.Run("off is idempotent and concurrent", func(t *testing.T) {
-		f, rule := build(t)
+	t.Run("on enables every rule, in order", func(t *testing.T) {
+		f, rules := build(t)
 		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
-		sw.attach(ctx, rule)
+		sw.attach(ctx, rules[:]...)
+		if err := sw.on(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := f.callList("rules.EnableIfAttached"), []string{
+			"rules.EnableIfAttached " + rules[0], "rules.EnableIfAttached " + rules[1],
+		}; !slices.Equal(got, want) {
+			t.Errorf("switch-ons = %v; want %v", got, want)
+		}
+		if err := sw.off(ctx, offCompleted); err != nil {
+			t.Fatal(err)
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("off is idempotent and concurrent", func(t *testing.T) {
+		f, rules := build(t)
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
+		sw.attach(ctx, rules[:]...)
 		if err := sw.on(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -1725,19 +1776,26 @@ func TestRuleSwitch(t *testing.T) {
 			}()
 		}
 		wg.Wait()
-		if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 10 {
-			t.Errorf("%d switch-off writes; want 10", n)
+		for _, rule := range rules {
+			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 10 {
+				t.Errorf("%d switch-off writes of %s; want 10", n, rule)
+			}
 		}
 		f.requireDemoRulesOff(t)
 	})
 
 	t.Run("off waits for an on in flight", func(t *testing.T) {
-		f, rule := build(t)
+		f, rules := build(t)
 		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
-		sw.attach(ctx, rule)
+		sw.attach(ctx, rules[:]...)
 		entered, release := make(chan struct{}), make(chan struct{})
+		var enterOnce sync.Once
 		var enableReturned atomic.Bool
-		f.onCall("rules.EnableIfAttached", func() { close(entered); <-release; enableReturned.Store(true) })
+		f.onCall("rules.EnableIfAttached", func() {
+			enterOnce.Do(func() { close(entered) })
+			<-release
+			enableReturned.Store(true)
+		})
 		var offOvertook atomic.Bool
 		f.onCall("rules.SetEnabled", func() {
 			if !enableReturned.Load() {
@@ -1758,21 +1816,59 @@ func TestRuleSwitch(t *testing.T) {
 		if offOvertook.Load() {
 			t.Error("the switch-off wrote while a switch-on was in flight")
 		}
+		for _, rule := range rules {
+			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+				t.Errorf("%d switch-off writes of %s; want 1", n, rule)
+			}
+		}
 		f.requireDemoRulesOff(t)
 	})
 
-	t.Run("a rule attached after close is switched off", func(t *testing.T) {
-		f, rule := build(t)
+	t.Run("rules attached after close are switched off", func(t *testing.T) {
+		f, rules := build(t)
 		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
 		if err := sw.off(ctx, offCompleted); err != nil {
 			t.Fatal(err)
 		}
-		sw.attach(ctx, rule)
-		if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
-			t.Errorf("%d switch-offs of the late rule; want 1", n)
+		sw.attach(ctx, rules[:]...)
+		for _, rule := range rules {
+			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+				t.Errorf("%d switch-offs of the late rule %s; want 1", n, rule)
+			}
 		}
 		if err := sw.on(ctx); err == nil {
 			t.Error("switch-on accepted")
 		}
+	})
+
+	t.Run("confirmed only once both rules are off", func(t *testing.T) {
+		f, rules := build(t)
+		sw := newRuleSwitch("demo-sw", failRuleOff{fakeRules{f}, rules[1]}, quiet, f.clock)
+		sw.attach(ctx, rules[:]...)
+		if err := sw.on(ctx); err != nil {
+			t.Fatal(err)
+		}
+		err := sw.off(ctx, offCompleted)
+		var fail *offFailure
+		if !errors.As(err, &fail) || !errors.Is(err, ErrRuleState) || !slices.Equal(fail.rules, rules[1:]) || fail.attempt != 1 {
+			t.Fatalf("off with the cpu rule's write failing: %v (%+v); want an offFailure naming only the cpu rule", err, fail)
+		}
+		if sw.isOff() || !slices.Equal(sw.notLanded(), rules[1:]) {
+			t.Errorf("isOff %v, not landed %v; want not confirmed, the cpu rule pending", sw.isOff(), sw.notLanded())
+		}
+		if r := f.rule(rules[0]); r == nil || r.Enabled {
+			t.Errorf("memory rule %+v; want switched off although the cpu rule's write failed", r)
+		}
+		// The write lands on a second try: now the switch is confirmed, and
+		// later switch-offs, landed already, are no failure.
+		sw.rules = fakeRules{f}
+		if err := sw.off(ctx, offCompleted); err != nil || !sw.isOff() || len(sw.notLanded()) != 0 {
+			t.Fatalf("second off: %v, isOff %v, not landed %v; want confirmed", err, sw.isOff(), sw.notLanded())
+		}
+		sw.rules = failRuleOff{fakeRules{f}, rules[1]}
+		if err := sw.off(ctx, offCompleted); err != nil || !sw.isOff() {
+			t.Errorf("an off after the confirmation whose write fails: %v, isOff %v; want nil, still confirmed", err, sw.isOff())
+		}
+		f.requireDemoRulesOff(t)
 	})
 }

@@ -85,8 +85,8 @@ func TestCatalog_Shape(t *testing.T) {
 	if got, want := CatalogTargets(), slices.Sorted(maps.Keys(targets)); !slices.Equal(got, want) {
 		t.Errorf("CatalogTargets() = %v; want %v", got, want)
 	}
-	if scenarioPhaseNames != [3]string{"baseline", "memory", "cpu"} {
-		t.Errorf("scenario phases = %v; want baseline, memory, cpu", scenarioPhaseNames)
+	if PhaseNames != [3]string{"baseline", "memory", "cpu"} {
+		t.Errorf("scenario phases = %v; want baseline, memory, cpu", PhaseNames)
 	}
 }
 
@@ -149,8 +149,35 @@ func TestScenarioByID(t *testing.T) {
 }
 
 // TestCatalog_ReturnsCopy: what a caller does to a returned catalog or
-// scenario never reaches the next call.
+// scenario never reaches the next call. The calls after the mutations are
+// compared with a literal snapshot of the fields mutated, which cannot alias
+// the live catalog however Catalog is written.
 func TestCatalog_ReturnsCopy(t *testing.T) {
+	type snap struct {
+		id          string
+		def         bool
+		memoryLoad  float64
+		cpuLoad     float64
+		workflow    string
+		memTarget   string
+		description string
+	}
+	snapOf := func(sc Scenario) snap {
+		return snap{sc.ID, sc.Default, sc.Memory.TargetLoad, sc.CPU.TargetLoad, sc.Workload.WorkflowID, sc.Memory.Target,
+			sc.Description}
+	}
+	want := []snap{
+		{"catalog-moderate", true, 0.1, 0.5, "demo-browse", "productcatalogservice",
+			"The service that lists the shop's products takes about a tenth of its memory limit more than usual, then spends about half of its CPU limit on busy work."},
+		{"catalog-heavy", false, 0.2, 1.0, "demo-browse", "productcatalogservice",
+			"The service that lists the shop's products takes about a fifth of its memory limit more than usual, then tries to spend all of its CPU limit on busy work."},
+		{"cart-moderate", false, 0.1, 0.5, "demo-browse", "cartservice",
+			"The service that keeps shopping carts takes about a tenth of its memory limit more than usual, then spends about half of its CPU limit on busy work."},
+		{"cart-heavy", false, 0.2, 1.0, "demo-browse", "cartservice",
+			"The service that keeps shopping carts takes about a fifth of its memory limit more than usual, then tries to spend all of its CPU limit on busy work."},
+	}
+	wantTargets := []string{"cartservice", "productcatalogservice"}
+
 	before := Catalog()
 	got := Catalog()
 	got[0].ID = "changed"
@@ -167,16 +194,22 @@ func TestCatalog_ReturnsCopy(t *testing.T) {
 	def := DefaultScenario()
 	def.Memory.Target = "changed"
 
-	if after := Catalog(); !slices.Equal(after, before) {
-		t.Errorf("catalog after mutating a returned copy = %+v; want %+v", after, before)
+	after := Catalog()
+	if len(after) != len(want) {
+		t.Fatalf("catalog after mutating a returned copy has %d scenarios; want %d", len(after), len(want))
 	}
-	if got := CatalogTargets(); got[0] == "changed" {
-		t.Errorf("CatalogTargets() after mutating a returned copy = %v", got)
+	for i, sc := range after {
+		if snapOf(sc) != want[i] {
+			t.Errorf("catalog[%d] after mutating a returned copy = %+v; want %+v", i, snapOf(sc), want[i])
+		}
 	}
-	if again, _ := ScenarioByID(before[0].ID); again != before[0] {
+	if got := CatalogTargets(); !slices.Equal(got, wantTargets) {
+		t.Errorf("CatalogTargets() after mutating a returned copy = %v; want %v", got, wantTargets)
+	}
+	if again, ok := ScenarioByID("catalog-moderate"); !ok || snapOf(again) != want[0] {
 		t.Errorf("ScenarioByID after mutating a returned value = %+v", again)
 	}
-	if DefaultScenario().Memory.Target == "changed" {
-		t.Errorf("DefaultScenario after mutating a returned value = %+v", DefaultScenario())
+	if def := DefaultScenario(); snapOf(def) != want[0] {
+		t.Errorf("DefaultScenario after mutating a returned value = %+v; want %+v", snapOf(def), want[0])
 	}
 }

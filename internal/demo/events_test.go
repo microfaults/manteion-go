@@ -1122,7 +1122,7 @@ func TestEvents_SamplesReachTheStream(t *testing.T) {
 	st := x.open(t, runID, "a")
 	evs := st.eventsUntil(EventSample)
 	f := evs[len(evs)-1]
-	want := fmt.Sprintf(`{"run_id":%q,"phase":"plain","at":%q,"rps":5,"p95_ms":250.5,"error_rate":0.02,"target_cpu_cores":null,"target_memory_bytes":null}`, runID, stamp(testNow))
+	want := fmt.Sprintf(`{"run_id":%q,"phase":"baseline","at":%q,"rps":5,"p95_ms":250.5,"error_rate":0.02,"target_cpu_cores":null,"target_memory_bytes":null}`, runID, stamp(testNow))
 	if f.data != want {
 		t.Errorf("sample\n %s\nwant\n %s", f.data, want)
 	}

@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
+	"math"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/store"
 	"manteion-go/internal/zeus"
@@ -20,164 +23,458 @@ var testNow = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 
 const testRunCap = 5 * time.Minute
 
-// onlyRule returns the single rule the lab holds.
-func onlyRule(t *testing.T, f *fakeLab) *model.Rule {
-	t.Helper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.rules) != 1 {
-		t.Fatalf("lab holds %d rules, want 1", len(f.rules))
-	}
-	for _, r := range f.rules {
-		cp := *r
-		return &cp
-	}
-	return nil
-}
-
 // switchCalls lists every call that switches a rule's enabled flag.
 func switchCalls(f *fakeLab) []string {
 	return append(f.callList("rules.SetEnabled"), f.callList("rules.EnableIfAttached")...)
 }
 
-func TestBuildRun_Shape(t *testing.T) {
-	f := newFakeLab(t, testNow)
-	const runID = "demo-0001"
-
-	built, err := BuildRun(context.Background(), f.deps(), runID, testRunCap)
-	if err != nil {
-		t.Fatalf("BuildRun: %v", err)
-	}
-
-	rule := onlyRule(t, f)
-	if rule.Name != "demo-run-"+runID || rule.Service != "productcatalogservice" || rule.Enabled ||
-		rule.Priority != 100 || rule.Mode != "inline" || rule.Action.Type != "fault_spec" {
-		t.Errorf("rule = %+v; want demo-run-%s on productcatalogservice, disabled, priority 100, inline, fault_spec", rule, runID)
-	}
-	if len(rule.Match.Labels) != 0 || rule.Match.InjectionPoint != "" {
-		t.Errorf("rule match = %+v; want empty (every request)", rule.Match)
-	}
-	if len(f.specs) != 1 || rule.Action.FaultSpecID != f.specs[0].ID {
-		t.Errorf("rule spec = %q, lab specs %d; want the one demo spec", rule.Action.FaultSpecID, len(f.specs))
-	}
-	if built.RuleID != rule.ID {
-		t.Errorf("Built.RuleID = %q, want %q", built.RuleID, rule.ID)
-	}
-
-	exp, ok := f.experiments[built.ExperimentID]
-	if !ok || len(f.experiments) != 1 {
-		t.Fatalf("experiment %q not stored (lab holds %d)", built.ExperimentID, len(f.experiments))
-	}
-	if exp.Name != "demo-run-"+runID || exp.CreatedBy != "manteion-demo" || exp.Status != "planned" {
-		t.Errorf("experiment = %+v; want demo-run-%s by manteion-demo, planned", exp, runID)
-	}
-	if !exp.CreatedAt.Equal(testNow) {
-		t.Errorf("experiment created_at = %v, want the clock's %v", exp.CreatedAt, testNow)
-	}
-
-	phases := f.phasesOf(built.ExperimentID)
-	wantNames := []string{"plain", "catalog-latency-50ms", "plain-end"}
-	if len(phases) != 3 {
-		t.Fatalf("experiment has %d phases, want 3", len(phases))
-	}
-	for i, p := range phases {
-		if p.Name != wantNames[i] || p.Position != i || p.Status != "pending" || len(p.FrozenServices) != 0 || p.PersistCache {
-			t.Errorf("phase %d = %+v; want %s at %d, pending, nothing frozen", i, p, wantNames[i], i)
-		}
-		if built.PhaseIDs[i] != p.ID {
-			t.Errorf("Built.PhaseIDs[%d] = %q, want %q", i, built.PhaseIDs[i], p.ID)
-		}
-		wantPW := model.PhaseWorkflow{PhaseID: p.ID, WorkflowID: "demo-browse", VUs: 30, RateRPS: 3, DurationSec: 40, DatasetID: "ds-ok"}
-		if got := f.phaseWFs[p.ID]; len(got) != 1 || got[0] != wantPW {
-			t.Errorf("phase %d workflows = %+v; want [%+v]", i, got, wantPW)
+// specByID returns a copy of the lab's fault spec id, or nil.
+func specByID(f *fakeLab, id string) *model.FaultSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.specs {
+		if s.ID == id {
+			cp := *s
+			return &cp
 		}
 	}
+	return nil
+}
 
-	attach := f.callList("experiments.AttachPhaseRules")
-	if want := []string{"experiments.AttachPhaseRules " + phases[1].ID + " " + rule.ID}; !slices.Equal(attach, want) {
-		t.Errorf("AttachPhaseRules calls = %v; want only %v", attach, want)
+// decodeParams decodes a spec's params as a JSON object, nil when they are not
+// one.
+func decodeParams(raw json.RawMessage) map[string]any {
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil
 	}
-	if len(f.phaseRules) != 1 || !slices.Equal(f.phaseRules[phases[1].ID], []string{rule.ID}) {
-		t.Errorf("phase rule links = %v; want only phase 1 -> %s", f.phaseRules, rule.ID)
-	}
-	if sw := switchCalls(f); len(sw) != 0 || f.enabledEver[rule.ID] {
-		t.Errorf("the builder touched the rule's enabled flag: %v, enabled ever %v", sw, f.enabledEver[rule.ID])
-	}
-	if f.served(rule.ID) {
-		t.Errorf("a freshly built rule is served")
+	return params
+}
+
+// TestBuildRun_Scenario: for every catalog scenario, the run's phases are
+// baseline, memory and cpu at 40 s, each running the scenario's workflow at 30
+// VUs and 3 rps; its two rules, demo-run-<id>-memory and demo-run-<id>-cpu,
+// run in their step's target, are disabled, and are each attached to exactly
+// their own phase; each rule's fault spec says exactly the step's fault and
+// target_load. Nothing is switched and nothing is served.
+func TestBuildRun_Scenario(t *testing.T) {
+	for _, sc := range Catalog() {
+		t.Run(sc.ID, func(t *testing.T) {
+			f := newFakeLab(t, testNow)
+			runID := id.New(RunIDPrefix)
+
+			built, err := BuildRun(context.Background(), f.deps(), runID, sc, testRunCap)
+			if err != nil {
+				t.Fatalf("BuildRun: %v", err)
+			}
+
+			if n := len(f.rules); n != 2 {
+				t.Fatalf("lab holds %d rules, want 2", n)
+			}
+			steps := [2]FaultStep{sc.Memory, sc.CPU}
+			wantRule := [2]string{"demo-run-" + runID + "-memory", "demo-run-" + runID + "-cpu"}
+			wantSpec := [2]string{
+				"demo-memory-" + sc.Memory.Target + "-" + sc.Memory.Intensity,
+				"demo-cpu-" + sc.CPU.Target + "-" + sc.CPU.Intensity,
+			}
+			for i, st := range steps {
+				rule := f.rule(built.RuleIDs[i])
+				if rule == nil {
+					t.Fatalf("Built.RuleIDs[%d] = %q names no rule", i, built.RuleIDs[i])
+				}
+				if rule.Name != wantRule[i] || rule.Service != st.Target || rule.Enabled || rule.Priority != 100 ||
+					rule.Mode != "background" || rule.Action.Type != "fault_spec" {
+					t.Errorf("%s rule = %+v; want %s on %s, disabled, priority 100, background, fault_spec",
+						st.Kind, rule, wantRule[i], st.Target)
+				}
+				if len(rule.Match.Labels) != 0 || rule.Match.InjectionPoint != "" {
+					t.Errorf("%s rule match = %+v; want empty (every request)", st.Kind, rule.Match)
+				}
+				spec := specByID(f, rule.Action.FaultSpecID)
+				if spec == nil {
+					t.Fatalf("%s rule names spec %q, which the lab does not hold", st.Kind, rule.Action.FaultSpecID)
+				}
+				if spec.Name != wantSpec[i] || spec.Category != "resource" || spec.FaultType != string(st.Kind) ||
+					spec.Host != "" || spec.Network != nil || spec.DurationMs != 60000 || spec.RampUpMs != 0 || spec.RampDownMs != 0 {
+					t.Errorf("%s spec = %+v; want %s, resource/%s, duration_ms 60000, no host, network or ramp",
+						st.Kind, spec, wantSpec[i], st.Kind)
+				}
+				if params := decodeParams(spec.Params); len(params) != 1 || params["target_load"] != st.TargetLoad {
+					t.Errorf("%s spec params = %s; want exactly {\"target_load\":%v}", st.Kind, spec.Params, st.TargetLoad)
+				}
+			}
+			if len(f.specs) != 2 || built.RuleIDs[0] == built.RuleIDs[1] ||
+				f.rule(built.RuleIDs[0]).Action.FaultSpecID == f.rule(built.RuleIDs[1]).Action.FaultSpecID {
+				t.Errorf("specs %d, rules %v; want one spec per fault step, two distinct rules", len(f.specs), built.RuleIDs)
+			}
+
+			exp, ok := f.experiments[built.ExperimentID]
+			if !ok || len(f.experiments) != 1 {
+				t.Fatalf("experiment %q not stored (lab holds %d)", built.ExperimentID, len(f.experiments))
+			}
+			if exp.Name != "demo-run-"+runID || exp.CreatedBy != "manteion-demo" || exp.Status != "planned" {
+				t.Errorf("experiment = %+v; want demo-run-%s by manteion-demo, planned", exp, runID)
+			}
+			if !exp.CreatedAt.Equal(testNow) {
+				t.Errorf("experiment created_at = %v, want the clock's %v", exp.CreatedAt, testNow)
+			}
+
+			phases := f.phasesOf(built.ExperimentID)
+			wantNames := []string{"baseline", "memory", "cpu"}
+			if len(phases) != 3 {
+				t.Fatalf("experiment has %d phases, want 3", len(phases))
+			}
+			for i, p := range phases {
+				if p.Name != wantNames[i] || p.Position != i || p.Status != "pending" || len(p.FrozenServices) != 0 || p.PersistCache {
+					t.Errorf("phase %d = %+v; want %s at %d, pending, nothing frozen", i, p, wantNames[i], i)
+				}
+				if built.PhaseIDs[i] != p.ID {
+					t.Errorf("Built.PhaseIDs[%d] = %q, want %q", i, built.PhaseIDs[i], p.ID)
+				}
+				wantPW := model.PhaseWorkflow{PhaseID: p.ID, WorkflowID: sc.Workload.WorkflowID, VUs: 30, RateRPS: 3,
+					DurationSec: 40, DatasetID: "ds-ok"}
+				if got := f.phaseWFs[p.ID]; len(got) != 1 || got[0] != wantPW {
+					t.Errorf("phase %d workflows = %+v; want [%+v]", i, got, wantPW)
+				}
+			}
+
+			wantLinks := map[string][]string{phases[1].ID: {built.RuleIDs[0]}, phases[2].ID: {built.RuleIDs[1]}}
+			if !maps.EqualFunc(f.phaseRules, wantLinks, slices.Equal) {
+				t.Errorf("phase rule links = %v; want only memory -> %s and cpu -> %s", f.phaseRules, built.RuleIDs[0], built.RuleIDs[1])
+			}
+			attach := f.callList("experiments.AttachPhaseRules")
+			if want := []string{
+				"experiments.AttachPhaseRules " + phases[1].ID + " " + built.RuleIDs[0],
+				"experiments.AttachPhaseRules " + phases[2].ID + " " + built.RuleIDs[1],
+			}; !slices.Equal(attach, want) {
+				t.Errorf("AttachPhaseRules calls = %v; want only %v", attach, want)
+			}
+
+			// buildWrites, which the failure tables walk, is every write, in order.
+			var ops []string
+			for _, c := range writeCalls(f) {
+				ops = append(ops, strings.SplitN(c, " ", 2)[0])
+			}
+			var wantOps []string
+			for _, w := range buildWrites {
+				wantOps = append(wantOps, strings.SplitN(w, "#", 2)[0])
+			}
+			if !slices.Equal(ops, wantOps) {
+				t.Errorf("writes = %v; want %v", ops, wantOps)
+			}
+
+			for _, rid := range built.RuleIDs {
+				if f.enabledEver[rid] || f.served(rid) {
+					t.Errorf("rule %s was enabled or is served", rid)
+				}
+			}
+			if sw := switchCalls(f); len(sw) != 0 {
+				t.Errorf("the builder touched a rule's enabled flag: %v", sw)
+			}
+		})
 	}
 }
 
-func TestBuildRun_ReusesSpec(t *testing.T) {
+// TestBuildRun_DB_Scenario: every catalog scenario builds on the real store
+// (it skips without the test database). The store accepts both resource fault
+// specs and both background rules; a second build reuses each spec; each rule
+// is linked to its own phase only; and the store serves each rule, to its
+// step's target, only while its own phase runs.
+func TestBuildRun_DB_Scenario(t *testing.T) {
+	l := newDBLab(t)
+	ctx := context.Background()
+	for _, sc := range Catalog() {
+		t.Run(sc.ID, func(t *testing.T) {
+			runID := id.New(RunIDPrefix)
+			first, err := BuildRun(ctx, l.d, runID, sc, testRunCap)
+			if err != nil {
+				t.Fatalf("BuildRun: %v", err)
+			}
+			second, err := BuildRun(ctx, l.d, id.New(RunIDPrefix), sc, testRunCap)
+			if err != nil {
+				t.Fatalf("second BuildRun: %v", err)
+			}
+			specs, err := l.d.Specs.ListSpecs(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			steps := [2]FaultStep{sc.Memory, sc.CPU}
+			for i, st := range steps {
+				r1, err1 := l.rules.Get(ctx, first.RuleIDs[i])
+				r2, err2 := l.rules.Get(ctx, second.RuleIDs[i])
+				if err1 != nil || err2 != nil {
+					t.Fatalf("read %s rules: %v, %v", st.Kind, err1, err2)
+				}
+				if r1.Name != RuleName(runID, st.Kind) || r1.Service != st.Target || r1.Enabled || r1.Mode != "background" ||
+					r1.Priority != 100 || r1.Action.Type != "fault_spec" {
+					t.Errorf("%s rule = %+v; want %s on %s, disabled, background, priority 100", st.Kind, r1, RuleName(runID, st.Kind), st.Target)
+				}
+				if r1.Action.FaultSpecID != r2.Action.FaultSpecID {
+					t.Errorf("%s rules of two runs use specs %s and %s; want the same", st.Kind, r1.Action.FaultSpecID, r2.Action.FaultSpecID)
+				}
+				at := slices.IndexFunc(specs, func(s *model.FaultSpec) bool { return s.ID == r1.Action.FaultSpecID })
+				if at < 0 {
+					t.Fatalf("%s rule's spec %s not stored", st.Kind, r1.Action.FaultSpecID)
+				}
+				if s := specs[at]; s.Name != SpecNameFor(st) || !specMatches(s, st) {
+					t.Errorf("%s spec as stored = %+v (params %s); want %s, exactly the step's fault", st.Kind, s, s.Params, SpecNameFor(st))
+				}
+			}
+			for i, pid := range first.PhaseIDs {
+				links, err := l.exps.ListPhaseRules(ctx, pid)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got []string
+				for _, k := range links {
+					got = append(got, k.RuleID)
+				}
+				if want := [][]string{nil, {first.RuleIDs[0]}, {first.RuleIDs[1]}}[i]; !slices.Equal(got, want) {
+					t.Errorf("phase %d links %v; want %v", i, got, want)
+				}
+			}
+
+			// Served only while its own phase runs, under a running experiment.
+			served := func(svc string) []string {
+				rules, err := l.rules.ForService(ctx, svc)
+				if err != nil {
+					t.Fatalf("ForService(%s): %v", svc, err)
+				}
+				var out []string
+				for _, r := range rules {
+					if slices.Contains(first.RuleIDs[:], r.ID) {
+						out = append(out, r.ID)
+					}
+				}
+				return out
+			}
+			for _, rule := range first.RuleIDs {
+				if err := SetRuleEnabled(ctx, l.d.Rules, rule, true); err != nil {
+					t.Fatalf("switch on: %v", err)
+				}
+			}
+			l.moveExperiment(first.ExperimentID, "running", "planned")
+			l.movePhase(first.PhaseIDs[0], "running", "pending")
+			if a, b := served(sc.Memory.Target), served(sc.CPU.Target); len(a) != 0 || len(b) != 0 {
+				t.Errorf("baseline running: served %v, %v; want none", a, b)
+			}
+			l.movePhase(first.PhaseIDs[0], "completed", "running")
+			l.movePhase(first.PhaseIDs[1], "running", "pending")
+			if got := served(sc.Memory.Target); !slices.Equal(got, first.RuleIDs[:1]) {
+				t.Errorf("memory phase running: %s serves %v; want only the memory rule", sc.Memory.Target, got)
+			}
+			l.movePhase(first.PhaseIDs[1], "completed", "running")
+			l.movePhase(first.PhaseIDs[2], "running", "pending")
+			if got := served(sc.CPU.Target); !slices.Equal(got, first.RuleIDs[1:]) {
+				t.Errorf("cpu phase running: %s serves %v; want only the cpu rule", sc.CPU.Target, got)
+			}
+			for _, rule := range first.RuleIDs {
+				if err := SetRuleEnabled(ctx, l.d.Rules, rule, false); err != nil {
+					t.Fatalf("switch off: %v", err)
+				}
+			}
+			if a, b := served(sc.Memory.Target), served(sc.CPU.Target); len(a) != 0 || len(b) != 0 {
+				t.Errorf("after the switch-off: served %v, %v; want none", a, b)
+			}
+		})
+	}
+}
+
+// TestBuildRun_UsesTheScenariosWorkload: the workflow and the dataset come
+// from the scenario's workload, not from a fixed name.
+func TestBuildRun_UsesTheScenariosWorkload(t *testing.T) {
+	sc := DefaultScenario()
+	sc.Workload = Workload{WorkflowID: "wf-other", DatasetName: "other-products", Description: "other"}
+	f := newFakeLab(t, testNow)
+	f.workflows["wf-other"] = true
+	f.datasets = append(f.datasets, zeus.Dataset{ID: "ds-other", Name: "other-products", SizeBytes: 10, CreatedAt: testNow.Add(-2 * time.Hour)})
+
+	built, err := BuildRun(context.Background(), f.deps(), "demo-wl", sc, testRunCap)
+	if err != nil {
+		t.Fatalf("BuildRun: %v", err)
+	}
+	if got := f.callList("workflows.Get"); !slices.Equal(got, []string{"workflows.Get wf-other"}) {
+		t.Errorf("workflow reads = %v; want only wf-other", got)
+	}
+	for _, pid := range built.PhaseIDs {
+		if pw := f.phaseWFs[pid]; len(pw) != 1 || pw[0].WorkflowID != "wf-other" || pw[0].DatasetID != "ds-other" {
+			t.Errorf("phase %s workflows = %+v; want wf-other on ds-other", pid, pw)
+		}
+	}
+}
+
+// TestBuildRun_SpecReused: one fault spec per distinct fault step, created by
+// the first build that needs it and reused by every later one; a stored spec
+// that says exactly the step, however its params are written, is used as it
+// is.
+func TestBuildRun_SpecReused(t *testing.T) {
 	f := newFakeLab(t, testNow)
 	d := f.deps()
+	sc := DefaultScenario()
 
-	first, err := BuildRun(context.Background(), d, "demo-a", testRunCap)
+	first, err := BuildRun(context.Background(), d, "demo-a", sc, testRunCap)
 	if err != nil {
 		t.Fatalf("first build: %v", err)
 	}
-	second, err := BuildRun(context.Background(), d, "demo-b", testRunCap)
+	second, err := BuildRun(context.Background(), d, "demo-b", sc, testRunCap)
 	if err != nil {
 		t.Fatalf("second build: %v", err)
 	}
-
-	if got := f.callList("specs.CreateSpec"); len(got) != 1 {
-		t.Fatalf("CreateSpec calls = %v; want exactly one over two builds", got)
+	if got, want := f.callList("specs.CreateSpec"), []string{
+		"specs.CreateSpec demo-memory-productcatalogservice-moderate",
+		"specs.CreateSpec demo-cpu-productcatalogservice-moderate",
+	}; !slices.Equal(got, want) {
+		t.Fatalf("CreateSpec calls = %v; want %v over two builds", got, want)
 	}
-	spec := f.specs[0]
-	if spec.Name != "demo-catalog-latency-50ms" || spec.Category != "inline" || spec.FaultType != "latency" || spec.DurationMs != 60000 {
-		t.Errorf("spec = %+v; want demo-catalog-latency-50ms, inline latency, duration_ms 60000", spec)
+	for i := range first.RuleIDs {
+		a, b := f.rules[first.RuleIDs[i]], f.rules[second.RuleIDs[i]]
+		if a.Action.FaultSpecID != b.Action.FaultSpecID {
+			t.Errorf("rule %d of the two runs uses specs %q and %q; want the same", i, a.Action.FaultSpecID, b.Action.FaultSpecID)
+		}
 	}
-	var params map[string]any
-	if err := json.Unmarshal(spec.Params, &params); err != nil || len(params) != 1 || params["delay"] != "50ms" {
-		t.Errorf("spec params = %s (%v); want {\"delay\":\"50ms\"}", spec.Params, err)
-	}
-	if a, b := f.rules[first.RuleID], f.rules[second.RuleID]; a.Action.FaultSpecID != spec.ID || b.Action.FaultSpecID != spec.ID {
-		t.Errorf("rules use specs %q and %q; want both %q", a.Action.FaultSpecID, b.Action.FaultSpecID, spec.ID)
-	}
-	if first.RuleID == second.RuleID || first.ExperimentID == second.ExperimentID {
+	if first.ExperimentID == second.ExperimentID || slices.ContainsFunc(first.RuleIDs[:], func(r string) bool {
+		return slices.Contains(second.RuleIDs[:], r)
+	}) {
 		t.Errorf("two builds share ids: %+v and %+v", first, second)
 	}
-}
 
-// TestBuildRun_IgnoresAlteredSpec: a spec that carries the demo's name but no
-// longer says +50 ms latency is never reused; the builder makes a correct one.
-func TestBuildRun_IgnoresAlteredSpec(t *testing.T) {
-	f := newFakeLab(t, testNow)
-	altered := &model.FaultSpec{ID: "spec-altered", Name: SpecName, Category: "inline", FaultType: "latency",
-		Params: json.RawMessage(`{"delay":"500ms"}`), DurationMs: 60000, CreatedAt: testNow.Add(-time.Hour)}
-	f.specs = append(f.specs, altered)
-
-	built, err := BuildRun(context.Background(), f.deps(), "demo-x", testRunCap)
-	if err != nil {
-		t.Fatalf("BuildRun: %v", err)
+	// Every scenario, twice: one spec per distinct step, never more.
+	distinct := map[string]bool{}
+	for _, other := range Catalog() {
+		distinct[SpecNameFor(other.Memory)], distinct[SpecNameFor(other.CPU)] = true, true
+		for _, run := range []string{"demo-c-" + other.ID, "demo-d-" + other.ID} {
+			if _, err := BuildRun(context.Background(), d, run, other, testRunCap); err != nil {
+				t.Fatalf("build %s: %v", run, err)
+			}
+		}
 	}
-	if got := f.rules[built.RuleID].Action.FaultSpecID; got == altered.ID {
-		t.Fatalf("rule uses the altered spec %q", got)
-	}
-	if len(f.callList("specs.CreateSpec")) != 1 {
-		t.Errorf("CreateSpec calls = %v; want one fresh spec", f.callList("specs.CreateSpec"))
+	if n := len(f.callList("specs.CreateSpec")); n != len(distinct) || len(f.specs) != len(distinct) {
+		t.Errorf("CreateSpec calls %d, specs %d; want %d, one per distinct step", n, len(f.specs), len(distinct))
 	}
 
-	// A correct spec that already exists is reused as it is.
+	// A stored spec that says exactly the step is reused as it is.
 	g := newFakeLab(t, testNow)
-	good := &model.FaultSpec{ID: "spec-good", Name: SpecName, Category: "inline", FaultType: "latency",
-		Params: json.RawMessage(`{ "delay": "50ms" }`), DurationMs: 60000, CreatedAt: testNow.Add(-time.Hour)}
-	g.specs = append(g.specs, good)
-	built, err = BuildRun(context.Background(), g.deps(), "demo-y", testRunCap)
+	heavy, ok := ScenarioByID("catalog-heavy")
+	if !ok {
+		t.Fatal("no catalog-heavy scenario")
+	}
+	stored := &model.FaultSpec{ID: "spec-stored", Name: SpecNameFor(heavy.CPU), Category: "resource", FaultType: "cpu",
+		Params: json.RawMessage(`{ "target_load": 1.0 }`), DurationMs: 60000, CreatedAt: testNow.Add(-time.Hour)}
+	g.specs = append(g.specs, stored)
+	built, err := BuildRun(context.Background(), g.deps(), "demo-y", heavy, testRunCap)
 	if err != nil {
 		t.Fatalf("BuildRun with a stored spec: %v", err)
 	}
-	if got := g.rules[built.RuleID].Action.FaultSpecID; got != good.ID || len(g.callList("specs.CreateSpec")) != 0 {
-		t.Errorf("rule spec = %q, CreateSpec calls %v; want the stored %q and no create", got, g.callList("specs.CreateSpec"), good.ID)
+	if got := g.rules[built.RuleIDs[1]].Action.FaultSpecID; got != stored.ID {
+		t.Errorf("cpu rule spec = %q; want the stored %q", got, stored.ID)
 	}
+	if got := g.callList("specs.CreateSpec"); !slices.Equal(got, []string{"specs.CreateSpec " + SpecNameFor(heavy.Memory)}) {
+		t.Errorf("CreateSpec calls = %v; want only the memory step's", got)
+	}
+}
+
+// TestBuildRun_SpecDrifted: a stored spec that carries a step's name but says
+// anything else than the catalog (another target_load, a mechanism or any
+// other params key, another category, type, duration, a host or a ramp) is an
+// error before anything is written: no spec is created beside it, no rule, no
+// experiment, and the drifted spec is left as it is.
+func TestBuildRun_SpecDrifted(t *testing.T) {
+	sc := DefaultScenario()
+	exact := func(st FaultStep) *model.FaultSpec {
+		params, err := json.Marshal(map[string]float64{"target_load": st.TargetLoad})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &model.FaultSpec{ID: "spec-drifted", Name: SpecNameFor(st), Category: "resource", FaultType: string(st.Kind),
+			Params: params, DurationMs: 60000, CreatedAt: testNow.Add(-time.Hour)}
+	}
+	raw := func(s string) func(*model.FaultSpec) {
+		return func(f *model.FaultSpec) { f.Params = json.RawMessage(s) }
+	}
+	cases := []struct {
+		name string
+		step FaultStep
+		edit func(*model.FaultSpec)
+	}{
+		{"memory: another target_load", sc.Memory, raw(`{"target_load":0.2}`)},
+		{"cpu: another target_load", sc.CPU, raw(`{"target_load":0.51}`)},
+		{"a mechanism", sc.Memory, raw(`{"target_load":0.1,"mechanism":"balloon"}`)},
+		{"another params key", sc.CPU, raw(`{"target_load":0.5,"cores":1}`)},
+		{"target_load as a string", sc.CPU, raw(`{"target_load":"0.5"}`)},
+		{"no target_load", sc.Memory, raw(`{}`)},
+		{"params not an object", sc.Memory, raw(`[0.1]`)},
+		{"params null", sc.CPU, raw(`null`)},
+		{"another category", sc.CPU, func(s *model.FaultSpec) { s.Category = "inline" }},
+		{"another type", sc.Memory, func(s *model.FaultSpec) { s.FaultType = "cpu" }},
+		{"another duration", sc.CPU, func(s *model.FaultSpec) { s.DurationMs = 30000 }},
+		{"a host", sc.Memory, func(s *model.FaultSpec) { s.Host = "process" }},
+		{"a ramp", sc.CPU, func(s *model.FaultSpec) { s.RampUpMs = 1000 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeLab(t, testNow)
+			drifted := exact(tc.step)
+			tc.edit(drifted)
+			f.specs = append(f.specs, drifted)
+			before := *drifted
+			var buf bytes.Buffer
+			d := f.deps()
+			d.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+			_, err := BuildRun(context.Background(), d, "demo-drift", sc, testRunCap)
+			if !errors.Is(err, ErrBuild) || errors.Is(err, ErrNoDataset) || errors.Is(err, ErrCleanupIncomplete) {
+				t.Fatalf("err = %v; want ErrBuild", err)
+			}
+			if writes := writeCalls(f); len(writes) != 0 {
+				t.Errorf("writes: %v; want none", writes)
+			}
+			if left := f.leftovers(); len(left) != 0 {
+				t.Errorf("left behind: %v", left)
+			}
+			if len(f.specs) != 1 || string(f.specs[0].Params) != string(before.Params) || f.specs[0].Category != before.Category ||
+				f.specs[0].FaultType != before.FaultType || f.specs[0].DurationMs != before.DurationMs {
+				t.Errorf("specs = %d, first %+v; want only the drifted one, untouched", len(f.specs), f.specs[0])
+			}
+			if !strings.Contains(buf.String(), drifted.ID) {
+				t.Errorf("log does not name the drifted spec %s:\n%s", drifted.ID, buf.String())
+			}
+			assertNoLeak(t, err.Error())
+		})
+	}
+
+	t.Run("a drifted spec beside an exact one", func(t *testing.T) {
+		f := newFakeLab(t, testNow)
+		good := exact(sc.Memory)
+		good.ID = "spec-exact"
+		bad := exact(sc.Memory)
+		raw(`{"target_load":0.2}`)(bad)
+		f.specs = append(f.specs, good, bad)
+		if _, err := BuildRun(context.Background(), f.deps(), "demo-drift", sc, testRunCap); !errors.Is(err, ErrBuild) {
+			t.Fatalf("err = %v; want ErrBuild", err)
+		}
+		if writes := writeCalls(f); len(writes) != 0 {
+			t.Errorf("writes: %v; want none", writes)
+		}
+	})
+
+	t.Run("control: the exact spec is used", func(t *testing.T) {
+		f := newFakeLab(t, testNow)
+		f.specs = append(f.specs, exact(sc.Memory))
+		built, err := BuildRun(context.Background(), f.deps(), "demo-exact", sc, testRunCap)
+		if err != nil {
+			t.Fatalf("BuildRun: %v", err)
+		}
+		if got := f.rules[built.RuleIDs[0]].Action.FaultSpecID; got != "spec-drifted" {
+			t.Errorf("memory rule spec = %q; want the stored one", got)
+		}
+	})
 }
 
 func TestBuildRun_PicksUsableDataset(t *testing.T) {
 	runCap := testRunCap
 	edge := testNow.Add(runCap + time.Minute) // must expire strictly after this
 	ds := func(id string, size int64, created time.Time, ttl int) zeus.Dataset {
-		return zeus.Dataset{ID: id, Name: DatasetName, SizeBytes: size, TTLS: ttl, CreatedAt: created}
+		return zeus.Dataset{ID: id, Name: "demo-products", SizeBytes: size, TTLS: ttl, CreatedAt: created}
 	}
 
 	cases := []struct {
@@ -213,7 +510,7 @@ func TestBuildRun_PicksUsableDataset(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeLab(t, testNow)
 			f.datasets = tc.datasets
-			built, err := BuildRun(context.Background(), f.deps(), "demo-ds", runCap)
+			built, err := BuildRun(context.Background(), f.deps(), "demo-ds", DefaultScenario(), runCap)
 			if tc.want == "" {
 				if !errors.Is(err, ErrNoDataset) {
 					t.Fatalf("err = %v; want ErrNoDataset", err)
@@ -259,7 +556,7 @@ func TestBuildRun_LoadPreconditions(t *testing.T) {
 		setup func(f *fakeLab)
 		want  error
 	}{
-		{"workflow demo-browse missing", func(f *fakeLab) { delete(f.workflows, WorkflowID) }, ErrNoDataset},
+		{"workflow demo-browse missing", func(f *fakeLab) { delete(f.workflows, "demo-browse") }, ErrNoDataset},
 		{"zeus unreachable", func(f *fakeLab) { f.fail("zeus.ListDatasets", errLeaky) }, ErrNoDataset},
 		{"workflow read fails", func(f *fakeLab) { f.fail("workflows.Get", errLeaky) }, ErrBuild},
 	}
@@ -267,7 +564,7 @@ func TestBuildRun_LoadPreconditions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeLab(t, testNow)
 			tc.setup(f)
-			_, err := BuildRun(context.Background(), f.deps(), "demo-pre", testRunCap)
+			_, err := BuildRun(context.Background(), f.deps(), "demo-pre", DefaultScenario(), testRunCap)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v; want %v", err, tc.want)
 			}
@@ -290,7 +587,7 @@ func TestBuildRun_DoneContextIsNotNoDataset(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			f.onCall(step, cancel)
-			_, err := BuildRun(ctx, f.deps(), "demo-ctx", testRunCap)
+			_, err := BuildRun(ctx, f.deps(), "demo-ctx", DefaultScenario(), testRunCap)
 			if !errors.Is(err, context.Canceled) || errors.Is(err, ErrNoDataset) || errors.Is(err, ErrBuild) {
 				t.Fatalf("err = %v; want context.Canceled and neither ErrNoDataset nor ErrBuild", err)
 			}
@@ -303,7 +600,7 @@ func TestBuildRun_DoneContextIsNotNoDataset(t *testing.T) {
 		f := newFakeLab(t, testNow)
 		ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
 		defer cancel()
-		_, err := BuildRun(ctx, f.deps(), "demo-ctx", testRunCap)
+		_, err := BuildRun(ctx, f.deps(), "demo-ctx", DefaultScenario(), testRunCap)
 		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNoDataset) {
 			t.Fatalf("err = %v; want context.DeadlineExceeded, not ErrNoDataset", err)
 		}
@@ -314,7 +611,7 @@ func TestBuildRun_DoneContextIsNotNoDataset(t *testing.T) {
 		for _, z := range []stubZeus{{}, {err: errors.New("connection reset by peer")}} {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			if _, err := pickDataset(ctx, z, testNow, testRunCap); !errors.Is(err, context.Canceled) {
+			if _, err := pickDataset(ctx, z, "demo-products", testNow, testRunCap); !errors.Is(err, context.Canceled) {
 				t.Errorf("pickDataset with %+v on a cancelled context: err = %v; want context.Canceled", z, err)
 			}
 		}
@@ -332,32 +629,40 @@ func (s stubZeus) ListDatasets(context.Context) ([]zeus.Dataset, error) {
 	return s.datasets, s.err
 }
 
+// TestBuildRun_FailureCleansUp: a failure after both rules and the experiment
+// were written deletes the experiment first, then each rule, and switches
+// nothing.
 func TestBuildRun_FailureCleansUp(t *testing.T) {
 	f := newFakeLab(t, testNow)
 	f.fail("experiments.AttachPhaseRules", errLeaky)
 
-	_, err := BuildRun(context.Background(), f.deps(), "demo-fail", testRunCap)
+	_, err := BuildRun(context.Background(), f.deps(), "demo-fail", DefaultScenario(), testRunCap)
 	if !errors.Is(err, ErrBuild) || errors.Is(err, ErrCleanupIncomplete) {
 		t.Fatalf("err = %v; want ErrBuild with a complete cleanup", err)
 	}
 
-	if created := f.callList("rules.Create"); len(created) != 1 {
-		t.Fatalf("rules.Create calls = %v; want 1", created)
+	if created := f.callList("rules.Create"); len(created) != 2 {
+		t.Fatalf("rules.Create calls = %v; want 2", created)
 	}
-	deletes := append(f.callList("experiments.Delete"), f.callList("rules.Delete")...)
-	if len(deletes) != 2 {
-		t.Fatalf("delete calls = %v; want one experiment and one rule delete", deletes)
+	expDeletes, ruleDeletes := f.callList("experiments.Delete"), f.callList("rules.Delete")
+	if len(expDeletes) != 1 || len(ruleDeletes) != 2 {
+		t.Fatalf("delete calls = %v, %v; want one experiment and two rule deletes", expDeletes, ruleDeletes)
 	}
-	expID := strings.TrimPrefix(deletes[0], "experiments.Delete ")
-	ruleID := strings.TrimPrefix(deletes[1], "rules.Delete ")
+	expID := strings.TrimPrefix(expDeletes[0], "experiments.Delete ")
 	all := f.callList("")
-	if indexOf(all, "experiments.Delete "+expID) > indexOf(all, "rules.Delete "+ruleID) {
-		t.Errorf("calls = %v; want experiments.Delete before rules.Delete", all)
+	if !strings.HasPrefix(expID, "exp-") {
+		t.Errorf("deleted %q; want the run's experiment", expID)
 	}
-	if !strings.HasPrefix(expID, "exp-") || !strings.HasPrefix(ruleID, "rule-") {
-		t.Errorf("deleted %q and %q; want the run's experiment and rule", expID, ruleID)
+	for _, del := range ruleDeletes {
+		ruleID := strings.TrimPrefix(del, "rules.Delete ")
+		if indexOf(all, "experiments.Delete "+expID) > indexOf(all, del) {
+			t.Errorf("calls = %v; want experiments.Delete before %s", all, del)
+		}
+		if !strings.HasPrefix(ruleID, "rule-") || f.enabledEver[ruleID] {
+			t.Errorf("deleted %q (enabled ever %v); want one of the run's rules, never switched", ruleID, f.enabledEver[ruleID])
+		}
 	}
-	if sw := switchCalls(f); len(sw) != 0 || f.enabledEver[ruleID] {
+	if sw := switchCalls(f); len(sw) != 0 {
 		t.Errorf("rule switched during a failed build: %v", sw)
 	}
 	if left := f.leftovers(); len(left) != 0 {
@@ -375,23 +680,27 @@ func indexOf(list []string, s string) int {
 	return -1
 }
 
-// buildWrites are the build's writes in order, as fake operation keys.
+// buildWrites are the build's writes in order, as fake operation keys:
+// TestBuildRun_Scenario checks that this is every write a build makes.
 var buildWrites = []string{
-	"specs.CreateSpec",
-	"rules.Create",
+	"specs.CreateSpec#1",
+	"specs.CreateSpec#2",
+	"rules.Create#1",
+	"rules.Create#2",
 	"experiments.Create",
 	"experiments.CreatePhase#1",
 	"experiments.AttachPhaseWorkflows#1",
 	"experiments.CreatePhase#2",
 	"experiments.AttachPhaseWorkflows#2",
-	"experiments.AttachPhaseRules",
+	"experiments.AttachPhaseRules#1",
 	"experiments.CreatePhase#3",
 	"experiments.AttachPhaseWorkflows#3",
+	"experiments.AttachPhaseRules#2",
 }
 
 // checkFailedBuild asserts what every failed build guarantees: ErrBuild, a
-// complete cleanup, nothing per run left, the rule never switched, and an
-// error string without the cause's text or any id.
+// complete cleanup, nothing per run left (neither rule, no experiment), no
+// rule ever switched, and an error string without the cause's text or any id.
 func checkFailedBuild(t *testing.T, f *fakeLab, err error) {
 	t.Helper()
 	if !errors.Is(err, ErrBuild) || errors.Is(err, ErrNoDataset) || errors.Is(err, ErrCleanupIncomplete) {
@@ -414,14 +723,16 @@ func checkFailedBuild(t *testing.T, f *fakeLab, err error) {
 	assertNoLeak(t, err.Error())
 }
 
-// TestBuildRun_FailureAtEveryStepLeavesNothing injects a failure, with nothing
-// written, at each write of the build in turn (and at the spec listing).
-func TestBuildRun_FailureAtEveryStepLeavesNothing(t *testing.T) {
+// TestBuildRun_FailsHalfWay injects a failure, with nothing written, at each
+// write of the build in turn (and at the spec listing): both rules' creates
+// and both attaches included. Whichever fails, no rule and no experiment is
+// left.
+func TestBuildRun_FailsHalfWay(t *testing.T) {
 	for _, step := range append([]string{"specs.ListSpecs"}, buildWrites...) {
 		t.Run(step, func(t *testing.T) {
 			f := newFakeLab(t, testNow)
 			f.fail(step, errLeaky)
-			_, err := BuildRun(context.Background(), f.deps(), "demo-step", testRunCap)
+			_, err := BuildRun(context.Background(), f.deps(), "demo-step", DefaultScenario(), testRunCap)
 			checkFailedBuild(t, f, err)
 		})
 	}
@@ -436,7 +747,7 @@ func TestBuildRun_CommittedButFailedWriteIsCleanedUp(t *testing.T) {
 		t.Run(step, func(t *testing.T) {
 			f := newFakeLab(t, testNow)
 			f.failAfterCommit(step, errLeaky)
-			_, err := BuildRun(context.Background(), f.deps(), "demo-commit", testRunCap)
+			_, err := BuildRun(context.Background(), f.deps(), "demo-commit", DefaultScenario(), testRunCap)
 			checkFailedBuild(t, f, err)
 		})
 	}
@@ -451,7 +762,7 @@ func TestBuildRun_CleanupOutlivesCancelledContext(t *testing.T) {
 	defer cancel()
 	f.onCall("experiments.AttachPhaseWorkflows#3", cancel)
 
-	_, err := BuildRun(ctx, f.deps(), "demo-cancel", testRunCap)
+	_, err := BuildRun(ctx, f.deps(), "demo-cancel", DefaultScenario(), testRunCap)
 	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrBuild) || errors.Is(err, ErrCleanupIncomplete) {
 		t.Fatalf("err = %v; want context.Canceled with a complete cleanup", err)
 	}
@@ -461,8 +772,11 @@ func TestBuildRun_CleanupOutlivesCancelledContext(t *testing.T) {
 }
 
 // TestBuildRun_CleanupFailureIsReported: when the cleanup itself fails, the
-// build returns ErrBuild and ErrCleanupIncomplete, the rule stays disabled,
-// and the log names what was left behind with the full cause.
+// build returns ErrBuild and ErrCleanupIncomplete, and the log names what was
+// left behind with the full cause. The failure comes after the memory rule
+// was attached and before the CPU rule was: the experiment's delete fails, so
+// the store refuses the memory rule's delete (its phase still links it) and
+// that rule is left, disabled; the CPU rule, linked nowhere, is deleted.
 func TestBuildRun_CleanupFailureIsReported(t *testing.T) {
 	f := newFakeLab(t, testNow)
 	f.fail("experiments.AttachPhaseWorkflows#3", errLeaky)
@@ -471,7 +785,7 @@ func TestBuildRun_CleanupFailureIsReported(t *testing.T) {
 	d := f.deps()
 	d.Logger = slog.New(slog.NewTextHandler(&buf, nil))
 
-	_, err := BuildRun(context.Background(), d, "demo-stuck", testRunCap)
+	_, err := BuildRun(context.Background(), d, "demo-stuck", DefaultScenario(), testRunCap)
 	var se *StepError
 	if !errors.Is(err, ErrBuild) || !errors.Is(err, ErrCleanupIncomplete) || !errors.As(err, &se) || !se.CleanupIncomplete {
 		t.Fatalf("err = %v; want ErrBuild with ErrCleanupIncomplete", err)
@@ -480,26 +794,35 @@ func TestBuildRun_CleanupFailureIsReported(t *testing.T) {
 		t.Errorf("err text %q does not say the cleanup is incomplete", err.Error())
 	}
 	assertNoLeak(t, err.Error())
-	rule := onlyRule(t, f)
-	if rule.Enabled || f.enabledEver[rule.ID] || f.served(rule.ID) {
-		t.Errorf("rule left enabled or served: %+v", rule)
+	if n := len(f.rules); n != 1 {
+		t.Fatalf("lab holds %d rules; want the run's memory rule only", n)
 	}
 	var expID string
 	for id := range f.experiments {
 		expID = id
 	}
+	want := []string{expID, "pq: delete timed out", "pq: dial 192.0.2.10", "cleanup_incomplete=true"}
+	for id, rule := range f.rules {
+		if rule.Name != RuleName("demo-stuck", FaultMemory) || rule.Enabled || f.enabledEver[id] || f.served(id) {
+			t.Errorf("rule left = %+v; want the memory rule, never enabled, not served", rule)
+		}
+		want = append(want, id)
+	}
+	if dels := f.callList("rules.Delete"); len(dels) != 2 {
+		t.Errorf("rule deletes = %v; want both rules' attempted", dels)
+	}
 	logs := buf.String()
-	for _, want := range []string{expID, rule.ID, "pq: delete timed out", "pq: dial 192.0.2.10", "cleanup_incomplete=true"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("log lacks %q:\n%s", want, logs)
+	for _, w := range want {
+		if !strings.Contains(logs, w) {
+			t.Errorf("log lacks %q:\n%s", w, logs)
 		}
 	}
 }
 
 // TestBuildRun_HungCleanupDeleteDoesNotStarveTheOther: the experiment delete
-// of a cleanup hangs; it is cut off by its own timeout, the rule delete is
-// still attempted on a fresh one, the build returns within the two timeouts,
-// and the error says the cleanup is incomplete.
+// of a cleanup hangs; it is cut off by its own timeout, each rule delete is
+// still attempted on a fresh context of its own, the build returns within the
+// timeouts, and the error says the cleanup is incomplete.
 func TestBuildRun_HungCleanupDeleteDoesNotStarveTheOther(t *testing.T) {
 	f := newFakeLab(t, testNow)
 	f.fail("experiments.AttachPhaseWorkflows#2", errLeaky)
@@ -507,41 +830,131 @@ func TestBuildRun_HungCleanupDeleteDoesNotStarveTheOther(t *testing.T) {
 	const timeout = 50 * time.Millisecond
 
 	start := time.Now()
-	_, err := buildRun(context.Background(), f.deps(), "demo-hang", testRunCap, timeout)
+	_, err := buildRun(context.Background(), f.deps(), "demo-hang", DefaultScenario(), testRunCap, timeout)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, ErrBuild) || !errors.Is(err, ErrCleanupIncomplete) {
 		t.Fatalf("err = %v; want ErrBuild with ErrCleanupIncomplete", err)
 	}
-	// The failure came before the rule was attached, so its delete, on a
-	// fresh context of its own, succeeds although the first delete hung.
+	// The failure came before either rule was attached, so their deletes, each
+	// on a fresh context of its own, succeed although the first delete hung.
 	dels := f.callList("rules.Delete")
-	if len(dels) != 1 {
-		t.Fatalf("rules.Delete calls = %v; want it attempted after the hung experiment delete", dels)
+	if len(dels) != 2 {
+		t.Fatalf("rules.Delete calls = %v; want both attempted after the hung experiment delete", dels)
 	}
-	if id := strings.TrimPrefix(dels[0], "rules.Delete "); f.rule(id) != nil {
-		t.Errorf("rule %s still there: its delete ran on the hung delete's expired context", id)
+	for _, del := range dels {
+		if id := strings.TrimPrefix(del, "rules.Delete "); f.rule(id) != nil {
+			t.Errorf("rule %s still there: its delete ran on the hung delete's expired context", id)
+		}
 	}
-	if elapsed > 2*timeout+500*time.Millisecond {
-		t.Errorf("build returned after %v; want within two cleanup timeouts", elapsed)
+	if elapsed > 3*timeout+500*time.Millisecond {
+		t.Errorf("build returned after %v; want within the cleanup timeouts", elapsed)
 	}
 	if len(f.experiments) != 1 {
 		t.Errorf("experiments = %d; want the planned one the hung delete left", len(f.experiments))
 	}
 }
 
+// TestBuildRun_RefusesBadInput: a missing run id, run cap or dependency, or a
+// scenario whose steps are not a memory then a CPU fault with a target, an
+// intensity and a target_load in (0, 1], or that names no workload, writes
+// nothing.
 func TestBuildRun_RefusesBadInput(t *testing.T) {
 	f := newFakeLab(t, testNow)
-	if _, err := BuildRun(context.Background(), f.deps(), "", testRunCap); !errors.Is(err, ErrBuild) {
+	sc := DefaultScenario()
+	if _, err := BuildRun(context.Background(), f.deps(), "", sc, testRunCap); !errors.Is(err, ErrBuild) {
 		t.Errorf("empty run id: err = %v; want ErrBuild", err)
+	}
+	if _, err := BuildRun(context.Background(), f.deps(), "demo-cap", sc, 0); !errors.Is(err, ErrBuild) {
+		t.Errorf("no run cap: err = %v; want ErrBuild", err)
 	}
 	d := f.deps()
 	d.Clock = nil
-	if _, err := BuildRun(context.Background(), d, "demo-nil", testRunCap); !errors.Is(err, ErrBuild) {
+	if _, err := BuildRun(context.Background(), d, "demo-nil", sc, testRunCap); !errors.Is(err, ErrBuild) {
 		t.Errorf("missing clock: err = %v; want ErrBuild", err)
 	}
-	if writes := writeCalls(f); len(writes) != 0 {
-		t.Errorf("writes: %v; want none", writes)
+	bad := map[string]func(*Scenario){
+		"zero scenario":         func(s *Scenario) { *s = Scenario{} },
+		"steps swapped":         func(s *Scenario) { s.Memory, s.CPU = s.CPU, s.Memory },
+		"memory step of cpu":    func(s *Scenario) { s.Memory.Kind = FaultCPU },
+		"no memory target":      func(s *Scenario) { s.Memory.Target = "" },
+		"no cpu intensity":      func(s *Scenario) { s.CPU.Intensity = "" },
+		"target_load 0":         func(s *Scenario) { s.Memory.TargetLoad = 0 },
+		"target_load above 1":   func(s *Scenario) { s.CPU.TargetLoad = 1.5 },
+		"target_load NaN":       func(s *Scenario) { s.CPU.TargetLoad = math.NaN() },
+		"target_load negative":  func(s *Scenario) { s.Memory.TargetLoad = -0.1 },
+		"no workflow":           func(s *Scenario) { s.Workload.WorkflowID = "" },
+		"no dataset":            func(s *Scenario) { s.Workload.DatasetName = "" },
+		"target_load +Infinity": func(s *Scenario) { s.CPU.TargetLoad = math.Inf(1) },
+	}
+	for name, edit := range bad {
+		s := DefaultScenario()
+		edit(&s)
+		if _, err := BuildRun(context.Background(), f.deps(), "demo-bad", s, testRunCap); !errors.Is(err, ErrBuild) {
+			t.Errorf("%s: err = %v; want ErrBuild", name, err)
+		}
+	}
+	if calls := f.callList(""); len(calls) != 0 {
+		t.Errorf("calls: %v; want none", calls)
+	}
+}
+
+// TestRuleAndSpecNames pins the names the build gives a run's rules and the
+// shared fault specs.
+func TestRuleAndSpecNames(t *testing.T) {
+	if got := RuleName("demo-x", FaultMemory); got != "demo-run-demo-x-memory" {
+		t.Errorf("RuleName(memory) = %q", got)
+	}
+	if got := RuleName("demo-x", FaultCPU); got != "demo-run-demo-x-cpu" {
+		t.Errorf("RuleName(cpu) = %q", got)
+	}
+	if got := SpecNameFor(DefaultScenario().Memory); got != "demo-memory-productcatalogservice-moderate" {
+		t.Errorf("SpecNameFor(default memory) = %q", got)
+	}
+	heavy, _ := ScenarioByID("cart-heavy")
+	if got := SpecNameFor(heavy.CPU); got != "demo-cpu-cartservice-heavy" {
+		t.Errorf("SpecNameFor(cart-heavy cpu) = %q", got)
+	}
+}
+
+// TestRunIDOfRule: a run's rule names, the new two (demo-run-<id>-memory,
+// demo-run-<id>-cpu) and build 2's one (demo-run-<id>), give the run id back;
+// anything else is not a run's rule. A run id is demo- and a lower-case
+// canonical UUID, so no run id ends in -memory or -cpu and each name has one
+// reading.
+func TestRunIDOfRule(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		runID := id.New(RunIDPrefix)
+		for _, name := range []string{RuleName(runID, FaultMemory), RuleName(runID, FaultCPU), RunNamePrefix + runID} {
+			if got, ok := RunIDOfRule(name); !ok || got != runID {
+				t.Fatalf("RunIDOfRule(%q) = %q, %v; want %q", name, got, ok, runID)
+			}
+		}
+		for _, k := range []FaultKind{FaultMemory, FaultCPU} {
+			if validRunID(runID + "-" + string(k)) {
+				t.Fatalf("%s-%s passes as a run id", runID, k)
+			}
+		}
+	}
+	runID := id.New(RunIDPrefix)
+	for _, name := range []string{
+		"", "smoke-x", "demo-run-", "demo-run-x", "demo-run-x-memory", "demo-run--memory", "demo-run--cpu",
+		runID, runID + "-memory", // no demo-run- prefix
+		"x" + RunNamePrefix + runID,
+		RunNamePrefix + runID + "-latency",
+		RunNamePrefix + runID + "-MEMORY",
+		RunNamePrefix + runID + "-memory-cpu",
+		RunNamePrefix + runID + "-cpu-memory",
+		RunNamePrefix + runID + "-memory ",
+		RunNamePrefix + runID + "memory",
+		RunNamePrefix + strings.ToUpper(runID),
+		RunNamePrefix + strings.ToUpper(runID) + "-cpu",
+		RunNamePrefix + runID[:len(runID)-1] + "-cpu",
+		RunNamePrefix + "demo-run-" + runID,
+	} {
+		if got, ok := RunIDOfRule(name); ok || got != "" {
+			t.Errorf("RunIDOfRule(%q) = %q, %v; want not a run's rule", name, got, ok)
+		}
 	}
 }
 
@@ -575,15 +988,16 @@ func (s *ctxSpyRules) SetEnabled(ctx context.Context, id string, enabled bool) e
 }
 
 func TestSetRuleEnabled(t *testing.T) {
-	// newLabWithRule builds a run, so its rule is attached to the fault phase.
+	// newLabWithRule builds a run and returns its memory rule, attached to the
+	// memory phase.
 	newLabWithRule := func(t *testing.T) (*fakeLab, string) {
 		t.Helper()
 		f := newFakeLab(t, testNow)
-		built, err := BuildRun(context.Background(), f.deps(), "demo-sw", testRunCap)
+		built, err := BuildRun(context.Background(), f.deps(), "demo-sw", DefaultScenario(), testRunCap)
 		if err != nil {
 			t.Fatalf("BuildRun: %v", err)
 		}
-		return f, built.RuleID
+		return f, built.RuleIDs[0]
 	}
 
 	t.Run("on enables an attached demo rule, off disables it", func(t *testing.T) {
@@ -649,7 +1063,7 @@ func TestSetRuleEnabled(t *testing.T) {
 
 	t.Run("off is never refused and a missing rule is success", func(t *testing.T) {
 		f, _ := newLabWithRule(t)
-		operator := &model.Rule{ID: "rule-operator", Name: "smoke-x", Service: TargetService, Enabled: true,
+		operator := &model.Rule{ID: "rule-operator", Name: "smoke-x", Service: "productcatalogservice", Enabled: true,
 			Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: f.specs[0].ID}}
 		if err := (fakeRules{f}).Create(context.Background(), operator); err != nil {
 			t.Fatal(err)
@@ -677,7 +1091,7 @@ func TestSetRuleEnabled(t *testing.T) {
 
 	t.Run("on refuses an unattached rule and leaves it disabled", func(t *testing.T) {
 		f, _ := newLabWithRule(t)
-		loose := &model.Rule{ID: "rule-loose", Name: RunNamePrefix + "loose", Service: TargetService,
+		loose := &model.Rule{ID: "rule-loose", Name: RunNamePrefix + "loose", Service: "productcatalogservice",
 			Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: f.specs[0].ID}}
 		if err := (fakeRules{f}).Create(context.Background(), loose); err != nil {
 			t.Fatal(err)

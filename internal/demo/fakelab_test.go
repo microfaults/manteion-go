@@ -25,11 +25,11 @@ func TestFakeLab_InvariantRecorder(t *testing.T) {
 	t.Run("deleting the experiment of an enabled rule", func(t *testing.T) {
 		f := newFakeLab(t, testNow)
 		f.expectViolations()
-		built, err := BuildRun(ctx, f.deps(), "demo-inv", testRunCap)
+		built, err := BuildRun(ctx, f.deps(), "demo-inv", DefaultScenario(), testRunCap)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := SetRuleEnabled(ctx, fakeRules{f}, built.RuleID, true); err != nil {
+		if err := SetRuleEnabled(ctx, fakeRules{f}, built.RuleIDs[0], true); err != nil {
 			t.Fatal(err)
 		}
 		if v := f.violations(); len(v) != 0 {
@@ -39,7 +39,7 @@ func TestFakeLab_InvariantRecorder(t *testing.T) {
 			t.Fatal(err)
 		}
 		v := f.violations()
-		if len(v) != 1 || !strings.Contains(v[0], "experiments.Delete") || !strings.Contains(v[0], built.RuleID) {
+		if len(v) != 1 || !strings.Contains(v[0], "experiments.Delete") || !strings.Contains(v[0], built.RuleIDs[0]) {
 			t.Fatalf("violations = %v; want one, after experiments.Delete, naming the rule", v)
 		}
 	})
@@ -48,7 +48,7 @@ func TestFakeLab_InvariantRecorder(t *testing.T) {
 		f := newFakeLab(t, testNow)
 		f.expectViolations()
 		f.specs = append(f.specs, &model.FaultSpec{ID: "spec-x"})
-		r := &model.Rule{ID: "rule-a", Name: RunNamePrefix + "a", Service: TargetService, Enabled: true,
+		r := &model.Rule{ID: "rule-a", Name: RunNamePrefix + "a", Service: testTarget, Enabled: true,
 			Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "spec-x"}}
 		if err := (fakeRules{f}).Create(ctx, r); err != nil {
 			t.Fatal(err)
@@ -70,7 +70,7 @@ func TestFakeLab_InvariantRecorder(t *testing.T) {
 	t.Run("operator rules are not the demo's", func(t *testing.T) {
 		f := newFakeLab(t, testNow)
 		f.specs = append(f.specs, &model.FaultSpec{ID: "spec-x"})
-		r := &model.Rule{ID: "rule-op", Name: "smoke-x", Service: TargetService, Enabled: true,
+		r := &model.Rule{ID: "rule-op", Name: "smoke-x", Service: testTarget, Enabled: true,
 			Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "spec-x"}}
 		if err := (fakeRules{f}).Create(ctx, r); err != nil {
 			t.Fatal(err)
@@ -81,40 +81,50 @@ func TestFakeLab_InvariantRecorder(t *testing.T) {
 	})
 }
 
-// TestFakeLab_Served: the fake serves a rule as RuleRepo.ForService does.
+// TestFakeLab_Served: the fake serves a rule as RuleRepo.ForService does: a
+// run's memory rule only while the memory phase runs under a running
+// experiment, its CPU rule only while the cpu phase does.
 func TestFakeLab_Served(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeLab(t, testNow)
-	built, err := BuildRun(ctx, f.deps(), "demo-srv", testRunCap)
+	built, err := BuildRun(ctx, f.deps(), "demo-srv", DefaultScenario(), testRunCap)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, exp, fault := built.RuleID, built.ExperimentID, built.PhaseIDs[FaultPhaseIndex]
-	step := func(what string, want bool) {
+	mem, cpu, exp := built.RuleIDs[0], built.RuleIDs[1], built.ExperimentID
+	memPhase, cpuPhase := built.PhaseIDs[1], built.PhaseIDs[2]
+	step := func(what string, wantMem, wantCPU bool) {
 		t.Helper()
-		if got := f.served(id); got != want {
-			t.Errorf("%s: served = %v, want %v", what, got, want)
+		if got := f.served(mem); got != wantMem {
+			t.Errorf("%s: memory rule served = %v, want %v", what, got, wantMem)
+		}
+		if got := f.served(cpu); got != wantCPU {
+			t.Errorf("%s: cpu rule served = %v, want %v", what, got, wantCPU)
 		}
 	}
-	step("built: disabled, planned", false)
-	if err := SetRuleEnabled(ctx, fakeRules{f}, id, true); err != nil {
-		t.Fatal(err)
+	step("built: disabled, planned", false, false)
+	for _, id := range built.RuleIDs {
+		if err := SetRuleEnabled(ctx, fakeRules{f}, id, true); err != nil {
+			t.Fatal(err)
+		}
 	}
-	step("enabled, experiment planned, phase pending", false)
+	step("enabled, experiment planned, phases pending", false, false)
 	f.setExperimentStatus(exp, "running")
-	step("enabled, experiment running, phase pending", false)
-	f.setPhaseStatus(fault, "running")
-	step("enabled, experiment running, phase running", true)
-	f.setPhaseStatus(fault, "draining")
-	step("phase draining", false)
-	f.setPhaseStatus(fault, "running")
+	step("enabled, experiment running, phases pending", false, false)
+	f.setPhaseStatus(memPhase, "running")
+	step("experiment running, memory phase running", true, false)
+	f.setPhaseStatus(memPhase, "draining")
+	step("memory phase draining", false, false)
+	f.setPhaseStatus(memPhase, "completed")
+	f.setPhaseStatus(cpuPhase, "running")
+	step("cpu phase running", false, true)
 	f.setExperimentStatus(exp, "cancelled")
-	step("phase running under a cancelled experiment", false)
+	step("cpu phase running under a cancelled experiment", false, false)
 	f.setExperimentStatus(exp, "running")
-	if err := SetRuleEnabled(ctx, fakeRules{f}, id, false); err != nil {
+	if err := SetRuleEnabled(ctx, fakeRules{f}, cpu, false); err != nil {
 		t.Fatal(err)
 	}
-	step("disabled while its phase runs", false)
+	step("cpu rule disabled while its phase runs", false, false)
 }
 
 // TestFakeLab_ListPages: List pages, orders and counts like ExperimentRepo.List.
@@ -124,7 +134,7 @@ func TestFakeLab_ListPages(t *testing.T) {
 	f.clock.SetStep(time.Millisecond)
 	var ids []string // newest first
 	for i := 0; i < 5; i++ {
-		built, err := BuildRun(ctx, f.deps(), fmt.Sprintf("demo-%d", i), testRunCap)
+		built, err := BuildRun(ctx, f.deps(), fmt.Sprintf("demo-%d", i), DefaultScenario(), testRunCap)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +214,7 @@ func TestFakeLab_HooksMayCallBack(t *testing.T) {
 	})
 	built := make(chan error, 1)
 	go func() {
-		_, err := BuildRun(ctx, f.deps(), "demo-hook", testRunCap)
+		_, err := BuildRun(ctx, f.deps(), "demo-hook", DefaultScenario(), testRunCap)
 		built <- err
 	}()
 	select {
@@ -239,7 +249,7 @@ func TestFakeLab_HooksMayCallBack(t *testing.T) {
 // TestFakeLab_RuleNeedsKnownSpec: rules.fault_spec_id is a foreign key.
 func TestFakeLab_RuleNeedsKnownSpec(t *testing.T) {
 	f := newFakeLab(t, testNow)
-	r := &model.Rule{ID: "rule-x", Name: RunNamePrefix + "x", Service: TargetService, Mode: "inline",
+	r := &model.Rule{ID: "rule-x", Name: RunNamePrefix + "x", Service: testTarget, Mode: "inline",
 		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: "spec-unknown"}}
 	err := (fakeRules{f}).Create(context.Background(), r)
 	if err == nil || errors.Is(err, store.ErrNotFound) {

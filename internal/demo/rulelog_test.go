@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -54,9 +55,9 @@ func capturedHarness(t *testing.T, tweak func(*Config)) (*harness, *captureHandl
 	return x, c
 }
 
-// TestRuleLog_CompletedRun: a run that completes logs its rule switched on
-// once and switched off once, at Info, with the run and rule ids, the off with
-// reason completed; nothing about the switch at Warn.
+// TestRuleLog_CompletedRun: a run that completes logs each of its two rules
+// switched on once and switched off once, at Info, with the run and rule ids,
+// the off with reason completed; nothing about the switch at Warn.
 func TestRuleLog_CompletedRun(t *testing.T) {
 	t.Parallel()
 	x, c := capturedHarness(t, noCap)
@@ -65,11 +66,12 @@ func TestRuleLog_CompletedRun(t *testing.T) {
 	x.start()
 	awaitEnd(t, ch)
 	x.stop()
-	rule := x.f.ruleIDOfRun(r.RunID)
-	ids := map[string]string{"run_id": r.RunID, "rule_id": rule}
-	requireOneRecord(t, "switched on", ruleRecords(c, "demo: rule switched on", rule), slog.LevelInfo, ids)
-	ids["reason"] = offCompleted
-	requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo, ids)
+	for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+		ids := map[string]string{"run_id": r.RunID, "rule_id": rule}
+		requireOneRecord(t, "switched on", ruleRecords(c, "demo: rule switched on", rule), slog.LevelInfo, ids)
+		ids["reason"] = offCompleted
+		requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo, ids)
+	}
 	for _, rec := range c.all() {
 		if rec.Level >= slog.LevelWarn {
 			t.Errorf("a line at %s: %s", rec.Level, rec.Message)
@@ -77,17 +79,17 @@ func TestRuleLog_CompletedRun(t *testing.T) {
 	}
 }
 
-// TestRuleLog_ShutdownMidRun: a shutdown while the run's rule is on logs the
-// switch-off once at Info with reason shutdown. Shutdown's own switch-off
-// races the ending's: both write, and the second is a Debug line, not a
-// second Info "off".
+// TestRuleLog_ShutdownMidRun: a shutdown while the run's rules are on logs
+// each rule's switch-off once at Info with reason shutdown. Shutdown's own
+// switch-off races the ending's: both write each rule, and the second is a
+// Debug line, not a second Info "off".
 func TestRuleLog_ShutdownMidRun(t *testing.T) {
 	t.Parallel()
 	x, c := capturedHarness(t, noCap)
 	r, ch := x.enqueue("a")
 	x.start()
 	awaitPhase(t, ch, 0, PhaseRunning)
-	rule := x.f.ruleIDOfRun(r.RunID)
+	rules := x.f.rulesOfRun(t, r.RunID)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := x.w.Shutdown(ctx); err != nil {
@@ -95,19 +97,24 @@ func TestRuleLog_ShutdownMidRun(t *testing.T) {
 	}
 	waitClosed(t, x.w.done, "Run to return")
 	x.stop()
-	if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 2 {
-		t.Fatalf("%d switch-off writes; want 2, Shutdown's and the ending's", n)
+	for _, rule := range rules {
+		if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 2 {
+			t.Fatalf("%d switch-off writes of %s; want 2, Shutdown's and the ending's", n, rule)
+		}
+		requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo,
+			map[string]string{"run_id": r.RunID, "rule_id": rule, "reason": offShutdown})
+		requireOneRecord(t, "the second switch-off", ruleRecords(c, "demo: rule already off", rule), slog.LevelDebug,
+			map[string]string{"run_id": r.RunID, "rule_id": rule})
 	}
-	requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo,
-		map[string]string{"run_id": r.RunID, "rule_id": rule, "reason": offShutdown})
-	requireOneRecord(t, "the second switch-off", ruleRecords(c, "demo: rule already off", rule), slog.LevelDebug,
-		map[string]string{"run_id": r.RunID, "rule_id": rule})
 }
 
-// TestRuleLog_FailingSwitchOff: a switch-off that fails five times logs one
-// Warn line, the first failure's, while the clock stands still, then its
-// success once at Info with the attempt that landed. When a minute passes
-// between failures, one more Warn line follows, and no more.
+// TestRuleLog_FailingSwitchOff: a switch-off of a run's two rules that fails
+// five times logs one Warn line per rule, the first failure's, while the
+// clock stands still, then each rule's success once at Info with the attempt
+// that landed. When a minute passes between failures, one more Warn line per
+// rule follows, and no more. Each attempt writes the memory rule, then the CPU
+// rule: writes 1 to 10 are the five failed attempts, write 7 opens the
+// fourth.
 func TestRuleLog_FailingSwitchOff(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -122,45 +129,50 @@ func TestRuleLog_FailingSwitchOff(t *testing.T) {
 			t.Parallel()
 			x, c := capturedHarness(t, noCap)
 			x.f.autopilot = true
-			for i := 1; i <= 5; i++ {
+			for i := 1; i <= 10; i++ {
 				x.f.fail(fmt.Sprintf("rules.SetEnabled#%d", i), errLeaky)
 			}
 			if tc.minuteAt > 0 {
-				x.f.onCall(fmt.Sprintf("rules.SetEnabled#%d", tc.minuteAt), func() { x.f.clock.Advance(offWarnEvery) })
+				x.f.onCall(fmt.Sprintf("rules.SetEnabled#%d", 2*tc.minuteAt-1), func() { x.f.clock.Advance(offWarnEvery) })
 			}
 			r, ch := x.enqueue("a")
 			x.start()
 			awaitEnd(t, ch)
-			rule := x.f.ruleIDOfRun(r.RunID)
-			waitFor(t, "the switch-off to land", func() bool { return len(x.f.callList("rules.SetEnabled "+rule+" false")) == 6 })
+			rules := x.f.rulesOfRun(t, r.RunID)
+			for _, rule := range rules {
+				waitFor(t, "the switch-off to land", func() bool { return len(x.f.callList("rules.SetEnabled "+rule+" false")) == 6 })
+			}
 			x.stop()
 
-			var warned []int
+			warned := map[string][]int{}
 			for _, rec := range c.all() {
 				if rec.Level != slog.LevelWarn {
 					continue
 				}
-				if v, ok := attr(rec, "rule_id"); !ok || v.String() != rule {
-					t.Errorf("a Warn line without the rule's id: %s", rec.Message)
+				v, ok := attr(rec, "rule_id")
+				if !ok || !slices.Contains(rules[:], v.String()) {
+					t.Errorf("a Warn line without one of the run's rule ids: %s", rec.Message)
 					continue
 				}
 				a, ok := attr(rec, "attempt")
-				if !ok { // the worker holding the next run says so once
+				if !ok { // the worker holding the next run says so once per rule
 					if !strings.Contains(rec.Message, "the next run waits") {
 						t.Errorf("Warn line %q without an attempt", rec.Message)
 					}
 					continue
 				}
-				warned = append(warned, int(a.Int64()))
+				warned[v.String()] = append(warned[v.String()], int(a.Int64()))
 				if !strings.Contains(rec.Message, "switching the run's rule off failed") {
 					t.Errorf("Warn line %q", rec.Message)
 				}
 			}
-			if fmt.Sprint(warned) != fmt.Sprint(tc.warnedAt) {
-				t.Errorf("Warn lines for attempts %v; want %v", warned, tc.warnedAt)
+			for _, rule := range rules {
+				if fmt.Sprint(warned[rule]) != fmt.Sprint(tc.warnedAt) {
+					t.Errorf("rule %s: Warn lines for attempts %v; want %v", rule, warned[rule], tc.warnedAt)
+				}
+				requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo,
+					map[string]string{"run_id": r.RunID, "reason": offCompleted, "attempt": "6"})
 			}
-			requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo,
-				map[string]string{"run_id": r.RunID, "reason": offCompleted, "attempt": "6"})
 		})
 	}
 }

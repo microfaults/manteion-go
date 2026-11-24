@@ -47,12 +47,17 @@ func strp(s string) *string { return &s }
 
 func f64p(f float64) *float64 { return &f }
 
+// samplePhases are a queued run's phases of the default scenario: baseline
+// with no fault, then memory and cpu, each with its kind, target and
+// intensity.
 func samplePhases() [3]PhaseView {
 	var out [3]PhaseView
 	for i := range out {
 		out[i] = PhaseView{Name: PhaseNames[i], Status: PhasePending, DurationS: PhaseDurationS}
 	}
-	out[FaultPhaseIndex].Fault = strp(FaultLabel)
+	sc := DefaultScenario()
+	out[1].Fault, out[1].Target, out[1].Intensity = strp("memory"), strp(sc.Memory.Target), strp(sc.Memory.Intensity)
+	out[2].Fault, out[2].Target, out[2].Intensity = strp("cpu"), strp(sc.CPU.Target), strp(sc.CPU.Intensity)
 	return out
 }
 
@@ -79,15 +84,16 @@ func TestRunJSON_QueuedRun(t *testing.T) {
 			"fault_observed", "measure")
 		if pm["name"] != PhaseNames[i] || pm["status"] != "pending" || pm["duration_s"] != 40.0 ||
 			pm["started_at"] != nil || pm["ended_at"] != nil || pm["result"] != nil ||
-			pm["target"] != nil || pm["intensity"] != nil || pm["fault_observed"] != nil || pm["measure"] != nil {
+			pm["fault_observed"] != nil || pm["measure"] != nil {
 			t.Errorf("phase %d = %v", i, pm)
 		}
-		wantFault := any(nil)
-		if i == 1 {
-			wantFault = "+50 ms latency on productcatalogservice"
-		}
-		if pm["fault"] != wantFault {
-			t.Errorf("phase %d fault = %v; want %v", i, pm["fault"], wantFault)
+		want := [3][3]any{
+			{nil, nil, nil},
+			{"memory", "productcatalogservice", "moderate"},
+			{"cpu", "productcatalogservice", "moderate"},
+		}[i]
+		if got := [3]any{pm["fault"], pm["target"], pm["intensity"]}; got != want {
+			t.Errorf("phase %d fault, target, intensity = %v; want %v", i, got, want)
 		}
 	}
 }
@@ -326,7 +332,7 @@ func TestStateJSON(t *testing.T) {
 	started := testNow
 	st := State{Capacity: 3, Accepting: false,
 		Queue: []QueueEntry{{RunID: "demo-1", Position: 0, Status: RunRunning}, {RunID: "demo-2", Position: 1, Status: RunQueued}},
-		Running: &RunningPhase{RunID: "demo-1", Phase: "plain", PhaseIndex: 0, PhaseStartedAt: &started,
+		Running: &RunningPhase{RunID: "demo-1", Phase: "baseline", PhaseIndex: 0, PhaseStartedAt: &started,
 			PhaseDurationS: 40, Progress: 0.25}}
 	m := decodeObject(t, st)
 	wantKeys(t, "state", m, "capacity", "accepting", "queue", "running")
@@ -337,7 +343,7 @@ func TestStateJSON(t *testing.T) {
 	if r["phase_started_at"] != "2026-11-20T12:00:00.000Z" || r["progress"] != 0.25 {
 		t.Errorf("running = %v", r)
 	}
-	r2 := decodeObject(t, RunningPhase{RunID: "demo-1", Phase: "plain", PhaseDurationS: 40})
+	r2 := decodeObject(t, RunningPhase{RunID: "demo-1", Phase: "baseline", PhaseDurationS: 40})
 	if v, ok := r2["phase_started_at"]; !ok || v != nil {
 		t.Errorf("phase_started_at = %v (present %v); want null", v, ok)
 	}
@@ -352,8 +358,8 @@ func TestSmallBodiesJSON(t *testing.T) {
 		{ErrorBody{Error: CodeQueueFull}, `{"error":"queue_full"}`},
 		{RecentRuns{}, `{"runs":[]}`},
 		{QueueEvent{RunID: "demo-1", Position: 1}, `{"run_id":"demo-1","position":1}`},
-		{PhaseEvent{RunID: "demo-1", Phase: "plain-end", PhaseIndex: 2, Status: PhaseRunning, At: testNow},
-			`{"run_id":"demo-1","phase":"plain-end","phase_index":2,"status":"running","at":"2026-11-20T12:00:00.000Z"}`},
+		{PhaseEvent{RunID: "demo-1", Phase: "cpu", PhaseIndex: 2, Status: PhaseRunning, At: testNow},
+			`{"run_id":"demo-1","phase":"cpu","phase_index":2,"status":"running","at":"2026-11-20T12:00:00.000Z"}`},
 		{Health{OK: false, Accepting: true, Checks: HealthChecks{Database: true, LoadGenerator: true, Target: true, Idle: true}},
 			`{"ok":false,"accepting":true,"checks":{"database":true,"load_generator":true,"metrics":false,"target":true,"idle":true}}`},
 	}
@@ -373,12 +379,12 @@ func TestSmallBodiesJSON(t *testing.T) {
 }
 
 func TestSampleJSON(t *testing.T) {
-	s := Sample{RunID: "demo-1", Phase: "plain", At: testNow, RPS: f64p(5), P95Ms: f64p(math.NaN()), ErrorRate: f64p(0)}
+	s := Sample{RunID: "demo-1", Phase: "baseline", At: testNow, RPS: f64p(5), P95Ms: f64p(math.NaN()), ErrorRate: f64p(0)}
 	b, err := json.Marshal(s)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if string(b) != `{"run_id":"demo-1","phase":"plain","at":"2026-11-20T12:00:00.000Z","rps":5,"p95_ms":null,"error_rate":0,"target_cpu_cores":null,"target_memory_bytes":null}` {
+	if string(b) != `{"run_id":"demo-1","phase":"baseline","at":"2026-11-20T12:00:00.000Z","rps":5,"p95_ms":null,"error_rate":0,"target_cpu_cores":null,"target_memory_bytes":null}` {
 		t.Errorf("sample = %s", b)
 	}
 	s = Sample{RunID: "demo-1", Phase: "memory", At: testNow, TargetCPUCores: f64p(0.0293), TargetMemoryBytes: f64p(61456499)}
@@ -386,7 +392,7 @@ func TestSampleJSON(t *testing.T) {
 		string(b) != `{"run_id":"demo-1","phase":"memory","at":"2026-11-20T12:00:00.000Z","rps":null,"p95_ms":null,"error_rate":null,"target_cpu_cores":0.0293,"target_memory_bytes":61456499}` {
 		t.Errorf("sample with the target's series = %s, %v", b, err)
 	}
-	s = Sample{RunID: "demo-1", Phase: "plain", At: testNow, RPS: f64p(math.Inf(1)), ErrorRate: f64p(math.Inf(-1)),
+	s = Sample{RunID: "demo-1", Phase: "baseline", At: testNow, RPS: f64p(math.Inf(1)), ErrorRate: f64p(math.Inf(-1)),
 		TargetCPUCores: f64p(math.NaN()), TargetMemoryBytes: f64p(math.Inf(1))}
 	m := decodeObject(t, s)
 	wantKeys(t, "sample", m, "run_id", "phase", "at", "rps", "p95_ms", "error_rate", "target_cpu_cores", "target_memory_bytes")
@@ -488,8 +494,8 @@ func TestPromQLStrings(t *testing.T) {
 }
 
 func TestContractNames(t *testing.T) {
-	if PhaseNames != [3]string{"plain", "catalog-latency-50ms", "plain-end"} || FaultPhaseIndex != 1 || PhaseDurationS != 40 {
-		t.Errorf("phases = %v, fault at %d, %d s", PhaseNames, FaultPhaseIndex, PhaseDurationS)
+	if PhaseNames != [3]string{"baseline", "memory", "cpu"} || PhaseDurationS != 40 {
+		t.Errorf("phases = %v, %d s; want baseline, memory, cpu, 40 s", PhaseNames, PhaseDurationS)
 	}
 	if HeaderClient != "X-Demo-Client" || HeaderEdgeSecret != "X-Demo-Edge-Secret" || DefaultClient != "local" || MaxClientBytes != 200 {
 		t.Errorf("headers = %q %q, default client %q, max %d", HeaderClient, HeaderEdgeSecret, DefaultClient, MaxClientBytes)
@@ -497,8 +503,11 @@ func TestContractNames(t *testing.T) {
 	if EventState != "state" || EventQueue != "queue" || EventPhase != "phase" || EventSample != "sample" || EventEnd != "end" {
 		t.Errorf("event types renamed")
 	}
-	if CreatedBy != "manteion-demo" || RunNamePrefix != "demo-run-" || SpecName != "demo-catalog-latency-50ms" || RunIDPrefix != "demo" {
-		t.Errorf("names = %q %q %q %q", CreatedBy, RunNamePrefix, SpecName, RunIDPrefix)
+	if CreatedBy != "manteion-demo" || RunNamePrefix != "demo-run-" || RunIDPrefix != "demo" {
+		t.Errorf("names = %q %q %q", CreatedBy, RunNamePrefix, RunIDPrefix)
+	}
+	if m, c := RuleName("demo-1", FaultMemory), RuleName("demo-1", FaultCPU); m != "demo-run-demo-1-memory" || c != "demo-run-demo-1-cpu" {
+		t.Errorf("rule names = %q %q", m, c)
 	}
 }
 
@@ -519,7 +528,7 @@ func TestNonFiniteNumbersNeverFailAResponse(t *testing.T) {
 		{math.NaN(), 0}, {math.Inf(1), 0}, {math.Inf(-1), 0}, {-0.2, 0}, {1.5, 1}, {0.4, 0.4},
 	} {
 		st := State{Capacity: 3, Queue: []QueueEntry{{RunID: "demo-1", Status: RunRunning}},
-			Running: &RunningPhase{RunID: "demo-1", Phase: "plain", PhaseDurationS: 40, Progress: tc.in}}
+			Running: &RunningPhase{RunID: "demo-1", Phase: "baseline", PhaseDurationS: 40, Progress: tc.in}}
 		m := decodeObject(t, st)
 		if got := m["running"].(map[string]any)["progress"]; got != tc.want {
 			t.Errorf("progress %v marshals as %v; want %v", tc.in, got, tc.want)

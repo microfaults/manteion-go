@@ -1,9 +1,10 @@
-// Package demo runs the public demo: anyone may queue one fixed experiment
-// (three 40 s phases: plain, +50 ms latency on productcatalogservice, plain)
-// and watch it run. Its central promise is that no fault stays served after a
-// run ends. Each run gets its own fault rule, created disabled and attached to
-// the middle phase; it is enabled only just before the run starts and
-// disabled on every ending, and a disabled rule is never served.
+// Package demo runs the public demo: anyone may queue a run of one scenario of
+// a fixed catalog (three 40 s phases: baseline with no fault, a memory fault,
+// then a CPU fault, each in the scenario's target service) and watch it run.
+// Its central promise is that no fault stays served after a run ends. Each run
+// gets its own two fault rules, created disabled and each attached to its own
+// fault phase; they are enabled only just before the run starts and disabled
+// on every ending, and a disabled rule is never served.
 //
 // This file is the public contract: the exact JSON every demo route and event
 // returns. No body ever carries an experiment, phase, rule or zeus id, a
@@ -33,14 +34,11 @@ const (
 
 	// PhaseDurationS is each phase's load duration, in seconds.
 	PhaseDurationS = 40
-	// FaultPhaseIndex is the position of the one phase that carries the fault.
-	FaultPhaseIndex = 1
-	// FaultLabel is how the fault phase describes its fault.
-	FaultLabel = "+50 ms latency on productcatalogservice"
 )
 
-// PhaseNames are the preset's phases in order.
-var PhaseNames = [3]string{"plain", "catalog-latency-50ms", "plain-end"}
+// PhaseNames are a run's phases in order: no fault, the memory fault, the CPU
+// fault.
+var PhaseNames = [3]string{"baseline", "memory", "cpu"}
 
 // The three Prometheus queries the live samples use, verbatim.
 const (
@@ -504,8 +502,8 @@ func ViewOf(sc Scenario) ScenarioView {
 		Default:     sc.Default,
 		Workload:    WorkloadView{Workflow: sc.Workload.WorkflowID, Dataset: sc.Workload.DatasetName, Description: sc.Workload.Description},
 	}
-	steps := [3]*FaultStep{nil, &sc.Memory, &sc.CPU}
-	for i, name := range scenarioPhaseNames {
+	steps := faultSteps(&sc)
+	for i, name := range PhaseNames {
 		p := ScenarioPhase{Name: name, DurationS: PhaseDurationS}
 		if st := steps[i]; st != nil {
 			kind, target, intensity := string(st.Kind), st.Target, st.Intensity

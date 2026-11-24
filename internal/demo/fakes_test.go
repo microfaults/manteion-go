@@ -101,9 +101,11 @@ type injection struct {
 	err  error
 }
 
-// newFakeLab returns a lab holding workflow demo-browse and one usable
-// demo-products dataset, whose clock starts at now and stands still. It fails
-// t at cleanup if the invariant was ever broken.
+// newFakeLab returns a lab that can run every catalog scenario: workflow
+// demo-browse, one usable demo-products dataset, and one alive instance of
+// each catalog target (inst-1 is productcatalogservice's). Its clock starts at
+// now and stands still. It fails t at cleanup if the invariant was ever
+// broken.
 func newFakeLab(t testing.TB, now time.Time) *fakeLab {
 	f := &fakeLab{
 		injections:  map[string]injection{},
@@ -116,12 +118,27 @@ func newFakeLab(t testing.TB, now time.Time) *fakeLab {
 		phaseRules:  map[string][]string{},
 		rules:       map[string]*model.Rule{},
 		enabledEver: map[string]bool{},
-		workflows:   map[string]bool{WorkflowID: true},
-		datasets: []zeus.Dataset{{ID: "ds-ok", Name: DatasetName, SizeBytes: 4096, TTLS: 0,
-			CreatedAt: now.Add(-time.Hour)}},
-		instances:  []*model.SDKInstance{{ID: "inst-1", Service: TargetService, Status: "alive"}},
-		results:    map[string][]*model.PhaseWorkflowResult{},
-		promValues: map[string]float64{},
+		workflows:   map[string]bool{},
+		results:     map[string][]*model.PhaseWorkflowResult{},
+		promValues:  map[string]float64{},
+	}
+	for _, sc := range Catalog() {
+		f.workflows[sc.Workload.WorkflowID] = true
+		if !slices.ContainsFunc(f.datasets, func(ds zeus.Dataset) bool { return ds.Name == sc.Workload.DatasetName }) {
+			id := "ds-ok"
+			if len(f.datasets) > 0 {
+				id += "-" + sc.Workload.DatasetName
+			}
+			f.datasets = append(f.datasets, zeus.Dataset{ID: id, Name: sc.Workload.DatasetName, SizeBytes: 4096,
+				TTLS: 0, CreatedAt: now.Add(-time.Hour)})
+		}
+	}
+	for _, svc := range CatalogTargets() {
+		id := "inst-" + svc
+		if svc == testTarget {
+			id = "inst-1"
+		}
+		f.instances = append(f.instances, &model.SDKInstance{ID: id, Service: svc, Status: "alive"})
 	}
 	t.Cleanup(func() {
 		if !f.allowViols {
@@ -326,32 +343,47 @@ func (f *fakeLab) requireDemoRulesOff(t testing.TB) {
 	}
 }
 
-// requireRunRuleOff fails t if the rule of run runID is enabled or served.
+// requireRunRulesOff fails t if any rule of run runID is enabled or served.
 // A run whose build never created a rule passes.
-func (f *fakeLab) requireRunRuleOff(t testing.TB, runID string) {
+func (f *fakeLab) requireRunRulesOff(t testing.TB, runID string) {
 	t.Helper()
-	id := f.ruleIDOfRun(runID)
-	if id == "" {
-		return
-	}
-	if r := f.rule(id); r != nil && r.Enabled {
-		t.Errorf("run %s: its rule is still enabled", runID)
-	}
-	if f.served(id) {
-		t.Errorf("run %s: its rule is served", runID)
+	for _, id := range f.ruleIDsOfRun(runID) {
+		if r := f.rule(id); r != nil && r.Enabled {
+			t.Errorf("run %s: its rule %s is still enabled", runID, id)
+		}
+		if f.served(id) {
+			t.Errorf("run %s: its rule %s is served", runID, id)
+		}
 	}
 }
 
-// ruleIDOfRun returns the id of run runID's rule, or "".
-func (f *fakeLab) ruleIDOfRun(runID string) string {
+// rulesOfRun returns the ids of run runID's two rules, memory then CPU, and
+// fails t unless exactly those exist: a test that loops over a run's rules
+// can then never pass by finding none.
+func (f *fakeLab) rulesOfRun(t testing.TB, runID string) [2]string {
+	t.Helper()
+	ids := f.ruleIDsOfRun(runID)
+	if len(ids) != 2 {
+		t.Fatalf("run %s has rules %v; want its memory and CPU rules", runID, ids)
+	}
+	return [2]string(ids)
+}
+
+// ruleIDsOfRun returns the ids of run runID's rules that exist, in this
+// order: its memory rule, its CPU rule (RuleName), and a rule of build 2's
+// name, demo-run-<run id>.
+func (f *fakeLab) ruleIDsOfRun(runID string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for id, r := range f.rules {
-		if r.Name == RunNamePrefix+runID {
-			return id
+	var out []string
+	for _, name := range []string{RuleName(runID, FaultMemory), RuleName(runID, FaultCPU), RunNamePrefix + runID} {
+		for id, r := range f.rules {
+			if r.Name == name {
+				out = append(out, id)
+			}
 		}
 	}
-	return ""
+	return out
 }
 
 // experimentIDOfRun returns the id of run runID's experiment, or "".
@@ -668,7 +700,7 @@ func (f *fakeLab) advanceLocked(expID string) {
 			continue
 		}
 		p.Status, p.CompletedAt = "completed", &now
-		f.results[p.ID] = []*model.PhaseWorkflowResult{{PhaseID: p.ID, WorkflowID: WorkflowID,
+		f.results[p.ID] = []*model.PhaseWorkflowResult{{PhaseID: p.ID, WorkflowID: DefaultScenario().Workload.WorkflowID,
 			RequestCount: 290 + int64(i), ErrorCount: int64(i), LatencyP50Us: 110_000, LatencyP95Us: 250_500,
 			LatencyP99Us: 359_000, ComputedAt: now}}
 		if i+1 < len(byPos) {
@@ -1141,6 +1173,10 @@ func (x fakePinger) PingContext(ctx context.Context) error {
 	}
 	return after
 }
+
+// testTarget is the default scenario's target (both of its faults'), the
+// service whose instances and served rules most tests look at.
+const testTarget = "productcatalogservice"
 
 // errLeaky is an injected cause whose text a client must never see: a driver
 // prefix, an address and ids.

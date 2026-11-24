@@ -286,7 +286,7 @@ func TestSampler_NaNIsNull(t *testing.T) {
 	defer unsub()
 	x.run()
 	s := firstSample(t, ch)
-	if got, want := sampleJSON(t, s), `{"run_id":"`+runID+`","phase":"plain","at":"2026-11-20T12:00:00.000Z","rps":5,"p95_ms":null,"error_rate":0,"target_cpu_cores":null,"target_memory_bytes":null}`; got != want {
+	if got, want := sampleJSON(t, s), `{"run_id":"`+runID+`","phase":"baseline","at":"2026-11-20T12:00:00.000Z","rps":5,"p95_ms":null,"error_rate":0,"target_cpu_cores":null,"target_memory_bytes":null}`; got != want {
 		t.Errorf("sample\n %s\nwant\n %s", got, want)
 	}
 	x.stop()

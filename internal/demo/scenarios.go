@@ -41,8 +41,11 @@ type Scenario struct {
 	Memory, CPU            FaultStep
 }
 
-// scenarioPhaseNames are a scenario run's phases in order.
-var scenarioPhaseNames = [3]string{"baseline", "memory", "cpu"}
+// faultSteps are sc's steps by phase position (PhaseNames): none for the
+// baseline, then the memory step, then the CPU step.
+func faultSteps(sc *Scenario) [3]*FaultStep {
+	return [3]*FaultStep{nil, &sc.Memory, &sc.CPU}
+}
 
 // The catalog's targets: each runs with a 200m CPU and 128Mi memory limit on
 // the lab.
@@ -65,10 +68,12 @@ const (
 	cpuHeavy       = 1.0
 )
 
-// browse is the one workload of the first release.
+// browse is the one workload of the first release: the manteion workflow
+// demo-browse on the zeus dataset demo-products (looked up by name at build
+// time, because its id changes whenever zeus restarts).
 var browse = Workload{
-	WorkflowID:  WorkflowID,
-	DatasetName: DatasetName,
+	WorkflowID:  "demo-browse",
+	DatasetName: "demo-products",
 	Description: "Each simulated visitor opens the shop's home page, may then open a product page, and may add that product to the cart; products are picked from a list of the shop's own.",
 }
 

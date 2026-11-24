@@ -2,6 +2,7 @@ package demo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,39 +19,109 @@ import (
 
 // ---- helpers ----
 
-// seeded is one run seeded into a fake lab.
+// seeded is one run of build 2's shape seeded into a lab (buildOldRun).
 type seeded struct {
-	runID string
-	Built
+	runID        string
+	ExperimentID string
+	RuleID       string
+	PhaseIDs     [3]string
 }
 
-// seed builds a run in f, one second (of f's clock) after the previous one,
-// switches its rule on when on, and moves its experiment to status: planned
-// (as built), running (its fault phase running, so an enabled rule is served),
-// or completed, failed or cancelled (phases not yet ended are skipped).
+// Build 2's run shape: three phases, the middle one carrying the run's one
+// rule, demo-run-<run id>, an inline +50 ms latency on productcatalogservice.
+var oldPhaseNames = [3]string{"plain", "catalog-latency-50ms", "plain-end"}
+
+const (
+	oldFaultPhase = 1
+	oldSpecName   = "demo-catalog-latency-50ms"
+)
+
+// buildOldRun writes run runID as build 2's BuildRun did, through d's repos:
+// the shared spec demo-catalog-latency-50ms (created once), one disabled rule
+// demo-run-<run id> on productcatalogservice, and a planned experiment
+// demo-run-<run id> whose phases plain, catalog-latency-50ms and plain-end
+// each run demo-browse at 30 VUs and 3 rps for 40 s, the rule attached to the
+// middle phase only. Such runs are what the sweep and retention know how to
+// group (one rule named like its experiment) and what a manteion upgraded from
+// build 2 still finds in its database.
+func buildOldRun(ctx context.Context, d Deps, runID string) (seeded, error) {
+	now := d.Clock.Now()
+	s := seeded{runID: runID}
+	specs, err := d.Specs.ListSpecs(ctx)
+	if err != nil {
+		return s, err
+	}
+	var specID string
+	for _, sp := range specs {
+		if sp.Name == oldSpecName {
+			specID = sp.ID
+		}
+	}
+	if specID == "" {
+		spec := &model.FaultSpec{ID: id.New("spec"), Name: oldSpecName, Category: "inline", FaultType: "latency",
+			Params: json.RawMessage(`{"delay":"50ms"}`), DurationMs: 60000, CreatedAt: now}
+		if err := d.Specs.CreateSpec(ctx, spec); err != nil {
+			return s, err
+		}
+		specID = spec.ID
+	}
+	rule := &model.Rule{ID: id.New("rule"), Name: RunNamePrefix + runID, Service: testTarget, Priority: 100, Mode: "inline",
+		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: specID}, CreatedAt: now, UpdatedAt: now}
+	if err := d.Rules.Create(ctx, rule); err != nil {
+		return s, err
+	}
+	s.RuleID = rule.ID
+	exp := &model.Experiment{ID: id.New("exp"), Name: RunNamePrefix + runID, Status: "planned", CreatedBy: CreatedBy, CreatedAt: now}
+	if err := d.Experiments.Create(ctx, exp); err != nil {
+		return s, err
+	}
+	s.ExperimentID = exp.ID
+	for i, name := range oldPhaseNames {
+		p := &model.ExperimentPhase{ID: id.New("phase"), ExperimentID: exp.ID, Name: name, Position: i, Status: "pending",
+			FrozenServices: []model.CacheBoxConfig{}}
+		if err := d.Experiments.CreatePhase(ctx, p); err != nil {
+			return s, err
+		}
+		s.PhaseIDs[i] = p.ID
+		if err := d.Experiments.AttachPhaseWorkflows(ctx, p.ID, []model.PhaseWorkflow{{PhaseID: p.ID,
+			WorkflowID: "demo-browse", VUs: 30, RateRPS: 3, DurationSec: 40, DatasetID: "ds-ok"}}); err != nil {
+			return s, err
+		}
+		if i == oldFaultPhase {
+			if err := d.Experiments.AttachPhaseRules(ctx, p.ID, []string{rule.ID}); err != nil {
+				return s, err
+			}
+		}
+	}
+	return s, nil
+}
+
+// seed writes a run of build 2's shape in f (buildOldRun), one second (of f's
+// clock) after the previous one, switches its rule on when on, and moves its
+// experiment to status: planned (as built), running (its fault phase running,
+// so an enabled rule is served), or completed, failed or cancelled (phases not
+// yet ended are skipped).
 func seed(t *testing.T, f *fakeLab, status string, on bool) seeded {
 	t.Helper()
 	ctx := context.Background()
-	s := seeded{runID: id.New(RunIDPrefix)}
-	built, err := BuildRun(ctx, f.deps(), s.runID, testRunCap)
+	s, err := buildOldRun(ctx, f.deps(), id.New(RunIDPrefix))
 	if err != nil {
 		t.Fatalf("seed: build: %v", err)
 	}
-	s.Built = built
 	f.clock.Advance(time.Second)
 	if on {
-		if err := SetRuleEnabled(ctx, fakeRules{f}, built.RuleID, true); err != nil {
+		if err := SetRuleEnabled(ctx, fakeRules{f}, s.RuleID, true); err != nil {
 			t.Fatalf("seed: switch on: %v", err)
 		}
 	}
 	switch status {
 	case "planned":
 	case "running":
-		f.setExperimentStatus(built.ExperimentID, "running")
-		f.setPhaseStatus(built.PhaseIDs[0], "completed")
-		f.setPhaseStatus(built.PhaseIDs[FaultPhaseIndex], "running")
+		f.setExperimentStatus(s.ExperimentID, "running")
+		f.setPhaseStatus(s.PhaseIDs[0], "completed")
+		f.setPhaseStatus(s.PhaseIDs[oldFaultPhase], "running")
 	case "completed", "failed", "cancelled":
-		f.endExperiment(built.ExperimentID, status, testNow, testNow)
+		f.endExperiment(s.ExperimentID, status, testNow, testNow)
 	default:
 		t.Fatalf("seed: unknown status %q", status)
 	}
@@ -81,7 +152,7 @@ func operatorSpec(f *fakeLab) string {
 
 func addRule(t *testing.T, f *fakeLab, ruleID, name string, enabled bool) {
 	t.Helper()
-	r := &model.Rule{ID: ruleID, Name: name, Service: TargetService, Enabled: enabled, Priority: 10, Mode: "inline",
+	r := &model.Rule{ID: ruleID, Name: name, Service: testTarget, Enabled: enabled, Priority: 10, Mode: "inline",
 		Action: model.RuleAction{Type: "fault_spec", FaultSpecID: operatorSpec(f)}, CreatedAt: f.clock.Now()}
 	if err := (fakeRules{f}).Create(context.Background(), r); err != nil {
 		t.Fatalf("add rule %s: %v", name, err)
@@ -590,7 +661,7 @@ func TestRetain_PagesPastTheStoreLimit(t *testing.T) {
 		for i := 0; i < n; i++ {
 			runID := id.New(RunIDPrefix)
 			at := testNow.Add(time.Duration(i) * time.Minute)
-			rule := &model.Rule{ID: fmt.Sprintf("rule-%03d", i), Name: RunNamePrefix + runID, Service: TargetService,
+			rule := &model.Rule{ID: fmt.Sprintf("rule-%03d", i), Name: RunNamePrefix + runID, Service: testTarget,
 				Mode: "inline", Action: model.RuleAction{Type: "fault_spec", FaultSpecID: spec}, CreatedAt: at}
 			if err := (fakeRules{f}).Create(context.Background(), rule); err != nil {
 				t.Fatal(err)
@@ -952,7 +1023,7 @@ func TestWorker_RetainCollectsWatchdogLeftover(t *testing.T) {
 	if err := <-passes; err != nil {
 		t.Fatalf("pass after the first run: %v", err)
 	}
-	leftover, leftRule := x.expID(first.RunID), x.f.ruleIDOfRun(first.RunID)
+	leftover, leftRules := x.expID(first.RunID), x.f.rulesOfRun(t, first.RunID)
 	if st := x.f.experimentStatus(leftover); st != "planned" {
 		t.Fatalf("the timed-out run's experiment is %s; want planned (left behind)", st)
 	}
@@ -975,8 +1046,8 @@ func TestWorker_RetainCollectsWatchdogLeftover(t *testing.T) {
 	if err := x.w.Retain(context.Background()); err != nil {
 		t.Fatalf("a later pass: %v", err)
 	}
-	if x.f.hasExperiment(leftover) || x.f.hasRule(leftRule) {
-		t.Error("the leftover and its rule were not deleted on the later pass")
+	if x.f.hasExperiment(leftover) || x.f.hasRule(leftRules[0]) || x.f.hasRule(leftRules[1]) {
+		t.Error("the leftover and its rules were not deleted on the later pass")
 	}
 }
 
@@ -997,9 +1068,8 @@ func TestWorker_ShutdownDisablesCurrentRule(t *testing.T) {
 	phases := x.f.phasesOf(exp)
 	x.f.setPhaseStatus(phases[0].ID, "completed")
 	x.f.setPhaseStatus(phases[1].ID, "running")
-	rule := x.f.ruleIDOfRun(r.RunID)
-	if !x.f.served(rule) {
-		t.Fatal("precondition: the fault phase runs but its rule is not served")
+	if rules := x.f.rulesOfRun(t, r.RunID); !x.f.served(rules[0]) {
+		t.Fatal("precondition: the memory phase runs but its rule is not served")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1030,8 +1100,8 @@ func TestWorker_ShutdownDisablesCurrentRule(t *testing.T) {
 	if _, err := x.q.Enqueue("c", testNow); !errors.Is(err, ErrQueueClosed) {
 		t.Errorf("enqueue after Shutdown: %v; want ErrQueueClosed", err)
 	}
-	if n := len(x.f.callList("rules.Create")); n != 1 {
-		t.Errorf("%d runs built; want only the first", n)
+	if n := len(x.f.callList("rules.Create")); n != 2 {
+		t.Errorf("%d rules created; want only the first run's two", n)
 	}
 }
 
@@ -1044,7 +1114,7 @@ func TestWorker_ShutdownReportsSwitchOffFailure(t *testing.T) {
 	r, ch := x.enqueue("a")
 	x.start()
 	awaitPhase(t, ch, 0, PhaseRunning)
-	rule := x.f.ruleIDOfRun(r.RunID)
+	rules := x.f.rulesOfRun(t, r.RunID)
 	x.f.fail("rules.SetEnabled", errLeaky)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1059,8 +1129,10 @@ func TestWorker_ShutdownReportsSwitchOffFailure(t *testing.T) {
 	}
 	assertNoLeak(t, err.Error())
 	waitClosed(t, x.w.done, "Run to return")
-	if r := x.f.rule(rule); r == nil || !r.Enabled {
-		t.Fatalf("precondition of the rest: rule %+v; want still on", r)
+	for _, rule := range rules {
+		if r := x.f.rule(rule); r == nil || !r.Enabled {
+			t.Fatalf("precondition of the rest: rule %+v; want still on", r)
+		}
 	}
 	x.f.uninject("rules.SetEnabled")
 	if err := Sweep(context.Background(), x.f.deps(), 20); err != nil {
@@ -1112,7 +1184,7 @@ func TestWorker_ShutdownBoundedByContext(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Shutdown: %v; want the deadline", err)
 		}
-		x.f.requireRunRuleOff(t, r.RunID)
+		x.f.requireRunRulesOff(t, r.RunID)
 		release()
 		waitClosed(t, x.w.done, "Run to return once unblocked")
 	})
@@ -1141,7 +1213,9 @@ func TestWorker_ShutdownBoundedByContext(t *testing.T) {
 			t.Errorf("Shutdown: %v; want an unfinished switch-off", err)
 		}
 		release()
-		waitFor(t, "the switch-off to land", func() bool { r := x.f.rule(x.f.ruleIDOfRun(r.RunID)); return r != nil && !r.Enabled })
+		for _, rule := range x.f.rulesOfRun(t, r.RunID) {
+			waitFor(t, "the switch-off to land", func() bool { r := x.f.rule(rule); return r != nil && !r.Enabled })
+		}
 		waitClosed(t, x.w.done, "Run to return")
 	})
 }
@@ -1504,7 +1578,7 @@ func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
 		pendingAtPass.Store(x.w.SwitchOffPending())
 		passes <- x.w.Retain(ctx)
 	}
-	x.f.fail("rules.SetEnabled#1", errLeaky) // the run's own first switch-off
+	x.f.fail("rules.SetEnabled#1", errLeaky) // the run's own first switch-off, of its memory rule
 	x.f.mu.Lock()
 	x.f.autopilot = true
 	x.f.mu.Unlock()
@@ -1518,9 +1592,13 @@ func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
 	if !pendingAtPass.Load() {
 		t.Fatal("precondition: the switch-off was not pending during the pass")
 	}
-	rule, exp := x.f.ruleIDOfRun(r.RunID), x.expID(r.RunID)
+	rules, exp := x.f.rulesOfRun(t, r.RunID), x.expID(r.RunID)
+	rule := rules[0]
 	if rr := x.f.rule(rule); rr == nil || !rr.Enabled {
-		t.Fatalf("precondition: the pending run's rule %+v; want still on", rr)
+		t.Fatalf("precondition: the pending run's memory rule %+v; want still on", rr)
+	}
+	if rr := x.f.rule(rules[1]); rr == nil || rr.Enabled {
+		t.Fatalf("precondition: the pending run's cpu rule %+v; want kept, off", rr)
 	}
 	if st := x.f.experimentStatus(exp); st != "completed" {
 		t.Errorf("the pending run's experiment is %q; want completed, kept", st)
@@ -1532,7 +1610,16 @@ func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
 		}
 	}
 	if !slices.Equal(writes, []string{"rules.SetEnabled " + rule + " false"}) {
-		t.Errorf("writes to the pending run's rule %v; want only the worker's one failed switch-off", writes)
+		t.Errorf("writes to the pending run's memory rule %v; want only the worker's one failed switch-off", writes)
+	}
+	writes = nil
+	for _, c := range callsFor(x.f, rules[1]) {
+		if strings.HasPrefix(c, "rules.SetEnabled ") || strings.HasPrefix(c, "rules.Delete ") {
+			writes = append(writes, c)
+		}
+	}
+	if !slices.Equal(writes, []string{"rules.SetEnabled " + rules[1] + " false"}) {
+		t.Errorf("writes to the pending run's cpu rule %v; want only the worker's one switch-off", writes)
 	}
 	for _, s := range older {
 		requireRemovedInOrder(t, x.f, s)

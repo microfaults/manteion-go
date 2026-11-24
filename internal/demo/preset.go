@@ -19,27 +19,24 @@ import (
 const (
 	// CreatedBy is the created_by of every demo experiment.
 	CreatedBy = "manteion-demo"
-	// RunNamePrefix + run id names a run's experiment and its rule.
+	// RunNamePrefix + run id names a run's experiment; RuleName adds the
+	// fault's kind for each of its rules.
 	RunNamePrefix = "demo-run-"
 	// RunIDPrefix is the prefix of run ids: id.New(RunIDPrefix).
 	RunIDPrefix = "demo"
-	// SpecName names the one fault spec every run's rule uses.
-	SpecName = "demo-catalog-latency-50ms"
-	// TargetService is the service the fault phase slows down.
-	TargetService = "productcatalogservice"
-	// WorkflowID is the manteion workflow every phase runs.
-	WorkflowID = "demo-browse"
-	// DatasetName is the zeus dataset the workflow reads, looked up by name
-	// at build time because its id changes whenever zeus restarts.
-	DatasetName = "demo-products"
 )
 
-// The preset's load, rule and spec.
+// A run's load, rules and specs.
 const (
-	loadVUs        = 30
-	loadRateRPS    = 3
-	rulePriority   = 100
-	specDelay      = "50ms"
+	loadVUs      = 30
+	loadRateRPS  = 3
+	rulePriority = 100
+	// ruleMode: the SDK runs every non-inline fault in the background anyway.
+	ruleMode = "background"
+	// specCategory is the atropos category of both fault kinds.
+	specCategory = "resource"
+	// specDurationMs outlasts a phase: the phase's end withdraws the rule,
+	// which stops the fault.
 	specDurationMs = 60000
 	// datasetSlack is how long past the run cap a dataset must still live.
 	datasetSlack = time.Minute
@@ -72,8 +69,14 @@ var (
 	ErrNotDemoRule = errors.New("demo: not a demo run's rule")
 )
 
-// errNoUsableDataset is the cause when zeus answers but holds no usable dataset.
-var errNoUsableDataset = errors.New("demo: no usable dataset")
+var (
+	// errNoUsableDataset is the cause when zeus answers but holds no usable
+	// dataset.
+	errNoUsableDataset = errors.New("demo: no usable dataset")
+	// errSpecDrifted is the cause when a stored fault spec carries a step's
+	// name but no longer says exactly the step's fault.
+	errSpecDrifted = errors.New("demo: a fault spec with the demo's name says another fault")
+)
 
 // StepError is the demo's internal error: the step that failed, its class and
 // the underlying cause. The class is one of the Err* values above, or the
@@ -132,36 +135,102 @@ func classFor(ctx context.Context, def error) error {
 	return def
 }
 
-// Built names the rows BuildRun created for one run.
+// Built names the rows BuildRun created for one run: its experiment, its two
+// rules (RuleIDs[0] the memory phase's, RuleIDs[1] the CPU phase's) and its
+// phases in order.
 type Built struct {
-	ExperimentID, RuleID string
-	PhaseIDs             [3]string
+	ExperimentID string
+	RuleIDs      [2]string
+	PhaseIDs     [3]string
 }
 
-// BuildRun writes one run's preset: a disabled fault rule on
-// productcatalogservice, and a planned experiment (created_by manteion-demo)
-// with the phases plain, catalog-latency-50ms and plain-end, each running
-// demo-browse at 30 VUs and 3 rps for 40 s on a demo-products dataset that
-// outlives now + runCap + 1 min; the rule is attached to the middle phase only.
-// The rule is never enabled here (that is SetRuleEnabled's job, just before the
-// start).
+// RuleName names run runID's rule for the fault of kind k:
+// demo-run-<run id>-memory or demo-run-<run id>-cpu.
+func RuleName(runID string, k FaultKind) string { return RunNamePrefix + runID + "-" + string(k) }
+
+// SpecNameFor names the shared fault spec of a fault step:
+// demo-<kind>-<target>-<intensity>, as demo-memory-productcatalogservice-moderate.
+func SpecNameFor(step FaultStep) string {
+	return "demo-" + string(step.Kind) + "-" + step.Target + "-" + step.Intensity
+}
+
+// RunIDOfRule returns the run id a run's rule is named for: <id> for
+// demo-run-<id>-memory and demo-run-<id>-cpu, and for build 2's single rule
+// demo-run-<id>. ok is false for any other name, including one whose <id> is
+// not of the shape this package mints (validRunID).
+//
+// The reading is unambiguous: a run id is "demo-" and a lower-case canonical
+// UUID (hex digits and hyphens only, of fixed length), and "-memory" and
+// "-cpu" hold letters no UUID has, so no run id ends in either and a name
+// matches at most one of the three forms.
+func RunIDOfRule(name string) (runID string, ok bool) {
+	rest, ok := strings.CutPrefix(name, RunNamePrefix)
+	if !ok {
+		return "", false
+	}
+	for _, k := range [...]FaultKind{FaultMemory, FaultCPU} {
+		if id, cut := strings.CutSuffix(rest, "-"+string(k)); cut && validRunID(id) {
+			return id, true
+		}
+	}
+	if validRunID(rest) {
+		return rest, true
+	}
+	return "", false
+}
+
+// buildable reports whether sc can be built: a memory step then a CPU step,
+// each with a target, an intensity label and a target_load in (0, 1], and a
+// workload that names its workflow and dataset.
+func buildable(sc Scenario) bool {
+	if sc.Memory.Kind != FaultMemory || sc.CPU.Kind != FaultCPU ||
+		sc.Workload.WorkflowID == "" || sc.Workload.DatasetName == "" {
+		return false
+	}
+	for _, st := range [...]FaultStep{sc.Memory, sc.CPU} {
+		if st.Target == "" || st.Intensity == "" || !(st.TargetLoad > 0 && st.TargetLoad <= 1) {
+			return false
+		}
+	}
+	return true
+}
+
+// BuildRun writes the rows of one run of scenario sc: two disabled fault
+// rules, demo-run-<run id>-memory in the memory step's target and
+// demo-run-<run id>-cpu in the CPU step's (mode background, priority 100,
+// matching every request), and a planned experiment demo-run-<run id>
+// (created_by manteion-demo) with the phases baseline, memory and cpu, each
+// running the scenario's workflow at 30 VUs and 3 rps for 40 s on a dataset of
+// the scenario's that outlives now + runCap + 1 min. The memory rule is
+// attached to the memory phase only and the CPU rule to the cpu phase only.
+// The rules are never enabled here (that is SetRuleEnabled's job, just before
+// the start).
+//
+// Each rule runs its step's shared fault spec (SpecNameFor): created by the
+// first build that needs it, reused by every later one, and checked before
+// use to still say exactly the step's fault (resource, the step's kind,
+// params {"target_load": the step's}, duration 60 s). A stored spec with the
+// step's name that says anything else is ErrBuild before anything is written:
+// it is never used, and none is created beside it.
 //
 // Nothing is written until the workflow and a dataset are known to exist
-// (else ErrNoDataset). The writes are not one transaction, so a failure at any
-// later step deletes what this call created, experiment first (which drops its
-// phase links) and then the rule, each delete on its own context detached
-// from ctx with its own timeout; the shared fault spec stays for the next run.
-// A write failure is ErrBuild, plus ErrCleanupIncomplete when a delete failed.
-// When ctx is done the class is ctx's error instead (see StepError).
-func BuildRun(ctx context.Context, d Deps, runID string, runCap time.Duration) (Built, error) {
-	return buildRun(ctx, d, runID, runCap, cleanupTimeout)
+// (else ErrNoDataset) and both specs are known not to have drifted. The writes
+// are not one transaction, so a failure at any later step deletes what this
+// call created, experiment first (which drops its phase links) and then each
+// rule, each delete on its own context detached from ctx with its own timeout;
+// the shared fault specs stay for the next run. A write failure is ErrBuild,
+// plus ErrCleanupIncomplete when a delete failed. When ctx is done the class
+// is ctx's error instead (see StepError). A scenario that is not buildable is
+// ErrBuild with nothing read or written.
+func BuildRun(ctx context.Context, d Deps, runID string, sc Scenario, runCap time.Duration) (Built, error) {
+	return buildRun(ctx, d, runID, sc, runCap, cleanupTimeout)
 }
 
 // buildRun is BuildRun with the timeout of each cleanup delete as a parameter.
-func buildRun(ctx context.Context, d Deps, runID string, runCap, cleanupTimeout time.Duration) (Built, error) {
-	log := d.logger().With("run_id", runID)
+func buildRun(ctx context.Context, d Deps, runID string, sc Scenario, runCap, cleanupTimeout time.Duration) (Built, error) {
+	log := d.logger().With("run_id", runID, "scenario", sc.ID)
 	if runID == "" || runCap <= 0 || d.Experiments == nil || d.Rules == nil || d.Specs == nil ||
-		d.Workflows == nil || d.Zeus == nil || d.Clock == nil {
+		d.Workflows == nil || d.Zeus == nil || d.Clock == nil || !buildable(sc) {
 		return Built{}, &StepError{Step: "check_input", Class: ErrBuild}
 	}
 	now := d.Clock.Now()
@@ -173,17 +242,18 @@ func buildRun(ctx context.Context, d Deps, runID string, runCap, cleanupTimeout 
 	}
 
 	// Preconditions: nothing is written before they hold.
-	if _, err := d.Workflows.Get(ctx, WorkflowID); err != nil {
+	if _, err := d.Workflows.Get(ctx, sc.Workload.WorkflowID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return refuse("get_workflow", ErrNoDataset, err)
 		}
 		return refuse("get_workflow", ErrBuild, err)
 	}
-	datasetID, err := pickDataset(ctx, d.Zeus, now, runCap)
+	datasetID, err := pickDataset(ctx, d.Zeus, sc.Workload.DatasetName, now, runCap)
 	if err != nil {
 		return refuse("pick_dataset", ErrNoDataset, err)
 	}
-	specID, step, err := ensureSpec(ctx, d.Specs, now, log)
+	steps := [2]FaultStep{sc.Memory, sc.CPU}
+	specIDs, step, err := ensureSpecs(ctx, d.Specs, steps, now, log)
 	if err != nil {
 		return refuse(step, ErrBuild, err)
 	}
@@ -194,40 +264,47 @@ func buildRun(ctx context.Context, d Deps, runID string, runCap, cleanupTimeout 
 	fail := func(step string, cause error) (Built, error) {
 		complete := made.undo(ctx, d, log, cleanupTimeout)
 		err := &StepError{Step: step, Class: classFor(ctx, ErrBuild), Cause: cause, CleanupIncomplete: !complete}
-		log.Warn("demo: run not built", "error", err, "experiment_id", made.experimentID, "rule_id", made.ruleID)
+		log.Warn("demo: run not built", "error", err, "experiment_id", made.experimentID, "rule_ids", made.ruleIDs)
 		return Built{}, err
 	}
 
-	rule := &model.Rule{
-		ID:        id.New("rule"),
-		Name:      RunNamePrefix + runID,
-		Service:   TargetService,
-		Enabled:   false,
-		Priority:  rulePriority,
-		Mode:      "inline",
-		Action:    model.RuleAction{Type: "fault_spec", FaultSpecID: specID},
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	made.ruleID = rule.ID
-	if err := d.Rules.Create(ctx, rule); err != nil {
-		return fail("create_rule", err)
+	var built Built
+	for i, st := range steps {
+		rule := &model.Rule{
+			ID:        id.New("rule"),
+			Name:      RuleName(runID, st.Kind),
+			Service:   st.Target,
+			Enabled:   false,
+			Priority:  rulePriority,
+			Mode:      ruleMode,
+			Action:    model.RuleAction{Type: "fault_spec", FaultSpecID: specIDs[i]},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		made.ruleIDs = append(made.ruleIDs, rule.ID)
+		if err := d.Rules.Create(ctx, rule); err != nil {
+			return fail("create_rule_"+string(st.Kind), err)
+		}
+		built.RuleIDs[i] = rule.ID
 	}
 
 	exp := &model.Experiment{
-		ID:          id.New("exp"),
-		Name:        RunNamePrefix + runID,
-		Description: "Public demo run: plain load, then " + FaultLabel + ", then plain load again.",
-		Status:      "planned",
-		CreatedBy:   CreatedBy,
-		CreatedAt:   now,
+		ID:   id.New("exp"),
+		Name: RunNamePrefix + runID,
+		Description: "Public demo run of scenario " + sc.ID + ": no fault, then the " + sc.Memory.Intensity +
+			" memory fault in " + sc.Memory.Target + ", then the " + sc.CPU.Intensity + " CPU fault in " + sc.CPU.Target + ".",
+		Status:    "planned",
+		CreatedBy: CreatedBy,
+		CreatedAt: now,
 	}
 	made.experimentID = exp.ID
 	if err := d.Experiments.Create(ctx, exp); err != nil {
 		return fail("create_experiment", err)
 	}
+	built.ExperimentID = exp.ID
 
-	built := Built{ExperimentID: exp.ID, RuleID: rule.ID}
+	// The rule each phase carries: none, the memory rule, the CPU rule.
+	phaseRule := [3]string{"", built.RuleIDs[0], built.RuleIDs[1]}
 	for i, name := range PhaseNames {
 		phase := &model.ExperimentPhase{
 			ID:             id.New("phase"),
@@ -243,7 +320,7 @@ func buildRun(ctx context.Context, d Deps, runID string, runCap, cleanupTimeout 
 		built.PhaseIDs[i] = phase.ID
 		load := []model.PhaseWorkflow{{
 			PhaseID:     phase.ID,
-			WorkflowID:  WorkflowID,
+			WorkflowID:  sc.Workload.WorkflowID,
 			VUs:         loadVUs,
 			RateRPS:     loadRateRPS,
 			DurationSec: PhaseDurationS,
@@ -252,30 +329,31 @@ func buildRun(ctx context.Context, d Deps, runID string, runCap, cleanupTimeout 
 		if err := d.Experiments.AttachPhaseWorkflows(ctx, phase.ID, load); err != nil {
 			return fail(fmt.Sprintf("attach_workflows_%d", i), err)
 		}
-		if i == FaultPhaseIndex {
-			if err := d.Experiments.AttachPhaseRules(ctx, phase.ID, []string{rule.ID}); err != nil {
-				return fail("attach_rule", err)
+		if ruleID := phaseRule[i]; ruleID != "" {
+			if err := d.Experiments.AttachPhaseRules(ctx, phase.ID, []string{ruleID}); err != nil {
+				return fail(fmt.Sprintf("attach_rule_%d", i), err)
 			}
 		}
 	}
-	log.Info("demo: run built", "experiment_id", exp.ID, "rule_id", rule.ID)
+	log.Info("demo: run built", "experiment_id", exp.ID, "rule_ids", built.RuleIDs[:])
 	return built, nil
 }
 
 // created is what a build wrote so far.
 type created struct {
-	experimentID, ruleID string
+	experimentID string
+	ruleIDs      []string
 }
 
 // undo deletes a failed build's rows: the experiment first (its phases and
-// their workflow and rule links go with it), then the rule, which the store
-// refuses to delete while a phase still links it. The rule was never enabled,
-// so it is not served at any point in between. Each delete runs on its own
+// their workflow and rule links go with it), then each rule, which the store
+// refuses to delete while a phase still links it. No rule was ever enabled,
+// so none is served at any point in between. Each delete runs on its own
 // context, detached from ctx (which may be why the build failed) and bounded
-// by timeout, so a hung first delete cannot starve the second. A row that
-// cannot be deleted is logged by id and left: a planned experiment and a
-// disabled rule serve nothing, and the start-up sweep removes them. undo
-// reports whether everything it tried to delete is gone.
+// by timeout, so a hung delete cannot starve the next. A row that cannot be
+// deleted is logged by id and left: a planned experiment and a disabled rule
+// serve nothing, and the start-up sweep removes them. undo reports whether
+// everything it tried to delete is gone.
 func (c created) undo(ctx context.Context, d Deps, log *slog.Logger, timeout time.Duration) bool {
 	del := func(fn func(context.Context, string) error, id string) error {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
@@ -290,23 +368,24 @@ func (c created) undo(ctx context.Context, d Deps, log *slog.Logger, timeout tim
 		if err := del(d.Experiments.Delete, c.experimentID); err != nil {
 			complete = false
 			log.Error("demo: cleanup left the run's planned experiment behind",
-				"experiment_id", c.experimentID, "rule_id", c.ruleID, "error", err)
+				"experiment_id", c.experimentID, "rule_ids", c.ruleIDs, "error", err)
 		}
 	}
-	if c.ruleID != "" {
-		if err := del(d.Rules.Delete, c.ruleID); err != nil {
+	for _, ruleID := range c.ruleIDs {
+		if err := del(d.Rules.Delete, ruleID); err != nil {
 			complete = false
-			log.Error("demo: cleanup left the run's disabled rule behind",
-				"rule_id", c.ruleID, "experiment_id", c.experimentID, "error", err)
+			log.Error("demo: cleanup left a disabled rule of the run behind",
+				"rule_id", ruleID, "experiment_id", c.experimentID, "error", err)
 		}
 	}
 	return complete
 }
 
-// pickDataset returns the id of the dataset the run's load reads: see
-// usableDataset. A zeus that cannot be asked, or that holds no usable dataset,
-// is an error; when ctx is done the error is ctx's own, never "no dataset".
-func pickDataset(ctx context.Context, z LoadGen, now time.Time, runCap time.Duration) (string, error) {
+// pickDataset returns the id of the dataset named name the run's load reads:
+// see usableDataset. A zeus that cannot be asked, or that holds no usable
+// dataset, is an error; when ctx is done the error is ctx's own, never "no
+// dataset".
+func pickDataset(ctx context.Context, z LoadGen, name string, now time.Time, runCap time.Duration) (string, error) {
 	all, err := z.ListDatasets(ctx)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return "", ctxErr
@@ -314,24 +393,24 @@ func pickDataset(ctx context.Context, z LoadGen, now time.Time, runCap time.Dura
 	if err != nil {
 		return "", err
 	}
-	ds, ok := usableDataset(all, now, runCap)
+	ds, ok := usableDataset(all, name, now, runCap)
 	if !ok {
 		return "", errNoUsableDataset
 	}
 	return ds.ID, nil
 }
 
-// usableDataset picks, among zeus's datasets, one named demo-products that has
-// rows and outlives the run: ExpiresAt is zero (zeus's ttl_s <= 0, which zeus
+// usableDataset picks, among zeus's datasets, one named name that has rows
+// and outlives the run: ExpiresAt is zero (zeus's ttl_s <= 0, which zeus
 // stores without expiry) or strictly after now + runCap + 1 min. Of several,
 // the newest wins (then the lowest id), so the choice does not depend on the
 // order zeus lists them in.
-func usableDataset(all []zeus.Dataset, now time.Time, runCap time.Duration) (zeus.Dataset, bool) {
+func usableDataset(all []zeus.Dataset, name string, now time.Time, runCap time.Duration) (zeus.Dataset, bool) {
 	need := now.Add(runCap + datasetSlack)
 	var best zeus.Dataset
 	found := false
 	for _, ds := range all {
-		if ds.Name != DatasetName || ds.SizeBytes <= 0 || ds.ID == "" {
+		if ds.Name != name || ds.SizeBytes <= 0 || ds.ID == "" {
 			continue
 		}
 		if exp := ds.ExpiresAt(); !exp.IsZero() && !exp.After(need) {
@@ -344,43 +423,73 @@ func usableDataset(all []zeus.Dataset, now time.Time, runCap time.Duration) (zeu
 	return best, found
 }
 
-// ensureSpec returns the id of the shared fault spec, creating it when no spec
-// named demo-catalog-latency-50ms still says exactly +50 ms inline latency. A
-// spec with that name but other content (edited by hand, say) is never used.
-// On error it also returns the step that failed.
-func ensureSpec(ctx context.Context, specs Specs, now time.Time, log *slog.Logger) (string, string, error) {
-	all, err := specs.ListSpecs(ctx)
-	if err != nil {
-		return "", "list_specs", err
-	}
-	for _, s := range all {
-		if s.Name != SpecName {
-			continue
-		}
-		if presetSpecMatches(s) {
-			return s.ID, "", nil
-		}
-		log.Warn("demo: a fault spec carries the demo's name but not its fault; not using it", "spec_id", s.ID)
-	}
-	spec := &model.FaultSpec{
-		ID:          id.New("spec"),
-		Name:        SpecName,
-		Category:    "inline",
-		FaultType:   "latency",
-		Params:      json.RawMessage(`{"delay":"` + specDelay + `"}`),
-		Description: "Public demo: " + FaultLabel + ".",
-		DurationMs:  specDurationMs,
-		CreatedAt:   now,
-	}
-	if err := specs.CreateSpec(ctx, spec); err != nil {
-		return "", "create_spec", err
-	}
-	return spec.ID, "", nil
+// specParams is a step's fault params: target_load and nothing else (no
+// mechanism: atropos picks its own).
+type specParams struct {
+	TargetLoad float64 `json:"target_load"`
 }
 
-// presetSpecMatches reports whether s is exactly the preset's fault.
-func presetSpecMatches(s *model.FaultSpec) bool {
-	if s.Category != "inline" || s.FaultType != "latency" || s.Host != "" || s.Network != nil ||
+// ensureSpecs returns, for each step, the id of its shared fault spec
+// (SpecNameFor): the stored one when it says exactly the step's fault, else a
+// new one. Both steps are checked before anything is created: a stored spec
+// with a step's name that says anything else (edited by hand, say) is
+// errSpecDrifted, logged with its id, and nothing is created. On error it
+// also returns the step that failed.
+func ensureSpecs(ctx context.Context, specs Specs, steps [2]FaultStep, now time.Time, log *slog.Logger) ([2]string, string, error) {
+	var ids [2]string
+	all, err := specs.ListSpecs(ctx)
+	if err != nil {
+		return ids, "list_specs", err
+	}
+	for i, st := range steps {
+		name := SpecNameFor(st)
+		for _, s := range all {
+			if s == nil || s.Name != name {
+				continue
+			}
+			if !specMatches(s, st) {
+				log.Warn("demo: a fault spec carries the demo's name but not the catalog's fault; not building the run",
+					"spec_id", s.ID, "spec", name)
+				return ids, "check_spec", errSpecDrifted
+			}
+			if ids[i] == "" {
+				ids[i] = s.ID
+			}
+		}
+	}
+	for i, st := range steps {
+		if ids[i] != "" {
+			continue
+		}
+		params, err := json.Marshal(specParams{TargetLoad: st.TargetLoad})
+		if err != nil {
+			return ids, "create_spec", err
+		}
+		spec := &model.FaultSpec{
+			ID:          id.New("spec"),
+			Name:        SpecNameFor(st),
+			Category:    specCategory,
+			FaultType:   string(st.Kind),
+			Params:      params,
+			Description: "Public demo: the " + st.Intensity + " " + string(st.Kind) + " fault in " + st.Target + ".",
+			DurationMs:  specDurationMs,
+			CreatedAt:   now,
+		}
+		if err := specs.CreateSpec(ctx, spec); err != nil {
+			return ids, "create_spec", err
+		}
+		ids[i] = spec.ID
+	}
+	return ids, "", nil
+}
+
+// specMatches reports whether s says exactly step st's fault: category
+// resource, the step's kind, no host, network envelope or ramp, duration_ms
+// 60000, and params that decode to exactly {"target_load": the step's} (no
+// mechanism, no other key). Values are compared decoded, not as bytes: the
+// store hands params back as they were sent.
+func specMatches(s *model.FaultSpec, st FaultStep) bool {
+	if s.Category != specCategory || s.FaultType != string(st.Kind) || s.Host != "" || s.Network != nil ||
 		s.DurationMs != specDurationMs || s.RampUpMs != 0 || s.RampDownMs != 0 {
 		return false
 	}
@@ -388,7 +497,8 @@ func presetSpecMatches(s *model.FaultSpec) bool {
 	if err := json.Unmarshal(s.Params, &params); err != nil || len(params) != 1 {
 		return false
 	}
-	return params["delay"] == specDelay
+	load, ok := params["target_load"].(float64)
+	return ok && load == st.TargetLoad
 }
 
 // SetRuleEnabled switches a run's rule on or off.
