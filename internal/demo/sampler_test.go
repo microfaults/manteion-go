@@ -286,7 +286,7 @@ func TestSampler_NaNIsNull(t *testing.T) {
 	defer unsub()
 	x.run()
 	s := firstSample(t, ch)
-	if got, want := sampleJSON(t, s), `{"run_id":"`+runID+`","phase":"plain","at":"2026-11-20T12:00:00.000Z","rps":5,"p95_ms":null,"error_rate":0}`; got != want {
+	if got, want := sampleJSON(t, s), `{"run_id":"`+runID+`","phase":"plain","at":"2026-11-20T12:00:00.000Z","rps":5,"p95_ms":null,"error_rate":0,"target_cpu_cores":null,"target_memory_bytes":null}`; got != want {
 		t.Errorf("sample\n %s\nwant\n %s", got, want)
 	}
 	x.stop()
@@ -349,7 +349,7 @@ func TestSampler_NullsAndClamp(t *testing.T) {
 	ch, unsub := x.h.Subscribe(runID)
 	defer unsub()
 	x.run()
-	if got := sampleJSON(t, firstSample(t, ch)); !strings.HasSuffix(got, `"rps":null,"p95_ms":null,"error_rate":1}`) {
+	if got := sampleJSON(t, firstSample(t, ch)); !strings.HasSuffix(got, `"rps":null,"p95_ms":null,"error_rate":1,"target_cpu_cores":null,"target_memory_bytes":null}`) {
 		t.Errorf("sample %s; want rps and p95 null, error_rate clamped to 1", got)
 	}
 	x.m.value(QueryErrorRate, -0.25)

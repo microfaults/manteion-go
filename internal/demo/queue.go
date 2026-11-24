@@ -259,9 +259,17 @@ func cloneRun(r Run) Run {
 	for i := range c.Phases {
 		p := &c.Phases[i]
 		p.Fault = clonePtr(p.Fault)
+		p.Target = clonePtr(p.Target)
+		p.Intensity = clonePtr(p.Intensity)
 		p.StartedAt = clonePtr(p.StartedAt)
 		p.EndedAt = clonePtr(p.EndedAt)
 		p.Result = clonePtr(p.Result)
+		p.FaultObserved = clonePtr(p.FaultObserved)
+		if p.Measure != nil {
+			m := *p.Measure
+			m.Value, m.Baseline = clonePtr(m.Value), clonePtr(m.Baseline)
+			p.Measure = &m
+		}
 	}
 	return c
 }

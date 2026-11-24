@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestQueue_ConcurrentEnqueueForLastSlot: 64 distinct clients race for the
@@ -194,5 +195,39 @@ func TestQueue_RunView(t *testing.T) {
 		if validRunID(bad) {
 			t.Errorf("validRunID(%q) = true", bad)
 		}
+	}
+}
+
+// TestCloneRun_SharesNoPointer: a copy shares no pointer with its run, the
+// fault phases' target, intensity, proof and measured figures included.
+func TestCloneRun_SharesNoPointer(t *testing.T) {
+	yes := true
+	start, end := testNow, testNow
+	r := Run{RunID: "demo-1", Scenario: "cart-heavy", Status: RunCompleted, Position: intp(0), QueuedAt: testNow,
+		StartedAt: &start, EndedAt: &end, Testbed: FixedTestbed()}
+	for i := range r.Phases {
+		at := testNow
+		r.Phases[i] = PhaseView{Name: fmt.Sprint("phase-", i), Fault: strp("cpu"), Target: strp("cartservice"),
+			Intensity: strp("heavy"), Status: PhaseCompleted, StartedAt: &at, EndedAt: &at, DurationS: 40,
+			Result: &Result{Requests: 1}, FaultObserved: &yes,
+			Measure: &Measure{Metric: "target_cpu_cores", Value: f64p(0.2), Baseline: f64p(0.02)}}
+	}
+	before, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := cloneRun(r)
+	*c.Position = 9
+	for i := range c.Phases {
+		p := &c.Phases[i]
+		*p.Fault, *p.Target, *p.Intensity = "changed", "changed", "changed"
+		*p.StartedAt = p.StartedAt.Add(time.Hour)
+		p.Result.Requests = 9
+		*p.FaultObserved = false
+		*p.Measure.Value, *p.Measure.Baseline = 9, 9
+		p.Measure.Metric = "target_memory_bytes"
+	}
+	if after, _ := json.Marshal(r); string(after) != string(before) {
+		t.Errorf("the run changed through its copy:\n %s\nwas\n %s", after, before)
 	}
 }

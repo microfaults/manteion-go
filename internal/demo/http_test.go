@@ -1524,13 +1524,14 @@ func TestRunJSONShape(t *testing.T) {
 
 func requireRunShape(t *testing.T, m map[string]any) {
 	t.Helper()
-	wantKeys(t, "run", m, "run_id", "status", "reason", "position", "queued_at", "started_at", "ended_at", "phases", "testbed")
+	wantKeys(t, "run", m, "run_id", "scenario", "status", "reason", "position", "queued_at", "started_at", "ended_at", "phases", "testbed")
 	phases, _ := m["phases"].([]any)
 	if len(phases) != 3 {
 		t.Fatalf("phases %v; want 3", m["phases"])
 	}
 	for _, p := range phases {
-		wantKeys(t, "phase", p.(map[string]any), "name", "fault", "status", "started_at", "ended_at", "duration_s", "result")
+		wantKeys(t, "phase", p.(map[string]any), "name", "fault", "target", "intensity", "status", "started_at", "ended_at",
+			"duration_s", "result", "fault_observed", "measure")
 	}
 	wantKeys(t, "testbed", m["testbed"].(map[string]any), "machine", "cpu_limits_m", "phase_duration_s", "note")
 }
