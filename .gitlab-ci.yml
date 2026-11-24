@@ -3,39 +3,14 @@
 #
 # Stages:
 #   check  — Go build/vet/test, OpenAPI freshness, race detection
-#   review — AI code review (schedule/manual/trigger only)
 #
 # Dependency: manteion-go has a local replace directive for atropos-go.
 # All Go jobs clone the sibling repo via CI_JOB_TOKEN before building.
 # Branch policy: always atropos-go 'develop' (stable integration branch).
-#
-# Required CI/CD variables (Settings > CI/CD > Variables, masked):
-#   ANTHROPIC_API_KEY — Anthropic API key          [if LLM_PROVIDER=claude]
-#   GOOGLE_API_KEY    — Google AI API key          [if LLM_PROVIDER=gemini]
-#
-# Optional:
-#   GITLAB_API_TOKEN  — Project access token (api scope); enables commit comments
-#   LLM_PROVIDER      — "claude" (default) or "gemini"
-#   LLM_MODEL         — Override model ID (e.g. "claude-opus-4-6")
-#   REVIEW_PROMPT     — Extra review instructions appended to the system prompt
-#   FROM_COMMIT       — Base commit ref (manual mode; omit for scheduled lookback)
-#   TO_COMMIT         — Head commit ref (default: HEAD)
-#   REVIEW_HOURS      — Hours to look back in scheduled mode (default: 24)
-#   MAX_DIFF_CHARS    — Max diff characters sent to the LLM (default: 120000)
 # ---------------------------------------------------------------------------
-
-variables:
-  LLM_PROVIDER: "claude"
-  LLM_MODEL: ""
-  REVIEW_PROMPT: ""
-  FROM_COMMIT: ""
-  TO_COMMIT: "HEAD"
-  REVIEW_HOURS: "24"
-  MAX_DIFF_CHARS: "120000"
 
 stages:
   - check
-  - review
 
 # ---------------------------------------------------------------------------
 # Go verification
@@ -98,7 +73,7 @@ go-integration:
     - go test -count=1 -timeout 120s ./...
 
 # ---------------------------------------------------------------------------
-# OpenAPI + review
+# OpenAPI
 # ---------------------------------------------------------------------------
 
 openapi-check:
@@ -115,26 +90,3 @@ openapi-check:
     - export PATH=$PATH:$(go env GOPATH)/bin
   script:
     - make openapi-check
-
-ai-review:
-  stage: review
-  image: python:3.12-slim
-  allow_failure: true
-  retry:
-    max: 2
-    when: script_failure
-  timeout: 15m
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "trigger"'
-  artifacts:
-    name: "ai-review-$CI_COMMIT_SHORT_SHA"
-    paths:
-      - review-output/
-    expire_in: 30 days
-    when: always
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq git > /dev/null
-  script:
-    - python3 scripts/ai-review.py
