@@ -283,8 +283,9 @@ func (w *Worker) spared() spared {
 //
 // It returns nil, or the switch-offs' failures (errors.Is ErrRuleState), and
 // ctx's error when the switch-offs or Run had not finished by then; a
-// switch-off still in flight goes on, with its own 10 s deadline. A rule that
-// stays on is the next start's SwitchOffAll's job.
+// switch-off still in flight goes on, with its own 10 s deadline, counted in
+// the worker's group (bg) until it returns. A rule that stays on is the next
+// start's SwitchOffAll's job.
 //
 // Safe to call any number of times, from any goroutine, while Run works, after
 // Run returned, and before Run: Run then returns at once, and the runs waiting
@@ -316,8 +317,12 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 		}
 	}
 
+	// The switch-offs are counted in w.bg until every one has returned, which
+	// can be after Shutdown and Run have (each write has its own 10 s).
 	switched := make(chan error, 1)
+	w.bg.Add(1)
 	go func() {
+		defer w.bg.Done()
 		failed := make([]error, len(runs))
 		var wg sync.WaitGroup
 		for i, a := range runs {

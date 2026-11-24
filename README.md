@@ -123,14 +123,18 @@ is `{"error":<code>}`.
   that is not JSON or not UTF-8, or one over 1 KiB.
 - A run carries `scenario` (its id) and three phases, `baseline`, `memory` and `cpu`, 40 s each.
   A fault phase carries `fault` (`memory` or `cpu`), `target`, `intensity`, and, once it has
-  completed, `measure` and `fault_observed`. `measure` is `{"metric","value","baseline"}`: the
-  target's own resident memory in bytes (`target_memory_bytes`) or CPU in cores
-  (`target_cpu_cores`), from its process metrics in Prometheus, over the phase and over the
-  baseline phase. `fault_observed` is true when the rise reaches a fixed threshold (6694502 bytes for
-  memory, 0.0503 cores for CPU), false when it does not, and null when either figure is missing (a failed, empty
-  or late query); a missing figure never fails the run. The figures are not stored: a run read
-  after a restart shows them, and `fault_observed`, as null. The event stream's `sample` frames
-  also carry the running phase's target's `target_cpu_cores` and `target_memory_bytes`.
+  completed, `measure` and `fault_observed`. `measure` is `{"metric","value","baseline"}`, from
+  the target's own process metrics in Prometheus: for the memory phase, its resident memory in bytes
+  (`target_memory_bytes`), the peak during the phase (`value`) and the lowest during the baseline
+  phase (`baseline`), so a previous run's memory still being released during the baseline does not
+  hide the rise; for the cpu phase, its CPU in cores (`target_cpu_cores`) over the phase and over
+  the baseline phase. Each figure is read over its phase's own window, however late after the
+  phase's end it is read (PromQL `offset`). `fault_observed` is true when the rise reaches a fixed
+  threshold (6694502 bytes for memory, 0.0503 cores for CPU), false when it does not, and null when
+  either figure is missing (a failed or empty query, or a phase's end read more than 300 s after
+  its time); a missing figure never fails the run. The figures are not stored: a run read after a
+  restart shows them, and `fault_observed`, as null. The event stream's `sample` frames also carry
+  the running phase's target's `target_cpu_cores` and `target_memory_bytes`.
 
 ## Environment
 

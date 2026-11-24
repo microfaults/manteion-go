@@ -1134,7 +1134,8 @@ func TestEvents_SamplesReachTheStream(t *testing.T) {
 
 // TestDemo_RunStartsAndStopsTheSampler: Run samples while a phase runs; once
 // Shutdown has stopped the worker, Run stops the sampler before it returns,
-// and no query follows.
+// and once the queries in flight then have ended (the worker's group), no
+// query follows.
 func TestDemo_RunStartsAndStopsTheSampler(t *testing.T) {
 	t.Parallel()
 	x := newDemo(t, func(c *Config, _ *Deps) {
@@ -1155,9 +1156,13 @@ func TestDemo_RunStartsAndStopsTheSampler(t *testing.T) {
 	defer cancel()
 	_ = x.d.Shutdown(ctx)
 	waitClosed(t, ran, "Run to return after Shutdown")
+	// A query started before the stop may still be in the client; each is
+	// counted in the worker's group, and one that had not reached the client
+	// by then never does.
+	waitClosed(t, groupDone(&x.d.w.bg), "the demo's goroutines to end")
 	n := len(x.f.callList("prom.QueryInstant "))
 	time.Sleep(50 * time.Millisecond)
 	if m := len(x.f.callList("prom.QueryInstant ")); m != n {
-		t.Errorf("%d queries after Run returned; want none", m-n)
+		t.Errorf("%d queries after Run returned and its goroutines ended; want none", m-n)
 	}
 }

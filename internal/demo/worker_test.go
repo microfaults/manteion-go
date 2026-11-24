@@ -2249,7 +2249,11 @@ func TestWorker_RetryWritesOnlyTheRuleStillOn(t *testing.T) {
 	isMemoryOfA := func(name string) bool { return runA != "" && name == RuleName(runA, FaultMemory) }
 	flaky := newFlakyOff(x.f, func(name string, n int) bool { return isMemoryOfA(name) && n <= 3 })
 	flaky.hold = func(name string, n int) bool { return isMemoryOfA(name) && n == 4 }
-	x.rebuild(func(d *Deps) { d.Rules = flaky })
+	logs := &syncBuffer{}
+	x.rebuild(func(d *Deps) {
+		d.Rules = flaky
+		d.Logger = slog.New(slog.NewTextHandler(logs, nil))
+	})
 	x.f.autopilot = true
 	a, chA := x.enqueue("a")
 	b, chB := x.enqueue("b")
@@ -2269,7 +2273,12 @@ func TestWorker_RetryWritesOnlyTheRuleStillOn(t *testing.T) {
 	if r := x.f.rule(rules[1]); r == nil || r.Enabled {
 		t.Errorf("cpu rule %+v; want off since the first attempt", r)
 	}
-	time.Sleep(20 * time.Millisecond)
+	// The worker writes this line just before it waits for the ended run's
+	// switch-off to land; from then on, with the memory rule's write held, it
+	// cannot pick up the next run until that write is released.
+	waitFor(t, "the worker to hold the next run", func() bool {
+		return strings.Contains(logs.String(), "the next run waits until the ended run's rule is switched off")
+	})
 	if len(x.f.ruleIDsOfRun(b.RunID)) != 0 {
 		t.Fatal("the next run was picked up while the memory rule's switch-off was pending")
 	}

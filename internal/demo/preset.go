@@ -53,8 +53,8 @@ const (
 // Internal errors. They are for logs and for choosing a Reason; no error, nor
 // its text, ever goes into a client's body.
 var (
-	// ErrNoDataset: the load generator cannot run the preset (no usable
-	// demo-products dataset, zeus unreachable, or no demo-browse workflow).
+	// ErrNoDataset: the load generator cannot run the scenario's workload (no
+	// usable dataset of its name, zeus unreachable, or its workflow missing).
 	ErrNoDataset = errors.New("demo: the load generator has no usable dataset or workflow")
 	// ErrBuild: the run's rows could not be written.
 	ErrBuild = errors.New("demo: the run could not be built")

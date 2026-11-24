@@ -105,16 +105,22 @@ func newUnsweptDemo(t *testing.T, tweak func(*Config, *Deps)) *demoHarness {
 }
 
 // start runs the demo's worker. The test's cleanup shuts the demo down and
-// waits for the worker and its goroutines.
+// waits for Run (the worker and the sampler) and then for their goroutines:
+// only once the sampler has stopped does nothing add to the worker's group.
 func (x *demoHarness) start() {
 	ctx, cancel := context.WithCancel(context.Background())
-	go x.d.Run(ctx)
+	ran := make(chan struct{})
+	go func() {
+		defer close(ran)
+		x.d.Run(ctx)
+	}()
 	x.t.Cleanup(func() {
 		sctx, scancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer scancel()
 		_ = x.d.Shutdown(sctx)
 		cancel()
 		waitClosed(x.t, x.d.w.done, "the worker to stop")
+		waitClosed(x.t, ran, "Run to return")
 		bg := make(chan struct{})
 		go func() { x.d.w.bg.Wait(); close(bg) }()
 		waitClosed(x.t, bg, "the worker's goroutines to end")

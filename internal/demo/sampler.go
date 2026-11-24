@@ -65,9 +65,12 @@ func sampleTarget(sc Scenario, phase string) string {
 //     one goroutine per metric, not one per round.
 //   - A metric's problem is logged at most once per run, phase and metric,
 //     with its detail, in manteion's log only; a client only ever sees null.
+//   - Each query's goroutine is counted in w's group (Worker.bg) until it
+//     returns; one that has not reached the client when ctx ends never asks.
 //
-// It returns once ctx is done and its round has stopped (at once with a nil w,
-// m or h). One sampler runs per demo: (*Demo).Run starts it.
+// It returns once ctx is done and its round has stopped, without waiting for
+// queries still in the client (at once with a nil w, m or h); from then on it
+// adds nothing to w's group. One sampler runs per demo: (*Demo).Run starts it.
 func RunSampler(ctx context.Context, w *Worker, m Metrics, h *Hub, cfg Config) {
 	if w == nil || m == nil || h == nil {
 		return
@@ -160,6 +163,7 @@ func (s *sampler) round(ctx context.Context, runID, phase, target string) {
 		}
 		asked[i] = true
 		n++
+		s.w.bg.Add(1)
 		go s.query(ctx, i, queries[i], answers)
 	}
 	var vals [numMetrics]*float64
@@ -195,10 +199,13 @@ wait:
 	s.h.Publish(runID, Event{Type: EventSample, Data: sample})
 }
 
-// query asks metric i's query q on its own QueryTimeout context and hands the
-// answer over; a panic is an error.
+// query asks metric i's query q on its own QueryTimeout context, unless ctx
+// is already done (the sampler stopped before the query reached the client:
+// it is not asked), and hands the answer over; a panic is an error. It runs
+// in a goroutine its round counted in the worker's group (w.bg), and leaves
+// the group when it returns.
 func (s *sampler) query(ctx context.Context, i int, q string, answers chan<- answer) {
-	qctx, cancel := context.WithTimeout(ctx, s.cfg.QueryTimeout)
+	defer s.w.bg.Done()
 	a := answer{metric: i}
 	defer func() {
 		if r := recover(); r != nil {
@@ -210,9 +217,8 @@ func (s *sampler) query(ctx context.Context, i int, q string, answers chan<- ans
 		// starts as soon as this one ends must find the metric free.
 		s.inflight[i].Store(false)
 		answers <- a
-		cancel()
 	}()
-	a.v, a.err = s.m.QueryInstant(qctx, q)
+	a.v, a.err = askUnlessDone(ctx, s.m, q, s.cfg.QueryTimeout)
 }
 
 // value is a's value as a sample holds it: nil for a failure, NaN or ±Inf;

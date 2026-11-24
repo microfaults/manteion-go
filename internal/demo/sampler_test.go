@@ -519,8 +519,9 @@ func TestSampler_RoundStartDecides(t *testing.T) {
 
 // TestSampler_StopsWithItsContext: the sampler returns at once when its
 // context ends, well within one tick, even with a round waiting on a query
-// that ignores its context; once that query returns, no goroutine is left.
-// Not parallel: it counts goroutines.
+// that ignores its context; that query is counted in the worker's group until
+// it returns (G3), and then no goroutine is left. Not parallel: it counts
+// goroutines.
 func TestSampler_StopsWithItsContext(t *testing.T) {
 	x := newSamplerHarness(t, 200*time.Millisecond, 150*time.Millisecond)
 	x.m.all(hang)
@@ -542,7 +543,10 @@ func TestSampler_StopsWithItsContext(t *testing.T) {
 	if d := time.Since(began); d > 75*time.Millisecond {
 		t.Errorf("the sampler took %v to stop; want at once, well within its 200 ms tick", d)
 	}
+	done := groupDone(&x.w.bg)
+	requireNotDone(t, done, 30*time.Millisecond, "the worker's group, with an rps query held in the client,")
 	free()
+	waitClosed(t, done, "the held query to return")
 	waitGoroutines(t, before, time.Second)
 
 	stopped := make(chan struct{})
@@ -551,6 +555,38 @@ func TestSampler_StopsWithItsContext(t *testing.T) {
 		RunSampler(context.Background(), x.w, nil, x.h, DefaultConfig())
 	}()
 	waitClosed(t, stopped, "RunSampler without Prometheus to return")
+}
+
+// TestSampler_NotAskedOnceStopped (G3): a round whose context is already done
+// asks nothing: none of its queries reaches the client, even from the
+// goroutines it started. Once those have ended (the worker's group), nothing
+// was asked, no sample was published, and every metric is free again: the
+// next round, on a live context, asks all five.
+func TestSampler_NotAskedOnceStopped(t *testing.T) {
+	t.Parallel()
+	x := newSamplerHarness(t, time.Hour, time.Second)
+	x.m.all(func(context.Context) (float64, error) { return 1, nil })
+	runID := id.New(RunIDPrefix)
+	x.setCurrentOf(runID, DefaultScenario(), PhaseNames[0], true)
+	ch, unsub := x.h.Subscribe(runID)
+	defer unsub()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	x.s.round(ctx, runID, PhaseNames[0], targetCatalog)
+	waitClosed(t, groupDone(&x.w.bg), "the round's goroutines to end")
+	if calls, _, _, _ := x.m.snapshot(); len(calls) != 0 {
+		t.Errorf("a round cut short before its queries started asked %v; want nothing", calls)
+	}
+	if got := samples(t, ch, 0); len(got) != 0 {
+		t.Errorf("%d samples from a round cut short", len(got))
+	}
+	x.s.round(context.Background(), runID, PhaseNames[0], targetCatalog)
+	calls, _, _, _ := x.m.snapshot()
+	for _, q := range sampleQueriesOf(targetCatalog) {
+		if calls[q] != 1 {
+			t.Errorf("%s asked %d times by the next round; want 1", q, calls[q])
+		}
+	}
 }
 
 // TestSampler_LogsOncePerPhaseAndMetric: a failing query is logged with its

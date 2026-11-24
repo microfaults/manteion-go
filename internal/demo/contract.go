@@ -358,10 +358,12 @@ const (
 var errMetric = errors.New("demo: measure metric outside the public list")
 
 // Measure is a fault phase's measured proof: the target's own memory (memory
-// phase) or CPU (cpu phase) over the phase (Value) and over the baseline phase
-// (Baseline). A figure whose query failed is nil; nil, NaN and ±Inf marshal as
-// null. Metric must be MetricTargetMemoryBytes or MetricTargetCPUCores: any
-// other refuses to marshal.
+// phase: its peak during the phase as Value, its lowest during the baseline
+// phase as Baseline) or CPU (cpu phase: over the phase as Value, over the
+// baseline phase as Baseline), each read over its phase's own window. A
+// figure whose query failed is nil; nil, NaN and ±Inf marshal as null. Metric
+// must be MetricTargetMemoryBytes or MetricTargetCPUCores: any other refuses
+// to marshal.
 type Measure struct {
 	Metric   string   `json:"metric"`
 	Value    *float64 `json:"value"`

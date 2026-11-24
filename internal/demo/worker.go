@@ -146,8 +146,16 @@ type Worker struct {
 	ended   atomic.Uint64   // runs ended in this process (endedCount)
 	halted  context.Context // done once halt was called
 	haltFn  context.CancelFunc
-	done    chan struct{}  // closed when Run returns
-	bg      sync.WaitGroup // the worker's goroutines that may outlive a run: starts, late cancels, switch-off retries
+	done    chan struct{} // closed when Run returns
+	// bg counts the goroutines of the worker, and of its sampler, that may
+	// outlive the call that started them: starts, late cancels, switch-off
+	// retries, watchdogs, Shutdown's switch-offs, and proof and sample queries
+	// still in the client. A goroutine its starter always waits for (each
+	// rule's write in ruleSwitch.offLocked, each run's switch-off in Shutdown)
+	// is counted through that starter. Nothing in the package waits on it;
+	// it is how a test knows every goroutine has ended. It is added to only
+	// while Run or the sampler runs, or by Shutdown.
+	bg sync.WaitGroup
 }
 
 // active is the run the worker is on.
@@ -178,8 +186,8 @@ type active struct {
 	startDone  chan struct{} // closed when the start goroutine returns
 	startErr   error         // StartExperiment's answer, valid once startDone is closed
 	// The run's proof (observe.go): the phases whose figures were asked
-	// for, and the baseline phase's figures (the memory target's memory, the
-	// CPU target's CPU), nil when not measured.
+	// for, and the baseline phase's figures (the memory target's lowest
+	// memory, the CPU target's CPU), nil when not measured.
 	proved              [3]bool
 	baseMemory, baseCPU *float64
 
@@ -368,7 +376,7 @@ func (w *Worker) currentExperimentID() string {
 
 func (w *Worker) runOne(parent context.Context, runID string, sc Scenario) {
 	a := w.pickUp(parent, runID, sc)
-	defer a.timer.Stop()
+	defer w.disarm(a)
 	defer a.cancel()
 	out := w.guardedDrive(a)
 	if !a.started {
@@ -408,9 +416,23 @@ func (w *Worker) pickUp(parent context.Context, runID string, sc Scenario) *acti
 	w.mu.Lock()
 	w.cur = a
 	w.mu.Unlock()
-	a.timer = time.AfterFunc(w.cfg.RunCap, func() { w.fireWatchdog(a) })
+	// The watchdog is counted in w.bg from now until it has run, or until
+	// disarm stops it before it runs.
+	w.bg.Add(1)
+	a.timer = time.AfterFunc(w.cfg.RunCap, func() {
+		defer w.bg.Done()
+		w.fireWatchdog(a)
+	})
 	w.log.Info("demo: run picked up", "run_id", runID, "scenario", sc.ID)
 	return a
+}
+
+// disarm stops the run's watchdog. If that stops it before it ran, it leaves
+// w.bg here; one that already fired leaves it when it returns.
+func (w *Worker) disarm(a *active) {
+	if a.timer.Stop() {
+		w.bg.Done()
+	}
 }
 
 // fireWatchdog runs on the timer's goroutine at the cap, without waiting for
@@ -678,7 +700,8 @@ func (w *Worker) refresh(ctx context.Context, a *active) (unknown bool, err erro
 			changed = append(changed, PhaseEvent{RunID: a.runID, Phase: PhaseNames[i], PhaseIndex: i, Status: st, At: phaseAt(p, st, now)})
 		}
 	}
-	// First, so each figure is read as close to its phase's end as can be.
+	// First, so each figure is read as soon after its phase's end as can be
+	// (it is read over the phase's own window whenever it is read).
 	proofs := w.prove(ctx, a, seen)
 	var results [3]*Result
 	for i := range a.last {
@@ -1485,8 +1508,11 @@ func (s *ruleSwitch) off(ctx context.Context, why string) error {
 // on a context detached from ctx with its own 10 s (switchOffRule), all
 // started at once, so k rules take as long as the slowest write, not k
 // writes. A panic in a write is that rule's failure. It returns when every
-// write has returned. The write that lands a rule's switch-off is logged at
-// Info (Debug for a rule found gone), in the rules' order.
+// write has returned, so a worker's writes end before the goroutine that
+// called off goes on: Run's own, or one counted in the worker's group (bg),
+// a switch-off retry's, a watchdog's or one of Shutdown's. The write that
+// lands a rule's switch-off is logged at Info (Debug for a rule found gone),
+// in the rules' order.
 func (s *ruleSwitch) offLocked(ctx context.Context, why string) error {
 	pending := s.notLanded()
 	if len(pending) > 0 {

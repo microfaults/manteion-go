@@ -113,7 +113,9 @@ func (c Config) routeTimeout() time.Duration { return 4 * c.QueryTimeout }
 
 // Run works the queue, one run at a time (Worker.Run), and samples the live
 // metrics while a phase runs (RunSampler), until ctx is done or Shutdown is
-// called; the sampler has stopped when it returns. Call it once, after Sweep.
+// called; the sampler has stopped when it returns (a query it started that is
+// still in the client is counted in the worker's group until it returns, and
+// none starts any more). Call it once, after Sweep.
 func (d *Demo) Run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

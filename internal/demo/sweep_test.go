@@ -1218,6 +1218,45 @@ func TestWorker_ShutdownBoundedByContext(t *testing.T) {
 		}
 		waitClosed(t, x.w.done, "Run to return")
 	})
+
+	// G3 (M3): an ended run's switch-off that Shutdown starts and that is
+	// still held when Shutdown and Run have returned is counted in the
+	// worker's group until it returns.
+	t.Run("a pending run's switch-off outlives Run", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, noCap)
+		ctx := context.Background()
+		runID := id.New(RunIDPrefix)
+		built, err := BuildRun(ctx, x.f.deps(), runID, DefaultScenario(), testRunCap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := &active{runID: runID, expID: built.ExperimentID, sw: newRuleSwitch(runID, fakeRules{x.f}, x.w.log, x.f.clock)}
+		a.sw.attach(ctx, built.RuleIDs[:]...)
+		if err := a.sw.on(ctx); err != nil {
+			t.Fatal(err)
+		}
+		x.start() // the line is empty: Run waits for a run
+		waitFor(t, "Run to start", x.w.running.Load)
+		x.w.mu.Lock()
+		x.w.pending = a
+		x.w.mu.Unlock()
+		entered, release := stuck(x, "rules.SetEnabled")
+		defer release()
+
+		sctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		if err := x.w.Shutdown(sctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Shutdown: %v; want an unfinished switch-off", err)
+		}
+		waitClosed(t, entered, "the switch-off to block")
+		waitClosed(t, x.w.done, "Run to return")
+		done := groupDone(&x.w.bg)
+		requireNotDone(t, done, 30*time.Millisecond, "the worker's group, with Shutdown's switch-off held,")
+		release()
+		waitClosed(t, done, "Shutdown's switch-off to return")
+		x.f.requireRunRulesOff(t, runID)
+	})
 }
 
 // TestWorker_ShutdownIsSafeAnyTime: before Run (Run then returns at once and
