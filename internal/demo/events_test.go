@@ -1104,8 +1104,9 @@ func TestEncodeFrame(t *testing.T) {
 func zero() float64 { return 0 }
 
 // TestEvents_SamplesReachTheStream: while a phase runs, the demo's sampler
-// publishes the three metrics, and the stream forwards them as sample frames
-// with exactly the contract's keys.
+// publishes the frontend's three metrics and the phase's target's own CPU and
+// memory, and the stream forwards them as sample frames with exactly the
+// contract's keys.
 func TestEvents_SamplesReachTheStream(t *testing.T) {
 	t.Parallel()
 	x := newStreamDemo(t, streamOpts{tweak: func(c *Config, _ *Deps) {
@@ -1113,8 +1114,11 @@ func TestEvents_SamplesReachTheStream(t *testing.T) {
 		c.SampleEvery = 20 * time.Millisecond
 		c.QueryTimeout = 500 * time.Millisecond // answers come at once; a round ends with its last
 	}})
+	target := DefaultScenario().Memory.Target // baseline's: the memory fault's target
 	x.f.mu.Lock()
 	x.f.promValues[QueryRPS], x.f.promValues[QueryP95Ms], x.f.promValues[QueryErrorRate] = 5, 250.5, 0.02
+	x.f.promValues[liveTargetQuery(FaultCPU, target)] = 0.031
+	x.f.promValues[liveTargetQuery(FaultMemory, target)] = 47_185_920
 	x.f.mu.Unlock()
 	runID := x.postOK("a")
 	x.start()
@@ -1122,7 +1126,7 @@ func TestEvents_SamplesReachTheStream(t *testing.T) {
 	st := x.open(t, runID, "a")
 	evs := st.eventsUntil(EventSample)
 	f := evs[len(evs)-1]
-	want := fmt.Sprintf(`{"run_id":%q,"phase":"baseline","at":%q,"rps":5,"p95_ms":250.5,"error_rate":0.02,"target_cpu_cores":null,"target_memory_bytes":null}`, runID, stamp(testNow))
+	want := fmt.Sprintf(`{"run_id":%q,"phase":"baseline","at":%q,"rps":5,"p95_ms":250.5,"error_rate":0.02,"target_cpu_cores":0.031,"target_memory_bytes":47185920}`, runID, stamp(testNow))
 	if f.data != want {
 		t.Errorf("sample\n %s\nwant\n %s", f.data, want)
 	}

@@ -16,22 +16,44 @@ const (
 	metricRPS = iota
 	metricP95
 	metricErrorRate
+	metricTargetCPU
+	metricTargetMemory
 	numMetrics
 )
 
-var (
-	metricQueries = [numMetrics]string{QueryRPS, QueryP95Ms, QueryErrorRate}
-	metricNames   = [numMetrics]string{"rps", "p95_ms", "error_rate"}
-)
+var metricNames = [numMetrics]string{"rps", "p95_ms", "error_rate", MetricTargetCPUCores, MetricTargetMemoryBytes}
+
+// sampleQueries are a round's queries, by metric: the contract's three, then
+// target's own CPU and memory (liveTargetQuery). The target's two are ""
+// (not asked, null) when target is not a catalog target.
+func sampleQueries(target string) [numMetrics]string {
+	q := [numMetrics]string{QueryRPS, QueryP95Ms, QueryErrorRate}
+	if isCatalogTarget(target) {
+		q[metricTargetCPU], q[metricTargetMemory] = liveTargetQuery(FaultCPU, target), liveTargetQuery(FaultMemory, target)
+	}
+	return q
+}
+
+// sampleTarget is the service whose own CPU and memory the live samples of a
+// run of sc carry in phase: the CPU fault's target during cpu, the memory
+// fault's target during baseline and memory.
+func sampleTarget(sc Scenario, phase string) string {
+	if phase == PhaseNames[2] {
+		return sc.CPU.Target
+	}
+	return sc.Memory.Target
+}
 
 // RunSampler publishes the live metrics of the run in progress as sample
 // events until ctx is done. Every Config.SampleEvery it asks w what runs, and
-// only while a phase is running does it make a round: the three contract
-// queries at once, each on its own context with Config.QueryTimeout, so that
-// one hung query delays neither the others nor the next round.
+// only while a phase is running does it make a round: the five queries (the
+// frontend's three of the contract, and the phase's target's own CPU and
+// memory, sampleTarget) at once, each on its own context with
+// Config.QueryTimeout, so that one hung query delays neither the others nor
+// the next round.
 //
 //   - A failed, empty, NaN or infinite answer is null in the sample; the error
-//     rate is clamped into 0..1. A sample whose three values are all null is
+//     rate is clamped into 0..1. A sample whose five values are all null is
 //     not published.
 //   - A sample belongs to the run and phase that were current when its round
 //     started, stamped with that moment, and is dropped if that run is no
@@ -96,7 +118,7 @@ func (s *sampler) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		runID, phase, running := s.w.Current()
+		runID, phase, running, target := s.w.sampling()
 		if runID == "" || !running {
 			continue
 		}
@@ -109,13 +131,14 @@ func (s *sampler) run(ctx context.Context) {
 		go func() {
 			defer rounds.Done()
 			defer s.busy.Store(false)
-			s.round(ctx, runID, phase)
+			s.round(ctx, runID, phase, target)
 		}()
 	}
 }
 
-// round queries the three metrics for runID's phase and publishes the sample.
-func (s *sampler) round(ctx context.Context, runID, phase string) {
+// round queries the five metrics for runID's phase, whose target is target,
+// and publishes the sample.
+func (s *sampler) round(ctx context.Context, runID, phase, target string) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.log.Error("demo: a sampling round panicked", "run_id", runID, "phase", phase,
@@ -124,16 +147,20 @@ func (s *sampler) round(ctx context.Context, runID, phase string) {
 	}()
 	at := s.w.d.Clock.Now()
 	answers := make(chan answer, numMetrics) // never blocks a query, even one abandoned
+	queries := sampleQueries(target)
 	var asked, answered [numMetrics]bool
 	n := 0
 	for i := range numMetrics {
+		if queries[i] == "" {
+			continue
+		}
 		if !s.inflight[i].CompareAndSwap(false, true) {
 			s.note(runID, phase, i, "its previous query has not returned", nil)
 			continue
 		}
 		asked[i] = true
 		n++
-		go s.query(ctx, i, answers)
+		go s.query(ctx, i, queries[i], answers)
 	}
 	var vals [numMetrics]*float64
 	timer := time.NewTimer(s.cfg.QueryTimeout)
@@ -155,7 +182,8 @@ wait:
 			return
 		}
 	}
-	sample := Sample{RunID: runID, Phase: phase, At: at, RPS: vals[metricRPS], P95Ms: vals[metricP95], ErrorRate: vals[metricErrorRate]}
+	sample := Sample{RunID: runID, Phase: phase, At: at, RPS: vals[metricRPS], P95Ms: vals[metricP95], ErrorRate: vals[metricErrorRate],
+		TargetCPUCores: vals[metricTargetCPU], TargetMemoryBytes: vals[metricTargetMemory]}
 	if sample.Empty() {
 		return
 	}
@@ -167,9 +195,9 @@ wait:
 	s.h.Publish(runID, Event{Type: EventSample, Data: sample})
 }
 
-// query asks metric i on its own QueryTimeout context and hands the answer
-// over; a panic is an error.
-func (s *sampler) query(ctx context.Context, i int, answers chan<- answer) {
+// query asks metric i's query q on its own QueryTimeout context and hands the
+// answer over; a panic is an error.
+func (s *sampler) query(ctx context.Context, i int, q string, answers chan<- answer) {
 	qctx, cancel := context.WithTimeout(ctx, s.cfg.QueryTimeout)
 	a := answer{metric: i}
 	defer func() {
@@ -184,7 +212,7 @@ func (s *sampler) query(ctx context.Context, i int, answers chan<- answer) {
 		answers <- a
 		cancel()
 	}()
-	a.v, a.err = s.m.QueryInstant(qctx, metricQueries[i])
+	a.v, a.err = s.m.QueryInstant(qctx, q)
 }
 
 // value is a's value as a sample holds it: nil for a failure, NaN or ±Inf;

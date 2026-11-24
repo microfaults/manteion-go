@@ -50,10 +50,22 @@ func (m *scriptedMetrics) value(query string, v float64) {
 	m.set(query, func(context.Context) (float64, error) { return v, nil })
 }
 
+// all sets fn for the contract's three queries and for every catalog target's
+// two live queries.
 func (m *scriptedMetrics) all(fn func(context.Context) (float64, error)) {
 	for _, q := range []string{QueryRPS, QueryP95Ms, QueryErrorRate} {
 		m.set(q, fn)
 	}
+	for _, svc := range CatalogTargets() {
+		m.set(liveTargetQuery(FaultCPU, svc), fn)
+		m.set(liveTargetQuery(FaultMemory, svc), fn)
+	}
+}
+
+// sampleQueriesOf are the five queries of a sample whose phase's target is
+// svc: the contract's three, then svc's own CPU and memory.
+func sampleQueriesOf(svc string) []string {
+	return []string{QueryRPS, QueryP95Ms, QueryErrorRate, liveTargetQuery(FaultCPU, svc), liveTargetQuery(FaultMemory, svc)}
 }
 
 func (m *scriptedMetrics) QueryInstant(ctx context.Context, query string) (float64, error) {
@@ -141,6 +153,13 @@ func (x *samplerHarness) setCurrent(runID, phase string, running bool) {
 	x.w.cur = &active{runID: runID, phase: phase, phaseRunning: running}
 }
 
+// setCurrentOf is setCurrent for a run of scenario sc.
+func (x *samplerHarness) setCurrentOf(runID string, sc Scenario, phase string, running bool) {
+	x.w.mu.Lock()
+	defer x.w.mu.Unlock()
+	x.w.cur = &active{runID: runID, sc: sc, phase: phase, phaseRunning: running}
+}
+
 // run starts the sampler; the test's cleanup stops it.
 func (x *samplerHarness) run() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -214,11 +233,11 @@ func sampleJSON(t *testing.T, s Sample) string {
 
 // ---- the brief's tests ----
 
-// TestSampler_HangingPrometheus: every query hangs until its deadline
-// (QueryTimeout 20 ms, SampleEvery 30 ms). Over 200 ms at least three rounds
-// are made, each query on its own deadline, no sample is published, and the
-// run goes on as if nothing happened: the worker keeps polling and the run
-// completes.
+// TestSampler_HangingPrometheus: every query, the frontend's three and the
+// target's two, hangs until its deadline (QueryTimeout 20 ms, SampleEvery
+// 30 ms). Over 200 ms at least three rounds are made, each query on its own
+// deadline, no sample is published, and the run goes on as if nothing
+// happened: the worker keeps polling and the run completes.
 func TestSampler_HangingPrometheus(t *testing.T) {
 	t.Parallel()
 	x := newHarness(t, noCap)
@@ -243,9 +262,15 @@ func TestSampler_HangingPrometheus(t *testing.T) {
 	waitClosed(t, done, "the sampler to stop")
 
 	calls, _, deadlines, noDeadline := m.snapshot()
-	for _, q := range []string{QueryRPS, QueryP95Ms, QueryErrorRate} {
+	five := sampleQueriesOf(DefaultScenario().Memory.Target)
+	for _, q := range five {
 		if calls[q] < 3 {
 			t.Errorf("%d calls of %s in 200 ms; want at least 3 rounds", calls[q], q)
+		}
+	}
+	for q := range calls {
+		if !slices.Contains(five, q) {
+			t.Errorf("the sampler asked %s; want only the baseline phase's five", q)
 		}
 	}
 	if noDeadline != 0 {
@@ -568,4 +593,158 @@ func TestSampler_LogsOncePerPhaseAndMetric(t *testing.T) {
 	for _, s := range samples(t, ch, 0) {
 		assertNoLeak(t, sampleJSON(t, s))
 	}
+}
+
+// TestSampler_TargetSeries: each sample carries the phase's target's own CPU
+// and memory, from the two live queries: the memory fault's target during
+// baseline and memory, the CPU fault's target during cpu. One target query
+// that ignores its deadline does not hold the four others, nor the next
+// round, and is not asked again until it returns; a sample whose five values
+// are all null is not sent.
+func TestSampler_TargetSeries(t *testing.T) {
+	t.Parallel()
+	sc := splitScenario()
+	t.Run("values", func(t *testing.T) {
+		t.Parallel()
+		x := newSamplerHarness(t, 10*time.Millisecond, 500*time.Millisecond)
+		x.m.value(QueryRPS, 3)
+		x.m.value(QueryP95Ms, 120)
+		x.m.value(QueryErrorRate, 0)
+		x.m.value(liveTargetQuery(FaultCPU, targetCatalog), 0.031)
+		x.m.value(liveTargetQuery(FaultMemory, targetCatalog), 47_000_000)
+		x.m.value(liveTargetQuery(FaultCPU, targetCart), 0.19)
+		x.m.value(liveTargetQuery(FaultMemory, targetCart), 39_000_000)
+		runID := id.New(RunIDPrefix)
+		ch, unsub := x.h.Subscribe(runID)
+		defer unsub()
+		x.setCurrentOf(runID, sc, PhaseNames[0], true)
+		x.run()
+		for _, tc := range []struct {
+			phase    string
+			cpu, mem string
+		}{
+			{PhaseNames[0], "0.031", "47000000"},
+			{PhaseNames[1], "0.031", "47000000"},
+			{PhaseNames[2], "0.19", "39000000"},
+		} {
+			x.setCurrentOf(runID, sc, tc.phase, true)
+			var s Sample
+			for i := 0; ; i++ {
+				if s = firstSample(t, ch); s.Phase == tc.phase {
+					break
+				}
+				if i == 20 {
+					t.Fatalf("no sample of phase %s", tc.phase)
+				}
+			}
+			want := `"rps":3,"p95_ms":120,"error_rate":0,"target_cpu_cores":` + tc.cpu + `,"target_memory_bytes":` + tc.mem + `}`
+			if got := sampleJSON(t, s); !strings.HasSuffix(got, want) {
+				t.Errorf("phase %s: sample %s; want it to end %s", tc.phase, got, want)
+			}
+		}
+	})
+
+	t.Run("one hung", func(t *testing.T) {
+		t.Parallel()
+		x := newSamplerHarness(t, 40*time.Millisecond, 30*time.Millisecond)
+		release := make(chan struct{})
+		var once sync.Once
+		free := func() { once.Do(func() { close(release) }) }
+		t.Cleanup(free)
+		hung := liveTargetQuery(FaultMemory, targetCatalog)
+		x.m.value(QueryRPS, 3)
+		x.m.value(QueryP95Ms, 120)
+		x.m.value(QueryErrorRate, 0.5)
+		x.m.value(liveTargetQuery(FaultCPU, targetCatalog), 0.031)
+		x.m.set(hung, func(context.Context) (float64, error) {
+			<-release // ignores its context
+			return 47_000_000, nil
+		})
+		runID := id.New(RunIDPrefix)
+		x.setCurrentOf(runID, sc, PhaseNames[1], true)
+		ch, unsub := x.h.Subscribe(runID)
+		defer unsub()
+		x.run()
+		got := samples(t, ch, 300*time.Millisecond)
+		if len(got) < 4 {
+			t.Errorf("%d samples in 300 ms at 40 ms with one target query hung; want at least 4", len(got))
+		}
+		for _, s := range got {
+			if s.RPS == nil || s.P95Ms == nil || s.ErrorRate == nil || s.TargetCPUCores == nil || *s.TargetCPUCores != 0.031 ||
+				s.TargetMemoryBytes != nil {
+				t.Errorf("sample %s; want every value but target_memory_bytes", sampleJSON(t, s))
+			}
+		}
+		if n := x.m.count(hung); n != 1 {
+			t.Errorf("%d target memory queries while the first hung; want 1", n)
+		}
+		free()
+		for i := 0; ; i++ {
+			if s := firstSample(t, ch); s.TargetMemoryBytes != nil {
+				if *s.TargetMemoryBytes != 47_000_000 {
+					t.Errorf("target_memory_bytes %v; want 47000000", *s.TargetMemoryBytes)
+				}
+				break
+			}
+			if i == 50 {
+				t.Fatalf("no sample with target_memory_bytes once the hung query returned")
+			}
+		}
+	})
+
+	t.Run("all null", func(t *testing.T) {
+		t.Parallel()
+		x := newSamplerHarness(t, 10*time.Millisecond, 500*time.Millisecond)
+		x.m.all(func(context.Context) (float64, error) { return math.NaN(), nil })
+		x.m.value(liveTargetQuery(FaultMemory, targetCart), 39_000_000)
+		runID := id.New(RunIDPrefix)
+		ch, unsub := x.h.Subscribe(runID)
+		defer unsub()
+		x.setCurrentOf(runID, sc, PhaseNames[0], true)
+		x.run()
+		waitFor(t, "five rounds", func() bool { return x.m.count(liveTargetQuery(FaultMemory, targetCatalog)) >= 5 })
+		if got := samples(t, ch, 0); len(got) != 0 {
+			t.Errorf("%d samples with all five values null (first %s)", len(got), sampleJSON(t, got[0]))
+		}
+		x.setCurrentOf(runID, sc, PhaseNames[2], true) // cartservice's memory answers
+		if s := firstSample(t, ch); s.Phase != PhaseNames[2] || s.TargetMemoryBytes == nil || *s.TargetMemoryBytes != 39_000_000 {
+			t.Errorf("sample %s; want the cpu phase's, with cartservice's memory", sampleJSON(t, s))
+		}
+	})
+}
+
+// TestSampler_TargetSeriesBoundedGoroutines: with all five queries ignoring
+// their deadline, however many rounds pass, at most one query per metric is
+// in flight: five goroutines, not five a round. Not parallel: it counts
+// goroutines.
+func TestSampler_TargetSeriesBoundedGoroutines(t *testing.T) {
+	x := newSamplerHarness(t, 10*time.Millisecond, 5*time.Millisecond)
+	release := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	x.m.all(func(context.Context) (float64, error) {
+		<-release // ignores its context
+		return 1, nil
+	})
+	x.setCurrentOf(id.New(RunIDPrefix), splitScenario(), PhaseNames[0], true)
+	before := runtime.NumGoroutine()
+	x.run()
+	waitFor(t, "twenty rounds", func() bool { return x.s.rounds.Load() >= 20 })
+	if n := runtime.NumGoroutine() - before; n > numMetrics+3 {
+		t.Errorf("%d more goroutines after %d rounds with every query hung; want at most %d", n, x.s.rounds.Load(), numMetrics+3)
+	}
+	calls, maxActive, _, _ := x.m.snapshot()
+	five := sampleQueriesOf(targetCatalog)
+	for _, q := range five {
+		if calls[q] != 1 || maxActive[q] != 1 {
+			t.Errorf("%s: %d calls, %d at once; want 1 and 1", q, calls[q], maxActive[q])
+		}
+	}
+	if len(calls) != len(five) {
+		t.Errorf("queries %v; want the five of the baseline phase", calls)
+	}
+	free()
+	x.stop()
+	waitGoroutines(t, before, time.Second)
 }

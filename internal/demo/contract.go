@@ -308,8 +308,10 @@ func (r Run) MarshalJSON() ([]byte, error) {
 // phase without a fault (baseline); on a fault phase Fault is the fault's kind
 // (memory or cpu), Target the service it runs in and Intensity its public
 // label. Result is null until the phase's results are harvested. Measure is
-// null until the fault phase's proof is measured, and FaultObserved is null
-// unless both of its figures were measured (see Measure).
+// null until the fault phase has completed (its proof is measured then).
+// FaultObserved marshals as null unless Measure holds both figures as finite
+// numbers, whatever the view holds: this is the one place that rule is
+// enforced.
 type PhaseView struct {
 	Name          string      `json:"name"`
 	Fault         *string     `json:"fault"`
@@ -325,6 +327,10 @@ type PhaseView struct {
 }
 
 func (p PhaseView) MarshalJSON() ([]byte, error) {
+	observed := p.FaultObserved
+	if p.Measure == nil || finite(p.Measure.Value) == nil || finite(p.Measure.Baseline) == nil {
+		observed = nil
+	}
 	return json.Marshal(struct {
 		Name          string      `json:"name"`
 		Fault         *string     `json:"fault"`
@@ -338,7 +344,7 @@ func (p PhaseView) MarshalJSON() ([]byte, error) {
 		FaultObserved *bool       `json:"fault_observed"`
 		Measure       *Measure    `json:"measure"`
 	}{p.Name, p.Fault, p.Target, p.Intensity, p.Status, stampPtr(p.StartedAt), stampPtr(p.EndedAt), p.DurationS, p.Result,
-		p.FaultObserved, p.Measure})
+		observed, p.Measure})
 }
 
 // Names of a Measure's metric.

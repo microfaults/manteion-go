@@ -92,6 +92,8 @@ func (c Config) teardownTimeout() time.Duration  { return c.RunCap }
 //  5. StartExperiment, in a goroutine of the worker's, on a context that no
 //     request and no shutdown cancels, only the watchdog;
 //  6. every Config.StatusPoll the experiment and its phases are read; a phase
+//     that completed has its proof's figures read (observe.go: at most
+//     Config.QueryTimeout per read, never failing the run), and a phase
 //     whose public status changed is published;
 //  7. the run ends. Every ending, before anything else, switches the rules
 //     off, all at once.
@@ -134,6 +136,10 @@ type Worker struct {
 	runs    runIndex
 	lookups chan struct{}
 
+	// proofSlots holds one token per proof query that has not returned
+	// (observe.go, maxProofQueries).
+	proofSlots chan struct{}
+
 	offRetry backoff // the switch-off retry schedule; set before Run
 
 	running atomic.Bool
@@ -171,6 +177,11 @@ type active struct {
 	started    bool          // StartExperiment was launched
 	startDone  chan struct{} // closed when the start goroutine returns
 	startErr   error         // StartExperiment's answer, valid once startDone is closed
+	// The run's proof (observe.go): the phases whose figures were asked
+	// for, and the baseline phase's figures (the memory target's memory, the
+	// CPU target's CPU), nil when not measured.
+	proved              [3]bool
+	baseMemory, baseCPU *float64
 
 	// Written by the worker goroutine under Worker.mu.
 	expID        string
@@ -244,7 +255,7 @@ func NewWorker(d Deps, cfg Config, q *Queue, h *Hub) *Worker {
 	halted, haltFn := context.WithCancel(context.Background())
 	return &Worker{d: d, cfg: cfg, q: q, h: h, log: d.logger(), halted: halted, haltFn: haltFn,
 		done: make(chan struct{}), offRetry: backoff{first: offRetryFirst, max: offRetryMax},
-		lookups: make(chan struct{}, maxDBLookups)}
+		lookups: make(chan struct{}, maxDBLookups), proofSlots: make(chan struct{}, maxProofQueries)}
 }
 
 // Run works the queue, one run at a time, until ctx is done or halt is called.
@@ -329,6 +340,17 @@ func (w *Worker) Current() (runID, phase string, phaseRunning bool) {
 		return "", "", false
 	}
 	return w.cur.runID, w.cur.phase, w.cur.phaseRunning
+}
+
+// sampling is Current with the service whose own CPU and memory a live sample
+// of that phase carries (sampleTarget); "" between runs.
+func (w *Worker) sampling() (runID, phase string, phaseRunning bool, target string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cur == nil {
+		return "", "", false, ""
+	}
+	return w.cur.runID, w.cur.phase, w.cur.phaseRunning, sampleTarget(w.cur.sc, w.cur.phase)
 }
 
 // currentExperimentID is the current run's experiment id once built, else "":
@@ -617,10 +639,12 @@ func (w *Worker) poll(a *active) (outcome, bool) {
 	return outcome{}, false
 }
 
-// refresh reads the run's phases and the results of completed ones, updates
-// the run's view and Current, then publishes each phase whose public status
-// changed, in phase order. A phase whose core status the contract does not
-// know keeps its last public status; refresh then reports unknown.
+// refresh reads the run's phases, the proof figures of those that completed
+// since the last read (prove: at most QueryTimeout) and the results of
+// completed ones, updates the run's view and Current, then publishes each
+// phase whose public status changed, in phase order. A phase whose core
+// status the contract does not know keeps its last public status; refresh
+// then reports unknown.
 func (w *Worker) refresh(ctx context.Context, a *active) (unknown bool, err error) {
 	rctx, cancel := context.WithTimeout(ctx, w.cfg.readTimeout())
 	phases, err := w.d.Experiments.ListPhasesForExperiment(rctx, a.expID)
@@ -654,6 +678,8 @@ func (w *Worker) refresh(ctx context.Context, a *active) (unknown bool, err erro
 			changed = append(changed, PhaseEvent{RunID: a.runID, Phase: PhaseNames[i], PhaseIndex: i, Status: st, At: phaseAt(p, st, now)})
 		}
 	}
+	// First, so each figure is read as close to its phase's end as can be.
+	proofs := w.prove(ctx, a, seen)
 	var results [3]*Result
 	for i := range a.last {
 		if a.last[i] != PhaseCompleted || a.haveResult[i] || seen[i] == nil {
@@ -677,6 +703,10 @@ func (w *Worker) refresh(ctx context.Context, a *active) (unknown bool, err erro
 			pv.Status, pv.StartedAt, pv.EndedAt = a.last[i], clonePtr(p.StartedAt), clonePtr(p.CompletedAt)
 			if results[i] != nil {
 				pv.Result = results[i]
+			}
+			if pr := proofs[i]; pr != nil {
+				m := pr.measure
+				pv.Measure, pv.FaultObserved = &m, pr.observed
 			}
 		}
 	})
@@ -1180,7 +1210,9 @@ func (w *Worker) findExperiment(ctx context.Context, runID string) (*model.Exper
 
 // runFromDB builds a run's view from its experiment, phases and results: its
 // scenario and phases as storedView tells them, then each phase's status,
-// times and result.
+// times and result. No proof figure is stored, so a completed fault phase
+// shows its measure's metric with both figures null, and fault_observed null
+// (storedMeasure); Prometheus is never asked.
 func (w *Worker) runFromDB(ctx context.Context, exp *model.Experiment) (Run, error) {
 	rctx, cancel := context.WithTimeout(ctx, w.cfg.readTimeout())
 	phases, err := w.d.Experiments.ListPhasesForExperiment(rctx, exp.ID)
@@ -1216,6 +1248,7 @@ func (w *Worker) runFromDB(ctx context.Context, exp *model.Experiment) (Run, err
 				return Run{}, err
 			}
 			pv.Result = res
+			pv.Measure = storedMeasure(pv.Fault)
 		}
 	}
 	return r, nil
@@ -1499,6 +1532,15 @@ func (s *ruleSwitch) offLocked(ctx context.Context, why string) error {
 				}
 				s.log.Info("demo: rule switched off", attrs...)
 			}
+			// A landed switch-off is final: no later off writes this rule
+			// again (each writes only the rules not landed), so none would
+			// undo a switch-on that commits after this write, such as an
+			// EnableIfAttached whose commit came late after its call had
+			// failed. Such a rule is served only while its own phase runs
+			// under a running experiment; what switches it off is retention's
+			// unconditional switch-off of every rule of the run before it
+			// deletes the run's experiment, or the next start-up's switch-off
+			// of every enabled demo rule, whichever comes first.
 			s.mu.Lock()
 			s.landed[ruleID] = true
 			s.mu.Unlock()
