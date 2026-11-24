@@ -29,13 +29,18 @@ var evalTimeout = 5 * time.Second
 
 // unsafeBuiltins are refused at compile time: a policy must never reach the
 // network or inspect the process from inside the evaluator. Against OPA
-// v1.19.1 this closes every network and host path: the only builtins that
-// perform I/O are http.send (topdown/http.go, which also reaches the CA file
-// and environment readers of crypto.go through its TLS options) and
-// net.lookup_ip_addr (topdown/net.go); print is erased because print
-// statements are not enabled. TestSandbox_PinsNondeterministicBuiltins pins
-// this classification to the OPA version.
-var unsafeBuiltins = map[string]struct{}{"http.send": {}, "net.lookup_ip_addr": {}, "opa.runtime": {}}
+// v1.22.4 this closes every network and host path: the builtins that perform
+// I/O are http.send (topdown/http.go, which also reaches the CA file and
+// environment readers of crypto.go through its TLS options),
+// net.lookup_ip_addr (topdown/net.go), and json.verify_schema and
+// json.match_schema, which fetch a schema's remote $refs
+// (topdown/jsonschema.go); print is erased because print statements are not
+// enabled. TestSandbox_PinsNondeterministicBuiltins pins this classification
+// to the OPA version.
+var unsafeBuiltins = map[string]struct{}{
+	"http.send": {}, "net.lookup_ip_addr": {}, "opa.runtime": {},
+	"json.verify_schema": {}, "json.match_schema": {},
+}
 
 // harmlessNondeterministicBuiltins are the builtins OPA flags nondeterministic
 // that a policy may still call: they read the clock or a random source and

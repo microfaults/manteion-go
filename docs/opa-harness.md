@@ -319,15 +319,16 @@ anything, so a wrong URL degrades the policy instead of crashing manteion.
 
   The "before" build predates the OPA dependency and the atropos pin advance
   (`303c6d1`), so the delta includes both; OPA is most of it.
-- OPA is pinned to v1.19.1, whose `go.mod` says `go 1.25.0` and so fits this
-  module's `go 1.25.5`. The OPA version is tied to the Go toolchain: moving
-  OPA forward can require raising the module's `go` directive.
-- The evaluator is sandboxed: `http.send`, `net.lookup_ip_addr` and
-  `opa.runtime` are refused at compile time, builtin errors are strict, and
+- OPA is v1.22.4, whose `go.mod` says `go 1.26.0`; this module says
+  `go 1.27.3`. A newer OPA can require raising the module's `go` directive.
+- The evaluator is sandboxed: `http.send`, `net.lookup_ip_addr`,
+  `opa.runtime`, `json.verify_schema` and `json.match_schema` are refused at
+  compile time (the two schema builtins fetch a schema's remote `$ref`s),
+  builtin errors are strict, and
   each evaluation (and each compile) runs under a 5 s timeout.
 - Trust model: policies are operator-authored, and the sandbox is not a
   boundary against a hostile author. It blocks the network and process
-  inspection (the denied builtins above are every builtin in OPA v1.19.1
+  inspection (the denied builtins above are every builtin in OPA v1.22.4
   that performs I/O; `TestSandbox_PinsNondeterministicBuiltins` fails an OPA
   upgrade that adds a nondeterministic builtin until it is classified), and
   it bounds evaluation time (the timeout), not memory: `net.cidr_expand` of a

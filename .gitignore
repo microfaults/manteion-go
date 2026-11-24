@@ -5,5 +5,3 @@
 # The docker build uses parent context + replace directive and doesn't need it.
 go.work
 go.work.sum
-# make openapi-local's scratch copy of go.work (removed when the target exits)
-/.openapi.go.work*

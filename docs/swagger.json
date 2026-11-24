@@ -503,7 +503,8 @@
                         "$ref": "#/components/schemas/atropos.DelayRequest"
                     },
                     "replay_set": {
-                        "$ref": "#/components/schemas/atropos.ReplaySetRef"
+                        "$ref": "#/components/schemas/atropos.ReplaySetRef",
+                        "description": "ReplaySet is the replay set desired on this instance: absent means no replay\nset is desired, so the instance clears one it holds. Present, it names the\nset to pull: ExperimentID and PhaseID are the (experiment, phase) pair it\nis installed under (the cache-box serves it only to the rule whose context\nmatches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from\nURL, and SHA256 is the W5 digest over its entries."
                     },
                     "rules": {
                         "items": {
@@ -523,7 +524,6 @@
                 "type": "object"
             },
             "atropos.ReplaySetRef": {
-                "description": "ReplaySet is the replay set desired on this instance: absent means no replay\nset is desired, so the instance clears one it holds. Present, it names the\nset to pull: ExperimentID and PhaseID are the (experiment, phase) pair it\nis installed under (the cache-box serves it only to the rule whose context\nmatches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from\nURL, and SHA256 is the W5 digest over its entries.",
                 "properties": {
                     "count": {
                         "type": "integer"
@@ -583,7 +583,8 @@
                         "$ref": "#/components/schemas/atropos.DelayRequest"
                     },
                     "replay_set": {
-                        "$ref": "#/components/schemas/atropos.ReplaySetRef"
+                        "$ref": "#/components/schemas/atropos.ReplaySetRef",
+                        "description": "ReplaySet is the replay set desired on this instance: absent means no replay\nset is desired, so the instance clears one it holds. Present, it names the\nset to pull: ExperimentID and PhaseID are the (experiment, phase) pair it\nis installed under (the cache-box serves it only to the rule whose context\nmatches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from\nURL, and SHA256 is the W5 digest over its entries."
                     },
                     "rules": {
                         "items": {
@@ -659,7 +660,6 @@
                 "type": "object"
             },
             "model.CacheBoxRuleConfig": {
-                "description": "when type=cachebox",
                 "properties": {
                     "key_strategy": {
                         "description": "\"exact\" | \"exact_with_host\" | \"exact_with_body\"",
@@ -673,7 +673,6 @@
                 "type": "object"
             },
             "model.Direction": {
-                "description": "\"upstream\", \"downstream\", \"\" (non-network)",
                 "enum": [
                     "upstream",
                     "downstream",
@@ -687,7 +686,6 @@
                 ]
             },
             "model.ExecutionMode": {
-                "description": "\"parallel\" or \"sequential\"",
                 "enum": [
                     "parallel",
                     "sequential"
@@ -707,7 +705,8 @@
                         "type": "integer"
                     },
                     "execution_mode": {
-                        "$ref": "#/components/schemas/model.ExecutionMode"
+                        "$ref": "#/components/schemas/model.ExecutionMode",
+                        "description": "\"parallel\" or \"sequential\""
                     },
                     "id": {
                         "type": "string"
@@ -737,7 +736,8 @@
                         "type": "string"
                     },
                     "direction": {
-                        "$ref": "#/components/schemas/model.Direction"
+                        "$ref": "#/components/schemas/model.Direction",
+                        "description": "\"upstream\", \"downstream\", \"\" (non-network)"
                     },
                     "fault_spec_id": {
                         "type": "string"
@@ -967,7 +967,8 @@
             "model.RuleAction": {
                 "properties": {
                     "cachebox": {
-                        "$ref": "#/components/schemas/model.CacheBoxRuleConfig"
+                        "$ref": "#/components/schemas/model.CacheBoxRuleConfig",
+                        "description": "when type=cachebox"
                     },
                     "fault_composition_id": {
                         "description": "when type=fault_composition",
@@ -1296,16 +1297,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/CacheIngestEnvelope",
-                                        "summary": "body",
-                                        "description": "the batch"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/CacheIngestEnvelope",
+                                "summary": "body",
+                                "description": "the batch"
                             }
                         }
                     },
@@ -1431,16 +1425,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.FaultComposition",
-                                        "summary": "composition",
-                                        "description": "Composition definition"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.FaultComposition",
+                                "summary": "composition",
+                                "description": "Composition definition"
                             }
                         }
                     },
@@ -1617,16 +1604,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.FaultSpec",
-                                        "summary": "spec",
-                                        "description": "Fault spec definition"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.FaultSpec",
+                                "summary": "spec",
+                                "description": "Fault spec definition"
                             }
                         }
                     },
@@ -1780,16 +1760,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.FaultSpec",
-                                        "summary": "spec",
-                                        "description": "Updated fault spec"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.FaultSpec",
+                                "summary": "spec",
+                                "description": "Updated fault spec"
                             }
                         }
                     },
@@ -1907,16 +1880,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.OPAPolicy",
-                                        "summary": "policy",
-                                        "description": "Policy definition"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.OPAPolicy",
+                                "summary": "policy",
+                                "description": "Policy definition"
                             }
                         }
                     },
@@ -2092,16 +2058,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.OPAPolicy",
-                                        "summary": "policy",
-                                        "description": "Policy definition"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.OPAPolicy",
+                                "summary": "policy",
+                                "description": "Policy definition"
                             }
                         }
                     },
@@ -2377,16 +2336,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.Rule",
-                                        "summary": "rule",
-                                        "description": "Rule definition"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.Rule",
+                                "summary": "rule",
+                                "description": "Rule definition"
                             }
                         }
                     },
@@ -2530,16 +2482,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.Rule",
-                                        "summary": "rule",
-                                        "description": "Updated rule"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.Rule",
+                                "summary": "rule",
+                                "description": "Updated rule"
                             }
                         }
                     },
@@ -2805,16 +2750,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/model.SDKInstance",
-                                        "summary": "instance",
-                                        "description": "SDK instance metadata (id, service, address, poll_interval_ms, routes, host, capabilities)"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/model.SDKInstance",
+                                "summary": "instance",
+                                "description": "SDK instance metadata (id, service, address, poll_interval_ms, routes, host, capabilities)"
                             }
                         }
                     },
@@ -2997,16 +2935,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.StatusReport",
-                                        "summary": "report",
-                                        "description": "applied-state report"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.StatusReport",
+                                "summary": "report",
+                                "description": "applied-state report"
                             }
                         }
                     },

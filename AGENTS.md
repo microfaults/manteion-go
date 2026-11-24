@@ -29,13 +29,15 @@ Remotes: `github` (github.com/microfaults, public) is the primary remote; `origi
 make verify          # go build, gofmt -l (fails on output), go vet, go test
 go test -race ./...
 make integration     # MANTEION_INTEGRATION=1 MANTEION_TEST_DB=1 go test -count=1 -timeout 300s -p 1 ./...
-make openapi-local   # regenerate docs/swagger.{yaml,json} on this Mac
+make openapi         # regenerate docs/swagger.{yaml,json}
+make openapi-check   # regenerate, then fail if the committed spec differs (CI's gate)
 go run ./cmd/manteion
 ```
 
 - Plain `go test ./...` passes while skipping every database-backed test. Store and orchestrator suites need `MANTEION_INTEGRATION=1`; many api and orchestrator tests also need `MANTEION_TEST_DB=1`. `make integration` sets both. CI's `go-integration` job sets only `MANTEION_INTEGRATION`, so the `MANTEION_TEST_DB` tests skip there too.
 - The DB tests need Postgres: `colima start`, then `docker compose up -d postgres` (postgres:18-alpine on 5432). The default DSN is `postgres://manteion:manteion@localhost:5432/manteion?sslmode=disable`; set `MANTEION_DATABASE_URL` to use another. If another worktree's compose holds 5432, run a separate `postgres:18-alpine` on `127.0.0.1:55432` and point `MANTEION_DATABASE_URL` at it. Keep `-p 1`: the suites share one database and truncate every table between tests. Remove the container and volume afterwards.
-- OpenAPI: use `make openapi-local`, then `git diff --exit-code -- docs/swagger.yaml docs/swagger.json` (that diff is what CI's `openapi-check` fails on). Plain `make openapi` fails here because swag v2.0.0-rc5 cannot parse Go 1.27's standard library and `go.work` declares go 1.27; `openapi-local` runs under go.mod's go1.25.5 through a temporary copy of `go.work`. Needs `swag` v2.0.0-rc5 and python3 with PyYAML (install notes in the Makefile header).
+- OpenAPI: `make openapi` regenerates the spec and `make openapi-check` then runs `git diff --exit-code -- docs/swagger.yaml docs/swagger.json`, which is what CI's `openapi-check` job runs. Needs `swag` v2.0.0-rc6 built with Go 1.27.3 or newer (swag parses the standard library of the Go it was built with, and go.mod says `go 1.27.3`) and python3 with PyYAML (install notes in the Makefile header). The spec is generated through the same module resolution as the build, so the local `go.work` must declare a `go` line of at least 1.27.3 (`go work edit -go=1.27.3`), as `go build` requires too.
+- Go: go.mod says `go 1.27.3` with no toolchain line; CI uses `golang:1.27` and the Dockerfile `golang:1.27-alpine`. The pinned atropos trees (`atropos-pin`, `atropos-beds-pin`) say `go 1.25.5` and require older OpenTelemetry, gRPC and Prometheus versions than this module; minimal version selection builds them with this module's newer ones, which both resolutions compile.
 - The experiment and phase handlers carry no swag annotations, so the spec does not cover them; the code is the reference.
 - `go run ./cmd/manteion` listens on `:9090` (`MANTEION_ADDR`). The Kubernetes manifest sets `:8080`, which is why other repos say `manteion:8080`. With `MANTEION_DEMO=true` it also listens on `:8090` (`MANTEION_DEMO_ADDR`, see "Demo mode"); the manifest turns demo mode on.
 

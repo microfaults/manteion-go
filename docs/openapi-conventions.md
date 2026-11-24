@@ -4,7 +4,7 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 
 ## Toolchain
 
-- `swag` v2.0.0-rc5 (pinned; v2.0.0 has not been released yet). Install with `go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5`. Note: `swag --version` self-reports `v2.0.0` regardless of which v2 RC is installed; trust the `go install` command pin (`@v2.0.0-rc5`), not the binary's banner.
+- `swag` v2.0.0-rc6 (pinned; v2.0.0 has not been released yet). Install with `go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc6`, using Go 1.27.3 or newer: swag parses the standard library of the Go it was built with, and `go.mod` says `go 1.27.3`. Note: `swag --version` self-reports `v2.0.0` regardless of which v2 RC is installed; trust the `go install` command pin (`@v2.0.0-rc6`), not the binary's banner (`go version -m $(which swag)` shows both the swag version and the Go that built it).
 - The general-info annotations use swag v2's `@servers.url` / `@servers.description` directives (paired by ordinal position) rather than the deprecated `@host` / `@BasePath` / `@schemes` triplet. Re-evaluate the syntax once swag publishes a stable v2.0.0.
 - The post-processor at `scripts/strip-empty-externaldocs.py` strips empty `externalDocs:` blocks emitted by swag v2.0.x; remove this once swag publishes a release that omits empty stubs.
 - Specs are committed at `docs/swagger.{yaml,json}` and validated in CI on pushes to `main`/`develop`.
@@ -40,12 +40,15 @@ All Go handlers in this repo use [swaggo/swag](https://github.com/swaggo/swag) v
 
 ## Regenerating the spec
 
-Run `make openapi` from the repo root. On a host whose Go is newer than swag rc5
-can parse (Go 1.27 fails with "method must have no type parameters" in the
-stdlib), run `make openapi-local` instead: it runs the same generation under the
-`go.mod` toolchain, through a scratch copy of `go.work` whose `go` line matches
-(see the Makefile). The output is identical; check it with
-`git diff --exit-code -- docs/swagger.yaml docs/swagger.json`.
+Run `make openapi` from the repo root, then `make openapi-check` (it
+regenerates and runs `git diff --exit-code -- docs/swagger.yaml
+docs/swagger.json`, the same gate CI runs). swag resolves packages through the
+same module setup as `go build`, so a local `go.work` needs a `go` line of at
+least go.mod's.
+
+Request bodies are emitted as a plain `$ref` to their schema. A field whose
+type is a named schema carries its doc comment as a `description` beside the
+`$ref` on the property, not on the shared component schema.
 
 Commit `docs/swagger.{yaml,json}` together with handler edits. CI fails if the spec is stale.
 

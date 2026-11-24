@@ -408,6 +408,21 @@ components:
           $ref: '#/components/schemas/atropos.DelayRequest'
         replay_set:
           $ref: '#/components/schemas/atropos.ReplaySetRef'
+          description: 'ReplaySet is the replay set desired on this instance: absent
+            means no replay
+
+            set is desired, so the instance clears one it holds. Present, it names
+            the
+
+            set to pull: ExperimentID and PhaseID are the (experiment, phase) pair
+            it
+
+            is installed under (the cache-box serves it only to the rule whose context
+
+            matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched
+            from
+
+            URL, and SHA256 is the W5 digest over its entries.'
         rules:
           items:
             $ref: '#/components/schemas/atropos.CompiledRule'
@@ -420,18 +435,6 @@ components:
           type: integer
       type: object
     atropos.ReplaySetRef:
-      description: 'ReplaySet is the replay set desired on this instance: absent means
-        no replay
-
-        set is desired, so the instance clears one it holds. Present, it names the
-
-        set to pull: ExperimentID and PhaseID are the (experiment, phase) pair it
-
-        is installed under (the cache-box serves it only to the rule whose context
-
-        matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from
-
-        URL, and SHA256 is the W5 digest over its entries.'
       properties:
         count:
           type: integer
@@ -483,6 +486,21 @@ components:
           $ref: '#/components/schemas/atropos.DelayRequest'
         replay_set:
           $ref: '#/components/schemas/atropos.ReplaySetRef'
+          description: 'ReplaySet is the replay set desired on this instance: absent
+            means no replay
+
+            set is desired, so the instance clears one it holds. Present, it names
+            the
+
+            set to pull: ExperimentID and PhaseID are the (experiment, phase) pair
+            it
+
+            is installed under (the cache-box serves it only to the rule whose context
+
+            matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched
+            from
+
+            URL, and SHA256 is the W5 digest over its entries.'
         rules:
           items:
             $ref: '#/components/schemas/atropos.CompiledRule'
@@ -532,7 +550,6 @@ components:
           type: string
       type: object
     model.CacheBoxRuleConfig:
-      description: when type=cachebox
       properties:
         key_strategy:
           description: '"exact" | "exact_with_host" | "exact_with_body"'
@@ -542,7 +559,6 @@ components:
           type: string
       type: object
     model.Direction:
-      description: '"upstream", "downstream", "" (non-network)'
       enum:
       - upstream
       - downstream
@@ -553,7 +569,6 @@ components:
       - DirectionDownstream
       - DirectionNone
     model.ExecutionMode:
-      description: '"parallel" or "sequential"'
       enum:
       - parallel
       - sequential
@@ -569,6 +584,7 @@ components:
           type: integer
         execution_mode:
           $ref: '#/components/schemas/model.ExecutionMode'
+          description: '"parallel" or "sequential"'
         id:
           type: string
         members:
@@ -589,6 +605,7 @@ components:
           type: string
         direction:
           $ref: '#/components/schemas/model.Direction'
+          description: '"upstream", "downstream", "" (non-network)'
         fault_spec_id:
           type: string
       type: object
@@ -751,6 +768,7 @@ components:
       properties:
         cachebox:
           $ref: '#/components/schemas/model.CacheBoxRuleConfig'
+          description: when type=cachebox
         fault_composition_id:
           description: when type=fault_composition
           type: string
@@ -1010,11 +1028,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/CacheIngestEnvelope'
-                description: the batch
-                summary: body
+              $ref: '#/components/schemas/CacheIngestEnvelope'
+              description: the batch
+              summary: body
         description: the batch
         required: true
       responses:
@@ -1100,11 +1116,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.FaultComposition'
-                description: Composition definition
-                summary: composition
+              $ref: '#/components/schemas/model.FaultComposition'
+              description: Composition definition
+              summary: composition
         description: Composition definition
         required: true
       responses:
@@ -1215,11 +1229,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.FaultSpec'
-                description: Fault spec definition
-                summary: spec
+              $ref: '#/components/schemas/model.FaultSpec'
+              description: Fault spec definition
+              summary: spec
         description: Fault spec definition
         required: true
       responses:
@@ -1318,11 +1330,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.FaultSpec'
-                description: Updated fault spec
-                summary: spec
+              $ref: '#/components/schemas/model.FaultSpec'
+              description: Updated fault spec
+              summary: spec
         description: Updated fault spec
         required: true
       responses:
@@ -1410,11 +1420,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.OPAPolicy'
-                description: Policy definition
-                summary: policy
+              $ref: '#/components/schemas/model.OPAPolicy'
+              description: Policy definition
+              summary: policy
         description: Policy definition
         required: true
       responses:
@@ -1530,11 +1538,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.OPAPolicy'
-                description: Policy definition
-                summary: policy
+              $ref: '#/components/schemas/model.OPAPolicy'
+              description: Policy definition
+              summary: policy
         description: Policy definition
         required: true
       responses:
@@ -1747,11 +1753,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.Rule'
-                description: Rule definition
-                summary: rule
+              $ref: '#/components/schemas/model.Rule'
+              description: Rule definition
+              summary: rule
         description: Rule definition
         required: true
       responses:
@@ -1842,11 +1846,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.Rule'
-                description: Updated rule
-                summary: rule
+              $ref: '#/components/schemas/model.Rule'
+              description: Updated rule
+              summary: rule
         description: Updated rule
         required: true
       responses:
@@ -2066,12 +2068,10 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/model.SDKInstance'
-                description: SDK instance metadata (id, service, address, poll_interval_ms,
-                  routes, host, capabilities)
-                summary: instance
+              $ref: '#/components/schemas/model.SDKInstance'
+              description: SDK instance metadata (id, service, address, poll_interval_ms,
+                routes, host, capabilities)
+              summary: instance
         description: SDK instance metadata (id, service, address, poll_interval_ms,
           routes, host, capabilities)
         required: true
@@ -2225,11 +2225,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.StatusReport'
-                description: applied-state report
-                summary: report
+              $ref: '#/components/schemas/atropos.StatusReport'
+              description: applied-state report
+              summary: report
         description: applied-state report
         required: true
       responses:

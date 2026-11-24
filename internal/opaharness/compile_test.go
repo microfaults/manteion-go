@@ -33,6 +33,7 @@ func TestCompile_Rejects(t *testing.T) {
 	tests := []struct{ name, src, wantErr string }{
 		{"parse error", "package atropos\nmutations contains x if { x := }", "rego_parse_error"},
 		{"unsafe builtin", "package atropos\nmutations contains r if { r := http.send({\"method\": \"get\", \"url\": \"http://x\"}) }", "unsafe built-in"},
+		{"schema builtin", "package atropos\nmutations contains r if { r := json.match_schema({}, {\"$ref\": \"http://x/s.json\"}) }", "unsafe built-in"},
 		{"wrong package", "package other\nmutations contains 1", "package atropos"},
 		{"empty", "   ", "package atropos"},
 	}

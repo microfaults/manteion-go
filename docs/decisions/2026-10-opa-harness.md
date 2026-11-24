@@ -35,8 +35,8 @@ Consequences:
 - The binary grows by about 16 MB stripped (19271026 → 35356802 bytes) and
   21.5 MB unstripped (29182226 → 50717666), measured on darwin/arm64; see
   `docs/opa-harness.md` ("Cost and limits").
-- The OPA version is tied to the Go toolchain: v1.19.1 fits the module's
-  `go 1.25.5`, and a newer OPA can require raising the `go` directive.
+- The OPA version is tied to the Go toolchain: a newer OPA can require
+  raising the module's `go` directive.
 - A second policy language, Rego, sits next to the UI's rule model.
   Policies are stored in `opa_policies` and managed through
   `/api/v1/opa/policies`.
