@@ -50,8 +50,9 @@ type Queue struct {
 // queued is one run in the line.
 type queued struct {
 	client string
-	run    Run  // Position is not kept here: it is the entry's index in line
-	taken  bool // the worker has picked the run up
+	sc     Scenario // the scenario the run runs, as queued
+	run    Run      // Position is not kept here: it is the entry's index in line
+	taken  bool     // the worker has picked the run up
 }
 
 // NewQueue returns an empty queue holding at most capacity runs (at least 1).
@@ -62,13 +63,15 @@ func NewQueue(capacity int) *Queue {
 	return &Queue{capacity: capacity, wake: make(chan struct{}, 1)}
 }
 
-// Enqueue adds a run for client at the end of the line and returns its view:
-// status queued, its position, queued at now. It refuses with ErrQueueClosed
-// once the worker was halted or stopped, then with ErrClientHasRun when the
-// client already has a run in the line, and with ErrQueueFull when the line is
-// at capacity. The run's id is id.New(RunIDPrefix). Nothing is built here: the
-// worker builds a run when it picks it up.
-func (q *Queue) Enqueue(client string, now time.Time) (Run, error) {
+// Enqueue adds a run of scenario sc for client at the end of the line and
+// returns its view: sc's id and phases, status queued, its position, queued
+// at now. It refuses with ErrQueueClosed once the worker was halted or
+// stopped, then with ErrClientHasRun when the client already has a run in the
+// line, and with ErrQueueFull when the line is at capacity. The run's id is
+// id.New(RunIDPrefix). Nothing is built here: the worker builds a run of sc
+// when it picks it up. The caller chooses sc from the catalog; nothing of a
+// request reaches it but the choice of an entry.
+func (q *Queue) Enqueue(client string, sc Scenario, now time.Time) (Run, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
@@ -82,7 +85,7 @@ func (q *Queue) Enqueue(client string, now time.Time) (Run, error) {
 	if len(q.line) >= q.capacity {
 		return Run{}, ErrQueueFull
 	}
-	e := &queued{client: client, run: newRun(id.New(RunIDPrefix), now)}
+	e := &queued{client: client, sc: sc, run: newRun(id.New(RunIDPrefix), sc, now)}
 	q.line = append(q.line, e)
 	select {
 	case q.wake <- struct{}{}:
@@ -140,29 +143,29 @@ func (q *Queue) closeLine() {
 }
 
 // next waits until the first run in the line is one the worker has not taken
-// yet, marks it taken and returns its id. It returns false once ctx is done or
-// the queue is closed, without taking anything.
-func (q *Queue) next(ctx context.Context) (string, bool) {
+// yet, marks it taken and returns its id and its scenario. It returns false
+// once ctx is done or the queue is closed, without taking anything.
+func (q *Queue) next(ctx context.Context) (string, Scenario, bool) {
 	for {
 		if ctx.Err() != nil {
-			return "", false
+			return "", Scenario{}, false
 		}
 		q.mu.Lock()
 		if q.closed {
 			q.mu.Unlock()
-			return "", false
+			return "", Scenario{}, false
 		}
 		if len(q.line) > 0 && !q.line[0].taken {
-			q.line[0].taken = true
-			runID := q.line[0].run.RunID
+			e := q.line[0]
+			e.taken = true
 			q.mu.Unlock()
-			return runID, true
+			return e.run.RunID, e.sc, true
 		}
 		q.mu.Unlock()
 		select {
 		case <-q.wake:
 		case <-ctx.Done():
-			return "", false
+			return "", Scenario{}, false
 		}
 	}
 }
@@ -229,11 +232,10 @@ func (q *Queue) remove(runID string) (moved []QueueEvent, ok bool) {
 
 // ---- run views ----
 
-// newRun is a queued run's first view: the default scenario's id and its three
-// phases pending, each fault phase with its fault's kind, target and
-// intensity, the fixed testbed, no position (callers add it).
-func newRun(runID string, queuedAt time.Time) Run {
-	sc := DefaultScenario() // Task 4: the queued entry's scenario, or the one read from the database
+// newRun is a queued run's first view: scenario sc's id and its three phases
+// pending, each fault phase with its fault's kind, target and intensity, the
+// fixed testbed, no position (callers add it).
+func newRun(runID string, sc Scenario, queuedAt time.Time) Run {
 	r := Run{RunID: runID, Scenario: sc.ID, Status: RunQueued, QueuedAt: queuedAt, Testbed: FixedTestbed()}
 	steps := faultSteps(&sc)
 	for i := range r.Phases {

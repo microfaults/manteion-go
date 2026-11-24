@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -55,17 +56,53 @@ func capturedHarness(t *testing.T, tweak func(*Config)) (*harness, *captureHandl
 	return x, c
 }
 
-// TestRuleLog_CompletedRun: a run that completes logs each of its two rules
-// switched on once and switched off once, at Info, with the run and rule ids,
-// the off with reason completed; nothing about the switch at Warn.
+// TestRuleLog_CompletedRun: a run that completes logs exactly two rules
+// switched on and two switched off, one of each per rule, at Info, with the
+// run and rule ids, the off with reason completed; nothing about the switch at
+// Warn. Neither rule is ever served outside its own phase: the fake checks
+// that after every write, and the test at every phase of the run.
 func TestRuleLog_CompletedRun(t *testing.T) {
 	t.Parallel()
 	x, c := capturedHarness(t, noCap)
 	x.f.autopilot = true
+	var outside atomic.Int32
+	var runID atomic.Value
+	x.f.onCall("experiments.ListPhasesForExperiment", func() { // before each autopilot step
+		id, _ := runID.Load().(string)
+		ids := x.f.ruleIDsOfRun(id)
+		if len(ids) != 2 {
+			return
+		}
+		phases := x.f.phasesOf(x.f.experimentIDOfRun(id))
+		for i, rule := range ids {
+			running := len(phases) == 3 && phases[i+1].Status == "running" && x.f.experimentStatus(phases[i+1].ExperimentID) == "running"
+			if x.f.served(rule) != running {
+				outside.Add(1)
+			}
+		}
+	})
 	r, ch := x.enqueue("a")
+	runID.Store(r.RunID)
 	x.start()
 	awaitEnd(t, ch)
 	x.stop()
+	if n := len(x.f.callList("experiments.ListPhasesForExperiment")); n < 4 {
+		t.Fatalf("precondition: %d phase reads; want one per step of the run", n)
+	}
+	if n := outside.Load(); n != 0 {
+		t.Errorf("%d times a rule was served outside its own phase, or not served in it", n)
+	}
+	for msg, want := range map[string]int{"demo: rule switched on": 2, "demo: rule switched off": 2} {
+		n := 0
+		for _, rec := range c.all() {
+			if rec.Message == msg {
+				n++
+			}
+		}
+		if n != want {
+			t.Errorf("%d %q lines; want %d", n, msg, want)
+		}
+	}
 	for _, rule := range x.f.rulesOfRun(t, r.RunID) {
 		ids := map[string]string{"run_id": r.RunID, "rule_id": rule}
 		requireOneRecord(t, "switched on", ruleRecords(c, "demo: rule switched on", rule), slog.LevelInfo, ids)
@@ -81,8 +118,8 @@ func TestRuleLog_CompletedRun(t *testing.T) {
 
 // TestRuleLog_ShutdownMidRun: a shutdown while the run's rules are on logs
 // each rule's switch-off once at Info with reason shutdown. Shutdown's own
-// switch-off races the ending's: both write each rule, and the second is a
-// Debug line, not a second Info "off".
+// switch-off races the ending's: whichever writes first lands both rules,
+// and the other finds them landed and writes nothing.
 func TestRuleLog_ShutdownMidRun(t *testing.T) {
 	t.Parallel()
 	x, c := capturedHarness(t, noCap)
@@ -98,13 +135,11 @@ func TestRuleLog_ShutdownMidRun(t *testing.T) {
 	waitClosed(t, x.w.done, "Run to return")
 	x.stop()
 	for _, rule := range rules {
-		if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 2 {
-			t.Fatalf("%d switch-off writes of %s; want 2, Shutdown's and the ending's", n, rule)
+		if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+			t.Fatalf("%d switch-off writes of %s; want 1", n, rule)
 		}
 		requireOneRecord(t, "switched off", ruleRecords(c, "demo: rule switched off", rule), slog.LevelInfo,
 			map[string]string{"run_id": r.RunID, "rule_id": rule, "reason": offShutdown})
-		requireOneRecord(t, "the second switch-off", ruleRecords(c, "demo: rule already off", rule), slog.LevelDebug,
-			map[string]string{"run_id": r.RunID, "rule_id": rule})
 	}
 }
 

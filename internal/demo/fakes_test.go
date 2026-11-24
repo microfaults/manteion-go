@@ -250,15 +250,55 @@ func (f *fakeLab) begin(ctx context.Context, op, arg string) (after, err error) 
 // ---- invariant, serving and inspection ----
 
 // checkLocked records a violation for every demo-run-* rule, and every rule a
-// test watches (watchRule), that is enabled and attached to no phase. Called
-// with f.mu held after each mutation.
+// test watches (watchRule), that is enabled and attached to no phase; and for
+// every rule of a scenario's run (demo-run-<run id>-memory or -cpu) that is
+// served through a running phase other than its own (the phase named for its
+// fault's kind). Called with f.mu held after each mutation.
 func (f *fakeLab) checkLocked(op string) {
 	for id, r := range f.rules {
 		if r.Enabled && (strings.HasPrefix(r.Name, RunNamePrefix) || f.watched[id]) && !f.attachedLocked(id) {
 			f.viols = append(f.viols,
 				fmt.Sprintf("after %s: rule %s (%s) is enabled and attached to no phase", op, id, r.Name))
 		}
+		if p := f.servedThroughLocked(id); p != nil && kindOfRuleName(r.Name) != "" && p.Name != kindOfRuleName(r.Name) {
+			f.viols = append(f.viols,
+				fmt.Sprintf("after %s: rule %s (%s) is served while phase %s (%s) runs, not its own", op, id, r.Name, p.ID, p.Name))
+		}
 	}
+}
+
+// kindOfRuleName is the fault kind a scenario's run names its rule for
+// (demo-run-<run id>-memory: memory), or "" for any other name.
+func kindOfRuleName(name string) string {
+	runID, ok := RunIDOfRule(name)
+	if !ok {
+		return ""
+	}
+	for _, k := range []FaultKind{FaultMemory, FaultCPU} {
+		if name == RuleName(runID, k) {
+			return string(k)
+		}
+	}
+	return ""
+}
+
+// servedThroughLocked is the running phase, of a running experiment, through
+// which the enabled rule is served, or nil.
+func (f *fakeLab) servedThroughLocked(ruleID string) *model.ExperimentPhase {
+	if r := f.rules[ruleID]; r == nil || !r.Enabled {
+		return nil
+	}
+	for pid, ids := range f.phaseRules {
+		if !slices.Contains(ids, ruleID) {
+			continue
+		}
+		if p := f.phases[pid]; p != nil && p.Status == "running" {
+			if e := f.experiments[p.ExperimentID]; e != nil && e.Status == "running" {
+				return p
+			}
+		}
+	}
+	return nil
 }
 
 func (f *fakeLab) attachedLocked(ruleID string) bool {
@@ -700,7 +740,11 @@ func (f *fakeLab) advanceLocked(expID string) {
 			continue
 		}
 		p.Status, p.CompletedAt = "completed", &now
-		f.results[p.ID] = []*model.PhaseWorkflowResult{{PhaseID: p.ID, WorkflowID: DefaultScenario().Workload.WorkflowID,
+		workflowID := ""
+		if wfs := f.phaseWFs[p.ID]; len(wfs) > 0 {
+			workflowID = wfs[0].WorkflowID
+		}
+		f.results[p.ID] = []*model.PhaseWorkflowResult{{PhaseID: p.ID, WorkflowID: workflowID,
 			RequestCount: 290 + int64(i), ErrorCount: int64(i), LatencyP50Us: 110_000, LatencyP95Us: 250_500,
 			LatencyP99Us: 359_000, ComputedAt: now}}
 		if i+1 < len(byPos) {

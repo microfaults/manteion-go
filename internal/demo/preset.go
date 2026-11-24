@@ -164,8 +164,8 @@ func SpecNameFor(step FaultStep) string {
 // "-cpu" hold letters no UUID has, so no run id ends in either and a name
 // matches at most one of the three forms.
 func RunIDOfRule(name string) (runID string, ok bool) {
-	rest, ok := strings.CutPrefix(name, RunNamePrefix)
-	if !ok {
+	rest, found := strings.CutPrefix(name, RunNamePrefix)
+	if !found {
 		return "", false
 	}
 	for _, k := range [...]FaultKind{FaultMemory, FaultCPU} {
@@ -177,6 +177,51 @@ func RunIDOfRule(name string) (runID string, ok bool) {
 		return rest, true
 	}
 	return "", false
+}
+
+// runDescriptionPrefix opens the description of every run's experiment; the
+// scenario's id follows it, up to a colon. The description is where a run
+// keeps its scenario's id: the experiment has no other field for it, and a
+// run read back from the database after its scenario left the catalog still
+// names it (scenarioOfDescription).
+const runDescriptionPrefix = "Public demo run of scenario "
+
+// runDescription is the description of a run of sc's experiment:
+// runDescriptionPrefix, the scenario's id, a colon, and the run in words.
+func runDescription(sc Scenario) string {
+	return runDescriptionPrefix + sc.ID + ": no fault, then the " + sc.Memory.Intensity + " memory fault in " +
+		sc.Memory.Target + ", then the " + sc.CPU.Intensity + " CPU fault in " + sc.CPU.Target + "."
+}
+
+// scenarioOfDescription reads back the scenario id runDescription wrote. ok is
+// false for a description that does not carry one (build 2's runs), and for
+// one whose id is not a public label (publicLabel): what it returns may be
+// shown to anyone.
+func scenarioOfDescription(desc string) (string, bool) {
+	rest, found := strings.CutPrefix(desc, runDescriptionPrefix)
+	if !found {
+		return "", false
+	}
+	id, _, found := strings.Cut(rest, ":")
+	if !found || !publicLabel(id) {
+		return "", false
+	}
+	return id, true
+}
+
+// publicLabel reports whether s may be shown as a scenario id, a service name
+// or an intensity read from the database: 1 to 64 characters, each a
+// lower-case letter, a digit or a hyphen.
+func publicLabel(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // buildable reports whether sc can be built: a memory step then a CPU step,
@@ -204,7 +249,8 @@ func buildable(sc Scenario) bool {
 // the scenario's that outlives now + runCap + 1 min. The memory rule is
 // attached to the memory phase only and the CPU rule to the cpu phase only.
 // The rules are never enabled here (that is SetRuleEnabled's job, just before
-// the start).
+// the start). The experiment's description names the scenario's id
+// (runDescription), which is how a run read back from the database knows it.
 //
 // Each rule runs its step's shared fault spec (SpecNameFor): created by the
 // first build that needs it, reused by every later one, and checked before
@@ -289,13 +335,12 @@ func buildRun(ctx context.Context, d Deps, runID string, sc Scenario, runCap, cl
 	}
 
 	exp := &model.Experiment{
-		ID:   id.New("exp"),
-		Name: RunNamePrefix + runID,
-		Description: "Public demo run of scenario " + sc.ID + ": no fault, then the " + sc.Memory.Intensity +
-			" memory fault in " + sc.Memory.Target + ", then the " + sc.CPU.Intensity + " CPU fault in " + sc.CPU.Target + ".",
-		Status:    "planned",
-		CreatedBy: CreatedBy,
-		CreatedAt: now,
+		ID:          id.New("exp"),
+		Name:        RunNamePrefix + runID,
+		Description: runDescription(sc),
+		Status:      "planned",
+		CreatedBy:   CreatedBy,
+		CreatedAt:   now,
 	}
 	made.experimentID = exp.ID
 	if err := d.Experiments.Create(ctx, exp); err != nil {

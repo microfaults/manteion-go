@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"manteion-go/internal/id"
 	"manteion-go/internal/model"
 	"manteion-go/internal/orchestrator"
 )
@@ -65,10 +66,18 @@ func newHarness(t *testing.T, tweak func(*Config)) *harness {
 	return &harness{t: t, f: f, cfg: cfg, q: q, h: h, w: w}
 }
 
-// enqueue queues a run for client and subscribes to its events.
+// enqueue queues a run of the default scenario for client and subscribes to
+// its events.
 func (x *harness) enqueue(client string) (Run, <-chan Event) {
 	x.t.Helper()
-	r, err := x.q.Enqueue(client, x.f.clock.Now())
+	return x.enqueueOf(client, DefaultScenario())
+}
+
+// enqueueOf queues a run of scenario sc for client and subscribes to its
+// events.
+func (x *harness) enqueueOf(client string, sc Scenario) (Run, <-chan Event) {
+	x.t.Helper()
+	r, err := x.q.Enqueue(client, sc, x.f.clock.Now())
 	if err != nil {
 		x.t.Fatal(err)
 	}
@@ -372,7 +381,7 @@ func TestWorker_PreflightRefusals(t *testing.T) {
 			if n := len(x.q.Snapshot()); n != 0 {
 				t.Errorf("%d runs in line; want the slot freed", n)
 			}
-			if _, err := x.q.Enqueue("a", testNow); err != nil {
+			if _, err := x.q.Enqueue("a", DefaultScenario(), testNow); err != nil {
 				t.Errorf("same client after the refusal: %v", err)
 			}
 		})
@@ -384,11 +393,154 @@ func TestWorker_PreflightRefusals(t *testing.T) {
 func TestPreflight_OwnExperimentIsNotBusy(t *testing.T) {
 	f := newFakeLab(t, testNow)
 	f.experiments["exp-own"] = &model.Experiment{ID: "exp-own", Name: "own", Status: "running", CreatedBy: CreatedBy}
-	if reason, ok := Preflight(context.Background(), f.deps(), "exp-own"); !ok || !reason.IsZero() {
+	if reason, ok := Preflight(context.Background(), f.deps(), DefaultScenario(), "exp-own"); !ok || !reason.IsZero() {
 		t.Fatalf("Preflight = %q, %v; want ok", reason, ok)
 	}
-	if reason, ok := Preflight(context.Background(), f.deps(), ""); ok || reason != ReasonLabBusy {
+	if reason, ok := Preflight(context.Background(), f.deps(), DefaultScenario(), ""); ok || reason != ReasonLabBusy {
 		t.Fatalf("Preflight without own id = %q, %v; want lab_busy", reason, ok)
+	}
+}
+
+// splitScenario is a scenario outside the catalog whose two faults run in
+// different services: its memory fault in productcatalogservice, its CPU
+// fault in cartservice.
+func splitScenario() Scenario {
+	sc := DefaultScenario()
+	sc.ID, sc.Default = "split", false
+	sc.CPU.Target = targetCart
+	return sc
+}
+
+// downService marks every instance of svc stale.
+func (f *fakeLab) downService(svc string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, in := range f.instances {
+		if in.Service == svc {
+			in.Status = "stale"
+		}
+	}
+}
+
+// TestPreflight_EveryTargetOfTheScenario: preflight needs an alive instance of
+// every service the run's scenario targets, and reads no other service's: a
+// scenario whose CPU target has none is refused target_unavailable although
+// its memory target has one, and the other way round; a scenario on one
+// service needs only that one. Its dataset is the scenario's own.
+func TestPreflight_EveryTargetOfTheScenario(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		sc     Scenario
+		down   string
+		want   Reason
+		reads  []string
+		noData bool
+	}{
+		{"both targets alive", splitScenario(), "", Reason{}, []string{testTarget, targetCart}, false},
+		{"the CPU target down", splitScenario(), targetCart, ReasonTargetUnavailable, []string{testTarget, targetCart}, false},
+		{"the memory target down", splitScenario(), testTarget, ReasonTargetUnavailable, []string{testTarget}, false},
+		{"one target, another service down", DefaultScenario(), targetCart, Reason{}, []string{testTarget}, false},
+		{"its dataset missing", func() Scenario { s := splitScenario(); s.Workload.DatasetName = "demo-other"; return s }(),
+			"", ReasonLoadGeneratorUnavailable, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeLab(t, testNow)
+			f.downService(tc.down)
+			reason, ok := Preflight(context.Background(), f.deps(), tc.sc, "")
+			if ok != tc.want.IsZero() || reason != tc.want {
+				t.Errorf("Preflight = %q, %v; want %q", reason, ok, tc.want)
+			}
+			var reads []string
+			for _, c := range f.callList("instances.InstancesForService ") {
+				reads = append(reads, strings.TrimPrefix(c, "instances.InstancesForService "))
+			}
+			if !slices.Equal(reads, tc.reads) {
+				t.Errorf("instances read for %v; want %v", reads, tc.reads)
+			}
+		})
+	}
+}
+
+// TestWorker_RunsTheQueuedScenario: the worker preflights, builds and shows
+// the scenario the run was queued with, not the default: its rules run in
+// the scenario's target, and every view of the run, live, ended and from the
+// database, names it. A run of a scenario whose CPU target is down is refused
+// target_unavailable before anything is built.
+func TestWorker_RunsTheQueuedScenario(t *testing.T) {
+	t.Parallel()
+	t.Run("completed", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, noCap)
+		x.f.autopilot = true
+		heavy, ok := ScenarioByID("cart-heavy")
+		if !ok {
+			t.Fatal("no cart-heavy in the catalog")
+		}
+		r, ch := x.enqueueOf("a", heavy)
+		if r.Scenario != "cart-heavy" {
+			t.Errorf("queued view's scenario %q", r.Scenario)
+		}
+		x.start()
+		_, end := awaitEnd(t, ch)
+		requireEnded(t, end, RunCompleted, Reason{})
+		if end.Scenario != "cart-heavy" {
+			t.Errorf("ended view's scenario %q; want cart-heavy", end.Scenario)
+		}
+		for i := 1; i < 3; i++ {
+			if p := end.Phases[i]; p.Target == nil || *p.Target != targetCart || p.Intensity == nil || *p.Intensity != "heavy" ||
+				p.Result == nil {
+				t.Errorf("phase %d = %+v; want cartservice, heavy, with its result", i, p)
+			}
+		}
+		for i, rule := range x.f.rulesOfRun(t, r.RunID) {
+			if rr := x.f.rule(rule); rr == nil || rr.Service != targetCart {
+				t.Errorf("rule %d %+v; want one in cartservice", i, rr)
+			}
+		}
+		for _, c := range x.f.callList("instances.InstancesForService ") {
+			if c != "instances.InstancesForService "+targetCart {
+				t.Errorf("preflight read %q; want only the scenario's target", c)
+			}
+		}
+		x.stop()
+		w2 := NewWorker(x.f.deps(), x.cfg, NewQueue(3), NewHub())
+		if v, err := w2.View(context.Background(), r.RunID); err != nil || v.Scenario != "cart-heavy" ||
+			v.Phases[2].Target == nil || *v.Phases[2].Target != targetCart {
+			t.Errorf("view from the database = %+v, %v; want the run of cart-heavy", v, err)
+		}
+	})
+	t.Run("a target down", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, nil)
+		x.f.downService(targetCart)
+		_, ch := x.enqueueOf("a", splitScenario())
+		x.start()
+		_, end := awaitEnd(t, ch)
+		requireEnded(t, end, RunFailed, ReasonTargetUnavailable)
+		if c := x.f.callList("rules.Create"); len(c) != 0 {
+			t.Errorf("rules created %v; want none", c)
+		}
+	})
+}
+
+// TestWorker_ReadResultPrefersTheRunsWorkflow: of a phase's result rows, the
+// one of the workflow asked for, else the first.
+func TestWorker_ReadResultPrefersTheRunsWorkflow(t *testing.T) {
+	t.Parallel()
+	f := newFakeLab(t, testNow)
+	w := NewWorker(f.deps(), workerConfig(), nil, nil)
+	f.mu.Lock()
+	f.results["phase-x"] = []*model.PhaseWorkflowResult{{PhaseID: "phase-x", WorkflowID: "demo-other", RequestCount: 1},
+		{PhaseID: "phase-x", WorkflowID: "demo-browse", RequestCount: 2}}
+	f.mu.Unlock()
+	for workflow, want := range map[string]int64{"demo-browse": 2, "demo-other": 1, "": 1, "demo-none": 1} {
+		res, err := w.readResult(context.Background(), "phase-x", workflow)
+		if err != nil || res == nil || res.Requests != want {
+			t.Errorf("readResult(%q) = %+v, %v; want %d requests", workflow, res, err, want)
+		}
 	}
 }
 
@@ -929,11 +1081,11 @@ func TestWorker_EveryEndingFreesOnceAndEndsLast(t *testing.T) {
 	// Exactly the three slots are free again (the worker takes the first of
 	// these at once; it still counts).
 	for _, cl := range []string{"a", "b", "c"} {
-		if _, err := x.q.Enqueue(cl, testNow); err != nil {
+		if _, err := x.q.Enqueue(cl, DefaultScenario(), testNow); err != nil {
 			t.Errorf("client %s after its run ended: %v", cl, err)
 		}
 	}
-	if _, err := x.q.Enqueue("d", testNow); !errors.Is(err, ErrQueueFull) {
+	if _, err := x.q.Enqueue("d", DefaultScenario(), testNow); !errors.Is(err, ErrQueueFull) {
 		t.Errorf("fourth enqueue: %v; want ErrQueueFull", err)
 	}
 	x.stop()
@@ -1457,7 +1609,7 @@ func TestWorker_EnqueueRefusedOnceStopped(t *testing.T) {
 		x.start()
 		waitClosed(t, entered, "the worker to block in a read")
 		x.w.halt()
-		if _, err := x.q.Enqueue("b", testNow); !errors.Is(err, ErrQueueClosed) {
+		if _, err := x.q.Enqueue("b", DefaultScenario(), testNow); !errors.Is(err, ErrQueueClosed) {
 			t.Errorf("enqueue after halt: %v; want ErrQueueClosed", err)
 		}
 		select {
@@ -1474,7 +1626,7 @@ func TestWorker_EnqueueRefusedOnceStopped(t *testing.T) {
 		x := newHarness(t, nil)
 		x.start()
 		x.stop()
-		if _, err := x.q.Enqueue("a", testNow); !errors.Is(err, ErrQueueClosed) {
+		if _, err := x.q.Enqueue("a", DefaultScenario(), testNow); !errors.Is(err, ErrQueueClosed) {
 			t.Errorf("enqueue after Run returned: %v; want ErrQueueClosed", err)
 		}
 	})
@@ -1484,7 +1636,7 @@ func TestWorker_EnqueueRefusedOnceStopped(t *testing.T) {
 		if err := x.w.Shutdown(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := x.q.Enqueue("a", testNow); !errors.Is(err, ErrQueueClosed) {
+		if _, err := x.q.Enqueue("a", DefaultScenario(), testNow); !errors.Is(err, ErrQueueClosed) {
 			t.Errorf("enqueue after Shutdown: %v; want ErrQueueClosed", err)
 		}
 	})
@@ -1515,7 +1667,7 @@ func TestWorker_EnqueueRacingStopIsNeverOrphaned(t *testing.T) {
 					default:
 					}
 					runtime.Gosched()
-					r, err := x.q.Enqueue(fmt.Sprintf("c%d-%d", g, i), testNow)
+					r, err := x.q.Enqueue(fmt.Sprintf("c%d-%d", g, i), DefaultScenario(), testNow)
 					switch {
 					case err == nil:
 						mu.Lock()
@@ -1776,10 +1928,80 @@ func TestRuleSwitch(t *testing.T) {
 			}()
 		}
 		wg.Wait()
+		// The first off to get the switch lands both; the others find them
+		// landed and write nothing.
 		for _, rule := range rules {
-			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 10 {
-				t.Errorf("%d switch-off writes of %s; want 10", n, rule)
+			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+				t.Errorf("%d switch-off writes of %s; want 1", n, rule)
 			}
+		}
+		if !sw.isOff() {
+			t.Error("not confirmed off")
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("off writes every rule at once", func(t *testing.T) {
+		f, rules := build(t)
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
+		sw.attach(ctx, rules[:]...)
+		if err := sw.on(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Each write waits (a second at most) until every rule's write has
+		// begun: written one after the other, no two are ever in flight.
+		var arrived, inFlight, most atomic.Int32
+		f.onCall("rules.SetEnabled", func() {
+			n := inFlight.Add(1)
+			for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+			}
+			arrived.Add(1)
+			deadline := time.Now().Add(time.Second)
+			for arrived.Load() < int32(len(rules)) && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			inFlight.Add(-1)
+		})
+		if err := sw.off(ctx, offCompleted); err != nil {
+			t.Fatal(err)
+		}
+		if got := most.Load(); got != int32(len(rules)) {
+			t.Errorf("at most %d switch-offs in flight at once; want all %d", got, len(rules))
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("on that fails switches off what it switched on", func(t *testing.T) {
+		f, rules := build(t)
+		f.fail("rules.EnableIfAttached#2", errLeaky)
+		sw := newRuleSwitch("demo-sw", fakeRules{f}, quiet, f.clock)
+		sw.attach(ctx, rules[:]...)
+		if err := sw.on(ctx); !errors.Is(err, ErrRuleState) {
+			t.Fatalf("on with the cpu rule's switch-on failing: %v; want the rule-state failure", err)
+		}
+		if !f.ruleEnabledEver(rules[0]) {
+			t.Fatal("precondition: the memory rule was never switched on")
+		}
+		// At once, before on returns: not left to the run's ending.
+		for _, rule := range rules {
+			if r := f.rule(rule); r == nil || r.Enabled {
+				t.Errorf("rule %s %+v once on returned; want off", rule, r)
+			}
+			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+				t.Errorf("%d switch-off writes of %s; want 1", n, rule)
+			}
+		}
+		if !sw.isOff() {
+			t.Error("the switch is not confirmed off after the failed switch-on")
+		}
+		if err := sw.on(ctx); err == nil {
+			t.Error("a second switch-on was accepted")
+		}
+		if err := sw.off(ctx, offFailed); err != nil {
+			t.Errorf("the ending's off: %v", err)
+		}
+		if n := len(f.callList("rules.SetEnabled ")); n != 2 {
+			t.Errorf("%d switch-off writes in all; want 2, the ending's off writing nothing more", n)
 		}
 		f.requireDemoRulesOff(t)
 	})
@@ -1859,16 +2081,337 @@ func TestRuleSwitch(t *testing.T) {
 		if r := f.rule(rules[0]); r == nil || r.Enabled {
 			t.Errorf("memory rule %+v; want switched off although the cpu rule's write failed", r)
 		}
-		// The write lands on a second try: now the switch is confirmed, and
-		// later switch-offs, landed already, are no failure.
+		// The write lands on a second try, which writes only the rule not yet
+		// off: now the switch is confirmed.
 		sw.rules = fakeRules{f}
+		mark := len(f.callList("rules.SetEnabled "))
 		if err := sw.off(ctx, offCompleted); err != nil || !sw.isOff() || len(sw.notLanded()) != 0 {
 			t.Fatalf("second off: %v, isOff %v, not landed %v; want confirmed", err, sw.isOff(), sw.notLanded())
 		}
+		if got := f.callList("rules.SetEnabled ")[mark:]; !slices.Equal(got, []string{"rules.SetEnabled " + rules[1] + " false"}) {
+			t.Errorf("the second off wrote %v; want only the cpu rule's switch-off", got)
+		}
+		// Later switch-offs find every rule landed and write nothing at all.
 		sw.rules = failRuleOff{fakeRules{f}, rules[1]}
+		mark = len(f.callList("rules.SetEnabled "))
 		if err := sw.off(ctx, offCompleted); err != nil || !sw.isOff() {
-			t.Errorf("an off after the confirmation whose write fails: %v, isOff %v; want nil, still confirmed", err, sw.isOff())
+			t.Errorf("an off after the confirmation: %v, isOff %v; want nil, still confirmed", err, sw.isOff())
+		}
+		if got := f.callList("rules.SetEnabled ")[mark:]; len(got) != 0 {
+			t.Errorf("an off after the confirmation wrote %v; want nothing", got)
 		}
 		f.requireDemoRulesOff(t)
+	})
+}
+
+// ---- a run's rules as a set ----
+
+// flakyOff is the fake's Rules, except for switch-offs: one for which
+// fails(name, n) holds (the rule's name; n counts its switch-offs, from 1) is
+// refused with errLeaky and recorded as "rules.SetEnabled <id> false
+// (refused)"; one for which hold(name, n) holds first closes held and waits
+// for release.
+type flakyOff struct {
+	fakeRules
+	fails   func(name string, n int) bool
+	hold    func(name string, n int) bool
+	held    chan struct{}
+	release chan struct{}
+
+	once  sync.Once
+	mu    sync.Mutex
+	count map[string]int
+}
+
+func newFlakyOff(f *fakeLab, fails func(name string, n int) bool) *flakyOff {
+	return &flakyOff{fakeRules: fakeRules{f}, fails: fails, held: make(chan struct{}), release: make(chan struct{}),
+		count: map[string]int{}}
+}
+
+func (r *flakyOff) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	if enabled {
+		return r.fakeRules.SetEnabled(ctx, id, enabled)
+	}
+	name := ""
+	if rule := r.f.rule(id); rule != nil {
+		name = rule.Name
+	}
+	r.mu.Lock()
+	r.count[id]++
+	n := r.count[id]
+	r.mu.Unlock()
+	if r.fails != nil && r.fails(name, n) {
+		r.f.mu.Lock()
+		r.f.calls = append(r.f.calls, "rules.SetEnabled "+id+" false (refused)")
+		r.f.mu.Unlock()
+		return errLeaky
+	}
+	if r.hold != nil && r.hold(name, n) {
+		r.once.Do(func() { close(r.held) })
+		<-r.release
+	}
+	return r.fakeRules.SetEnabled(ctx, id, false)
+}
+
+// timedOff is the fake's Rules, except that once armed each switch-off waits
+// delay (or until its context ends) before it writes, and is timed.
+type timedOff struct {
+	fakeRules
+	delay time.Duration
+	armed atomic.Bool
+
+	mu   sync.Mutex
+	offs []offTiming
+}
+
+// offTiming is one switch-off: when it began and when it returned, and how.
+type offTiming struct {
+	ruleID     string
+	start, end time.Time
+	err        error
+}
+
+func (r *timedOff) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	if enabled || !r.armed.Load() {
+		return r.fakeRules.SetEnabled(ctx, id, enabled)
+	}
+	start := time.Now()
+	var err error
+	select {
+	case <-time.After(r.delay):
+		err = r.fakeRules.SetEnabled(ctx, id, false)
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	r.mu.Lock()
+	r.offs = append(r.offs, offTiming{id, start, time.Now(), err})
+	r.mu.Unlock()
+	return err
+}
+
+// first is the first armed switch-off of rule id.
+func (r *timedOff) first(id string) (offTiming, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, o := range r.offs {
+		if o.ruleID == id {
+			return o, true
+		}
+	}
+	return offTiming{}, false
+}
+
+// TestWorker_SwitchOnFailsForTheSecondRule: the store refuses to switch the
+// CPU rule on after the memory rule went on. The memory rule is switched off
+// at once by the switch-on itself, nothing starts, the run fails
+// internal_error, and each rule gets exactly one switch-off write: the
+// ending, finding both landed, writes nothing more.
+func TestWorker_SwitchOnFailsForTheSecondRule(t *testing.T) {
+	t.Parallel()
+	x := newHarness(t, noCap)
+	x.f.fail("rules.EnableIfAttached#2", errLeaky)
+	r, ch := x.enqueue("a")
+	x.start()
+	_, end := awaitEnd(t, ch)
+	x.f.requireDemoRulesOff(t)
+	requireEnded(t, end, RunFailed, ReasonInternalError)
+	rules := x.f.rulesOfRun(t, r.RunID)
+	if !x.f.ruleEnabledEver(rules[0]) || x.f.ruleEnabledEver(rules[1]) {
+		t.Fatalf("precondition: memory rule on %v, cpu rule on %v; want true, false",
+			x.f.ruleEnabledEver(rules[0]), x.f.ruleEnabledEver(rules[1]))
+	}
+	for _, rule := range rules {
+		if n := len(x.f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+			t.Errorf("%d switch-off writes of %s; want 1", n, rule)
+		}
+	}
+	if c := x.f.callList("orch."); len(c) != 0 {
+		t.Errorf("orchestrator calls %v; want none", c)
+	}
+	if x.w.SwitchOffPending() {
+		t.Error("SwitchOffPending after a switch-off that landed")
+	}
+	if st := x.f.experimentStatus(x.expID(r.RunID)); st != "planned" {
+		t.Errorf("experiment %s; want planned, left for the sweep", st)
+	}
+}
+
+// TestWorker_RetryWritesOnlyTheRuleStillOn (Review Focus 2): the ending's
+// switch-off lands on the CPU rule and fails on the memory rule, which then
+// fails twice more. The switch is not confirmed: SwitchOffPending holds and
+// the next run is not picked up, while the memory rule stays on and the CPU
+// rule off. Every retry writes the memory rule alone; once its fourth write
+// lands, the next run goes.
+func TestWorker_RetryWritesOnlyTheRuleStillOn(t *testing.T) {
+	t.Parallel()
+	x := newHarness(t, noCap)
+	var runA string
+	isMemoryOfA := func(name string) bool { return runA != "" && name == RuleName(runA, FaultMemory) }
+	flaky := newFlakyOff(x.f, func(name string, n int) bool { return isMemoryOfA(name) && n <= 3 })
+	flaky.hold = func(name string, n int) bool { return isMemoryOfA(name) && n == 4 }
+	x.rebuild(func(d *Deps) { d.Rules = flaky })
+	x.f.autopilot = true
+	a, chA := x.enqueue("a")
+	b, chB := x.enqueue("b")
+	runA = a.RunID
+	x.start()
+
+	_, endA := awaitEnd(t, chA)
+	requireEnded(t, endA, RunCompleted, Reason{})
+	waitClosed(t, flaky.held, "the memory rule's fourth switch-off")
+	rules := x.f.rulesOfRun(t, a.RunID)
+	if !x.w.SwitchOffPending() {
+		t.Error("SwitchOffPending is false while the memory rule's switch-off has not landed")
+	}
+	if r := x.f.rule(rules[0]); r == nil || !r.Enabled {
+		t.Errorf("memory rule %+v; want still on", r)
+	}
+	if r := x.f.rule(rules[1]); r == nil || r.Enabled {
+		t.Errorf("cpu rule %+v; want off since the first attempt", r)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if len(x.f.ruleIDsOfRun(b.RunID)) != 0 {
+		t.Fatal("the next run was picked up while the memory rule's switch-off was pending")
+	}
+	close(flaky.release)
+	waitFor(t, "the next run's pickup", func() bool { return len(x.f.ruleIDsOfRun(b.RunID)) != 0 })
+	if x.w.SwitchOffPending() {
+		t.Error("SwitchOffPending after the switch-off landed")
+	}
+
+	var writes []string
+	for _, c := range x.f.callList("rules.SetEnabled ") {
+		if strings.Contains(c, " "+rules[0]+" ") || strings.Contains(c, " "+rules[1]+" ") {
+			writes = append(writes, c)
+		}
+	}
+	mem, cpu := "rules.SetEnabled "+rules[0]+" false", "rules.SetEnabled "+rules[1]+" false"
+	refused := mem + " (refused)"
+	if len(writes) != 5 {
+		t.Fatalf("switch-off writes of run a's rules: %v; want 5", writes)
+	}
+	// The ending's attempt wrote both rules at once, in either order; each
+	// retry wrote the memory rule alone.
+	if first := []string{writes[0], writes[1]}; !slices.Contains(first, refused) || !slices.Contains(first, cpu) {
+		t.Errorf("the ending's writes %v; want the memory rule's (refused) and the cpu rule's", first)
+	}
+	if retries := writes[2:]; !slices.Equal(retries, []string{refused, refused, mem}) {
+		t.Errorf("the retries wrote %v; want only the memory rule's: refused twice, then landed", retries)
+	}
+	_, endB := awaitEnd(t, chB)
+	requireEnded(t, endB, RunCompleted, Reason{})
+}
+
+// TestWorker_ShutdownSwitchesRulesOffAtOnce: with a store whose every
+// switch-off takes 4 s, Shutdown's 15 s budget still covers every rule of
+// every run in flight, because every switch-off starts at once: each one
+// begins within a second of the Shutdown, whichever run it belongs to, and
+// lands before Shutdown returns.
+func TestWorker_ShutdownSwitchesRulesOffAtOnce(t *testing.T) {
+	t.Parallel()
+	const write, budget = 4 * time.Second, 15 * time.Second
+
+	shutdown := func(t *testing.T, x *harness, slow *timedOff, rules []string) {
+		t.Helper()
+		slow.armed.Store(true)
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		began := time.Now()
+		err := x.w.Shutdown(ctx)
+		took := time.Since(began)
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if took >= budget {
+			t.Errorf("Shutdown took %s; want inside its %s", took, budget)
+		}
+		for _, rule := range rules {
+			o, ok := slow.first(rule)
+			if !ok {
+				t.Errorf("rule %s was never switched off", rule)
+				continue
+			}
+			if d := o.start.Sub(began); d > time.Second {
+				t.Errorf("rule %s's switch-off began %s after the Shutdown; want at once, beside every other", rule, d)
+			}
+			if o.err != nil || o.end.Sub(began) >= took+time.Millisecond {
+				t.Errorf("rule %s's switch-off: %v, returned %s after the Shutdown (which took %s); want landed before it returned",
+					rule, o.err, o.end.Sub(began), took)
+			}
+			if r := x.f.rule(rule); r == nil || r.Enabled {
+				t.Errorf("rule %s %+v; want off", rule, r)
+			}
+		}
+	}
+
+	t.Run("the run in progress", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, noCap)
+		slow := &timedOff{fakeRules: fakeRules{x.f}, delay: write}
+		x.rebuild(func(d *Deps) { d.Rules = slow })
+		r, ch := x.enqueue("a")
+		x.start()
+		awaitPhase(t, ch, 0, PhaseRunning)
+		phases := x.f.phasesOf(x.expID(r.RunID))
+		x.f.setPhaseStatus(phases[0].ID, "completed")
+		x.f.setPhaseStatus(phases[1].ID, "running")
+		rules := x.f.rulesOfRun(t, r.RunID)
+		if !x.f.served(rules[0]) {
+			t.Fatal("precondition: the memory phase runs but its rule is not served")
+		}
+		shutdown(t, x, slow, rules[:])
+		_, end := awaitEnd(t, ch)
+		requireEnded(t, end, RunCancelled, ReasonInterrupted)
+	})
+
+	t.Run("the run in progress and an ended run still pending", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, noCap)
+		slow := &timedOff{fakeRules: fakeRules{x.f}, delay: write}
+		x.rebuild(func(d *Deps) { d.Rules = slow })
+		ctx := context.Background()
+		var runs []*active
+		var rules []string
+		for range 2 {
+			runID := id.New(RunIDPrefix)
+			built, err := BuildRun(ctx, x.f.deps(), runID, DefaultScenario(), testRunCap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := &active{runID: runID, expID: built.ExperimentID, sw: newRuleSwitch(runID, slow, x.w.log, x.f.clock)}
+			a.sw.attach(ctx, built.RuleIDs[:]...)
+			if err := a.sw.on(ctx); err != nil {
+				t.Fatal(err)
+			}
+			runs, rules = append(runs, a), append(rules, built.RuleIDs[:]...)
+		}
+		x.start() // the line is empty: Run waits for a run
+		waitFor(t, "Run to start", x.w.running.Load)
+		x.w.mu.Lock()
+		x.w.cur, x.w.pending = runs[0], runs[1]
+		x.w.mu.Unlock()
+		shutdown(t, x, slow, rules)
+	})
+
+	t.Run("the watchdog", func(t *testing.T) {
+		t.Parallel()
+		x := newHarness(t, func(c *Config) { c.RunCap = 300 * time.Millisecond })
+		slow := &timedOff{fakeRules: fakeRules{x.f}, delay: time.Second}
+		x.rebuild(func(d *Deps) { d.Rules = slow })
+		slow.armed.Store(true)
+		r, ch := x.enqueue("a")
+		x.start()
+		_, end := awaitEnd(t, ch)
+		requireEnded(t, end, RunCancelled, ReasonTimedOut)
+		rules := x.f.rulesOfRun(t, r.RunID)
+		o0, ok0 := slow.first(rules[0])
+		o1, ok1 := slow.first(rules[1])
+		if !ok0 || !ok1 {
+			t.Fatalf("switch-offs: memory %v, cpu %v; want both", ok0, ok1)
+		}
+		if d := o0.start.Sub(o1.start).Abs(); d > 500*time.Millisecond {
+			t.Errorf("the watchdog's switch-offs began %s apart; want at once", d)
+		}
+		x.f.requireDemoRulesOff(t)
 	})
 }

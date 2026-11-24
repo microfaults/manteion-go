@@ -322,7 +322,7 @@ func (d *Demo) handlePostRun(w http.ResponseWriter, r *http.Request) {
 		d.writeError(w, CodeUnavailable, 0)
 		return
 	}
-	run, wait, err := d.admit(client)
+	run, wait, err := d.admit(client, DefaultScenario()) // Task 6: the scenario the body names
 	if err == nil && run.Position == nil {
 		err = errors.New("demo: an enqueued run came back without a position")
 	}
@@ -333,13 +333,13 @@ func (d *Demo) handlePostRun(w http.ResponseWriter, r *http.Request) {
 	d.writeJSON(w, r, http.StatusCreated, Enqueued{RunID: run.RunID, Status: run.Status, Position: *run.Position})
 }
 
-// admit enqueues a run for client, or says why not and how long to wait. The
-// wait is an estimate where the queue decides: for queue_full, the phases the
-// run at the head has not finished, 40 s each; for client_has_run, the
-// phases left up to and including the client's own run, or the client's
-// enqueue limit if that ends later (until both have passed, a retry is
-// refused again).
-func (d *Demo) admit(client string) (Run, time.Duration, error) {
+// admit enqueues a run of scenario sc for client, or says why not and how long
+// to wait. The wait is an estimate where the queue decides: for queue_full,
+// the phases the run at the head has not finished, 40 s each; for
+// client_has_run, the phases left up to and including the client's own run,
+// or the client's enqueue limit if that ends later (until both have passed, a
+// retry is refused again).
+func (d *Demo) admit(client string, sc Scenario) (Run, time.Duration, error) {
 	d.admitMu.Lock()
 	defer d.admitMu.Unlock()
 	if pos, err := d.q.check(client); err != nil {
@@ -351,7 +351,7 @@ func (d *Demo) admit(client string) (Run, time.Duration, error) {
 	if ok, wait := d.lim.enqueueWait(client); !ok {
 		return Run{}, wait, errEnqueueLimited
 	}
-	run, err := d.enqueue(client, d.d.Clock.Now())
+	run, err := d.enqueue(client, sc, d.d.Clock.Now())
 	switch {
 	case errors.Is(err, ErrQueueFull):
 		return Run{}, lineWait(d.q.Snapshot(), 0), err

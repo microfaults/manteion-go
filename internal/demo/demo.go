@@ -56,7 +56,7 @@ type Demo struct {
 	// take.
 	view       func(ctx context.Context, runID string) (Run, error)
 	readRecent func(ctx context.Context, n int) ([]Run, bool)
-	enqueue    func(client string, now time.Time) (Run, error)
+	enqueue    func(client string, sc Scenario, now time.Time) (Run, error)
 }
 
 // New builds the demo over d: a queue of cfg.Capacity, a hub, a limiter and
@@ -142,7 +142,7 @@ func (d *Demo) SwitchOffAll(ctx context.Context) error {
 // and then opens the lab: POST is accepted from now on. It opens the lab even
 // when the sweep reports incomplete, which is logged here and returned: the
 // lab must not stay closed because one clean-up step failed, and the worker's
-// guarantees (each run's rule off on every ending) do not depend on the
+// guarantees (each run's rules off on every ending) do not depend on the
 // sweep; the next start's sweep tries again. Give ctx a deadline (the wiring
 // gives 2 minutes). Its listings of the demo's experiments fill the worker's
 // run index (lookups.go), as each retention pass's do afterwards.
@@ -166,10 +166,10 @@ func (d *Demo) markReady() {
 
 // Shutdown stops the demo as manteion shuts down: POST answers 503
 // unavailable from now on; the worker shuts down (Worker.Shutdown: the
-// current rule switched off, every run in line ended interrupted), and the
-// error it returns is logged and returned; then every event stream's channel
-// is closed (Hub.CloseAll). It returns by ctx's deadline (the wiring gives it
-// its own context of about 15 s). Safe to call more than once.
+// current run's rules switched off, every run in line ended interrupted), and
+// the error it returns is logged and returned; then every event stream's
+// channel is closed (Hub.CloseAll). It returns by ctx's deadline (the wiring
+// gives it its own context of about 15 s). Safe to call more than once.
 func (d *Demo) Shutdown(ctx context.Context) error {
 	d.stopping.Store(true)
 	err := d.w.Shutdown(ctx)
@@ -299,10 +299,13 @@ func (d *Demo) refreshHealth(done chan struct{}, prev [numChecks]bool, had bool)
 // deadline:
 //
 //   - database: the database answers a ping;
-//   - load_generator: zeus answers and holds a usable demo dataset for a run
-//     of Config.RunCap (preflight's check);
+//   - load_generator: zeus answers and holds a usable dataset of every
+//     catalog workload for a run of Config.RunCap (preflight's check, for
+//     the whole catalog);
 //   - metrics: Prometheus answers;
-//   - target: productcatalogservice has an alive instance (preflight's check);
+//   - target: every service a catalog scenario targets (CatalogTargets) has
+//     an alive instance (preflight's check, for the whole catalog): a run of
+//     any scenario could then pass it;
 //   - idle: no experiment is running except the run in progress's own (the
 //     worker's current experiment). An ended run whose switch-off is pending
 //     is not the run in progress: while its experiment still runs (its cancel
@@ -325,7 +328,7 @@ func (d *Demo) probeAll(prev [numChecks]bool, had bool) [numChecks]bool {
 			return true
 		},
 		checkLoadGenerator: func(ctx context.Context, log *slog.Logger) bool {
-			return loadGenReady(ctx, d.d, d.cfg.RunCap, log)
+			return loadGenReady(ctx, d.d, catalogDatasets(), d.cfg.RunCap, log)
 		},
 		checkMetrics: func(ctx context.Context, log *slog.Logger) bool {
 			if d.d.Prom == nil || !d.d.Prom.Healthy(ctx) {
@@ -335,7 +338,7 @@ func (d *Demo) probeAll(prev [numChecks]bool, had bool) [numChecks]bool {
 			return true
 		},
 		checkTarget: func(ctx context.Context, log *slog.Logger) bool {
-			return targetReady(ctx, d.d, log)
+			return targetReady(ctx, d.d, CatalogTargets(), log)
 		},
 		checkIdle: func(ctx context.Context, log *slog.Logger) bool {
 			idle, err := labIdle(ctx, d.d, own)

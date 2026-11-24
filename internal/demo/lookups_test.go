@@ -2,15 +2,20 @@ package demo
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"manteion-go/internal/id"
+	"manteion-go/internal/model"
 )
 
 // ---- helpers ----
@@ -398,5 +403,169 @@ func TestLookups_EventsRoute(t *testing.T) {
 	g.release()
 	for i := 0; i < 2; i++ {
 		requireError(t, <-held, http.StatusNotFound, "not_found")
+	}
+}
+
+// ---- runs read back from the database ----
+
+// goneScenario is a scenario no catalog holds (one a later release removed):
+// its memory fault in productcatalogservice and its CPU fault in cartservice,
+// both at an intensity labelled label with the given loads.
+func goneScenario(id, label string, memLoad, cpuLoad float64) Scenario {
+	sc := DefaultScenario()
+	sc.ID, sc.Default = id, false
+	sc.Memory = FaultStep{Kind: FaultMemory, Target: targetCatalog, Intensity: label, TargetLoad: memLoad}
+	sc.CPU = FaultStep{Kind: FaultCPU, Target: targetCart, Intensity: label, TargetLoad: cpuLoad}
+	return sc
+}
+
+// phaseFaults is each phase's name, fault, target and intensity as the
+// contract marshals them (nil for null), with fault_observed and measure.
+func phaseFaults(t *testing.T, r Run) [3][6]any {
+	t.Helper()
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("the run does not marshal: %v", err)
+	}
+	assertNoLeak(t, string(b))
+	var m struct {
+		Phases []map[string]any `json:"phases"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil || len(m.Phases) != 3 {
+		t.Fatalf("phases of %s: %v", b, err)
+	}
+	var out [3][6]any
+	for i, p := range m.Phases {
+		out[i] = [6]any{p["name"], p["fault"], p["target"], p["intensity"], p["fault_observed"], p["measure"]}
+	}
+	return out
+}
+
+// TestView_StoredRuns (Review Focus 3 and 5): runs a worker has never seen,
+// read back from the database, as a manteion upgraded or restarted finds
+// them.
+//   - A run of a catalog scenario reads as that scenario builds it.
+//   - A run of a scenario no longer in the catalog keeps its stored id and its
+//     stored phase names; each fault phase's fault, target and intensity come
+//     from its own rule and that rule's spec, and are null where they cannot
+//     be read (a rule gone, a spec gone). A read that fails is unavailable
+//     (503), not a view with nulls.
+//   - A run of build 2's shape reads exactly as build 2 served it: no
+//     scenario (""), its phases plain, catalog-latency-50ms and plain-end,
+//     the middle one's fault "+50 ms latency on productcatalogservice", and
+//     the fields build 2 did not have null.
+//
+// Recent lists each the same way.
+func TestView_StoredRuns(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFakeLab(t, testNow)
+	cart := seedPair(t, f, scenario(t, "cart-heavy"), "completed", false)
+	removed := seedPair(t, f, goneScenario("gone-split", "extreme", 0.15, 0.75), "completed", false)
+	partial := seedPair(t, f, goneScenario("gone-wild", "wild", 0.05, 0.25), "failed", false)
+	dropRule(t, f, partial, 1)
+	f.mu.Lock() // the memory rule's spec is gone too
+	memRule := f.rules[partial.RuleIDs[0]]
+	f.specs = slices.DeleteFunc(f.specs, func(s *model.FaultSpec) bool { return s.ID == memRule.Action.FaultSpecID })
+	f.mu.Unlock()
+	old := seed(t, f, "cancelled", false)
+
+	const n = "<null>"
+	null := func(v any) any {
+		if v == n {
+			return nil
+		}
+		return v
+	}
+	row := func(name, fault, target, intensity string) [6]any {
+		return [6]any{name, null(fault), null(target), null(intensity), nil, nil}
+	}
+	cases := []struct {
+		name     string
+		runID    string
+		scenario string
+		status   RunStatus
+		phases   [3][6]any
+	}{
+		{"a catalog scenario", cart.runID, "cart-heavy", RunCompleted, [3][6]any{
+			row("baseline", n, n, n), row("memory", "memory", "cartservice", "heavy"), row("cpu", "cpu", "cartservice", "heavy")}},
+		{"a scenario since removed", removed.runID, "gone-split", RunCompleted, [3][6]any{
+			row("baseline", n, n, n), row("memory", "memory", "productcatalogservice", "extreme"), row("cpu", "cpu", "cartservice", "extreme")}},
+		{"a removed scenario, a rule and a spec gone", partial.runID, "gone-wild", RunFailed, [3][6]any{
+			row("baseline", n, n, n), row("memory", "memory", "productcatalogservice", n), row("cpu", n, n, n)}},
+		{"build 2's shape", old.runID, "", RunCancelled, [3][6]any{
+			row("plain", n, n, n), row("catalog-latency-50ms", "+50 ms latency on productcatalogservice", n, n), row("plain-end", n, n, n)}},
+	}
+	w := NewWorker(f.deps(), workerConfig(), nil, nil)
+	for _, tc := range cases {
+		v, err := w.View(ctx, tc.runID)
+		if err != nil {
+			t.Errorf("%s: View: %v", tc.name, err)
+			continue
+		}
+		if v.RunID != tc.runID || v.Scenario != tc.scenario || v.Status != tc.status {
+			t.Errorf("%s: run %s, scenario %q, status %s; want %s, %q, %s", tc.name, v.RunID, v.Scenario, v.Status,
+				tc.runID, tc.scenario, tc.status)
+		}
+		if got := phaseFaults(t, v); got != tc.phases {
+			t.Errorf("%s: phases\n got %v\nwant %v", tc.name, got, tc.phases)
+		}
+	}
+
+	// Recent shows each run as View does.
+	recent, complete := NewWorker(f.deps(), workerConfig(), nil, nil).Recent(ctx, 10)
+	if !complete || len(recent) != len(cases) {
+		t.Fatalf("Recent = %d runs, complete %v; want %d", len(recent), complete, len(cases))
+	}
+	for _, tc := range cases {
+		i := slices.IndexFunc(recent, func(r Run) bool { return r.RunID == tc.runID })
+		if i < 0 || recent[i].Scenario != tc.scenario || phaseFaults(t, recent[i]) != tc.phases {
+			t.Errorf("%s: in Recent as %+v; want as View shows it", tc.name, recent)
+		}
+	}
+
+	// A failed read of a removed scenario's rules is unavailable, not a view
+	// with nulls kept for ever; once the read works the run reads in full.
+	w3 := NewWorker(f.deps(), workerConfig(), nil, nil)
+	f.fail("rules.Get", errLeaky)
+	if v, err := w3.View(ctx, removed.runID); !errors.Is(err, ErrRunUnavailable) || v.RunID != "" {
+		t.Errorf("View when the run's rules cannot be read = %+v, %v; want ErrRunUnavailable", v, err)
+	}
+	f.uninject("rules.Get")
+	f.fail("specs.ListSpecs", errLeaky)
+	if _, err := w3.View(ctx, removed.runID); !errors.Is(err, ErrRunUnavailable) {
+		t.Errorf("View when the specs cannot be read: %v; want ErrRunUnavailable", err)
+	}
+	f.uninject("specs.ListSpecs")
+	if v, err := w3.View(ctx, removed.runID); err != nil || phaseFaults(t, v) != cases[1].phases {
+		t.Errorf("View once the reads work = %+v, %v; want the run in full", v, err)
+	}
+}
+
+// TestScenarioOfDescription: the scenario id BuildRun writes into the
+// experiment's description reads back exactly, for every catalog scenario and
+// a removed one; a description that does not carry one, or carries something
+// that is not an id, reads as none.
+func TestScenarioOfDescription(t *testing.T) {
+	t.Parallel()
+	for _, sc := range append(Catalog(), goneScenario("gone-split", "extreme", 0.15, 0.75)) {
+		if got, ok := scenarioOfDescription(runDescription(sc)); !ok || got != sc.ID {
+			t.Errorf("scenario of %q = %q, %v; want %q", runDescription(sc), got, ok, sc.ID)
+		}
+	}
+	for _, desc := range []string{
+		"",
+		"Public demo run: plain load, then +50 ms latency on productcatalogservice, then plain load again.",
+		"Public demo run of scenario : no fault.",
+		"Public demo run of scenario cart heavy: no fault.",
+		"Public demo run of scenario <script>: no fault.",
+		"Public demo run of scenario Cart-Heavy: no fault.",
+		"Public demo run of scenario cart-heavy",
+		"public demo run of scenario cart-heavy: no fault.",
+		"Public demo run of scenario " + strings.Repeat("a", 65) + ": no fault.",
+	} {
+		if got, ok := scenarioOfDescription(desc); ok {
+			t.Errorf("scenario of %q = %q; want none", desc, got)
+		}
 	}
 }

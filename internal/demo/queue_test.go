@@ -15,7 +15,7 @@ import (
 func TestQueue_ConcurrentEnqueueForLastSlot(t *testing.T) {
 	q := NewQueue(3)
 	for _, c := range []string{"a", "b"} {
-		if _, err := q.Enqueue(c, testNow); err != nil {
+		if _, err := q.Enqueue(c, DefaultScenario(), testNow); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -30,7 +30,7 @@ func TestQueue_ConcurrentEnqueueForLastSlot(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := q.Enqueue(fmt.Sprintf("client-%d", i), testNow)
+			_, err := q.Enqueue(fmt.Sprintf("client-%d", i), DefaultScenario(), testNow)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -58,33 +58,33 @@ func TestQueue_ConcurrentEnqueueForLastSlot(t *testing.T) {
 // the line it may enqueue again.
 func TestQueue_OneRunPerClient(t *testing.T) {
 	q := NewQueue(2)
-	first, err := q.Enqueue("a", testNow)
+	first, err := q.Enqueue("a", DefaultScenario(), testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Enqueue("a", testNow); !errors.Is(err, ErrClientHasRun) {
+	if _, err := q.Enqueue("a", DefaultScenario(), testNow); !errors.Is(err, ErrClientHasRun) {
 		t.Fatalf("second enqueue: %v; want ErrClientHasRun", err)
 	}
-	if _, err := q.Enqueue("b", testNow); err != nil {
+	if _, err := q.Enqueue("b", DefaultScenario(), testNow); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Enqueue("a", testNow); !errors.Is(err, ErrClientHasRun) {
+	if _, err := q.Enqueue("a", DefaultScenario(), testNow); !errors.Is(err, ErrClientHasRun) {
 		t.Fatalf("full queue, same client: %v; want ErrClientHasRun", err)
 	}
-	if _, err := q.Enqueue("c", testNow); !errors.Is(err, ErrQueueFull) {
+	if _, err := q.Enqueue("c", DefaultScenario(), testNow); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("full queue, new client: %v; want ErrQueueFull", err)
 	}
 	// The worker taking the run does not free the client: running counts.
-	if id, ok := q.next(t.Context()); !ok || id != first.RunID {
-		t.Fatalf("next = %q, %v; want %q", id, ok, first.RunID)
+	if id, sc, ok := q.next(t.Context()); !ok || id != first.RunID || sc.ID != DefaultScenario().ID {
+		t.Fatalf("next = %q, %q, %v; want %q of the default scenario", id, sc.ID, ok, first.RunID)
 	}
-	if _, err := q.Enqueue("a", testNow); !errors.Is(err, ErrClientHasRun) {
+	if _, err := q.Enqueue("a", DefaultScenario(), testNow); !errors.Is(err, ErrClientHasRun) {
 		t.Fatalf("running run: %v; want ErrClientHasRun", err)
 	}
 	if _, ok := q.remove(first.RunID); !ok {
 		t.Fatal("remove failed")
 	}
-	if _, err := q.Enqueue("a", testNow); err != nil {
+	if _, err := q.Enqueue("a", DefaultScenario(), testNow); err != nil {
 		t.Fatalf("after its run left the line: %v", err)
 	}
 }
@@ -93,21 +93,21 @@ func TestQueue_OneRunPerClient(t *testing.T) {
 // what waits for the worker to end, and next returns false at once.
 func TestQueue_Closed(t *testing.T) {
 	q := NewQueue(3)
-	r, err := q.Enqueue("a", testNow)
+	r, err := q.Enqueue("a", DefaultScenario(), testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	q.closeLine()
 	q.closeLine()
 	for _, c := range []string{"a", "b"} {
-		if _, err := q.Enqueue(c, testNow); !errors.Is(err, ErrQueueClosed) {
+		if _, err := q.Enqueue(c, DefaultScenario(), testNow); !errors.Is(err, ErrQueueClosed) {
 			t.Errorf("enqueue %s on a closed queue: %v; want ErrQueueClosed", c, err)
 		}
 	}
 	if w := q.waiting(); !slices.Equal(w, []string{r.RunID}) {
 		t.Errorf("waiting = %v; want the run queued before the close", w)
 	}
-	if id, ok := q.next(t.Context()); ok {
+	if id, _, ok := q.next(t.Context()); ok {
 		t.Errorf("next on a closed queue took %q", id)
 	}
 }
@@ -119,7 +119,7 @@ func TestQueue_Positions(t *testing.T) {
 	q := NewQueue(3)
 	var ids []string
 	for i, c := range []string{"a", "b", "c"} {
-		r, err := q.Enqueue(c, testNow)
+		r, err := q.Enqueue(c, DefaultScenario(), testNow)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,7 +134,7 @@ func TestQueue_Positions(t *testing.T) {
 			t.Fatalf("snapshot[%d] = %s at %v; want %s at %d", i, r.RunID, r.Position, ids[i], i)
 		}
 	}
-	if _, ok := q.next(t.Context()); !ok {
+	if _, _, ok := q.next(t.Context()); !ok {
 		t.Fatal("next failed")
 	}
 	moved, ok := q.remove(ids[0])
@@ -156,21 +156,36 @@ func TestQueue_Positions(t *testing.T) {
 	}
 }
 
-// TestQueue_RunView: a queued run's view is the contract's Run with the
-// default scenario's id and phases (baseline with no fault, then memory and
-// cpu with their fault, target and intensity), the fixed testbed and a run id
-// of the demo's shape.
+// TestQueue_RunView: a queued run's view is the contract's Run with its own
+// scenario's id and phases (baseline with no fault, then memory and cpu with
+// their fault, target and intensity), the fixed testbed and a run id of the
+// demo's shape; the worker takes the run with that scenario, and every view
+// of the run shows it.
 func TestQueue_RunView(t *testing.T) {
 	q := NewQueue(3)
-	r, err := q.Enqueue("a", testNow)
+	heavy, ok := ScenarioByID("cart-heavy")
+	if !ok {
+		t.Fatal("no cart-heavy in the catalog")
+	}
+	r, err := q.Enqueue("a", heavy, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !validRunID(r.RunID) {
 		t.Errorf("run id %q has not the demo's shape", r.RunID)
 	}
-	if r.Scenario != "catalog-moderate" {
-		t.Errorf("scenario = %q; want the default, catalog-moderate", r.Scenario)
+	if r.Scenario != "cart-heavy" {
+		t.Errorf("scenario = %q; want the queued one, cart-heavy", r.Scenario)
+	}
+	if snap := q.Snapshot(); len(snap) != 1 || snap[0].Scenario != "cart-heavy" {
+		t.Errorf("snapshot = %+v; want the run of cart-heavy", snap)
+	}
+	if id, sc, ok := q.next(t.Context()); !ok || id != r.RunID || sc != heavy {
+		t.Errorf("next = %q, %+v, %v; want the run with its scenario", id, sc, ok)
+	}
+	other, err := q.Enqueue("b", DefaultScenario(), testNow)
+	if err != nil || other.Scenario != DefaultScenario().ID || *other.Phases[1].Target != "productcatalogservice" {
+		t.Errorf("a run of the default scenario = %+v, %v", other, err)
 	}
 	str := func(p *string) any {
 		if p == nil {
@@ -180,8 +195,8 @@ func TestQueue_RunView(t *testing.T) {
 	}
 	wantFaults := [3][3]any{
 		{nil, nil, nil},
-		{"memory", "productcatalogservice", "moderate"},
-		{"cpu", "productcatalogservice", "moderate"},
+		{"memory", "cartservice", "heavy"},
+		{"cpu", "cartservice", "heavy"},
 	}
 	for i, p := range r.Phases {
 		if p.Name != PhaseNames[i] || p.Status != PhasePending || p.DurationS != PhaseDurationS ||
@@ -196,8 +211,8 @@ func TestQueue_RunView(t *testing.T) {
 	*r.Position = 7
 	*r.Phases[1].Fault, *r.Phases[2].Target, *r.Phases[2].Intensity = "changed", "changed", "changed"
 	again, _ := q.get(r.RunID)
-	if *again.Position != 0 || *again.Phases[1].Fault != "memory" || *again.Phases[2].Target != "productcatalogservice" ||
-		*again.Phases[2].Intensity != "moderate" {
+	if *again.Position != 0 || *again.Phases[1].Fault != "memory" || *again.Phases[2].Target != "cartservice" ||
+		*again.Phases[2].Intensity != "heavy" {
 		t.Fatalf("the queue's view changed through a copy: %+v", again)
 	}
 	b, err := json.Marshal(again)

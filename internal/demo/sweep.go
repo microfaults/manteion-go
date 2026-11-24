@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"manteion-go/internal/model"
@@ -192,12 +193,14 @@ func Sweep(ctx context.Context, d Deps, keep int) error {
 
 // Retain keeps the newest keep finished demo experiments (completed, failed or
 // cancelled; newest by creation) and deletes the rest, each as: every rule
-// grouped under its name (runKey: the run's rules) switched off; its phases'
-// rule links read, and the experiment kept if any links a rule that is not one
-// of those; the experiment deleted; then the run's rules deleted. A run's rule
-// whose experiment no longer exists is switched off and deleted too. Retain never touches a planned or running
-// experiment and never cancels anything; it pages through all the demo's
-// experiments. Once ctx is done it starts nothing new.
+// grouped under its name (runKey: the run's rules) switched off, and the
+// experiment kept unless every one of those landed; its phases' rule links
+// read, and the experiment kept if any links a rule that is not one of
+// those; the experiment deleted; then the run's rules deleted. A run's rule
+// whose experiment no longer exists is switched off and deleted too. Retain
+// never touches a planned or running experiment and never cancels anything;
+// it pages through all the demo's experiments. Once ctx is done it starts
+// nothing new.
 //
 // It knows no run in progress, so call it only where no run is being built:
 // from the worker's OnRunEnded, or with no worker running (Sweep does). The
@@ -265,15 +268,21 @@ func (w *Worker) spared() spared {
 }
 
 // Shutdown stops the worker as manteion shuts down. No run is picked up any
-// more; the run in progress has its rule switched off now, from this
-// goroutine, without waiting for the worker's; its experiment is not
-// cancelled (the next start's Sweep does that); it and every waiting run end
-// cancelled/interrupted, and Run returns. Shutdown waits for Run to return, or
-// for ctx to be done, whichever is first, so it returns by ctx's deadline even
-// when the worker goroutine is stuck.
+// more; the run in progress, and an ended run whose switch-off is still
+// pending, have their rules switched off now, without waiting for the
+// worker's goroutine: every run's switch-off starts at once, each in its own
+// goroutine, and each writes all its pending rules at once, so the time it
+// takes is the slowest single write's (each has 10 s), not the sum of them.
+// A run whose switch-off is already being written (its ending's, its
+// watchdog's) waits for that one first, then writes only what is still
+// pending. The run in progress's experiment is not cancelled (the next
+// start's Sweep does that); it and every waiting run end
+// cancelled/interrupted, and Run returns. Shutdown waits for Run to return,
+// or for ctx to be done, whichever is first, so it returns by ctx's deadline
+// even when the worker goroutine is stuck.
 //
-// It returns nil, or the switch-off's failure (errors.Is ErrRuleState), and
-// ctx's error when the switch-off or Run had not finished by then; a
+// It returns nil, or the switch-offs' failures (errors.Is ErrRuleState), and
+// ctx's error when the switch-offs or Run had not finished by then; a
 // switch-off still in flight goes on, with its own 10 s deadline. A rule that
 // stays on is the next start's SwitchOffAll's job.
 //
@@ -297,26 +306,28 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	// landed, and an ended run whose switch-off is still being retried (the
 	// retry stops with the worker, so this is its last try before the next
 	// start's switch-off). Each switch is idempotent; writes to one rule never
-	// overlap.
-	runs := []*active{before}
-	if after := w.currentActive(); after != before {
-		runs = append(runs, after)
-	}
-	if p := w.pendingActive(); p != nil && !slices.Contains(runs, p) {
-		runs = append(runs, p)
+	// overlap. Every run's switch-off starts now, beside the others': one run
+	// after another, a slow store would leave a later run's rules waiting
+	// past the budget.
+	var runs []*active
+	for _, a := range []*active{before, w.currentActive(), w.pendingActive()} {
+		if a != nil && !slices.Contains(runs, a) {
+			runs = append(runs, a)
+		}
 	}
 
 	switched := make(chan error, 1)
 	go func() {
-		var failed []error
-		for _, a := range runs {
-			if a == nil {
-				continue
-			}
-			if err := a.sw.off(ctx, offShutdown); err != nil {
-				failed = append(failed, err)
-			}
+		failed := make([]error, len(runs))
+		var wg sync.WaitGroup
+		for i, a := range runs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				failed[i] = w.tryOff(ctx, a, offShutdown)
+			}()
 		}
+		wg.Wait()
 		switched <- errors.Join(failed...)
 	}()
 	var errs []error
@@ -638,20 +649,26 @@ func (t *tidier) cancelStalePlanned(ctx context.Context, exps []*model.Experimen
 }
 
 // remove deletes one finished demo experiment: every rule grouped under its
-// name (runKey) off, then, if its phases link no other rule, the experiment,
-// then each of the run's rules (a rule with the name that is not a run's
-// stays, off). A step that fails, or
-// a foreign link, ends the sequence for this experiment.
+// name (runKey) switched off, each tried whatever happened to the others;
+// then, only if every one of those landed and its phases link no other rule,
+// the experiment; then each of the run's rules (a rule with the name that is
+// not a run's stays, off). A switch-off that fails, any later step that
+// fails, or a foreign link, ends the sequence for this experiment, which is
+// kept with whatever rules it still has for the next pass.
 func (t *tidier) remove(ctx context.Context, e *model.Experiment, rules []*model.Rule) {
 	if t.spared().owns(e) {
 		return
 	}
+	var stillOn []string
 	for _, r := range rules {
 		if !t.switchOff(ctx, r) {
-			t.log.Warn("demo: keeping a finished experiment whose rule could not be switched off",
-				"experiment_id", e.ID, "rule_id", r.ID)
-			return
+			stillOn = append(stillOn, r.ID)
 		}
+	}
+	if len(stillOn) > 0 {
+		t.log.Warn("demo: keeping a finished experiment whose rules could not all be switched off",
+			"experiment_id", e.ID, "rule_ids", stillOn)
+		return
 	}
 	if !t.linksOnly(ctx, e, rules) {
 		return

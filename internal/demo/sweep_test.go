@@ -1097,7 +1097,7 @@ func TestWorker_ShutdownDisablesCurrentRule(t *testing.T) {
 		t.Errorf("second Shutdown: %v", err)
 	}
 	// No run can be queued, let alone picked up, after Shutdown.
-	if _, err := x.q.Enqueue("c", testNow); !errors.Is(err, ErrQueueClosed) {
+	if _, err := x.q.Enqueue("c", DefaultScenario(), testNow); !errors.Is(err, ErrQueueClosed) {
 		t.Errorf("enqueue after Shutdown: %v; want ErrQueueClosed", err)
 	}
 	if n := len(x.f.callList("rules.Create")); n != 2 {
@@ -1570,6 +1570,10 @@ func TestSweep_HonoursDeadline(t *testing.T) {
 func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
 	t.Parallel()
 	x := newHarness(t, func(c *Config) { noCap(c); c.Retain = 1 })
+	// The run's own first switch-off of its memory rule fails.
+	x.rebuild(func(d *Deps) {
+		d.Rules = newFlakyOff(x.f, func(name string, n int) bool { return strings.HasSuffix(name, "-memory") && n == 1 })
+	})
 	x.w.offRetry = backoff{first: time.Hour, max: time.Hour} // stays pending until Shutdown
 	older := []seeded{seed(t, x.f, "completed", true), seed(t, x.f, "completed", false)}
 	passes := make(chan error, 4)
@@ -1578,7 +1582,6 @@ func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
 		pendingAtPass.Store(x.w.SwitchOffPending())
 		passes <- x.w.Retain(ctx)
 	}
-	x.f.fail("rules.SetEnabled#1", errLeaky) // the run's own first switch-off, of its memory rule
 	x.f.mu.Lock()
 	x.f.autopilot = true
 	x.f.mu.Unlock()
@@ -1609,7 +1612,7 @@ func TestWorkerRetain_WhileSwitchOffPending(t *testing.T) {
 			writes = append(writes, c)
 		}
 	}
-	if !slices.Equal(writes, []string{"rules.SetEnabled " + rule + " false"}) {
+	if !slices.Equal(writes, []string{"rules.SetEnabled " + rule + " false (refused)"}) {
 		t.Errorf("writes to the pending run's memory rule %v; want only the worker's one failed switch-off", writes)
 	}
 	writes = nil
@@ -1676,4 +1679,379 @@ func TestSweep_FailedSwitchOffLoggedOnce(t *testing.T) {
 	if err := (fakeRules{f}).SetEnabled(context.Background(), s.RuleID, false); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// ---- runs of scenarios, and a lab of both shapes ----
+
+// pair is one run of a scenario seeded into a lab through BuildRun: its
+// experiment, its two rules (memory, then CPU) and its phases.
+type pair struct {
+	runID        string
+	ExperimentID string
+	RuleIDs      [2]string
+	PhaseIDs     [3]string
+}
+
+// seedPair writes a run of scenario sc in f through BuildRun, one second (of
+// f's clock) after the previous one, switches both its rules on when on, and
+// moves its experiment to status as seed does: planned (as built), running
+// (its memory phase running, so an enabled memory rule is served), or
+// completed, failed or cancelled (phases not yet ended are skipped).
+func seedPair(t *testing.T, f *fakeLab, sc Scenario, status string, on bool) pair {
+	t.Helper()
+	ctx := context.Background()
+	runID := id.New(RunIDPrefix)
+	built, err := BuildRun(ctx, f.deps(), runID, sc, testRunCap)
+	if err != nil {
+		t.Fatalf("seed pair: build: %v", err)
+	}
+	p := pair{runID: runID, ExperimentID: built.ExperimentID, RuleIDs: built.RuleIDs, PhaseIDs: built.PhaseIDs}
+	f.clock.Advance(time.Second)
+	if on {
+		for _, rule := range p.RuleIDs {
+			if err := SetRuleEnabled(ctx, fakeRules{f}, rule, true); err != nil {
+				t.Fatalf("seed pair: switch on: %v", err)
+			}
+		}
+	}
+	switch status {
+	case "planned":
+	case "running":
+		f.setExperimentStatus(p.ExperimentID, "running")
+		f.setPhaseStatus(p.PhaseIDs[0], "completed")
+		f.setPhaseStatus(p.PhaseIDs[1], "running")
+	case "completed", "failed", "cancelled":
+		f.endExperiment(p.ExperimentID, status, testNow, testNow)
+	default:
+		t.Fatalf("seed pair: unknown status %q", status)
+	}
+	return p
+}
+
+// dropRule deletes rule i of the pair (0 memory, 1 CPU) as an operator would:
+// switched off, unlinked from its phase, then deleted.
+func dropRule(t *testing.T, f *fakeLab, p pair, i int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := (fakeRules{f}).SetEnabled(ctx, p.RuleIDs[i], false); err != nil {
+		t.Fatalf("switch off rule %s: %v", p.RuleIDs[i], err)
+	}
+	if err := (fakeExperiments{f}).AttachPhaseRules(ctx, p.PhaseIDs[i+1], nil); err != nil {
+		t.Fatalf("unlink rule %s: %v", p.RuleIDs[i], err)
+	}
+	if err := (fakeRules{f}).Delete(ctx, p.RuleIDs[i]); err != nil {
+		t.Fatalf("delete rule %s: %v", p.RuleIDs[i], err)
+	}
+}
+
+// requirePairRemovedInOrder checks that a pair's experiment and rules are gone,
+// and that every rule it still had (all but those numbered in gone) was
+// switched off before the experiment was deleted, every phase's links read
+// between the last of those switch-offs and the delete, and the experiment
+// deleted before each rule.
+func requirePairRemovedInOrder(t *testing.T, f *fakeLab, p pair, gone ...int) {
+	t.Helper()
+	if f.hasExperiment(p.ExperimentID) || f.hasRule(p.RuleIDs[0]) || f.hasRule(p.RuleIDs[1]) {
+		t.Errorf("run %s: experiment kept %v, rules kept %v %v; want all gone", p.runID,
+			f.hasExperiment(p.ExperimentID), f.hasRule(p.RuleIDs[0]), f.hasRule(p.RuleIDs[1]))
+		return
+	}
+	calls := f.callList("")
+	delExp := slices.Index(calls, "experiments.Delete "+p.ExperimentID)
+	if delExp < 0 {
+		t.Errorf("run %s: its experiment was never deleted", p.runID)
+		return
+	}
+	lastOff := -1
+	for i, rule := range p.RuleIDs {
+		if slices.Contains(gone, i) {
+			continue
+		}
+		off := slices.Index(calls, "rules.SetEnabled "+rule+" false")
+		del := slices.Index(calls, "rules.Delete "+rule)
+		if off < 0 || del < 0 || !(off < delExp && delExp < del) {
+			t.Errorf("run %s, rule %s: switch-off at %d, experiment delete at %d, rule delete at %d; want off < experiment < rule",
+				p.runID, rule, off, delExp, del)
+		}
+		lastOff = max(lastOff, off)
+	}
+	for _, pid := range p.PhaseIDs {
+		if at := slices.Index(calls, "experiments.ListPhaseRules "+pid); at < lastOff || at > delExp {
+			t.Errorf("run %s: phase %s's links read at %d; want between the last switch-off (%d) and the delete (%d)",
+				p.runID, pid, at, lastOff, delExp)
+		}
+	}
+}
+
+// requirePairKept checks that a pair's experiment and both rules are still
+// there, and that nothing deleted or cancelled any of them.
+func requirePairKept(t *testing.T, f *fakeLab, p pair) {
+	t.Helper()
+	if !f.hasExperiment(p.ExperimentID) || !f.hasRule(p.RuleIDs[0]) || !f.hasRule(p.RuleIDs[1]) {
+		t.Errorf("run %s: experiment kept %v, rules kept %v %v; want all kept", p.runID,
+			f.hasExperiment(p.ExperimentID), f.hasRule(p.RuleIDs[0]), f.hasRule(p.RuleIDs[1]))
+	}
+	for _, rowID := range []string{p.ExperimentID, p.RuleIDs[0], p.RuleIDs[1]} {
+		for _, c := range callsFor(f, rowID) {
+			if strings.HasPrefix(c, "experiments.Delete") || strings.HasPrefix(c, "rules.Delete") ||
+				strings.HasPrefix(c, "orch.CancelExperiment") {
+				t.Errorf("run %s: unexpected %q", p.runID, c)
+			}
+		}
+	}
+}
+
+// scenario returns the catalog's scenario id, failing t if there is none.
+func scenario(t *testing.T, id string) Scenario {
+	t.Helper()
+	sc, ok := ScenarioByID(id)
+	if !ok {
+		t.Fatalf("no scenario %q in the catalog", id)
+	}
+	return sc
+}
+
+// TestRetain_ScenarioRuns: retention over runs built through BuildRun, two
+// rules each. A finished run beyond keep goes as a set: both rules off, then
+// the experiment, then each rule; a pair with one rule already gone goes the
+// same way, the remaining rule alone; when one rule's switch-off fails, the
+// run is kept (its experiment not even tried), the other rule is off, and
+// the next pass removes it.
+func TestRetain_ScenarioRuns(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a pair", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		old := seedPair(t, f, scenario(t, "cart-heavy"), "completed", true)
+		older := seedPair(t, f, scenario(t, "catalog-moderate"), "failed", false)
+		newer := seedPair(t, f, scenario(t, "catalog-heavy"), "cancelled", false)
+		if err := Retain(context.Background(), f.deps(), 1); err != nil {
+			t.Fatalf("Retain: %v", err)
+		}
+		requirePairRemovedInOrder(t, f, old)
+		requirePairRemovedInOrder(t, f, older)
+		requirePairKept(t, f, newer)
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("one rule of the pair already gone", func(t *testing.T) {
+		t.Parallel()
+		for i, kind := range []FaultKind{FaultMemory, FaultCPU} {
+			t.Run(string(kind), func(t *testing.T) {
+				t.Parallel()
+				f := newFakeLab(t, testNow)
+				old := seedPair(t, f, DefaultScenario(), "completed", true)
+				dropRule(t, f, old, i)
+				newer := seedPair(t, f, DefaultScenario(), "completed", false)
+				if err := Retain(context.Background(), f.deps(), 1); err != nil {
+					t.Fatalf("Retain: %v", err)
+				}
+				requirePairRemovedInOrder(t, f, old, i)
+				requirePairKept(t, f, newer)
+				f.requireDemoRulesOff(t)
+			})
+		}
+	})
+
+	t.Run("one rule's switch-off fails", func(t *testing.T) {
+		t.Parallel()
+		for i, kind := range []FaultKind{FaultMemory, FaultCPU} {
+			t.Run(string(kind), func(t *testing.T) {
+				t.Parallel()
+				f := newFakeLab(t, testNow)
+				old := seedPair(t, f, DefaultScenario(), "completed", true)
+				newer := seedPair(t, f, DefaultScenario(), "completed", false)
+				d := f.deps()
+				d.Rules = failRuleOff{fakeRules{f}, old.RuleIDs[i]}
+				err := Retain(context.Background(), d, 1)
+				if !errors.Is(err, ErrRetainIncomplete) || !errors.Is(err, ErrRuleState) {
+					t.Fatalf("Retain: %v; want incomplete with a rule-state failure", err)
+				}
+				requirePairKept(t, f, old)
+				if n := len(f.callList("experiments.Delete")); n != 0 {
+					t.Errorf("%d experiment deletes; want none while a rule of the run could not be switched off", n)
+				}
+				other := old.RuleIDs[1-i]
+				if r := f.rule(other); r == nil || r.Enabled {
+					t.Errorf("the other rule %s %+v; want switched off although this one's write failed", other, r)
+				}
+				if r := f.rule(old.RuleIDs[i]); r == nil || !r.Enabled {
+					t.Fatalf("precondition of the rest: rule %+v; want still on", r)
+				}
+				if err := Retain(context.Background(), f.deps(), 1); err != nil {
+					t.Fatalf("Retain once the switch works: %v", err)
+				}
+				requirePairRemovedInOrder(t, f, old)
+				requirePairKept(t, f, newer)
+				f.requireDemoRulesOff(t)
+			})
+		}
+	})
+}
+
+// TestTidy_MixedLab: a lab holding runs of build 2's shape (one rule,
+// demo-run-<run id>) beside runs of scenarios (two rules each), some of each
+// left on. The start-up switch-off switches every enabled one off and does
+// nothing else; the sweep switches them all off before its first cancel,
+// cancels both kinds, and removes both kinds' orphaned rules; retention
+// removes the oldest of both kinds, each as its own set and in order, and
+// keeps the newest.
+func TestTidy_MixedLab(t *testing.T) {
+	t.Parallel()
+
+	t.Run("start-up switch-off", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		olds := []seeded{seed(t, f, "running", true), seed(t, f, "completed", true), seed(t, f, "planned", false)}
+		pairs := []pair{seedPair(t, f, DefaultScenario(), "running", true), seedPair(t, f, scenario(t, "cart-moderate"), "planned", true),
+			seedPair(t, f, scenario(t, "cart-heavy"), "completed", false)}
+		addRule(t, f, "rule-smoke", "smoke-x", true)
+		mark := len(f.callList(""))
+		if err := SwitchOffAll(context.Background(), f.deps()); err != nil {
+			t.Fatalf("SwitchOffAll: %v", err)
+		}
+		f.requireDemoRulesOff(t)
+		for _, c := range f.callList("")[mark:] {
+			if c != "rules.List " && !strings.HasPrefix(c, "rules.SetEnabled ") || strings.HasSuffix(c, " true") {
+				t.Errorf("SwitchOffAll made %q; want only the rule list and switch-offs", c)
+			}
+		}
+		want := []string{olds[0].RuleID, olds[1].RuleID, pairs[0].RuleIDs[0], pairs[0].RuleIDs[1], pairs[1].RuleIDs[0], pairs[1].RuleIDs[1]}
+		for _, rule := range want {
+			if n := len(f.callList("rules.SetEnabled " + rule + " false")); n != 1 {
+				t.Errorf("%d switch-offs of %s; want 1", n, rule)
+			}
+		}
+		if n := len(f.callList("rules.SetEnabled ")); n != len(want) {
+			t.Errorf("%d switch-offs; want one per enabled demo rule (%d)", n, len(want))
+		}
+		if r := f.rule("rule-smoke"); r == nil || !r.Enabled {
+			t.Error("the operator's rule was switched off")
+		}
+		for _, s := range olds {
+			requireKept(t, f, s)
+		}
+		for _, p := range pairs {
+			requirePairKept(t, f, p)
+		}
+	})
+
+	t.Run("sweep", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		olds := []seeded{seed(t, f, "running", true), seed(t, f, "planned", true)}
+		pairs := []pair{seedPair(t, f, DefaultScenario(), "running", true), seedPair(t, f, scenario(t, "cart-heavy"), "planned", true)}
+		// Rules a build wrote before it died, its experiment never written.
+		lone := id.New(RunIDPrefix)
+		addRule(t, f, "rule-lone-memory", RuleName(lone, FaultMemory), false)
+		addRule(t, f, "rule-lone-cpu", RuleName(lone, FaultCPU), false)
+		addRule(t, f, "rule-lone-old", RunNamePrefix+id.New(RunIDPrefix), false)
+		onAtCancel := offBeforeCancel(f)
+		if err := Sweep(context.Background(), f.deps(), 20); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if n := onAtCancel.Load(); n != 0 {
+			t.Errorf("%d demo rules were on at a cancel", n)
+		}
+		calls := f.callList("")
+		firstCancel := indexOfPrefix(calls, "orch.CancelExperiment ")
+		var exps, rules []string
+		for _, s := range olds {
+			exps, rules = append(exps, s.ExperimentID), append(rules, s.RuleID)
+		}
+		for _, p := range pairs {
+			exps, rules = append(exps, p.ExperimentID), append(rules, p.RuleIDs[:]...)
+		}
+		for _, rule := range rules {
+			if off := slices.Index(calls, "rules.SetEnabled "+rule+" false"); off < 0 || off > firstCancel {
+				t.Errorf("rule %s switched off at %d, first cancel at %d; want the switch-off first", rule, off, firstCancel)
+			}
+		}
+		for _, e := range exps {
+			if st := f.experimentStatus(e); st != "cancelled" {
+				t.Errorf("experiment %s: %s; want cancelled", e, st)
+			}
+		}
+		for _, rule := range []string{"rule-lone-memory", "rule-lone-cpu", "rule-lone-old"} {
+			if f.hasRule(rule) {
+				t.Errorf("the orphaned rule %s was kept", rule)
+			}
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("sweep, a rule gone and a switch-off failing", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		gone := seedPair(t, f, DefaultScenario(), "running", true)
+		dropRule(t, f, gone, 1)
+		failing := seedPair(t, f, scenario(t, "cart-moderate"), "running", true)
+		old := seed(t, f, "running", true)
+		d := f.deps()
+		d.Rules = failRuleOff{fakeRules{f}, failing.RuleIDs[0]}
+		err := Sweep(context.Background(), d, 20)
+		if !errors.Is(err, ErrSweepIncomplete) || !errors.Is(err, ErrRuleState) {
+			t.Fatalf("Sweep: %v; want incomplete with a rule-state failure", err)
+		}
+		for _, rule := range []string{gone.RuleIDs[0], failing.RuleIDs[1], old.RuleID} {
+			if r := f.rule(rule); r == nil || r.Enabled {
+				t.Errorf("rule %s %+v; want switched off", rule, r)
+			}
+		}
+		for _, e := range []string{gone.ExperimentID, failing.ExperimentID, old.ExperimentID} {
+			if st := f.experimentStatus(e); st != "cancelled" {
+				t.Errorf("experiment %s: %s; want cancelled", e, st)
+			}
+		}
+		if f.served(failing.RuleIDs[0]) {
+			t.Error("the rule that could not be switched off is served after its experiment was cancelled")
+		}
+		// It stays on under a cancelled experiment: the next start's sweep
+		// switches it off.
+		if err := Sweep(context.Background(), f.deps(), 20); err != nil {
+			t.Fatalf("the next sweep: %v", err)
+		}
+		f.requireDemoRulesOff(t)
+	})
+
+	t.Run("retention", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeLab(t, testNow)
+		// Oldest first, the two kinds alternating; some left on.
+		o1 := seed(t, f, "completed", true)
+		p1 := seedPair(t, f, scenario(t, "cart-moderate"), "failed", true)
+		o2 := seed(t, f, "cancelled", false)
+		p2 := seedPair(t, f, DefaultScenario(), "completed", false)
+		dropRule(t, f, p2, 1)
+		o3 := seed(t, f, "completed", false)
+		p3 := seedPair(t, f, scenario(t, "catalog-heavy"), "completed", true)
+		running := seedPair(t, f, DefaultScenario(), "running", true) // never counted, never touched
+		if err := Retain(context.Background(), f.deps(), 2); err != nil {
+			t.Fatalf("Retain: %v", err)
+		}
+		requireRemovedInOrder(t, f, o1)
+		requirePairRemovedInOrder(t, f, p1)
+		requireRemovedInOrder(t, f, o2)
+		requirePairRemovedInOrder(t, f, p2, 1)
+		requireKept(t, f, o3)
+		requirePairKept(t, f, p3)
+		requirePairKept(t, f, running)
+		if !f.served(running.RuleIDs[0]) {
+			t.Error("the running run's memory rule was switched off")
+		}
+		before := len(f.callList("experiments.Delete")) + len(f.callList("rules.Delete"))
+		if err := Retain(context.Background(), f.deps(), 2); err != nil {
+			t.Fatalf("second Retain: %v", err)
+		}
+		if after := len(f.callList("experiments.Delete")) + len(f.callList("rules.Delete")); after != before {
+			t.Errorf("a second pass deleted %d more rows", after-before)
+		}
+		// Switch the kept runs' rules off so the lab ends clean.
+		for _, rule := range append(running.RuleIDs[:], p3.RuleIDs[:]...) {
+			if err := SetRuleEnabled(context.Background(), fakeRules{f}, rule, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
 }

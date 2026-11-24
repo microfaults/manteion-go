@@ -76,22 +76,25 @@ func (c Config) teardownTimeout() time.Duration  { return c.RunCap }
 // Worker runs the queue's runs one at a time, and is the only caller of
 // StartExperiment and CancelExperiment, always from goroutines it owns.
 //
-// For each run, from the moment it picks the run up:
+// For each run, from the moment it picks the run up with the scenario it was
+// queued with:
 //
 //  1. a watchdog fires Config.RunCap later unless the run has ended: it
-//     switches the run's rule off at once, from its own goroutine, whatever
+//     switches the run's rules off at once, from its own goroutine, whatever
 //     the worker is blocked on, and cuts the run's calls short;
-//  2. preflight; the run is running from here (started_at);
-//  3. BuildRun: two disabled rules, each attached to its fault phase (memory,
-//     cpu), and a planned experiment;
+//  2. preflight of the run's scenario; the run is running from here
+//     (started_at);
+//  3. BuildRun of the run's scenario: two disabled rules, each attached to its
+//     fault phase (memory, cpu), and a planned experiment;
 //  4. the rules are switched on, one after the other (each only while a
-//     phase links it);
+//     phase links it); if one cannot be, every rule is switched off again at
+//     once and the run fails;
 //  5. StartExperiment, in a goroutine of the worker's, on a context that no
 //     request and no shutdown cancels, only the watchdog;
 //  6. every Config.StatusPoll the experiment and its phases are read; a phase
 //     whose public status changed is published;
 //  7. the run ends. Every ending, before anything else, switches the rules
-//     off.
+//     off, all at once.
 //     A watchdog, a start error, a panic, an unknown status or a vanished
 //     experiment then cancel the experiment, but only once its start has
 //     returned; a completed, failed or externally cancelled experiment needs
@@ -99,8 +102,9 @@ func (c Config) teardownTimeout() time.Duration  { return c.RunCap }
 //     final view is kept, its slot freed, its end event published (last), the
 //     runs behind it told their new positions, and OnRunEnded called;
 //  8. if the ending's switch-off did not land on every rule, it is retried
-//     with backoff from a goroutine of the worker's (SwitchOffPending reports
-//     it meanwhile), and the next run is not picked up until the switch-off of
+//     with backoff from a goroutine of the worker's, each retry writing only
+//     the rules whose switch-off has not landed (SwitchOffPending reports it
+//     meanwhile), and the next run is not picked up until the switch-off of
 //     every rule of this run has landed, or the worker stops.
 //
 // Every rule switch of a run goes through one ruleSwitch, which refuses a
@@ -143,6 +147,7 @@ type Worker struct {
 // active is the run the worker is on.
 type active struct {
 	runID string
+	sc    Scenario // the scenario the run was queued with
 	sw    *ruleSwitch
 
 	// ctx carries the run's own calls (preflight, build, switch-on, reads):
@@ -195,7 +200,7 @@ const (
 	offRetention = "retention"
 )
 
-// offReason is why the ending switches the run's rule off.
+// offReason is why the ending switches the run's rules off.
 func (o outcome) offReason() string {
 	switch {
 	case o.shutdown:
@@ -243,7 +248,7 @@ func NewWorker(d Deps, cfg Config, q *Queue, h *Hub) *Worker {
 }
 
 // Run works the queue, one run at a time, until ctx is done or halt is called.
-// The run in progress then ends cancelled/interrupted with its rule switched
+// The run in progress then ends cancelled/interrupted with its rules switched
 // off and its experiment left as it is (the start-up sweep cancels it), the
 // queue is closed (Enqueue answers ErrQueueClosed), every run still waiting
 // ends the same way, and Run returns. Call it once; a second call returns at
@@ -259,11 +264,11 @@ func (w *Worker) Run(ctx context.Context) {
 	defer stopOnHalt()
 
 	for {
-		runID, ok := w.q.next(ctx)
+		runID, sc, ok := w.q.next(ctx)
 		if !ok {
 			break
 		}
-		w.runOne(ctx, runID)
+		w.runOne(ctx, runID, sc)
 	}
 	// Close first, then read what waits: a run enqueued before the close is
 	// read here and ended, one after it is refused.
@@ -300,7 +305,7 @@ func (w *Worker) pendingActive() *active {
 	return w.pending
 }
 
-// switchOffCurrent switches the current run's rule off and closes its switch,
+// switchOffCurrent switches the current run's rules off and closes its switch,
 // so no switch-on of that run lands afterwards. The run goes on until it ends
 // (halt ends it). With no current run it does nothing. Safe to call any number
 // of times, from any goroutine. A shutdown calls halt, then this.
@@ -339,8 +344,8 @@ func (w *Worker) currentExperimentID() string {
 
 // ---- one run ----
 
-func (w *Worker) runOne(parent context.Context, runID string) {
-	a := w.pickUp(parent, runID)
+func (w *Worker) runOne(parent context.Context, runID string, sc Scenario) {
+	a := w.pickUp(parent, runID, sc)
 	defer a.timer.Stop()
 	defer a.cancel()
 	out := w.guardedDrive(a)
@@ -368,9 +373,11 @@ func (w *Worker) awaitOff(parent context.Context, a *active) {
 	}
 }
 
-// pickUp makes runID the current run and starts its watchdog.
-func (w *Worker) pickUp(parent context.Context, runID string) *active {
-	a := &active{runID: runID, sw: newRuleSwitch(runID, w.d.Rules, w.log, w.d.Clock), watchdog: make(chan struct{}), phase: PhaseNames[0]}
+// pickUp makes runID, a run of scenario sc, the current run and starts its
+// watchdog.
+func (w *Worker) pickUp(parent context.Context, runID string, sc Scenario) *active {
+	a := &active{runID: runID, sc: sc, sw: newRuleSwitch(runID, w.d.Rules, w.log, w.d.Clock), watchdog: make(chan struct{}),
+		phase: PhaseNames[0]}
 	for i := range a.last {
 		a.last[i] = PhasePending
 	}
@@ -380,7 +387,7 @@ func (w *Worker) pickUp(parent context.Context, runID string) *active {
 	w.cur = a
 	w.mu.Unlock()
 	a.timer = time.AfterFunc(w.cfg.RunCap, func() { w.fireWatchdog(a) })
-	w.log.Info("demo: run picked up", "run_id", runID)
+	w.log.Info("demo: run picked up", "run_id", runID, "scenario", sc.ID)
 	return a
 }
 
@@ -388,7 +395,7 @@ func (w *Worker) pickUp(parent context.Context, runID string) *active {
 // the worker. In this order: it marks the run timed out (so a call cut short
 // below is never read as a shutdown); closes the rule switch, which refuses
 // any later switch-on and cuts one in flight short; cancels the run's calls
-// and its start; tells the worker; and switches the rule off, after any
+// and its start; tells the worker; and switches the rules off, after any
 // switch-on still in flight.
 func (w *Worker) fireWatchdog(a *active) {
 	if a.ending.Load() {
@@ -437,7 +444,7 @@ func (w *Worker) guardedDrive(a *active) (out outcome) {
 // drive takes the run from preflight to the moment its ending is known.
 func (w *Worker) drive(a *active) outcome {
 	pctx, cancel := context.WithTimeout(a.ctx, w.cfg.preflightTimeout())
-	reason, ok := preflight(pctx, w.d, "", w.cfg.RunCap)
+	reason, ok := preflight(pctx, w.d, a.sc, "", w.cfg.RunCap)
 	cancel()
 	if !ok {
 		if o, stop := a.interrupted(); stop {
@@ -449,8 +456,7 @@ func (w *Worker) drive(a *active) outcome {
 	started := w.d.Clock.Now()
 	w.q.update(a.runID, func(r *Run) { r.Status, r.StartedAt = RunRunning, &started })
 
-	sc := DefaultScenario() // Task 4: the queued entry's scenario
-	built, err := BuildRun(a.ctx, w.d, a.runID, sc, w.cfg.RunCap)
+	built, err := BuildRun(a.ctx, w.d, a.runID, a.sc, w.cfg.RunCap)
 	if err != nil {
 		if o, stop := a.interrupted(); stop {
 			return o
@@ -472,9 +478,14 @@ func (w *Worker) drive(a *active) outcome {
 		if o, stop := a.interrupted(); stop {
 			return o
 		}
-		// Unattached, closed or failed: nothing started, and the ending
-		// switches off every rule, including one this switch-on enabled
-		// before it failed. The build's rows stay for the start-up sweep.
+		// Unattached, closed or failed: nothing started, and the switch-on
+		// itself switched off every rule again (a failed one of those
+		// switch-offs is logged here, and the ending tries it again). The
+		// build's rows stay for the start-up sweep.
+		var f *offFailure
+		if errors.As(err, &f) {
+			w.logOffFailure(a, f, "switching the run's rules off after a failed switch-on failed; the ending tries again")
+		}
 		w.log.Error("demo: the run's rules could not be switched on; not starting", "run_id", a.runID,
 			"experiment_id", built.ExperimentID, "rule_ids", built.RuleIDs[:], "error", err)
 		return outcome{status: RunFailed, reason: ReasonInternalError}
@@ -648,7 +659,7 @@ func (w *Worker) refresh(ctx context.Context, a *active) (unknown bool, err erro
 		if a.last[i] != PhaseCompleted || a.haveResult[i] || seen[i] == nil {
 			continue
 		}
-		res, err := w.readResult(ctx, seen[i].ID)
+		res, err := w.readResult(ctx, seen[i].ID, a.sc.Workload.WorkflowID)
 		if err != nil {
 			w.log.Warn("demo: reading a phase's results failed", "run_id", a.runID, "phase_id", seen[i].ID, "error", err)
 			continue
@@ -679,15 +690,15 @@ func (w *Worker) refresh(ctx context.Context, a *active) (unknown bool, err erro
 	return unknown, nil
 }
 
-// readResult returns a phase's load result, or nil while it has none.
-func (w *Worker) readResult(ctx context.Context, phaseID string) (*Result, error) {
+// readResult returns a phase's load result, or nil while it has none: the row
+// of workflowID (the run's scenario's workflow), else the first row.
+func (w *Worker) readResult(ctx context.Context, phaseID, workflowID string) (*Result, error) {
 	rctx, cancel := context.WithTimeout(ctx, w.cfg.readTimeout())
 	rows, err := w.d.Experiments.ListWorkflowResultsForPhase(rctx, phaseID)
 	cancel()
 	if err != nil {
 		return nil, err
 	}
-	workflowID := DefaultScenario().Workload.WorkflowID // Task 4: the run's scenario's workload
 	var row *model.PhaseWorkflowResult
 	for _, r := range rows {
 		if r != nil && (row == nil || r.WorkflowID == workflowID) {
@@ -839,7 +850,7 @@ func (w *Worker) cancelExperiment(parent context.Context, a *active) {
 	}
 }
 
-// tryOff is one switch-off of the run's rule, for the reason why, with a
+// tryOff is one switch-off of the run's rules, for the reason why, with a
 // panic turned into an error.
 func (w *Worker) tryOff(ctx context.Context, a *active, why string) (err error) {
 	defer func() {
@@ -1167,9 +1178,20 @@ func (w *Worker) findExperiment(ctx context.Context, runID string) (*model.Exper
 	return nil, ErrRunNotFound
 }
 
-// runFromDB builds a run's view from its experiment, phases and results.
+// runFromDB builds a run's view from its experiment, phases and results: its
+// scenario and phases as storedView tells them, then each phase's status,
+// times and result.
 func (w *Worker) runFromDB(ctx context.Context, exp *model.Experiment) (Run, error) {
-	r := newRun(strings.TrimPrefix(exp.Name, RunNamePrefix), exp.CreatedAt)
+	rctx, cancel := context.WithTimeout(ctx, w.cfg.readTimeout())
+	phases, err := w.d.Experiments.ListPhasesForExperiment(rctx, exp.ID)
+	cancel()
+	if err != nil {
+		return Run{}, err
+	}
+	r, workflowID, err := w.storedView(ctx, strings.TrimPrefix(exp.Name, RunNamePrefix), exp, phases)
+	if err != nil {
+		return Run{}, err
+	}
 	r.StartedAt, r.EndedAt = clonePtr(exp.StartedAt), clonePtr(exp.CompletedAt)
 	switch exp.Status {
 	case "completed":
@@ -1178,12 +1200,6 @@ func (w *Worker) runFromDB(ctx context.Context, exp *model.Experiment) (Run, err
 		r.Status, r.Reason = RunFailed, ReasonPhaseFailed
 	default: // cancelled, or left planned or running by an earlier process
 		r.Status, r.Reason = RunCancelled, ReasonInterrupted
-	}
-	rctx, cancel := context.WithTimeout(ctx, w.cfg.readTimeout())
-	phases, err := w.d.Experiments.ListPhasesForExperiment(rctx, exp.ID)
-	cancel()
-	if err != nil {
-		return Run{}, err
 	}
 	for _, p := range phases {
 		if p == nil || p.Position < 0 || p.Position >= len(r.Phases) {
@@ -1195,7 +1211,7 @@ func (w *Worker) runFromDB(ctx context.Context, exp *model.Experiment) (Run, err
 		}
 		pv.StartedAt, pv.EndedAt = clonePtr(p.StartedAt), clonePtr(p.CompletedAt)
 		if p.Status == "completed" {
-			res, err := w.readResult(ctx, p.ID)
+			res, err := w.readResult(ctx, p.ID, workflowID)
 			if err != nil {
 				return Run{}, err
 			}
@@ -1211,32 +1227,34 @@ func (w *Worker) runFromDB(ctx context.Context, exp *model.Experiment) (Run, err
 // memory rule and its CPU rule) goes through it.
 //
 //   - on enables the rules, one after the other (SetRuleEnabled, so each only
-//     while a phase links it). It is refused once the switch is closed, and
-//     stops at the first rule it cannot enable; the rules it enabled before
-//     stay on until the run's ending switches every rule off.
-//   - off closes the switch, cuts a switch-on in flight short, and disables
-//     every rule, one after the other (one unconditional write each, each on
-//     its own 10 s). It may be called any number of times, from any
-//     goroutine.
+//     while a phase links it). It is refused once the switch is closed. If it
+//     cannot enable a rule, it closes the switch and switches every rule off
+//     at once, as off does, before it returns: a rule it enabled is never
+//     left on for the run's ending to find.
+//   - off closes the switch, cuts a switch-on in flight short, and switches
+//     off every rule whose switch-off has not landed yet, all at once: one
+//     write each, each in its own goroutine on its own 10 s. It may be called
+//     any number of times, from any goroutine.
 //
-// Writes never overlap: each on and each off holds write across all its
-// writes. An off issued while an on is in flight therefore writes after it,
-// and an on that gets write after an off sees the switch closed and writes
-// nothing. So when off returns, each rule's last write was a switch-off, and
-// no switch-on follows it.
+// Writes never overlap a switch-on: each on and each off holds write across
+// all its writes. An off issued while an on is in flight therefore writes
+// after it, and an on that gets write after an off sees the switch closed and
+// writes nothing. So when off returns, each rule's last write was a
+// switch-off, and no switch-on follows it.
 //
 // A rule's switch-off has landed once one of its switch-off writes succeeded
-// (or found the rule gone). confirmed is closed once every rule's switch-off
-// has landed, by the off that lands the last one. From then on the rules are
-// off for good, as far as the demo is concerned: every later write is a
-// switch-off. Until then the switch is not confirmed, whichever rules are off.
+// (or found the rule gone). Every such write follows the switch's closing, so
+// nothing of the demo's switches that rule on again: no later off writes it
+// again, and a retry writes only the rules still pending. confirmed is closed
+// once every rule's switch-off has landed, by the off that lands the last
+// one. Until then the switch is not confirmed, whichever rules are off.
 //
 // Its log lines mark each rule in the log, with its rule_id: "demo: rule
 // switched on" at Info once its switch-on is written; "demo: rule switched
 // off" at Info, with its reason, once, for the write that landed its
-// switch-off; any later switch-off, and one that found the rule gone, is a
-// Debug line. A failed switch-off is its caller's to log
-// (Worker.logOffFailure), as the switch marks it (offFailure).
+// switch-off; a switch-off that found the rule gone is a Debug line. A failed
+// switch-off is its caller's to log (Worker.logOffFailure), as the switch
+// marks it (offFailure).
 type ruleSwitch struct {
 	runID string
 	rules Rules
@@ -1311,6 +1329,14 @@ func (s *ruleSwitch) isOff() bool {
 	}
 }
 
+// isClosed reports whether the switch was closed: no switch-on is written any
+// more.
+func (s *ruleSwitch) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 // failed is how many switch-offs have left a rule not landed.
 func (s *ruleSwitch) failed() int {
 	s.mu.Lock()
@@ -1351,9 +1377,13 @@ func (s *ruleSwitch) attach(ctx context.Context, ruleIDs ...string) {
 }
 
 // on switches the rules on, one after the other, unless the switch is closed
-// or has no rule. It stops at the first rule it cannot switch on, or once the
-// switch is closed, and returns why; a rule it switched on before stays on
-// until the run's ending switches every rule off.
+// or has no rule. If it cannot switch one on, it closes the switch (for
+// offFailed) and, still holding write, switches every rule off at once (see
+// off); it returns the switch-on's error, joined with that switch-off's
+// offFailure when one of those writes failed too (its caller logs it; the
+// run's ending tries again). A switch-on cut short because the switch was
+// closed meanwhile leaves the rules to the off that closed it, which writes
+// as soon as on lets go of write.
 func (s *ruleSwitch) on(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -1373,14 +1403,15 @@ func (s *ruleSwitch) on(ctx context.Context) error {
 	s.write.Lock()
 	defer s.write.Unlock()
 	for _, ruleID := range ruleIDs {
-		s.mu.Lock()
-		closed := s.closed
-		s.mu.Unlock()
-		if closed {
+		if s.isClosed() {
 			return errSwitchClosed
 		}
 		if err := SetRuleEnabled(ctx, s.rules, ruleID, true); err != nil {
-			return err
+			if s.isClosed() {
+				return err
+			}
+			s.shut(offFailed)
+			return errors.Join(err, s.offLocked(ctx, offFailed))
 		}
 		s.log.Info("demo: rule switched on", "run_id", s.runID, "rule_id", ruleID)
 	}
@@ -1402,62 +1433,83 @@ func (s *ruleSwitch) shut(why string) []string {
 	return slices.Clone(s.ruleIDs)
 }
 
-// off shuts the switch and switches every rule off, one after the other, for
-// the reason why, after any switch-on still in flight. Each rule gets one
-// unconditional write on its own 10 s, whether or not its switch-off landed
-// before. The write that lands a rule's switch-off is logged at Info, any
-// later one at Debug. Once every rule's switch-off has landed the switch is
-// confirmed off and off returns nil; otherwise it returns an offFailure naming
-// the rules whose switch-off has still not landed.
+// off shuts the switch and switches off, for the reason why and after any
+// switch-on still in flight, every rule whose switch-off has not landed, all
+// at once (offLocked). Once every rule's switch-off has landed the switch is
+// confirmed off and off returns nil; otherwise it returns an offFailure
+// naming the rules whose switch-off has still not landed.
 func (s *ruleSwitch) off(ctx context.Context, why string) error {
-	ruleIDs := s.shut(why)
-	if len(ruleIDs) == 0 {
+	if len(s.shut(why)) == 0 {
 		return nil
 	}
 	s.write.Lock()
 	defer s.write.Unlock()
-	var errs []error
-	for _, ruleID := range ruleIDs {
-		s.mu.Lock()
-		already := s.landed[ruleID]
-		s.mu.Unlock()
-		// Not SetRuleEnabled: every caller of off logs its failure.
-		gone, err := switchOffRule(ctx, s.rules, ruleID, switchOffTimeout)
-		if err != nil {
-			if already {
-				// Off for good already: the switch is closed, so nothing of
-				// the demo's switched it on since.
-				s.log.Debug("demo: a switch-off of a rule already off failed", "run_id", s.runID, "rule_id", ruleID,
-					"reason", why, "error", err)
+	return s.offLocked(ctx, why)
+}
+
+// offLocked is off's writes, with write held and the switch closed: one
+// unconditional switch-off of each rule not landed, each in its own goroutine
+// on a context detached from ctx with its own 10 s (switchOffRule), all
+// started at once, so k rules take as long as the slowest write, not k
+// writes. A panic in a write is that rule's failure. It returns when every
+// write has returned. The write that lands a rule's switch-off is logged at
+// Info (Debug for a rule found gone), in the rules' order.
+func (s *ruleSwitch) offLocked(ctx context.Context, why string) error {
+	pending := s.notLanded()
+	if len(pending) > 0 {
+		type result struct {
+			gone bool
+			err  error
+		}
+		results := make([]result, len(pending))
+		var wg sync.WaitGroup
+		for i, ruleID := range pending {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						s.log.Error("demo: switching a rule off panicked", "run_id", s.runID, "rule_id", ruleID,
+							"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+						results[i].err = &StepError{Step: "disable_rule", Class: ErrRuleState,
+							Cause: fmt.Errorf("demo: switching the rule off panicked: %v", r)}
+					}
+				}()
+				// Not SetRuleEnabled: every caller of off logs its failure.
+				gone, err := switchOffRule(ctx, s.rules, ruleID, switchOffTimeout)
+				results[i] = result{gone: gone, err: err}
+			}()
+		}
+		wg.Wait()
+		attempt := s.failed() + 1
+		var errs []error
+		for i, ruleID := range pending {
+			if err := results[i].err; err != nil {
+				errs = append(errs, err)
 				continue
 			}
-			errs = append(errs, err)
-			continue
-		}
-		// Logged before the switch is confirmed, so whoever waits on
-		// confirmed finds the line written.
-		switch {
-		case already:
-			s.log.Debug("demo: rule already off", "run_id", s.runID, "rule_id", ruleID, "reason", why)
-		case gone:
-			s.log.Debug("demo: rule already gone; nothing to switch off", "run_id", s.runID, "rule_id", ruleID, "reason", why)
-		default:
-			attrs := []any{"run_id", s.runID, "rule_id", ruleID, "reason", why}
-			if n := s.failed(); n > 0 {
-				attrs = append(attrs, "attempt", n+1)
+			// Logged before the switch is confirmed, so whoever waits on
+			// confirmed finds the line written.
+			if results[i].gone {
+				s.log.Debug("demo: rule already gone; nothing to switch off", "run_id", s.runID, "rule_id", ruleID, "reason", why)
+			} else {
+				attrs := []any{"run_id", s.runID, "rule_id", ruleID, "reason", why}
+				if attempt > 1 {
+					attrs = append(attrs, "attempt", attempt)
+				}
+				s.log.Info("demo: rule switched off", attrs...)
 			}
-			s.log.Info("demo: rule switched off", attrs...)
+			s.mu.Lock()
+			s.landed[ruleID] = true
+			s.mu.Unlock()
 		}
-		s.mu.Lock()
-		s.landed[ruleID] = true
-		s.mu.Unlock()
-	}
-	if pending := s.notLanded(); len(pending) > 0 {
-		err := errors.Join(errs...)
-		if err == nil {
-			err = errOffNotLanded
+		if left := s.notLanded(); len(left) > 0 {
+			err := errors.Join(errs...)
+			if err == nil {
+				err = errOffNotLanded
+			}
+			return s.failure(left, err)
 		}
-		return s.failure(pending, err)
 	}
 	s.confirm.Do(func() { close(s.confirmed) })
 	return nil

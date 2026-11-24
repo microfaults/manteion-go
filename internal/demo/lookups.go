@@ -1,11 +1,14 @@
 package demo
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
 
 	"manteion-go/internal/model"
+	"manteion-go/internal/store"
 )
 
 // Run lookups for the routes. A run that is not in memory (the line, or the
@@ -27,6 +30,10 @@ import (
 //   - Ended views. An ended run reads the same from the database for ever, so
 //     its view is kept (at most maxCachedViews) and a visitor re-reading an
 //     old run costs the store once.
+//
+// What a run read from the database shows is storedView's: its scenario as
+// built, or, for a scenario since removed from the catalog or a run of build
+// 2's shape, what its own rows still say.
 
 // maxDBLookups is the number of View's database lookups that may run at once.
 const maxDBLookups = 2
@@ -216,4 +223,153 @@ func settled(exp *model.Experiment, r Run) bool {
 		}
 	}
 	return true
+}
+
+// ---- runs read back from the database ----
+
+// Build 2's run shape, as build 2 served it: three phases with these names,
+// the middle one's fault described by build2FaultLabel, and no scenario.
+// Retention keeps 20 runs, so a manteion upgraded from build 2 shows such runs
+// only until newer ones replace them.
+var build2PhaseNames = [3]string{"plain", "catalog-latency-50ms", "plain-end"}
+
+const (
+	build2FaultPhase = 1
+	build2FaultLabel = "+50 ms latency on productcatalogservice"
+)
+
+// storedView is the first view of run runID read back from the database,
+// from its experiment and phases, with the workflow whose results its phases
+// show ("" for the first result row):
+//
+//   - a run whose experiment's description names a catalog scenario
+//     (scenarioOfDescription) is shown as that scenario builds it (newRun);
+//   - a run of build 2's shape (no scenario in its description, its phases
+//     named as build 2 named them) as build 2 served it: scenario "", its
+//     phases' names, the fault label on the middle one, and every field
+//     build 2 did not have null;
+//   - any other run, a scenario's since removed from the catalog, with its
+//     stored scenario id ("" when none can be read), its phases' stored names
+//     (where they are public labels), and each phase's fault, target and
+//     intensity as the run's own rule linked to that phase and the rule's
+//     spec say (faultsFromRules), null where they cannot be read.
+//
+// A read that fails is an error, so a view with nulls in it is never kept
+// for a failure that passes.
+func (w *Worker) storedView(ctx context.Context, runID string, exp *model.Experiment, phases []*model.ExperimentPhase) (Run, string, error) {
+	scID, named := scenarioOfDescription(exp.Description)
+	if sc, ok := ScenarioByID(scID); named && ok {
+		return newRun(runID, sc, exp.CreatedAt), sc.Workload.WorkflowID, nil
+	}
+	r := Run{RunID: runID, Scenario: scID, Status: RunQueued, QueuedAt: exp.CreatedAt, Testbed: FixedTestbed()}
+	for i := range r.Phases {
+		r.Phases[i] = PhaseView{Name: PhaseNames[i], Status: PhasePending, DurationS: PhaseDurationS}
+	}
+	var names [3]string
+	for _, p := range phases {
+		if p != nil && p.Position >= 0 && p.Position < len(names) {
+			names[p.Position] = p.Name
+		}
+	}
+	if !named && names == build2PhaseNames {
+		for i := range r.Phases {
+			r.Phases[i].Name = build2PhaseNames[i]
+		}
+		label := build2FaultLabel
+		r.Phases[build2FaultPhase].Fault = &label
+		return r, "", nil
+	}
+	for i, name := range names {
+		if publicLabel(name) {
+			r.Phases[i].Name = name
+		}
+	}
+	if err := w.faultsFromRules(ctx, runID, phases, &r); err != nil {
+		return Run{}, "", err
+	}
+	return r, "", nil
+}
+
+// faultsFromRules sets, on each phase of r, the fault the run's own rule
+// linked to that phase says: the rule named RuleName(runID, kind) gives the
+// fault's kind, its service the target, and its spec's name
+// (SpecNameFor: demo-<kind>-<target>-<intensity>) the intensity. A rule or
+// spec that no longer exists, or a value that is not a public label, leaves
+// its field null; a read that fails is returned. The specs are listed once,
+// and only if a rule is found.
+func (w *Worker) faultsFromRules(ctx context.Context, runID string, phases []*model.ExperimentPhase, r *Run) error {
+	if w.d.Experiments == nil || w.d.Rules == nil {
+		return errNotWired
+	}
+	var (
+		specs  []*model.FaultSpec
+		listed bool
+	)
+	read := func(fn func(context.Context) error) error {
+		rctx, cancel := context.WithTimeout(ctx, w.cfg.readTimeout())
+		defer cancel()
+		return fn(rctx)
+	}
+	for _, p := range phases {
+		if p == nil || p.Position < 0 || p.Position >= len(r.Phases) {
+			continue
+		}
+		var links []model.PhaseRule
+		if err := read(func(c context.Context) (err error) { links, err = w.d.Experiments.ListPhaseRules(c, p.ID); return }); err != nil {
+			return err
+		}
+		for _, l := range links {
+			var rule *model.Rule
+			err := read(func(c context.Context) (err error) { rule, err = w.d.Rules.Get(c, l.RuleID); return })
+			if errors.Is(err, store.ErrNotFound) || (err == nil && rule == nil) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			kind, ok := kindOfRule(runID, rule.Name)
+			if !ok {
+				continue
+			}
+			pv := &r.Phases[p.Position]
+			k := string(kind)
+			pv.Fault = &k
+			if !publicLabel(rule.Service) {
+				break
+			}
+			target := rule.Service
+			pv.Target = &target
+			if w.d.Specs == nil {
+				break
+			}
+			if !listed {
+				if err := read(func(c context.Context) (err error) { specs, err = w.d.Specs.ListSpecs(c); return }); err != nil {
+					return err
+				}
+				listed = true
+			}
+			i := slices.IndexFunc(specs, func(s *model.FaultSpec) bool { return s != nil && s.ID == rule.Action.FaultSpecID })
+			if i < 0 {
+				break
+			}
+			intensity, ok := strings.CutPrefix(specs[i].Name, SpecNameFor(FaultStep{Kind: kind, Target: target}))
+			if ok && publicLabel(intensity) {
+				pv.Intensity = &intensity
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// kindOfRule is the fault kind run runID's rule named name was made for:
+// memory for RuleName(runID, FaultMemory), cpu for RuleName(runID, FaultCPU).
+// ok is false for any other name, build 2's demo-run-<run id> included.
+func kindOfRule(runID, name string) (FaultKind, bool) {
+	for _, k := range [...]FaultKind{FaultMemory, FaultCPU} {
+		if name == RuleName(runID, k) {
+			return k, true
+		}
+	}
+	return "", false
 }

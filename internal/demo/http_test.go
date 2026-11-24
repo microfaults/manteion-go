@@ -1138,14 +1138,18 @@ func TestHealth(t *testing.T) {
 	if rec.Code != http.StatusOK || rec.Body.String() != want {
 		t.Fatalf("health: %d %s; want 200 %s", rec.Code, rec.Body, want)
 	}
+	// One probe of each check per refresh; the target's reads the instances
+	// of every catalog target.
+	targets := len(CatalogTargets())
 	probes := func() []int {
 		var n []int
 		for _, op := range []string{"db.PingContext", "zeus.Healthy", "prom.Healthy", "instances.InstancesForService", "experiments.RunningExperimentIDs"} {
 			n = append(n, len(x.f.callList(op)))
 		}
+		n[3] /= targets
 		return n
 	}
-	if p := probes(); !slices.Equal(p, []int{1, 1, 1, 1, 1}) {
+	if p := probes(); !slices.Equal(p, []int{1, 1, 1, 1, 1}) || len(x.f.callList("instances.InstancesForService")) != targets {
 		t.Fatalf("probes %v; want one of each", p)
 	}
 	x.f.clock.Advance(5*time.Second - time.Millisecond)
@@ -1232,6 +1236,36 @@ func TestHealth_EachCheck(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHealth_TargetCoversTheCatalog: target is true only when every service a
+// catalog scenario targets has an alive instance; each is read.
+func TestHealth_TargetCoversTheCatalog(t *testing.T) {
+	t.Parallel()
+	for _, svc := range CatalogTargets() {
+		t.Run(svc+" down", func(t *testing.T) {
+			t.Parallel()
+			x := newDemo(t, nil)
+			x.f.downService(svc)
+			rec, checks := x.health()
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status %d; want 503", rec.Code)
+			}
+			requireChecks(t, checks, "target")
+		})
+	}
+	t.Run("all alive", func(t *testing.T) {
+		t.Parallel()
+		x := newDemo(t, nil)
+		if rec, checks := x.health(); rec.Code != http.StatusOK {
+			t.Errorf("status %d, checks %v; want 200", rec.Code, checks)
+		}
+		for _, svc := range CatalogTargets() {
+			if len(x.f.callList("instances.InstancesForService "+svc)) == 0 {
+				t.Errorf("the instances of %s were not read", svc)
+			}
+		}
+	})
 }
 
 // stuckPinger is a database whose ping ignores its context and blocks until
@@ -1561,7 +1595,7 @@ func TestRun_Errors(t *testing.T) {
 	unknown := id.New(RunIDPrefix)
 	requireError(t, x.get(pathRun(unknown), "a"), http.StatusNotFound, "not_found")
 
-	ended := newRun(id.New(RunIDPrefix), testNow)
+	ended := newRun(id.New(RunIDPrefix), DefaultScenario(), testNow)
 	ended.Status, ended.Reason, ended.EndedAt = RunFailed, ReasonLabBusy, &testNow
 	x.d.w.mu.Lock()
 	x.d.w.finished = append(x.d.w.finished, ended)
@@ -1640,7 +1674,7 @@ func TestNoInternalLeak(t *testing.T) {
 		x := newDemo(t, nil)
 		runID := x.postOK("a")
 		x.d.view = func(context.Context, string) (Run, error) { return Run{}, errLeakyAll }
-		x.d.enqueue = func(string, time.Time) (Run, error) { return Run{}, errLeakyAll }
+		x.d.enqueue = func(string, Scenario, time.Time) (Run, error) { return Run{}, errLeakyAll }
 		rec := x.get(pathRun(runID), "a")
 		requireError(t, rec, http.StatusInternalServerError, "internal")
 		check(t, "view error", rec)
@@ -1816,7 +1850,7 @@ func TestRetrySeconds(t *testing.T) {
 // its 40 s and for a clock stepped back.
 func TestRunningPhase_ProgressClamped(t *testing.T) {
 	t.Parallel()
-	run := newRun("demo-x", testNow)
+	run := newRun("demo-x", DefaultScenario(), testNow)
 	for _, tc := range []struct {
 		started time.Duration
 		want    float64

@@ -433,7 +433,7 @@ func TestEvents_EndedBeyondTheHubsMemory(t *testing.T) {
 		})
 		// hubSealed more runs end after it: the hub no longer remembers its end.
 		for i := 0; i < hubSealed; i++ {
-			other := newRun(id.New(RunIDPrefix), testNow)
+			other := newRun(id.New(RunIDPrefix), DefaultScenario(), testNow)
 			other.Status, other.Reason = RunCancelled, ReasonInterrupted
 			x.d.hub.Publish(other.RunID, Event{Type: EventEnd, Data: other})
 		}
@@ -467,7 +467,7 @@ func TestEvents_SubscribeBeforeView(t *testing.T) {
 			ended.Status, ended.Reason, ended.Position, ended.EndedAt = RunCancelled, ReasonInterrupted, nil, &testNow
 			x.d.hub.Publish(r.RunID, Event{Type: EventEnd, Data: ended})
 			for i := 0; i < hubSealed; i++ {
-				other := newRun(id.New(RunIDPrefix), testNow)
+				other := newRun(id.New(RunIDPrefix), DefaultScenario(), testNow)
 				x.d.hub.Publish(other.RunID, Event{Type: EventEnd, Data: other})
 			}
 		}, []string{EventState, EventEnd}},
@@ -1045,7 +1045,7 @@ func TestEvents_StalledClientIsCut(t *testing.T) {
 func TestEncodeFrame(t *testing.T) {
 	t.Parallel()
 	nasty := "demo-a\nb\r\n\ndata: x\n\nevent: end"
-	run := newRun(nasty, testNow)
+	run := newRun(nasty, DefaultScenario(), testNow)
 	v := 5.0
 	good := []Event{
 		{EventState, run},
