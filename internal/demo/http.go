@@ -246,8 +246,11 @@ func scenarioOf(body []byte) (Scenario, bool) {
 			return Scenario{}, false
 		}
 		val, err := dec.Token()
+		if err != nil {
+			return Scenario{}, false
+		}
 		s, isString := val.(string)
-		if err != nil || !isString {
+		if !isString {
 			return Scenario{}, false
 		}
 		id = &s

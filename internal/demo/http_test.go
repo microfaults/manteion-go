@@ -414,6 +414,32 @@ func TestPostRun_QueueClosed(t *testing.T) {
 // namedBody is the body that names scenario id.
 func namedBody(id string) string { return `{"scenario":"` + id + `"}` }
 
+// jsonEscape is the start of a JSON \uXXXX escape, as it must appear in a
+// test body (a backslash, then u).
+const jsonEscape = "\x5cu"
+
+// requireEscapes checks that every case of bodies whose name says "escape"
+// carries a JSON \uXXXX escape, and that there are want of them: a tool that
+// decodes such escapes while writing this file would turn the case into a
+// plain one that proves nothing, and a renamed case would drop out of the
+// check.
+func requireEscapes(t *testing.T, bodies map[string]string, want int) {
+	t.Helper()
+	n := 0
+	for name, body := range bodies {
+		if !strings.Contains(name, "escape") {
+			continue
+		}
+		n++
+		if !strings.Contains(body, jsonEscape) {
+			t.Errorf("%s: the body %q carries no JSON escape", name, body)
+		}
+	}
+	if n != want {
+		t.Errorf("%d cases named for an escape; want %d", n, want)
+	}
+}
+
 // TestPostRun_Scenario: POST queues a run of the scenario its body names, by
 // exact id; no body, an empty or whitespace-only body (declared or chunked)
 // and {} queue the default. An id or key spelled with a JSON escape is the
@@ -440,8 +466,8 @@ func TestPostRun_Scenario(t *testing.T) {
 		{"empty object in whitespace", " {\n} \r\n", false, def.ID},
 		{"the default by name", namedBody(def.ID), false, def.ID},
 		{"whitespace between the tokens", "\t{ \"scenario\" :\n\"cart-heavy\" }\n", false, "cart-heavy"},
-		{"an escaped character in the id", `{"scenario":"cart-heavy"}`, false, "cart-heavy"},
-		{"an escaped character in the key", `{"scenario":"cart-heavy"}`, false, "cart-heavy"},
+		{"an escaped character in the id", `{"scenario":"cart\u002dheavy"}`, false, "cart-heavy"},
+		{"an escaped character in the key", `{"sc\u0065nario":"cart-heavy"}`, false, "cart-heavy"},
 		{"exactly the cap", atCap, false, "cart-moderate"},
 		{"exactly the cap, chunked", atCap, true, "cart-moderate"},
 	}
@@ -449,6 +475,11 @@ func TestPostRun_Scenario(t *testing.T) {
 		cases = append(cases, tc{"named " + sc.ID, namedBody(sc.ID), false, sc.ID},
 			tc{"named " + sc.ID + ", chunked", namedBody(sc.ID), true, sc.ID})
 	}
+	byName := map[string]string{}
+	for _, c := range cases {
+		byName[c.name] = c.body
+	}
+	requireEscapes(t, byName, 2)
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -524,7 +555,7 @@ var badBodies = map[string]string{
 	"the key twice, equal values":         `{"scenario":"catalog-moderate","scenario":"catalog-moderate"}`,
 	"the key twice, different values":     `{"scenario":"catalog-moderate","scenario":"cart-heavy"}`,
 	"the key twice, unknown first":        `{"scenario":"` + marker + `","scenario":"catalog-moderate"}`,
-	"the key twice, once escaped":         `{"scenario":"catalog-moderate","scenario":"catalog-moderate"}`,
+	"the key twice, once escaped":         `{"scenario":"catalog-moderate","sc\u0065nario":"catalog-moderate"}`,
 	"the id capitalised":                  `{"scenario":"Catalog-Moderate"}`,
 	"the id in capitals":                  `{"scenario":"CATALOG-MODERATE"}`,
 	"the id with a leading space":         `{"scenario":" catalog-moderate"}`,
@@ -555,8 +586,8 @@ var badBodies = map[string]string{
 	"one byte over the cap":               strings.Repeat(" ", maxBodyBytes-2) + "{}" + " ",
 	"a lone surrogate in the id":          `{"scenario":"\ud800catalog-moderate"}`,
 	"an id with a NUL escape":             `{"scenario":"catalog-moderate\u0000"}`,
-	"the key with an escaped capital":     `{"Scenario":"catalog-moderate"}`,
-	"an id with an escaped capital":       `{"scenario":"Catalog-moderate"}`,
+	"the key with an escaped capital":     `{"\u0053cenario":"catalog-moderate"}`,
+	"an id with an escaped capital":       `{"scenario":"\u0043atalog-moderate"}`,
 	"a nested object with the key inside": `{"scenario":{"scenario":"catalog-moderate"}}`,
 }
 
@@ -570,6 +601,7 @@ var badBodies = map[string]string{
 // each request line is at Debug with nothing of the body.
 func TestPostRun_BadBody(t *testing.T) {
 	t.Parallel()
+	requireEscapes(t, badBodies, 4)
 	debug := &syncBuffer{}
 	x := newDemo(t, func(_ *Config, d *Deps) {
 		d.Logger = slog.New(slog.NewJSONHandler(debug, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -1354,7 +1386,8 @@ func TestReads_RateLimitedPerClient(t *testing.T) {
 
 // unknownRoutes are requests that must all answer JSON 404 not_found: other
 // paths, other methods on known paths, and paths that are not in their
-// canonical form. The events path is not here: the next task registers it.
+// canonical form. None of the seven routes, the events route (events.go)
+// included, answers any of them.
 var unknownRoutes = []struct{ method, target string }{
 	{"GET", "/api/v1/rules"},
 	{"GET", "/api/v1/experiments"},
